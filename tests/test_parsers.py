@@ -6,6 +6,7 @@ error, and every protein silently loses that evidence.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
@@ -307,18 +308,69 @@ def test_legacy_foldseek_rows_warn_that_the_tm_gate_is_weaker(ma, tmp_path,
 
 
 # --- finding 18 -------------------------------------------------------
-def test_all_na_columns_do_not_break_the_feature_key(ma):
+@contextlib.contextmanager
+def string_dtype(enabled):
+    """Run a block under pandas' new string dtype, or under the old one.
+
+    The defect this section covers is a difference BETWEEN pandas versions, so
+    testing it on whichever pandas happens to be installed tests half of it.
+    `future.infer_string` turns on the pandas-3 behaviour today, which is what
+    lets one machine cover both.
+    """
+    fut = getattr(pd.options, "future", None)
+    if enabled and not hasattr(fut, "infer_string"):
+        pytest.skip("this pandas has no future.infer_string switch")
+    old = getattr(fut, "infer_string", None) if fut is not None else None
+    try:
+        if fut is not None and hasattr(fut, "infer_string"):
+            pd.options.future.infer_string = enabled
+        yield
+    finally:
+        if old is not None:
+            pd.options.future.infer_string = old
+
+
+@pytest.mark.parametrize("new_string_dtype", [False, True])
+def test_all_na_columns_do_not_break_the_feature_key(ma, new_string_dtype):
     # symptom: pandas >= 3 gives astype(str) a StringDtype whose NA is a real
     # float nan, so "_".join(row) raised TypeError. FragmentIon and
     # ProductCharge in an MSstats export are usually all-NA.
-    df = pd.DataFrame({"PeptideSequence": ["PEPK", "TIDEK"],
-                       "PrecursorCharge": [2, 3],
-                       "FragmentIon": [np.nan, np.nan],
-                       "ProductCharge": [None, None]})
-    out = ma.join_cols(df, ["PeptideSequence", "PrecursorCharge",
-                            "FragmentIon", "ProductCharge"])
-    assert list(out) == ["PEPK_2_nan_None", "TIDEK_3_nan_None"]
+    with string_dtype(new_string_dtype):
+        _assert_feature_key_survives_all_na(ma)
+
+
+def _assert_feature_key_survives_all_na(ma):
+    df = pd.DataFrame({"PeptideSequence": ["PEPK", "TIDEK", "PEPK"],
+                       "PrecursorCharge": [2, 3, 2],
+                       "FragmentIon": [np.nan, np.nan, np.nan],
+                       "ProductCharge": [None, None, None]})
+    cols = ["PeptideSequence", "PrecursorCharge", "FragmentIon",
+            "ProductCharge"]
+    out = ma.join_cols(df, cols)
+    # What is asserted is that a key comes back at all, and that it still has
+    # one slot per column. How a MISSING value is spelled inside it depends on
+    # the pandas version — older ones render it "nan"/"None", newer ones keep
+    # it NA so fillna("") empties the slot — and nothing in the pipeline reads
+    # the filler back, so pinning the spelling only breaks the test on a
+    # different pandas.
     assert all(isinstance(x, str) for x in out)
+    assert all(x.count("_") == len(cols) - 1 for x in out), \
+        "a missing column must still occupy its slot in the feature key"
+    assert out.iloc[0] == out.iloc[2], "identical rows must give one key"
+    assert out.iloc[0] != out.iloc[1]
+
+
+@pytest.mark.parametrize("new_string_dtype", [False, True])
+def test_a_partly_missing_column_still_separates_two_features(
+        ma, new_string_dtype):
+    # the slot matters: two features differing only in a column that is
+    # missing for one of them must not collapse into one.
+    with string_dtype(new_string_dtype):
+        df = pd.DataFrame({"PeptideSequence": ["PEPK", "PEPK"],
+                           "FragmentIon": ["y1", None]})
+        out = ma.join_cols(df, ["PeptideSequence", "FragmentIon"])
+        assert out.iloc[0] != out.iloc[1]
+        assert all(isinstance(x, str) for x in out)
 
 
 def test_msstats_csv_with_all_na_fragment_columns_reads(ma, tmp_path):
