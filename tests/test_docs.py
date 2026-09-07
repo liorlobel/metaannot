@@ -325,6 +325,19 @@ def test_the_docs_do_not_claim_the_shortlist_is_empty_by_construction():
     assert "LPxTG" in signalp_doc and "anchor domain" in signalp_doc
 
 
+def test_the_changelog_does_not_assert_the_claim_either():
+    # the same wrong sentence survived in CHANGELOG's v0.1.0 entry, which the
+    # check above did not cover. A released entry is a historical record, so it
+    # carries a marked correction rather than a silent rewrite — which is why
+    # this looks for the ASSERTING form only: v0.2.0's entry and the correction
+    # both quote the phrase in order to disown it.
+    txt = _norm(_text(CHANGELOG))
+    assert "is empty by construction" not in txt
+    assert "shortlist is empty" not in txt
+    # the correction must still be visible rather than the claim just deleted
+    assert "Corrected after v0.2.0" in txt
+
+
 def test_the_documented_gate_terms_match_the_code():
     # the doc describes surface_or_secreted as an OR of four things; if the
     # code's definition changes, the description has to change with it.

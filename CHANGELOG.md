@@ -172,5 +172,10 @@ rank is in force.
   so divide `--ram` by the worker count there.
 - **SignalP 6.0 is licence-gated** and must be installed by hand; see
   `docs/signalp-6.md`. Without it, and without a GPU for tmbed, the topology
-  stage is off and the report's effector shortlist is empty by construction
-  rather than by result.
+  stage is off, so the signal-peptide and beta-barrel terms of
+  `surface_or_secreted` are dead. That narrows the effector shortlist's gate
+  rather than closing it: an LPxTG sortase motif or an anchor domain still
+  qualifies a protein, and neither needs a topology tool.
+  *(Corrected after v0.2.0. This bullet originally said the shortlist is then
+  "empty by construction rather than by result", which is wrong — see the
+  v0.2.0 entry above. Nothing else in the v0.1.0 entry has been changed.)*
