@@ -14,6 +14,11 @@ config.yaml
 config_*.yaml
 install*.sh
 
+# ...except the worked example under examples/, whose configs ARE the content.
+# Its input/ and results/ stay ignored by the rules above, so no FASTA or
+# results table can be committed by accident.
+!examples/**/config.yaml
+
 __pycache__/
 *.py[cod]
 .venv/

@@ -85,6 +85,16 @@ coming back rather than to describe an intended feature. A handful are
 `xfail(strict)`: those name guards that are still missing, so a fix turns them
 green instead of being forgotten.
 
+## A worked example
+
+`examples/server-run-plan/` is a real plan for running eight metaproteome datasets on one
+server: eight configs plus a four-step runbook (`subset` → `doctor` → run in tmux →
+collect). Its paths and dataset names are one lab's, so it is a template rather than
+something to run as-is, but it is the shape of a multi-dataset run and it records the
+decisions such a run has to make — which stages are on and *why each of the others is
+off*, why `min_features_per_protein` is left at 1, what the identifier check found before
+anything long started, and what the whole thing is expected to cost.
+
 ## Start from a FragPipe manifest
 
 ```yaml

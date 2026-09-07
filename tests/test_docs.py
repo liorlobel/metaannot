@@ -217,7 +217,8 @@ def _documented_invocations(text):
     return out
 
 
-@pytest.mark.parametrize("doc", ["README.md", "TUTORIAL.md", "CLAUDE.md"])
+@pytest.mark.parametrize("doc", ["README.md", "TUTORIAL.md", "CLAUDE.md",
+                                 "examples/server-run-plan/README.md"])
 def test_every_documented_command_and_flag_exists_in_the_cli(cli_flags, doc):
     # symptom: the docs are a runbook. A flag that no longer exists sends the
     # reader into an argparse error six hours into a session.
@@ -359,3 +360,47 @@ def test_the_documented_gate_terms_match_the_code():
     expr = code[i + 1:j]
     for term in ("sp_class", "lpxtg", "anchor_domain", "n_tmb"):
         assert term in expr, f"{term} is no longer part of the gate"
+
+
+# --- the worked example under examples/ --------------------------------
+EXAMPLE = os.path.join(ROOT, "examples", "server-run-plan")
+
+
+def test_the_example_runbook_scripts_are_valid_shell():
+    # they are meant to be copied to a server and run; a syntax error there is
+    # found at hour six, not at review time.
+    import glob
+    scripts = sorted(glob.glob(os.path.join(EXAMPLE, "*.sh")))
+    assert scripts, "the example lost its scripts"
+    for s in scripts:
+        r = subprocess.run(["bash", "-n", s], capture_output=True, text=True)
+        assert r.returncode == 0, f"{os.path.basename(s)}: {r.stderr}"
+
+
+def test_the_example_configs_have_no_unrecognised_keys(ma):
+    # a typo in a shipped example config is a typo every reader copies. The
+    # same check `doctor` runs, applied at review time.
+    import glob
+    import yaml as _yaml
+    cfgs = sorted(glob.glob(os.path.join(EXAMPLE, "*", "config.yaml")))
+    assert len(cfgs) >= 8, f"expected the eight example configs, found {len(cfgs)}"
+    for c in cfgs:
+        body = _yaml.safe_load(open(c, encoding="utf-8"))
+        bad = ma.unknown_keys(body, ma.DEFAULT_CONFIG)
+        assert bad == [], f"{os.path.relpath(c, ROOT)}: {bad}"
+
+
+def test_the_example_configs_enable_the_stages_the_readme_claims(ma):
+    # the README says nine stages are on and names why each of the others is
+    # off. If a config drifts from that, the prose is wrong.
+    import glob
+    import yaml as _yaml
+    want = {"eggnog", "pfam", "dbcan", "diamond", "cluster", "ncbifam",
+            "kofam", "interpro", "join"}
+    for c in sorted(glob.glob(os.path.join(EXAMPLE, "*", "config.yaml"))):
+        run = _yaml.safe_load(open(c, encoding="utf-8"))["run"]
+        on = {k for k, v in run.items() if v}
+        assert on == want, f"{os.path.relpath(c, ROOT)} enables {sorted(on)}"
+        # every stage that exists must be stated one way or the other
+        missing = set(ma.DEFAULT_CONFIG["run"]) - set(run)
+        assert missing == set(), f"{os.path.relpath(c, ROOT)} is silent about {missing}"

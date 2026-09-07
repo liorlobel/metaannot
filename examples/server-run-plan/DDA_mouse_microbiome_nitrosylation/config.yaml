@@ -1,0 +1,68 @@
+# metaannot config — DDA_mouse_microbiome_nitrosylation
+# Generated 2026-09-07 from the eggNOG-only baseline run on the MacBook.
+#
+# PATHS ASSUME the Extreme Pro drive is mounted at /mnt/d on this server (D:\ in Windows),
+# which is how the UC run addressed it. If it is mounted elsewhere, fix every path with:
+#     sed -i 's#/mnt/d#/your/mount#g' */config.yaml
+#
+# Relative paths resolve against THIS FILE, so run metaannot from anywhere with
+#     metaannot.py run --config /path/to/DDA_mouse_microbiome_nitrosylation/config.yaml
+
+proteins_faa: "input/proteins.faa"        # built by 00_subset.sh, next to this file
+quant_table: "/mnt/d/Metaproteomics/PTM_analysis/DDA_mouse_microbiome_nitrosylation/Results_mouse_nitrosylation_1/combined_peptide.tsv"
+quant_format: "fragpipe_peptide"
+manifest: "/mnt/d/Metaproteomics/PTM_analysis/DDA_mouse_microbiome_nitrosylation/Results_mouse_nitrosylation_1/fragpipe-files.fp-manifest"
+emapper_precomputed:
+  - "/mnt/d/Proteomic_databases/iMGMC/eggnog_iMGMC.tsv.emapper.annotations"
+results_dir: "results"
+
+# The UC run's split on this machine: 22 cpu, 80 GB, 3 stages at once.
+threads: 22
+stage_workers: 3
+ram_gb: 80
+
+# min_features_per_protein is left at the documented default of 1.
+# The earlier UC server run set it to 2, which dropped 8,201 of 24,271 proteins before
+# the report saw them — disproportionately the small, KO-less ones this tool exists to
+# study, and the reason no dark protein reached its statistics. See issue #5.
+min_features_per_protein: 1
+
+run:
+  # the eight sources the UC run proved on this server
+  eggnog: true
+  pfam: true
+  dbcan: true
+  diamond: true
+  cluster: true
+  ncbifam: true
+  kofam: true          # THE POINT OF THIS RUN: a control on eggNOG's KO calls.
+                       # eggNOG assigns KOs by DIAMOND; KOfam uses per-family HMMs with
+                       # adaptive thresholds. On UC it rescued 8,129 proteins eggNOG
+                       # missed entirely, 2,598 of them reaching a specific KEGG map.
+  interpro: true       # by far the longest stage: 2.8 h for 38k proteins on UC
+  join: true
+  # off, each for a stated reason — not oversight:
+  topology: false      # SignalP 6.0 is licence-gated and not installed (docs/signalp-6.md);
+                       # tmbed needs a GPU. Without these the effector shortlist's gate
+                       # narrows to LPxTG + anchor domain rather than closing.
+  structure: false     # ESMFold needs a GPU; Foldseek AFDB50 is ~123 GB to download and
+                       # ~200 GB on disk. That decision is yours, not this file's.
+  hhblits: false       # queries dark_all.faa, which is only 2.7% of this dataset —
+  jackhmmer: false     # little to work on, and UniRef50 is 8.8 GB down / 27 GB on disk
+  context: false       # needs a gff whose ids match proteins_faa
+  smorf: false         # needs contigs_fna
+  effectors: false     # needs external predictor outputs
+  unipept: false       # needs the Unipept CLI run by hand
+  taxonomy: false      # needs unipept plus an NCBI taxdump
+
+db:
+  # CONFIRMED from the UC run's log:
+  ncbifam_hmm: "/mnt/d/Proteomic_databases/metaannot_db/NCBIfam.HMM"
+  diamond:
+    vfdb: "/mnt/d/Proteomic_databases/metaannot_db/vfdb_core.dmnd"
+  # INFERRED — `doctor` will tell you if any of these is wrong. Fix them here, not in code.
+  pfam_hmm: "/mnt/d/Proteomic_databases/metaannot_db/Pfam-A.hmm"
+  dbcan_hmm: "/mnt/d/Proteomic_databases/metaannot_db/dbCAN-HMMdb-V13.txt"
+  kofam_profiles: "/mnt/d/Proteomic_databases/metaannot_db/kofam/profiles"
+  kofam_ko_list: "/mnt/d/Proteomic_databases/metaannot_db/kofam/ko_list"
+  interproscan_sh: "/opt/interproscan/interproscan.sh"
