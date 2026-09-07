@@ -1,0 +1,86 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The default suite: pure Python, offline, no external search tool. The R
+  # tests in it skip cleanly here, because this image has no R.
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor metaannot is written to; 3.13 is the ceiling it is
+        # expected to keep working on.
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas pyyaml numpy pytest
+      - name: metaannot imports and answers --help
+        run: |
+          python metaannot.py --version
+          python metaannot.py --help
+      - name: default suite
+        run: pytest -q
+
+  # Everything marked slow: the full resume sweep and parallel-equals-serial
+  # across every quant_format x peptide_assignment. Kept off the default run
+  # because it is minutes rather than seconds.
+  slow:
+    name: slow suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas pyyaml numpy pytest
+      - run: pytest -q -m slow
+
+  # The R half: the report, the R object, and a real knit. Packages come from
+  # the Ubuntu archive rather than from source, which is minutes instead of an
+  # hour.
+  r:
+    name: R report and object
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install R and the packages the report loads
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            r-base-core pandoc \
+            r-cran-readr r-cran-dplyr r-cran-tidyr r-cran-tibble \
+            r-cran-stringr r-cran-ggplot2 r-cran-purrr r-cran-knitr \
+            r-cran-rmarkdown r-cran-patchwork \
+            r-bioc-limma r-bioc-summarizedexperiment r-bioc-s4vectors
+      - name: QFeatures, if the archive has it
+        # Not in every Ubuntu release. Its absence must SKIP the assay-link
+        # tests, never fail them, which is what the suite already does — this
+        # step only gives them a chance to run.
+        run: |
+          sudo apt-get install -y --no-install-recommends r-bioc-qfeatures \
+            || echo "QFeatures unavailable; its tests will skip"
+      - name: report what R actually has
+        run: |
+          Rscript -e 'cat(R.version.string, "\n"); for (p in c("readr","dplyr","tidyr","tibble","stringr","ggplot2","purrr","limma","knitr","rmarkdown","SummarizedExperiment","S4Vectors","QFeatures")) cat(sprintf("%-22s %s\n", p, requireNamespace(p, quietly=TRUE)))'
+          pandoc --version | head -1
+      - run: pip install pandas pyyaml numpy pytest
+      - name: R-marked tests, including a real knit
+        run: pytest -q -m "R" -o addopts=""
+      - name: doctor sees the R stack
+        run: python metaannot.py doctor || true
