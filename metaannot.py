@@ -5638,6 +5638,27 @@ def stage_join(cfg, p):
     with atomic_out(f"{p.quant_dir}/annotated_quant.tsv") as tmp:
         out.to_csv(tmp, sep="\t", index=False)
 
+    # Which columns of that table are samples, written down rather than left
+    # to be re-derived. The report and build_object.R both read this file
+    # first, and without it they fall back to design_from_input.tsv — or, with
+    # no manifest, to guessing from column types, which is the one path that
+    # can sweep an annotation column into the assay. This stage is the only
+    # place that KNOWS, because it is what renamed and selected them.
+    # One name per line: readLines() at the other end, trimmed, blanks
+    # dropped. An empty file is read as "no list", the same as no file.
+    odd = [c for c in int_cols if c != c.strip()]
+    if odd:
+        log(f"sample column name(s) {odd[:3]} have leading or trailing "
+            "whitespace. The report and the R object trim what they read from "
+            "quant/sample_columns.txt, so those names will not match the "
+            "columns of annotated_quant.tsv and will be reported as absent "
+            "there; fix the header or the manifest", "WARN")
+    with atomic_out(f"{p.quant_dir}/sample_columns.txt") as tmp:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("".join(c + "\n" for c in int_cols))
+    log(f"join: recorded {len(int_cols)} sample column(s) -> "
+        f"{p.quant_dir}/sample_columns.txt")
+
     fam_col = "family_id" if "family_id" in rep.columns else None
     if fam_col:
         t2g = rep[[fam_col, "group_id"]].dropna()

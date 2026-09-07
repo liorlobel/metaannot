@@ -257,18 +257,44 @@ def test_sample_columns_are_identified_positively_before_any_heuristic(ma):
         assert "types" in last, last
 
 
-@pytest.mark.xfail(reason="LIVE DEFECT: both build_object.R and the Rmd treat "
-                          "quant/sample_columns.txt as the most authoritative "
-                          "statement of which columns are samples, and NOTHING "
-                          "in metaannot.py ever writes it. Every run therefore "
-                          "falls through to design_from_input.tsv, or — with "
-                          "no manifest — to the column-type heuristic the file "
-                          "exists to avoid.",
-                   strict=True)
 def test_the_join_stage_writes_the_sample_column_list(tmp_path):
+    # symptom: both build_object.R and the Rmd read
+    # quant/sample_columns.txt as the most authoritative statement of which
+    # columns are samples, and nothing wrote it — so every run fell through to
+    # design_from_input.tsv, or with no manifest to the column-type heuristic
+    # the file exists to avoid.
     proj = build_project(tmp_path / "p")
     proj.run()
-    assert os.path.exists(proj.rpath("quant", "sample_columns.txt"))
+    path = proj.rpath("quant", "sample_columns.txt")
+    assert os.path.exists(path)
+    names = open(path, encoding="utf-8").read().splitlines()
+    assert names == proj.samples, "one sample name per line, in column order"
+
+
+def test_the_recorded_sample_columns_are_columns_of_annotated_quant(tmp_path):
+    # the file is only worth reading if it names the columns of the table it
+    # sits beside: the R side intersects the two.
+    proj = build_project(tmp_path / "p")
+    proj.run()
+    names = open(proj.rpath("quant", "sample_columns.txt"),
+                 encoding="utf-8").read().splitlines()
+    aq = pd.read_csv(proj.rpath("quant", "annotated_quant.tsv"), sep="\t",
+                     nrows=0)
+    assert names, "the list must not be empty for a run that quantified"
+    assert set(names) <= set(aq.columns)
+    # and it must name every column that actually carries intensities
+    assert set(names) == set(proj.samples)
+
+
+def test_the_sample_column_list_survives_a_manifest_rename(tmp_path):
+    # the quant table's columns are 'A_1 Intensity'; the manifest renames them
+    # to 'A_1'. The recorded list has to be the names as WRITTEN, not as read.
+    proj = build_project(tmp_path / "p")
+    proj.run()
+    names = open(proj.rpath("quant", "sample_columns.txt"),
+                 encoding="utf-8").read().splitlines()
+    assert not any(n.endswith("Intensity") for n in names)
+    assert names == ["A_1", "A_2", "B_1", "B_2"]
 
 
 def test_the_design_is_used_when_no_sample_column_list_exists(tmp_path):
@@ -685,3 +711,52 @@ def test_an_rscript_that_writes_nothing_is_reported_as_a_failure(ma, tmp_path):
         ma._run_rscript(["Rscript", "-e", "stop('boom')"], "a test", "hint")
     assert "Rscript exited" in str(e.value)
     assert "boom" in str(e.value)
+
+
+@needs_r("SummarizedExperiment", "S4Vectors")
+def test_the_object_identifies_samples_from_the_recorded_list(tmp_path):
+    # the whole point of writing the file: the object must say it used it,
+    # rather than falling back to the design or to column types.
+    proj = build_project(tmp_path / "p")
+    proj.run()
+    run_metaannot("object", "--config", proj.config_path, "--no-run",
+                  cwd=proj.root)
+    r = subprocess.run(["Rscript", proj.rpath("analysis", "build_object.R"),
+                        proj.results, proj.rpath("metaannot.rds"), "analysis"],
+                       capture_output=True, text=True, timeout=900)
+    assert r.returncode == 0, r.stderr
+    assert "samples (quant/sample_columns.txt):" in r.stdout, r.stdout[-600:]
+    assert "inferred from column types" not in r.stdout
+
+
+@needs_r("SummarizedExperiment", "S4Vectors")
+def test_the_object_needs_no_heuristic_when_there_is_no_manifest(tmp_path):
+    # symptom this fixes: with no manifest there is no design_from_input.tsv,
+    # so the sample columns used to be guessed. The recorded list covers it.
+    proj = build_project(tmp_path / "p")
+    proj.write_config(manifest="")
+    proj.run()
+    assert not os.path.exists(proj.rpath("quant", "design_from_input.tsv"))
+    run_metaannot("object", "--config", proj.config_path, "--no-run",
+                  cwd=proj.root)
+    r = subprocess.run(["Rscript", proj.rpath("analysis", "build_object.R"),
+                        proj.results, proj.rpath("metaannot.rds"), "analysis"],
+                       capture_output=True, text=True, timeout=900)
+    assert r.returncode == 0, r.stderr
+    assert "samples (quant/sample_columns.txt):" in r.stdout
+    assert "WARNING: no sample-column list" not in r.stdout
+
+
+@needs_r(*R_CORE, *R_BIOC)
+def test_the_report_identifies_samples_from_the_recorded_list(knitted):
+    if not knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    html = open(knitted.rpath("analysis", "analyse_metaannot.html"),
+                encoding="utf-8").read()
+    # The rendered NOTE, not the chunk source: code_folding echoes the whole
+    # document into the page, so any phrase that also appears in a comment
+    # there would match whatever the report actually did. This line carries
+    # the resolved path and count, which the source cannot.
+    assert re.search(r"sample columns identified from "
+                     r"quant/sample_columns\.txt: 8", html), \
+        "the report did not use the recorded sample-column list"
