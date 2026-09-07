@@ -82,6 +82,14 @@ rank is in force.
 - **Only the first contrast gets the full analysis.** Differential abundance is
   fitted for every contrast, but the ratio model, the effector shortlist and
   the R object cover the first one only.
+- **The InterProScan memory budget is passed through `_JAVA_OPTIONS`**, which
+  the JVM applies at higher precedence than a command-line `-Xmx` and which
+  every child JVM inherits. That is correct for the default standalone mode,
+  where InterProScan's workers are threads inside one JVM, and it is how the
+  stage budget actually reaches it. If you run InterProScan in distributed
+  mode, its worker JVMs are configured for 9 GB each in
+  `interproscan.properties` and would instead inherit the whole stage budget,
+  so divide `--ram` by the worker count there.
 - **SignalP 6.0 is licence-gated** and must be installed by hand; see
   `docs/signalp-6.md`. Without it, and without a GPU for tmbed, the topology
   stage is off and the report's effector shortlist is empty by construction
