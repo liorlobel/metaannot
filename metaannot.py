@@ -33,7 +33,7 @@ Requires: python3, pandas, pyyaml. External tools are needed only by the
 stages that use them; `doctor` reports which are missing.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Bumped only when the MEANING of a stage's output changes, so that existing
 # results become genuinely invalid. It is deliberately not __version__: tying

@@ -65,6 +65,26 @@ existing block instead.
 Requires python3 + pandas + pyyaml. R is needed only for the report; external
 tools only by the stages that use them. `doctor` says which are missing.
 
+## Tests
+
+```bash
+pip install pytest && pytest -q          # about 100 seconds
+pytest -q -m slow                        # the rest: resume, parallel vs serial
+```
+
+Offline, and needs none of the external tools: where a stage shells out to
+hmmsearch, DIAMOND or MMseqs2 the binary is a stub on `PATH` that writes a
+canned file, so the stage's own plumbing is exercised without it. Fixtures are
+generated from fixed seeds, so nothing binary is committed. The R tests skip
+cleanly when `Rscript` or one of its packages is absent, and knit the real
+report when they are present.
+
+Each test is named for the defect it protects against and carries a one-line
+comment stating the symptom, because most of them exist to stop something
+coming back rather than to describe an intended feature. A handful are
+`xfail(strict)`: those name guards that are still missing, so a fix turns them
+green instead of being forgotten.
+
 ## Start from a FragPipe manifest
 
 ```yaml

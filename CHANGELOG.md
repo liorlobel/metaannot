@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.2.0 — 2026-09-07
+
+A test suite, and the first three defects it and the first real run turned up.
+`SIGNATURE_VERSION` is unchanged at 1: no stage's output means anything
+different, so an existing results directory stays valid and nothing recomputes.
+
+### Added
+
+**`tests/` and CI, where there were none.** 419 tests, one named for each
+defect found by hand during development or by the first real run, every one
+carrying a one-line comment stating the symptom it protects against. The
+suite runs offline with no external tool: where a stage shells out to
+hmmsearch, DIAMOND or MMseqs2 the binary is a stub on PATH, so the stage's own
+plumbing — atomic writes, adoption, signatures, the results lock — is
+exercised without the tool. Fixtures are generated from fixed seeds; nothing
+binary is committed. The default suite is about a hundred seconds and excludes
+a `slow` mark carrying the resume sweep and parallel-versus-serial across
+every `quant_format` x `peptide_assignment`. R tests skip cleanly where R is
+absent and include a real knit where it is present. CI covers Python 3.9-3.13.
+
+This also settles two claims the README made and nothing checked: parallel and
+serial execution now provably produce identical output, and five repeated runs
+produce one hash.
+
+Eight tests are `xfail(strict)` rather than passing. Each names a guard that
+is still missing — among them `parse_emapper` raising a bare `KeyError` on a
+zero-row table, and a gap in a Unipept lineage truncating a protein's
+consensus to the rank before it. They are marked so a fix turns them green
+rather than being quietly forgotten.
+
+**`quant/sample_columns.txt`.** `build_object.R` and the report both read it
+as the authoritative statement of which columns carry intensities, and nothing
+wrote it, so every run fell through to `design_from_input.tsv` — or, with no
+manifest, to guessing from column types. The `join` stage now records what it
+detected, renamed and filtered. Not one of the stage's declared outputs, so an
+existing results directory keeps its old fallback until `join` reruns;
+`--force --only join` produces the file without recomputing anything else.
+
+### Fixed
+
+**A non-UTF-8 byte in a tool's output is no longer fatal.** One `0xa0` — a
+latin-1 non-breaking space — in a search result killed the `integrate` stage
+of the first full run on real data, after InterProScan had already spent three
+hours, with a message that named neither the file nor the stage. Every parser
+reads through `opener()`, and all six died on it: `parse_diamond`,
+`parse_interproscan`, `parse_kofam`, `parse_hmm_tblout`, `parse_hmm_lib_desc`
+and `read_fasta`. VFDB subject titles, InterPro descriptions, HMM `DESC` lines
+and FASTA headers all carry latin-1 in the wild. Now `errors="replace"`, the
+same as `read_delim_table` beside it, so a bad byte costs one character of a
+description rather than the stage.
+
+The gzip branch of the same function passed no encoding at all, so it used the
+locale's codec and was never UTF-8 by construction. `emapper_precomputed` is
+routinely a `.gz`, which made it the input most likely to be read differently
+on the server than on the laptop.
+
+**The effector shortlist is not "empty by construction" without SignalP.**
+`docs/signalp-6.md` and README said `surface_or_secreted` is False for
+everything when the topology stage is off, so an empty shortlist was a
+missing-tool artefact. Two of the gate's four terms need no topology tool: the
+LPxTG sortase motif, computed from the sequence, and an anchor domain from the
+`pfam` stage. On the first real run 604 proteins passed the gate with topology
+off, 155 of them KO-less; the shortlist was empty because nothing was
+significant — none of the 212 groups that reached the model passed FDR 0.05.
+The docs now say what SignalP genuinely adds, which is every secreted protein
+carrying neither motif, and that a shortlist without it is not empty but
+biased toward cell-wall-anchored surface proteins.
+
+### Known limitations
+
+Unchanged from v0.1.0, and still the ones that decide how a result is read:
+isobaric labelling is refused rather than quantified, only the first contrast
+gets the full analysis, and the InterProScan memory budget is inherited by
+child JVMs in distributed mode. See the v0.1.0 entry below.
+
+Issue #5 records a further one found by the same run: the report prints
+retention by bin, including a bin that contributes zero proteins to the model,
+but nothing escalates it — and on that run neither `4_dark` nor `3d_duf_only`
+reached the statistics at all.
+
 ## v0.1.0 — 2026-09-07
 
 First public release. This is the version that has actually been run end to end
