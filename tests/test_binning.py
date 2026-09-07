@@ -458,3 +458,33 @@ def test_an_integer_context_column_is_not_reported_as_a_detected_flag(
     flags = df.loc["P_dark1", "context_flags"]
     assert "n_cazymes_in_window" not in flags
     assert "prophage" in flags and "pul" not in flags
+
+
+def test_the_shortlist_gate_survives_without_signalp_or_tmbed(ma, tmp_path,
+                                                              paths_for):
+    # symptom (a doc claim, not a code one): docs/signalp-6.md and README said
+    # surface_or_secreted was "False for everything" without topology, so an
+    # empty effector shortlist was "empty by construction". It is not — the
+    # gate is an OR of four terms and two of them, the LPxTG motif and an
+    # anchor domain, need no topology tool at all. On the real UC run 604
+    # proteins passed it with topology off.
+    anchored = "M" + "A" * 150
+    sortase = ("M" + "A" * 100 + "LPKTG" + "AVILMFWCGPAVILMFWCGP" + "KRK")
+    ps = [F.Protein("P_anchor", anchored, in_emapper=False),
+          F.Protein("P_lpxtg", sortase, in_emapper=False),
+          F.Protein("P_plain", "M" + "D" * 150, in_emapper=False)]
+    cfg, p = paths_for("gate")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, ps)
+    # an anchor Pfam, from the pfam stage — nothing to do with topology
+    F.write_tblout(p.pfam, [("P_anchor", "Gram_pos_anchor",
+                             cfg["anchor_pfams"][0])])
+    assert not os.path.exists(p.signalp) and not os.path.exists(p.tmbed)
+
+    df = ma.build_annotation(cfg, p)
+    assert (df["sp_class"].fillna("") == "").all(), "no SignalP ran"
+    assert (df["n_tmb"].fillna(0) == 0).all(), "no tmbed ran"
+    assert bool(df.loc["P_anchor", "surface_or_secreted"])
+    assert bool(df.loc["P_lpxtg", "surface_or_secreted"])
+    assert not bool(df.loc["P_plain", "surface_or_secreted"])
+    assert int(df["surface_or_secreted"].sum()) == 2

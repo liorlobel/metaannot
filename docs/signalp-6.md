@@ -45,17 +45,33 @@ The SignalP row should read `OK` instead of `MANUAL`.
 `run.topology` also covers **tmbed**, which needs a GPU and is not installed
 here either, so the topology stage is off entirely. Without it:
 
-- `sp_class` (SEC/SPI, LIPO/SPII, TAT) is empty for every protein, so the
-  signal-peptide weights contribute nothing to `effector_score`.
+- `sp_class` (SEC/SPI, LIPO/SPII, TAT, PILIN) is empty for every protein, so
+  the signal-peptide weights contribute nothing to `effector_score`.
 - `n_tmb` and the beta-barrel weight are empty, so outer-membrane proteins are
   not scored.
-- `surface_or_secreted` is False for everything, which is the **gate** on the
-  report's effector shortlist. The shortlist is therefore empty by
-  construction, not because no candidate exists.
+- `surface_or_secreted` — the **gate** on the report's effector shortlist —
+  is narrowed, **not** closed. It is the OR of four terms, and two of them do
+  not come from topology at all: the C-terminal LPxTG sortase motif, computed
+  from the sequence, and an anchor domain from `anchor_pfams`, which comes
+  from the `pfam` stage. Those two keep working.
 
-That last point is the one that matters: an empty effector shortlist in the
-current report is a missing-tool artefact, not a scientific result. Anything
-depending on secretion prediction has to wait for SignalP.
+So an empty shortlist here does **not** explain itself. On the 38,204-protein
+UC test run, with topology off, 604 proteins still passed the gate — 573 by
+anchor domain, 43 by LPxTG — and 155 of those were KO-less. The shortlist was
+empty for an unrelated reason: nothing was significant. Not one of the 212
+protein groups that reached the model in the first contrast passed FDR 0.05
+(the best was 0.083), so the list would have been empty with SignalP installed
+too.
+
+Read the differential-abundance table before blaming the missing tool. Check
+the shortlist's other two conditions first — significance, then `has_ko` —
+because those are what emptied it there, and only then the gate.
+
+What SignalP genuinely adds is every secreted protein carrying neither an
+LPxTG motif nor an anchor domain, which is most of them: a Sec/SPI substrate
+with an ordinary N-terminal signal peptide is invisible to both surviving
+terms. The shortlist without it is not empty, it is biased toward
+cell-wall-anchored surface proteins.
 
 ## Note on the version
 
