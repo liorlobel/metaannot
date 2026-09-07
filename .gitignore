@@ -1,0 +1,21 @@
+# A run's own outputs and inputs, never the tool
+results/
+sub/
+input/
+*.faa
+*.fasta
+*.tsv
+*.rds
+*.html
+!docs/**/*.tsv
+
+# A project's own config, which holds local paths
+config.yaml
+config_*.yaml
+install*.sh
+
+__pycache__/
+*.py[cod]
+.venv/
+.Rhistory
+.DS_Store
