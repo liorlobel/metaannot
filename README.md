@@ -431,7 +431,12 @@ Proteins whose significance disappears under the second model were tracking
 their organism, not being regulated.
 
 The shortlist is not the top of `effector_score`: significant, no KO, and
-predicted to reach the host. Topology gates the list; the score only orders it.
+predicted to reach the host. `surface_or_secreted` gates the list; the score
+only orders it. That gate is the OR of a signal peptide, a beta-barrel, an
+LPxTG motif and an anchor domain — so with `topology` off it narrows to the
+last two rather than closing, and an empty shortlist is as likely to mean
+nothing was significant as it is to mean the tool was missing. Check the
+differential-abundance table before concluding either. See `docs/signalp-6.md`.
 
 ## Parallelism
 

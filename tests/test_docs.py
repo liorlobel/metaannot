@@ -309,3 +309,40 @@ def test_a_duplicate_key_really_is_refused():
     src = _text(METAANNOT_PY)
     assert "duplicate key" in src
     assert "_NoDupLoader" in src
+
+
+def test_the_docs_do_not_claim_the_shortlist_is_empty_by_construction():
+    # symptom: docs/signalp-6.md and README said surface_or_secreted is "False
+    # for everything" without SignalP/tmbed, so an empty effector shortlist was
+    # a missing-tool artefact. On the first real run 604 proteins passed the
+    # gate with topology off, and the shortlist was empty because nothing was
+    # significant — a different conclusion entirely.
+    signalp_doc = _text(os.path.join(ROOT, "docs", "signalp-6.md"))
+    txt = _norm(_text(README) + " " + signalp_doc)
+    assert "empty by construction" not in txt
+    assert "surface_or_secreted is False for everything" not in txt
+    # and the two terms that keep working must be named where the claim was
+    assert "LPxTG" in signalp_doc and "anchor domain" in signalp_doc
+
+
+def test_the_documented_gate_terms_match_the_code():
+    # the doc describes surface_or_secreted as an OR of four things; if the
+    # code's definition changes, the description has to change with it.
+    code = _text(METAANNOT_PY)
+    start = code.find('df["surface_or_secreted"] = (')
+    assert start != -1, "surface_or_secreted is no longer assigned in one place"
+    # to the matching paren, not to the first one: the expression spans lines
+    # and contains nested calls
+    i = code.index("(", start)
+    depth, j = 0, i
+    while j < len(code):
+        if code[j] == "(":
+            depth += 1
+        elif code[j] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    expr = code[i + 1:j]
+    for term in ("sp_class", "lpxtg", "anchor_domain", "n_tmb"):
+        assert term in expr, f"{term} is no longer part of the gate"

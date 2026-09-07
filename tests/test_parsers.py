@@ -524,3 +524,88 @@ def test_emapper_dashes_become_empty_strings(ma, tmp_path):
     F.write_emapper(path, F.protein_set()[:3])
     df = ma.parse_emapper(path)
     assert df.loc["P_ko_orphan", "KEGG_Pathway"] == ""
+
+
+# --- a defect found by the first full run on real data ----------------
+# 0xa0 is a latin-1 non-breaking space and is not valid UTF-8. VFDB subject
+# titles, InterPro signature descriptions, HMM DESC lines and FASTA headers
+# all carry latin-1 in the wild.
+NON_UTF8 = b"\xa0"
+
+
+@pytest.mark.parametrize("name,payload", [
+    ("vfdb.tsv",
+     b"P1\tVFG0001\t88.0\t150\t1e-40\t300.0\t90\t80\themolysin" + NON_UTF8 + b"BL\n"),
+    ("interproscan.tsv",
+     b"P1\tmd5\t300\tPfam\tPF00082\tPeptidase" + NON_UTF8
+     + b"S8\t10\t120\t1e-20\tT\t01-01-2026\n"),
+    ("kofam.tsv",
+     b"*\tP1\tK00001\t100\t150.0\t1e-40\t\"alcohol" + NON_UTF8 + b"dh\"\n"),
+    ("pfam.tblout",
+     b"P1 - Fam PF1 1e-5 10.0 0.0 1e-5 10.0 0.0 1.0 1 0 0 1 1 1 1 d"
+     + NON_UTF8 + b"esc\n"),
+    ("ncbifam.lib", b"NAME  TIGR1\nDESC  hypothetical" + NON_UTF8 + b"protein\n//\n"),
+    ("proteins.faa", b">P1 desc" + NON_UTF8 + b"here\nMKVAA\n"),
+])
+def test_a_non_utf8_byte_in_a_tool_output_is_not_fatal(ma, tmp_path, name,
+                                                       payload):
+    # symptom: one 0xa0 in a search result killed the integrate stage of a real
+    # run — after InterProScan had already spent three hours — with a message
+    # that named neither the file nor the stage:
+    #   FATAL stage 'integrate' failed: 'utf-8' codec can't decode byte 0xa0
+    path = tmp_path / name
+    path.write_bytes(payload)
+    parse = {
+        "vfdb.tsv": lambda p: ma.parse_diamond(p, 1e-10, 50, 30),
+        "interproscan.tsv": ma.parse_interproscan,
+        "kofam.tsv": ma.parse_kofam,
+        "pfam.tblout": ma.parse_hmm_tblout,
+        "ncbifam.lib": ma.parse_hmm_lib_desc,
+        "proteins.faa": lambda p: list(ma.read_fasta(p)),
+    }[name]
+    out = parse(str(path))
+    assert out, f"{name} parsed to nothing"
+
+
+def test_a_bad_byte_costs_one_character_not_the_record(ma, tmp_path):
+    # errors="replace", so the damage is bounded: the record still parses and
+    # only the offending character of the free text is lost.
+    path = tmp_path / "vfdb.tsv"
+    path.write_bytes(b"P1\tVFG0001\t88.0\t150\t1e-40\t300.0\t90\t80\t"
+                     b"hemolysin" + NON_UTF8 + b"BL\n")
+    hit = ma.parse_diamond(str(path), 1e-10, 50, 30)["P1"]
+    assert hit[0] == "VFG0001"
+    assert hit[3].startswith("hemolysin") and hit[3].endswith("BL")
+
+
+def test_an_identifier_is_not_silently_altered_by_the_replacement(ma,
+                                                                   tmp_path):
+    # the one place a replacement could do real harm is an id, so check that
+    # a CLEAN id beside a dirty description comes through untouched.
+    path = tmp_path / "p.faa"
+    path.write_bytes(b">CDPNAMPK_339076 hypothetical" + NON_UTF8
+                     + b" protein\nMKVAA\n")
+    assert [pid for pid, _ in ma.read_fasta(str(path))] == ["CDPNAMPK_339076"]
+
+
+def test_a_gzipped_input_is_read_as_utf8_whatever_the_locale(ma, tmp_path):
+    # symptom: the .gz branch passed no encoding at all, so TextIOWrapper used
+    # the LOCALE's codec — never UTF-8 by construction. emapper_precomputed is
+    # routinely a .gz, making it the input most likely to be read differently
+    # on the server than on the laptop.
+    import gzip
+    path = tmp_path / "cat.emapper.annotations.gz"
+    with gzip.open(path, "wb") as fh:
+        fh.write("#query\tseed_ortholog\tDescription\n"
+                 "P1\t820.SEED\tβ-glucosidase\n".encode("utf-8"))
+    df = ma.parse_emapper(str(path))
+    assert df.loc["P1", "Description"] == "β-glucosidase"
+
+
+def test_a_gzipped_input_with_a_bad_byte_is_also_survivable(ma, tmp_path):
+    import gzip
+    path = tmp_path / "cat.emapper.annotations.gz"
+    with gzip.open(path, "wb") as fh:
+        fh.write(b"#query\tseed_ortholog\tDescription\n"
+                 b"P1\t820.SEED\tprotein" + NON_UTF8 + b"alpha\n")
+    assert ma.parse_emapper(str(path)).loc["P1", "seed_ortholog"] == "820.SEED"

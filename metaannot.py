@@ -738,9 +738,34 @@ def die(msg):
 
 
 def opener(path):
+    """Text reader for a plain or gzipped file, tolerant of bad bytes.
+
+    Every parser in this file reads through here, so a strict decode makes one
+    stray byte anywhere in a tool's output fatal to the stage that reads it.
+    That is not hypothetical: a 0xa0 (latin-1 non-breaking space) in a search
+    result killed `integrate` on a real run after InterProScan had already
+    spent three hours, with a message — "'utf-8' codec can't decode byte 0xa0"
+    — that named neither the file nor the stage. VFDB subject titles, InterPro
+    signature descriptions, HMM DESC lines and FASTA headers all carry latin-1
+    in the wild, and none of them is ours to re-encode.
+
+    errors="replace", the same as read_delim_table already uses, so a bad byte
+    costs one character of a description instead of the stage. The blast
+    radius is small and already covered: these bytes turn up in free text, and
+    if one ever landed in an identifier the id-overlap diagnostics would say
+    so — an identifier that is not valid UTF-8 is broken whatever we do.
+
+    encoding is stated for the gzip branch too, where it was missing
+    altogether. TextIOWrapper falls back to the LOCALE's codec, so that branch
+    was never UTF-8 by construction — it was whatever the machine happened to
+    be set to, which is UTF-8 on a modern desktop and ASCII under a bare C
+    locale. emapper_precomputed is routinely a .gz, so this is the one input
+    most likely to be read differently on the server than on the laptop.
+    """
     if str(path).endswith(".gz"):
-        return io.TextIOWrapper(gzip.open(path, "rb"))
-    return open(path, encoding="utf-8")
+        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8",
+                                errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
 
 
 def read_fasta(path):
