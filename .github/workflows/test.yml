@@ -48,9 +48,13 @@ jobs:
       - run: pip install pandas pyyaml numpy pytest
       - run: pytest -q -m slow
 
-  # The R half: the report, the R object, and a real knit. Packages come from
-  # the Ubuntu archive rather than from source, which is minutes instead of an
-  # hour.
+  # The R half: the report, the R object, and a real knit.
+  #
+  # Not the Ubuntu archive: it has no r-bioc-qfeatures, so the assay-link
+  # tests — the headline deliverable of the R object, and the branch that had
+  # never been exercised before the suite existed — skipped in silence and the
+  # job still went green. P3M serves Bioconductor binaries for Ubuntu, so the
+  # whole stack installs in minutes without compiling.
   r:
     name: R report and object
     runs-on: ubuntu-latest
@@ -59,28 +63,55 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: install R and the packages the report loads
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-pandoc@v2
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          # Exactly what RMD_TEMPLATE's setup chunk and build_object.R load.
+          # Keep in step with doctor's RNEED/ROPT.
+          packages: |
+            any::readr
+            any::dplyr
+            any::tidyr
+            any::tibble
+            any::stringr
+            any::ggplot2
+            any::purrr
+            any::knitr
+            any::rmarkdown
+            any::patchwork
+            bioc::limma
+            bioc::SummarizedExperiment
+            bioc::S4Vectors
+            bioc::QFeatures
+      # A package that failed to install used to mean "those tests skip", which
+      # is precisely how the QFeatures gap stayed invisible: 19 passed, 2
+      # skipped, job green. Fail here instead, so the next gap is loud.
+      - name: every package the R tests need must be installed
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            r-base-core pandoc \
-            r-cran-readr r-cran-dplyr r-cran-tidyr r-cran-tibble \
-            r-cran-stringr r-cran-ggplot2 r-cran-purrr r-cran-knitr \
-            r-cran-rmarkdown r-cran-patchwork \
-            r-bioc-limma r-bioc-summarizedexperiment r-bioc-s4vectors
-      - name: QFeatures, if the archive has it
-        # Not in every Ubuntu release. Its absence must SKIP the assay-link
-        # tests, never fail them, which is what the suite already does — this
-        # step only gives them a chance to run.
-        run: |
-          sudo apt-get install -y --no-install-recommends r-bioc-qfeatures \
-            || echo "QFeatures unavailable; its tests will skip"
-      - name: report what R actually has
-        run: |
-          Rscript -e 'cat(R.version.string, "\n"); for (p in c("readr","dplyr","tidyr","tibble","stringr","ggplot2","purrr","limma","knitr","rmarkdown","SummarizedExperiment","S4Vectors","QFeatures")) cat(sprintf("%-22s %s\n", p, requireNamespace(p, quietly=TRUE)))'
+          # set -e explicitly, not relying on the runner's default shell: the
+          # pandoc line below runs after this check and would otherwise decide
+          # the step's exit status.
+          set -euo pipefail
+          Rscript -e '
+            need <- c("readr", "dplyr", "tidyr", "tibble", "stringr",
+                      "ggplot2", "purrr", "limma", "knitr", "rmarkdown",
+                      "SummarizedExperiment", "S4Vectors", "QFeatures")
+            cat(R.version.string, "\n")
+            have <- vapply(need, requireNamespace, logical(1), quietly = TRUE)
+            for (i in seq_along(need))
+              cat(sprintf("%-22s %s\n", need[i], have[i]))
+            if (any(!have))
+              stop("the R tests would SKIP for want of: ",
+                   paste(need[!have], collapse = ", "), call. = FALSE)'
           pandoc --version | head -1
       - run: pip install pandas pyyaml numpy pytest
       - name: R-marked tests, including a real knit
-        run: pytest -q -m "R" -o addopts=""
+        # -ra, so the log says what skipped and why. Without it the only
+        # evidence was a bare "ss" in the progress line.
+        run: pytest -q -m "R" -o addopts="-ra"
       - name: doctor sees the R stack
         run: python metaannot.py doctor || true
