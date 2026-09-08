@@ -51,7 +51,6 @@ run:
   jackhmmer: false     # little to work on, and UniRef50 is 8.8 GB down / 27 GB on disk
   context: false       # needs a gff whose ids match proteins_faa
   smorf: false         # needs contigs_fna
-  effectors: false     # needs external predictor outputs
   unipept: false       # needs the Unipept CLI run by hand
   taxonomy: false      # needs unipept plus an NCBI taxdump
 

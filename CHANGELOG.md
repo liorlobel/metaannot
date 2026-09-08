@@ -243,7 +243,79 @@ plex. Before this the only TMT line `doctor` printed lived inside
 layout this format is most particular about went unchecked until the run died
 on it.
 
+### Removed
+
+**The `effectors` stage, and with it `run.effectors`, `effector_predictions`
+and `effector_prediction_weight`.** It predicted nothing. It read result files
+the user had to obtain first from Bastion3/4/6, EffectiveDB, T4SEpp or
+SecretomeP — web services this tool has no way to invoke — so the stage's real
+requirement was that you go and do the work somewhere else and come back.
+
+Every one of those services is now unreachable. Probed from two networks:
+Bastion3/4/6 never complete a TCP handshake, BastionHub returns a 503,
+`effectors.csb.univie.ac.at` is NXDOMAIN, EffectiveDB's own redirect target
+404s, and SecretomeP is retired by DTU with only the 2004 *mammalian* standalone
+ever distributed. Scale would have killed the online route independently:
+455,000 proteins against a 100-sequence form is 4,550 scripted submissions to an
+unpaid academic server that grants no permission for it.
+
+Replacing it with an offline predictor was considered and rejected on the
+evidence rather than the effort. Every published model in this field is trained
+on 138–509 proteobacterial *pathogen* proteins — T4SEpp's 509 positives are 303
+*Legionella* and 135 *Coxiella*, and sixteen common gut genera appear zero times
+in its positives **and** its negatives, so a *Bacteroides* protein is outside
+both classes at once. The world's entire supply of validated T6SS effectors is
+331 sequences, four of them *Bacteroides*. On a gut metaproteome those numbers
+would have entered the score as a confident float with no way to see it going
+wrong.
+
+**Removing it is a provable no-op for every run performed to date.**
+`run.effectors` defaulted to `False` and `effector_predictions` to `{}`, and the
+ingest was gated on the table having more than one column, so on both paths the
+prediction columns were empty and the scoring loop added nothing. An older
+config carrying any of the three keys now gets a line saying the setting was
+removed and why — not a spelling suggestion, which would send you hunting for a
+typo you did not make. `doctor` reports them as a WARN and still exits zero.
+
+A `pred_*` column you join in yourself still reaches the candidate shortlist as
+a column. It deliberately no longer feeds the score, which is the right status
+for somebody else's model.
+
+### Changed
+
+**`effector_score` is now `export_score`.** Every term in it — signal peptide
+class, β-barrel, LPXTG or SLH anchor, CAZy, small size, toxin-like fold,
+mobile-element or secretion neighbourhood, no KO — asks whether a protein
+*leaves the cell*, not whether it is an effector of a secretion system. Nothing
+in the tool asks the second question any more, so the old name promised a claim
+the evidence never supported. `effector_score` is still written, with identical
+values, for one release. `bin_summary.tsv` gains `median_export_score`.
+
 ### Fixed
+
+**VFDB hits are weighted by VFDB's own category.** A flat `+4` threw away the
+one thing the hit already told you. On a real gut metaproteome, of 3,308 VFDB
+hits the two largest categories were *Immune modulation* (965) and
+*Nutritional/Metabolic factor* (903 — GroEL, ClpP, GuaA, LPS biosynthesis),
+each collecting the largest DIAMOND weight in the config, while the categories
+that actually name an exported effector — VFC0086 effector delivery (232) and
+VFC0235 exotoxin (132) — were 11% of the signal. `vfdb_category_weights` is
+keyed on the stable numeric code, because VFDB can reword a category name and
+will not renumber it; an unlisted code falls back to the flat weight, and the
+parse rate is logged once so a format change surfaces as a line rather than as
+silence. All 3,308 hits parsed. Score mass from VFDB falls to 52%.
+
+**`toxin_fold` could not fire.** It carries the joint-largest weight in the
+score and matched **0 of 38,204** proteins on a real run. The whole-word rule
+means the shipped `Tc toxin` pattern cannot match inside `holotoxin`, so PDB
+2vse — a genuine Tc-family holotoxin, and the one real hit in that dataset — was
+missed. `holotoxin` is now listed explicitly rather than loosening the existing
+pattern, and the contact-dependent and T6SS families gut commensals actually
+carry (`CdiA`, `LXG`, `Ntox`, `nuclease toxin`, `zeta toxin`) are added. Every
+pattern stays whole-word: bare `deaminase` and `hemolysin` already burned this
+once. The regex now also reads `hh_desc`, which is free and lifts the ceiling
+above the proteins that got a Foldseek hit at all.
+
 
 **A fold that fails is no longer allowed to destroy a stage that is nearly
 done.** On a 1,912-protein dark set, ESMFold reached 1,785 and then died with

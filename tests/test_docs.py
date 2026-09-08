@@ -126,7 +126,6 @@ def test_documented_numeric_defaults_match_default_config(ma):
         "min_features_per_protein": 1,
         "taxon_min_proteins_for_factor": 4,
         "stage_workers": 4,
-        "effector_prediction_weight": 3,
         "emapper_dbmem_min_gb": 64,
         "max_dark_structures": 2000,
         "max_len_structure": 700,
