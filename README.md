@@ -954,6 +954,50 @@ earlier, larger `dark.faa` cannot mask a shortfall — but when `finalise` takes
 its "no structure or profile evidence, reusing the first pass" path, no
 shortfall message is printed at all.
 
+### Do the sources agree, or merely overlap?
+
+Two sources reaching the same protein is not the same as the two of them
+agreeing about it, and only the second says the evidence is corroborated.
+`finalise` writes `results/source_agreement.tsv`, comparing every pair of
+columns that shares an identifier namespace:
+
+| comparison | what it tests |
+| --- | --- |
+| `pfam_accs` vs InterProScan's `Pfam:` | one Pfam-A library, two implementations |
+| `ncbifam_accs` vs InterProScan's `NCBIfam:` | one NCBIfam library, two implementations |
+| `ko` vs `kofam_ko` | orthology by DIAMOND against orthology by per-family HMM |
+| `pfam_hits` vs `pfams_emapper` | domains found directly against domains carried by the ortholog |
+
+Each row counts `identical`, `overlapping` (they share calls but one has more)
+and `disjoint` (both called something and they share nothing), plus which side
+is the superset when they differ. On the UC run:
+
+```
+comparison                          both  identical  overlapping  disjoint  pct_agree
+pfam: hmmsearch vs interproscan    34106      24834         9272         0      100.0
+ncbifam: hmmsearch vs interproscan 12677      12364          311         2      100.0
+ko: eggnog vs kofamscan            13797      12414         1021       362       97.4
+pfam names: hmmsearch vs eggnog    25393      16300         8081      1012       96.0
+```
+
+Read `disjoint` first. A few are ordinary — a paralogue boundary, a threshold
+near the edge of a family. **A rate near 100% is almost never real
+disagreement**, and the run says so rather than reporting a number that invites
+the wrong conclusion: it means the two columns hold different kinds of
+identifier and nothing is being compared at all.
+
+That is not hypothetical. `ncbifam_hits` holds family *names* (`PorV_fam`),
+while InterProScan reports *accessions* (`NF033709`). Comparing them scored
+97.2% "conflict" between two searches of one library. Adding `ncbifam_accs`
+— the accession was in the `hmmsearch` output all along and was simply being
+discarded — turned that into 100% agreement over the same 12,677 proteins.
+
+The direction matters too. Where hmmsearch and InterProScan differ on Pfam,
+hmmsearch is the superset in **every** case and InterProScan in none: the two
+never contradict each other, one is simply more sensitive. A pair like that is
+called out in the report, because "they disagree 27% of the time" and "one
+finds more than the other" are very different claims.
+
 ### The length a card can actually fold
 
 ESMFold's cost does not rise smoothly with length. It rises smoothly until the
