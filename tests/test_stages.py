@@ -5,9 +5,12 @@ pipeline's own logic without hmmsearch, DIAMOND, MMseqs2 or Foldseek.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
 import shutil
+import sys
 
 import pytest
 
@@ -21,8 +24,8 @@ def _searchable(tmp_path, root, **over):
     db.mkdir(exist_ok=True)
     for name in ("Pfam-A.hmm", "dbCAN.txt", "hmm_PGAP.LIB"):
         (db / name).write_text("HMMER3/f\n", encoding="utf-8")
-    (db / "vfdb.dmnd").write_text("fake", encoding="utf-8")
-    (db / "merops.dmnd").write_text("fake", encoding="utf-8")
+    F.write_dmnd(db / "vfdb.dmnd")
+    F.write_dmnd(db / "merops.dmnd")
     cfg = {
         "run": {"eggnog": True, "pfam": True, "dbcan": True, "diamond": True,
                 "cluster": True, "join": True, "topology": False,
@@ -175,7 +178,7 @@ def test_adding_a_diamond_database_invalidates_integrate(ma, tmp_path,
     proj.run()
     sig_before = proj.state()["integrate"]["signature"]
     db = tmp_path / "db" / "card.dmnd"
-    db.write_text("fake", encoding="utf-8")
+    F.write_dmnd(db)
     d = dict(proj.cfg["db"])
     d["diamond"] = dict(d["diamond"], card=str(db))
     proj.write_config(db=d)
@@ -458,3 +461,491 @@ def test_an_unknown_tmbed_gpu_setting_is_refused(ma, tmp_path, paths_for,
     with pytest.raises(ma.StageError) as e:
         ma.stage_tmbed(cfg, p)
     assert "unknown tmbed_use_gpu" in str(e.value)
+
+
+# --- run_cmd: progress out of a multi-hour tool ------------------------
+# symptom: tmbed ran 2 h 36 min and then died, twice, and InterProScan 2.9 h,
+# with nothing in the log between the command and the failure. Both write a
+# tqdm bar to stderr the whole time; stderr was captured and only quoted on
+# failure, so the only way to tell a live stage from a hung one was to watch
+# its CPU ticks accumulate in /proc.
+
+_TQDM_LIKE = r"""
+import sys, time
+for i in range(8):
+    sys.stderr.write('\r\x1b[32m 12%|##        | ' + str(i)
+                     + '/8 [00:00<00:05, 1.2it/s]\x1b[0m')
+    sys.stderr.flush()
+    time.sleep(0.08)
+"""
+
+
+def test_a_running_tool_reports_progress_instead_of_going_silent(
+        ma, monkeypatch, capsys):
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0.15)
+    assert ma.run_cmd([sys.executable, "-c", _TQDM_LIKE]) == "", \
+        "the return value is what every stage depends on"
+    progress = [l for l in capsys.readouterr().err.splitlines()
+                if " running " in l]
+    assert progress, "a tool that ran for several intervals said nothing"
+    # one readable line per interval, not a wall of partial redraws
+    assert all(l.count("it/s") <= 1 for l in progress)
+    assert all("\r" not in l and "\x1b" not in l for l in progress)
+    assert any(re.search(r"running \d+m\d\ds", l) for l in progress), \
+        "the elapsed time is the half of the message that proves it is alive"
+    assert any("12%|" in l for l in progress), \
+        "the tool's own progress is what says how far along it is"
+
+
+def test_progress_can_be_turned_off(ma, monkeypatch, capsys):
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0)
+    ma.run_cmd([sys.executable, "-c", _TQDM_LIKE])
+    assert " running " not in capsys.readouterr().err
+
+
+def test_a_silent_tool_still_gets_a_heartbeat(ma, monkeypatch, capsys):
+    # a stage that writes nothing at all is exactly the one you cannot tell
+    # from a hang, so the line goes out with or without tool output.
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0.15)
+    ma.run_cmd([sys.executable, "-c", "import time; time.sleep(0.5)"])
+    err = capsys.readouterr().err
+    assert "no output yet on stderr" in err
+
+
+def test_the_failure_tail_still_quotes_the_last_fifteen_lines(ma):
+    # unchanged on purpose: every stage's diagnosis comes out of this string.
+    code = ("import sys\n"
+            "for i in range(4000): sys.stderr.write('line %d\\n' % i)\n"
+            "sys.exit(3)\n")
+    with pytest.raises(RuntimeError) as e:
+        ma.run_cmd([sys.executable, "-c", code])
+    msg = str(e.value)
+    assert "exited 3" in msg
+    tail = msg.split("--- stderr tail ---\n")[1].splitlines()
+    assert tail == [f"line {i}" for i in range(3985, 4000)], \
+        "4000 lines through a bounded ring must still end in the last 15"
+
+
+_TQDM_THEN_DIES = r"""
+import sys, time
+for i in range(8):
+    sys.stderr.write('\r\x1b[32m %d%%|##        | %d/8 [00:00<00:05, 1.2it/s]'
+                     '\x1b[0m' % (12 * i, i))
+    sys.stderr.flush()
+    time.sleep(0.08)
+sys.stderr.write('\nCUDA out of memory. Tried to allocate 2.00 GiB\n')
+sys.exit(1)
+"""
+
+
+def test_a_carriage_return_bar_gives_progress_and_still_quotes_the_tail(
+        ma, monkeypatch, capsys):
+    # both halves in one run, because they trade against each other: a bar
+    # that only ever redraws in place is one unterminated line, so a reader
+    # that waited for a newline would print nothing while it ran AND leave the
+    # failure tail empty. This is tmbed's exact shape - hours of bar, then a
+    # CUDA OOM on the last line.
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0.15)
+    with pytest.raises(RuntimeError) as e:
+        ma.run_cmd([sys.executable, "-c", _TQDM_THEN_DIES])
+    progress = [l for l in capsys.readouterr().err.splitlines()
+                if " running " in l]
+    assert progress, "a carriage-return bar must still produce progress lines"
+    assert any("|##" in l for l in progress)
+    msg = str(e.value)
+    tail = msg.split("--- stderr tail ---\n")[1].splitlines()
+    assert tail, "the redraws must not swallow the tail"
+    assert tail[-1] == "CUDA out of memory. Tried to allocate 2.00 GiB", \
+        "the reason a stage died is the last thing it wrote"
+    assert any("it/s" in l for l in tail), \
+        "a redraw is a line of the ring like any other"
+    assert len(tail) <= 15
+
+
+def test_stderr_is_not_hoarded(ma):
+    assert ma._STDERR_KEEP <= 1000, \
+        "stdout goes to devnull because tens of MB bought nothing; the " \
+        "same reasoning caps what stderr may keep"
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("\x1b[32m 45%|####      | 45/100\x1b[0m", "45%|####      | 45/100"),
+    ("  padded  ", "padded"),
+    ("a\tb", "a b"),
+    ("", ""),
+])
+def test_a_progress_bar_becomes_one_sensible_line(ma, raw, want):
+    assert ma._progress_line(raw) == want
+
+
+def test_a_very_long_progress_line_is_truncated(ma):
+    assert len(ma._progress_line("x" * 5000)) == 160
+
+
+def test_the_progress_interval_comes_from_the_config(ma, monkeypatch):
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 999.0)
+    ma.set_progress_interval(ma.DEFAULT_CONFIG["progress_interval_s"])
+    assert ma._PROGRESS_INTERVAL == 60.0
+    ma.set_progress_interval(0)
+    assert ma._PROGRESS_INTERVAL == 0.0
+
+
+# --- logging must not be what kills a multi-hour run -------------------
+# symptom: tool output is decoded with errors="replace", so descriptions carry
+# U+FFFD; printing one to a cp1252 console raises UnicodeEncodeError, and the
+# run dies on the log line rather than on the work.
+
+def _cp1252_stream():
+    raw = io.BytesIO()
+    return raw, io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+
+
+def test_log_survives_a_character_the_console_cannot_encode(ma, monkeypatch):
+    raw, stream = _cp1252_stream()
+    monkeypatch.setattr(sys, "stderr", stream)
+    ma.log("subtilisin-like � peptidase")      # must not raise
+    stream.flush()
+    assert b"subtilisin-like" in raw.getvalue()
+    assert b"peptidase" in raw.getvalue(), \
+        "the rest of the line must survive the one bad character"
+
+
+@pytest.mark.parametrize("encoding", ["cp1252", "ascii", "latin-1", "cp437",
+                                     "utf-8"])
+def test_a_replacement_character_costs_a_character_not_the_run(ma, monkeypatch,
+                                                               encoding):
+    # "whatever the stream encoding": the console code page is the machine's,
+    # not ours - cp1252 here, cp437 on an older Windows, ascii under a bare C
+    # locale in a container - and only utf-8 can encode U+FFFD at all. The
+    # line must come out on every one of them.
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding=encoding, errors="strict")
+    monkeypatch.setattr(sys, "stderr", stream)
+    ma.log("PF00082 � subtilisin-like peptidase")   # must not raise
+    stream.flush()
+    out = raw.getvalue()
+    assert b"PF00082" in out and b"subtilisin-like peptidase" in out
+
+
+def test_the_log_file_is_written_as_defensively_as_the_console(ma,
+                                                               monkeypatch):
+    # log() writes twice. The run's own log file is opened as utf-8, but it is
+    # the half nobody watches, so a raise there would still end the run.
+    raw = io.BytesIO()
+    fh = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+    monkeypatch.setattr(ma, "_LOGFH", fh)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    ma.log("� in a VFDB subject title")
+    fh.flush()
+    assert b"in a VFDB subject title" in raw.getvalue()
+
+
+def test_configure_console_streams_makes_the_stream_unable_to_raise(
+        ma, monkeypatch):
+    raw, stream = _cp1252_stream()
+    monkeypatch.setattr(sys, "stdout", stream)
+    monkeypatch.setattr(sys, "stderr", stream)
+    ma.configure_console_streams()
+    stream.write("�")                          # must not raise
+    stream.flush()
+    assert raw.getvalue()
+
+
+def test_configure_console_streams_tolerates_a_stream_it_cannot_touch(
+        ma, monkeypatch):
+    class Dumb:
+        def write(self, s):
+            return len(s)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stderr", Dumb())
+    ma.configure_console_streams()                  # no reconfigure(): fine
+    ma.log("still works")
+
+
+# --- a database that cannot possibly hit ------------------------------
+# symptom (a): a `diamond makedb` that had failed left a ZERO-BYTE .dmnd on
+# disk. The stage would have searched it and reported no hits, which is
+# indistinguishable in the output from a real absence of virulence factors.
+# symptom (b): BAGEL built correctly - 262 sequences, median length 15 - and
+# returned exactly 0 hits against 38,204 proteins at --evalue 1e-10, because no
+# 15-residue alignment can reach 1e-10.
+def _dia_project(ma, tmp_path, paths_for, **dbs):
+    cfg, p = paths_for()
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        F.protein_set()[:2])
+    cfg["db"]["diamond"] = dbs
+    return cfg, p
+
+
+def test_a_zero_byte_diamond_database_is_refused_not_searched(
+        ma, tmp_path, paths_for, stub_bin):
+    db = tmp_path / "vfdb.dmnd"
+    db.write_bytes(b"")
+    cfg, p = _dia_project(ma, tmp_path, paths_for, vfdb=str(db))
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_diamond(cfg, p)
+    assert "0 bytes" in str(e.value)
+    assert "diamond makedb" in str(e.value)
+    # nothing was searched, so nothing may claim to be an answer
+    assert not os.path.exists(f"{p.diamond_dir}/vfdb.tsv")
+    assert not os.path.exists(p.diamond_done)
+
+
+def test_a_truncated_diamond_database_is_refused_too(ma, tmp_path, paths_for,
+                                                     stub_bin):
+    # 143 bytes is a real one-sequence database, so the floor is below that and
+    # above anything a half-finished makedb leaves.
+    db = tmp_path / "vfdb.dmnd"
+    db.write_bytes(b"DIAMOND" * 3)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, vfdb=str(db))
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_diamond(cfg, p)
+    assert "smaller than a DIAMOND header" in str(e.value)
+
+
+def test_a_database_with_no_sequences_is_refused(ma, tmp_path, paths_for,
+                                                 stub_bin):
+    db = F.write_dmnd(tmp_path / "vfdb.dmnd", sequences=0, letters=0)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, vfdb=db)
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_diamond(cfg, p)
+    assert "holds no sequences" in str(e.value)
+
+
+def test_a_healthy_database_is_searched_without_comment(ma, tmp_path,
+                                                        paths_for, stub_bin,
+                                                        capsys):
+    db = F.write_dmnd(tmp_path / "vfdb.dmnd", sequences=4000, letters=1400000)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, vfdb=db)
+    ma.stage_diamond(cfg, p)
+    err = capsys.readouterr().err
+    assert "incapable of a hit" not in err
+    assert os.path.exists(f"{p.diamond_dir}/vfdb.tsv")
+
+
+def test_a_short_peptide_database_warns_that_the_evalue_is_unreachable(
+        ma, tmp_path, paths_for, stub_bin, capsys):
+    # BAGEL's real shape: 262 sequences, median 15 residues.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
+    ma.stage_diamond(cfg, p)
+    err = capsys.readouterr().err
+    assert "incapable of a hit before it starts" in err
+    assert "15 residues" in err
+    assert "diamond_evalues" in err
+    # it still runs: this is a warning about the threshold, not a broken file
+    assert os.path.exists(f"{p.diamond_dir}/bagel.tsv")
+
+
+def test_the_warning_names_the_scoring_weight_the_database_is_holding(
+        ma, tmp_path, paths_for, stub_bin, capsys):
+    # bagel carries diamond_weights 3, equal to TADB3: a database that cannot
+    # hit is also holding a weight that says it can.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
+    ma.stage_diamond(cfg, p)
+    assert "diamond_weights bagel: 3" in capsys.readouterr().err
+
+
+def test_a_per_database_evalue_silences_the_warning_and_is_used(
+        ma, tmp_path, paths_for, stub_bin, capsys):
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
+    cfg["diamond_evalues"] = {"bagel": 1e-3}
+    ma.stage_diamond(cfg, p)
+    err = capsys.readouterr().err
+    assert "incapable of a hit" not in err
+    assert "searching at --evalue 0.001 from diamond_evalues" in err
+    assert ma.diamond_evalue_for(cfg, "bagel") == 1e-3
+    assert ma.diamond_evalue_for(cfg, "vfdb") == \
+        cfg["thresholds"]["diamond_evalue"]
+
+
+def test_a_non_numeric_per_database_evalue_is_a_message(ma):
+    cfg = {"diamond_evalues": {"bagel": "soon"},
+           "thresholds": {"diamond_evalue": 1e-10}}
+    with pytest.raises(ma.StageError) as e:
+        ma.diamond_evalue_for(cfg, "bagel")
+    assert "diamond_evalues.bagel must be a number" in str(e.value)
+
+
+def test_the_reachability_estimate_uses_diamonds_own_constants(ma):
+    # BLOSUM62 Lambda=0.267 K=0.041, as diamond prints them. A 15-residue
+    # perfect match against 4009 letters cannot reach 1e-10; a 350-residue one
+    # against the same database can reach anything.
+    assert (ma._DMND_LAMBDA, ma._DMND_K) == (0.267, 0.041)
+    assert ma.best_possible_evalue(4009, 15) > 1e-10
+    assert ma.best_possible_evalue(4009, 350) < 1e-10
+    assert ma.best_possible_evalue(0, 15) is None
+    assert ma.best_possible_evalue(4009, 0) is None
+
+
+def test_a_length_that_cannot_be_read_is_said_rather_than_guessed(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # no diamond on PATH and no source FASTA: the check must say the length is
+    # unknown rather than assume one and act on it.
+    db = F.write_dmnd(tmp_path / "vfdb.dmnd")
+    cfg, p = _dia_project(ma, tmp_path, paths_for, vfdb=db)
+    monkeypatch.setattr(ma, "have", lambda t: t != "diamond")
+    typical, letters, why = ma.diamond_db_profile(cfg, "vfdb", db)
+    assert (typical, letters) == (None, None)
+    assert "diamond is not installed" in why
+    bad, warn = ma.diamond_db_check(cfg, "vfdb", db)
+    assert bad is None
+    assert "nothing here can tell whether" in warn
+
+
+def test_a_source_fasta_beside_the_database_gives_the_median(
+        ma, tmp_path, paths_for, monkeypatch):
+    db = F.write_dmnd(tmp_path / "bagel.dmnd")
+    with open(tmp_path / "bagel.fas", "w", encoding="utf-8") as fh:
+        for i in range(5):
+            fh.write(">p%d\n%s\n" % (i, "M" * (10 + i)))
+    cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
+    monkeypatch.setattr(ma, "have", lambda t: t != "diamond")
+    typical, letters, why = ma.diamond_db_profile(cfg, "bagel", db)
+    assert typical == 12                      # median of 10..14
+    assert letters == 60
+    assert "median of 5 sequences" in why
+
+
+def test_doctor_refuses_a_zero_byte_diamond_database(tmp_path):
+    db = tmp_path / "vfdb.dmnd"
+    db.write_bytes(b"")
+    proj = build_project(tmp_path / "p", threads=1,
+                         db={"diamond": {"vfdb": str(db)}},
+                         run={"eggnog": True, "pfam": False, "dbcan": False,
+                              "diamond": True, "cluster": False, "join": False,
+                              "topology": False, "structure": False,
+                              "context": False, "unipept": False,
+                              "taxonomy": False, "ncbifam": False,
+                              "kofam": False, "interpro": False,
+                              "hhblits": False, "jackhmmer": False,
+                              "smorf": False, "effectors": False})
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=1)
+    assert "0 bytes" in proc.stdout
+    assert "diamond makedb" in proc.stdout
+
+
+def test_doctor_warns_about_a_database_too_short_for_the_evalue(tmp_path,
+                                                                stub_bin):
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
+    proj = build_project(tmp_path / "p", threads=1,
+                         db={"diamond": {"bagel": db}},
+                         run={"eggnog": True, "pfam": False, "dbcan": False,
+                              "diamond": True, "cluster": False, "join": False,
+                              "topology": False, "structure": False,
+                              "context": False, "unipept": False,
+                              "taxonomy": False, "ncbifam": False,
+                              "kofam": False, "interpro": False,
+                              "hhblits": False, "jackhmmer": False,
+                              "smorf": False, "effectors": False})
+    proc = run_metaannot("doctor", "--config", proj.config_path)
+    assert "incapable of a hit before it starts" in proc.stdout
+    assert "diamond_evalues" in proc.stdout
+
+
+def test_the_per_database_evalue_also_filters_the_hit_table(ma, tmp_path,
+                                                            stub_bin):
+    # filtering the table back down to thresholds.diamond_evalue in integrate
+    # would leave diamond_evalues doing nothing at all.
+    proj = _searchable(tmp_path, tmp_path / "p")
+    F.write_dmnd(tmp_path / "db" / "bagel.dmnd", sequences=262, letters=4009)
+    d = dict(proj.cfg["db"])
+    d["diamond"] = dict(d["diamond"], bagel=str(tmp_path / "db" / "bagel.dmnd"))
+    proj.write_config(db=d, diamond_evalues={"bagel": 1e-3})
+    proj.run()
+    got = open(proj.rpath("annotation_pass1.tsv"), encoding="utf-8").read()
+    assert "bagel_hit" in got
+    # the stub writes a 1e-40 hit, which passes either threshold; what matters
+    # is that the column exists and the run did not refuse the database
+    assert proj.state()["diamond"]["status"] == "ok"
+
+
+def test_changing_a_per_database_evalue_reruns_the_search(ma, tmp_path,
+                                                          stub_bin):
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.run()
+    before = proj.state()["diamond"]["signature"]
+    proj.write_config(diamond_evalues={"vfdb": 1e-3})
+    proj.run()
+    assert proj.state()["diamond"]["signature"] != before
+
+
+# ----------------------------------------------------------------------
+# foldseek asks for the columns the analysis needs
+# ----------------------------------------------------------------------
+def _fs_project(ma, tmp_path, paths_for):
+    cfg, p = paths_for()
+    tgt = tmp_path / "PDB"
+    tgt.write_text("x", encoding="utf-8")
+    cfg["db"]["foldseek_target"] = str(tgt)
+    cfg["db"]["foldseek_extra_targets"] = []
+    os.makedirs(p.structures, exist_ok=True)
+    with open(f"{p.structures}/P1.pdb", "w", encoding="utf-8") as fh:
+        fh.write("ATOM      1  CA  ALA A   1      "
+                 "0.000   0.000   0.000  1.00 90.00           C" + chr(10))
+    return cfg, p
+
+
+def test_foldseek_requests_qtmscore_and_qlen_not_the_legacy_columns(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
+    """The stage used to hardcode the 10-column legacy list.
+
+    FOLDSEEK_COLS' own comment says it "is what stage_foldseek should ask
+    for", and the stage ignored it — so the TM gate silently fell back to
+    alntmscore, which is normalised by the ALIGNMENT rather than the query,
+    and finalise printed advice to "re-run the foldseek stage to get qtmscore
+    and qlen" that re-running could not act on.
+    """
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append([str(c) for c in cmd])
+        return ""
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run)
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    try:
+        ma.stage_foldseek(cfg, p)
+    except Exception:              # noqa: BLE001
+        pass    # the fake writes no result file; the COMMAND is what matters
+    search = [c for c in seen if len(c) > 1 and c[1] == "easy-search"]
+    assert search, "no easy-search was issued"
+    fields = search[0][search[0].index("--format-output") + 1].split(",")
+    assert "qtmscore" in fields, "the query-normalised TM score must be requested"
+    assert "qlen" in fields, "qlen is what the coverage backstop needs"
+    assert fields == ma.FOLDSEEK_COLS
+
+
+def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
+    """Not every Foldseek release has qtmscore. Degrade, but never silently:
+    a run that quietly drops to the weaker gate is how this went unnoticed."""
+    calls = []
+
+    def fake_run(cmd, **kw):
+        c = [str(x) for x in cmd]
+        calls.append(c)
+        if c[1] == "easy-search" and "qtmscore" in c[c.index("--format-output") + 1]:
+            raise ma.StageError("Invalid selection: qtmscore")
+        return ""
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run)
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    try:
+        ma.stage_foldseek(cfg, p)
+    except Exception:              # noqa: BLE001
+        pass
+    search = [c for c in calls if len(c) > 1 and c[1] == "easy-search"]
+    assert len(search) == 2, "it must retry once with the legacy columns"
+    second = search[1][search[1].index("--format-output") + 1].split(",")
+    assert second == ma.FOLDSEEK_COLS_LEGACY
+    err = capsys.readouterr().err
+    assert "no qtmscore/qlen" in err
+    assert "normalised by the alignment" in err

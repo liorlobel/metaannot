@@ -1,12 +1,15 @@
 """The stage graph: selection, dependencies, the lock, resume and interrupt."""
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -111,6 +114,50 @@ def test_a_lock_from_a_dead_process_is_reclaimed(tmp_path, stub_bin):
                    "started": "2026-01-01T00:00:00"}, fh)
     proc = proj.run()
     assert "removing a stale lock" in proc.stderr
+
+
+def test_a_zero_byte_lock_left_by_a_crash_is_reclaimed(ma, tmp_path):
+    """A host bugcheck left exactly this: an O_EXCL create with no write.
+
+    `_holder_is_alive({})` says a garbled lock is alive, which is right for a
+    garbled one. An EMPTY one is different: its writer died inside the
+    microsecond window between creating the file and writing to it, so no live
+    run can own it, and treating it as alive made a crashed run permanently
+    unresumable without --force-unlock.
+    """
+    lk = tmp_path / ".metaannot.lock"
+    lk.write_bytes(b"")
+    old = time.time() - 3600
+    os.utime(lk, (old, old))
+    with ma.ResultsLock(str(lk), force=False):
+        assert lk.read_text(encoding="utf-8"), "the new holder must write itself in"
+    assert not lk.exists(), "the lock must be released on exit"
+
+
+def test_a_zero_byte_lock_that_just_appeared_is_left_alone(ma, tmp_path):
+    """The one window where an empty lock is legitimate: another run created
+    it a moment ago and has not written yet. Racing it would corrupt both."""
+    lk = tmp_path / ".metaannot.lock"
+    lk.write_bytes(b"")
+    with pytest.raises(ma.StageError) as e:
+        with ma.ResultsLock(str(lk), force=False):
+            pass
+    assert "already running" in str(e.value)
+
+
+def test_the_empty_lock_grace_is_a_time_window_not_a_size_test(ma, tmp_path):
+    """A NON-empty stale lock must still go down the liveness path, not the
+    new one -- otherwise any old lock would be reclaimed on age alone."""
+    lk = tmp_path / ".metaannot.lock"
+    lk.write_text(json.dumps({"pid": 1, "host": "some-other-node",
+                              "started": "2020-01-01T00:00:00"}),
+                  encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(lk, (old, old))
+    with pytest.raises(ma.StageError) as e:
+        with ma.ResultsLock(str(lk), force=False):
+            pass
+    assert "already running" in str(e.value)
 
 
 def test_a_lock_we_cannot_disprove_is_treated_as_alive(ma):
@@ -357,3 +404,177 @@ def test_serial_and_parallel_both_complete(tmp_path, stub_bin):
     b = _searchable(tmp_path, tmp_path / "b")
     b.run()
     assert _outputs(a) == _outputs(b)
+
+
+# --- the GPU lease ----------------------------------------------------
+# symptom: independent stages run concurrently and the CPU and RAM budgets are
+# split between them, but the GPU was not modelled at all. tmbed held 15.5 GB
+# of a 16 GB card and ESMFold peaked at 13.3 GB on a single short sequence; on
+# the run this comes from they only avoided each other by accident, because
+# they happened to be in separate invocations.
+def _needs(*gpu):
+    return lambda n: n in set(gpu)
+
+
+def test_two_gpu_stages_ready_together_do_not_both_start(ma):
+    go, wait = ma.gpu_lease(["tmbed", "esmfold"], [], 1,
+                            _needs("tmbed", "esmfold"))
+    assert go == ["tmbed"]
+    assert wait == ["esmfold"]
+
+
+def test_a_gpu_stage_waits_while_another_holds_the_card(ma):
+    go, wait = ma.gpu_lease(["esmfold"], ["tmbed"], 1,
+                            _needs("tmbed", "esmfold"))
+    assert go == []
+    assert wait == ["esmfold"]
+
+
+def test_cpu_stages_keep_running_while_the_gpu_is_leased(ma):
+    # the whole point: the device is leased, not the machine.
+    go, wait = ma.gpu_lease(["pfam", "esmfold", "interpro"], ["tmbed"], 1,
+                            _needs("tmbed", "esmfold"))
+    assert go == ["pfam", "interpro"]
+    assert wait == ["esmfold"]
+
+
+def test_the_lease_is_returned_when_the_holder_finishes(ma):
+    go, wait = ma.gpu_lease(["esmfold"], ["pfam"], 1, _needs("esmfold"))
+    assert (go, wait) == (["esmfold"], [])
+
+
+def test_gpu_workers_above_one_lets_that_many_run(ma):
+    # a lease COUNT, not a device map: nothing here spreads them over cards.
+    go, wait = ma.gpu_lease(["tmbed", "esmfold"], [], 2,
+                            _needs("tmbed", "esmfold"))
+    assert (go, wait) == (["tmbed", "esmfold"], [])
+
+
+def test_more_holders_than_slots_never_produces_a_negative_budget(ma):
+    go, wait = ma.gpu_lease(["esmfold"], ["tmbed", "other"], 1,
+                            _needs("tmbed", "other", "esmfold"))
+    assert (go, wait) == ([], ["esmfold"])
+
+
+def test_the_stages_that_use_gpu_device_are_the_ones_marked_gpu(ma):
+    # the invariant, so a stage added later that touches the card is not
+    # scheduled as if the GPU were free.
+    import inspect
+    marked = {st["name"] for st in ma.STAGES if st.get("gpu")}
+    uses = set()
+    for st in ma.STAGES:
+        try:
+            src = inspect.getsource(st["fn"])
+        except (OSError, TypeError):        # pragma: no cover
+            continue
+        if "gpu_device" in src:
+            uses.add(st["name"])
+    assert marked == uses, (
+        f"marked gpu={sorted(marked)} but gpu_device is used by "
+        f"{sorted(uses)}; a stage that touches the card must take the lease")
+    assert marked == {"tmbed", "esmfold"}
+
+
+def test_the_default_is_one_gpu_stage_at_a_time(ma):
+    assert ma.DEFAULT_CONFIG["gpu_workers"] == 1
+
+
+def test_gpu_workers_is_documented_as_a_lease_not_a_device_map(ma):
+    # a machine with several GPUs is NOT given one stage per device, and the
+    # config must say so rather than presenting 1 as a physical limit.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index('"gpu_workers"')
+    comment = src[max(0, i - 1200):i]
+    assert "not a device map" in comment.lower()
+    assert "same card" in comment.lower()
+
+
+def test_a_non_numeric_gpu_workers_is_a_message_not_a_traceback(tmp_path,
+                                                                stub_bin):
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.write_config(gpu_workers="lots")
+    proc = proj.run(expect=1)
+    assert "gpu_workers must be a whole number" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def _overlap(a, b):
+    return min(a[1], b[1]) - max(a[0], b[0]) > 0
+
+
+def _run_args(config):
+    """The Namespace `metaannot run` builds, with every default."""
+    return argparse.Namespace(config=config, faa=None, results_dir=None,
+                              threads=None, ram=None, only=None,
+                              from_stage=None, force=False, no_adopt=False,
+                              serial=False, force_unlock=False, dry_run=False)
+
+
+def test_two_gpu_stages_never_overlap_while_a_cpu_stage_does(ma, tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    # gpu_lease is pinned as a function above; this drives the real dispatch
+    # loop and watches the clock, because the lease only means anything if it
+    # is applied to every round and a deferred stage does not sit in a worker
+    # while it waits.
+    #
+    # A synthetic stage table, because the real one cannot present the case:
+    # integrate depends on tmbed and esmfold depends on integrate, so today the
+    # DAG happens to order the two GPU stages. The lease is what keeps them
+    # apart when that stops being true - which is exactly how the run this
+    # comes from avoided a CUDA OOM, by accident.
+    proj = build_project(tmp_path / "conc", stage_workers=3, threads=6)
+    seen, seen_lock = [], threading.Lock()
+
+    def recorder(name):
+        def fn(cfg, p):
+            t0 = time.time()
+            time.sleep(0.4)
+            with seen_lock:
+                seen.append((name, t0, time.time()))
+            with open(os.path.join(p.R, name + ".out"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("x\n")
+        return fn
+
+    def stage(name, gpu):
+        return dict(name=name, enabled=None, gpu=gpu, deps=[], keys=[],
+                    inp=lambda c, p: [],
+                    out=lambda p, n=name: [os.path.join(p.R, n + ".out")],
+                    fn=recorder(name))
+
+    stages = [stage("tmbed", True), stage("esmfold", True),
+              stage("pfam", False)]
+    monkeypatch.setattr(ma, "STAGES", stages)
+    monkeypatch.setattr(ma, "STAGE_NAMES", [st["name"] for st in stages])
+    # cmd_run opens the run's log file into this global; setting it to its own
+    # value registers monkeypatch's restore, so the handle does not leak into
+    # the rest of the session.
+    monkeypatch.setattr(ma, "_LOGFH", ma._LOGFH)
+
+    assert ma.cmd_run(_run_args(proj.config_path)) == 0
+    when = {name: (t0, t1) for name, t0, t1 in seen}
+    assert set(when) == {"tmbed", "esmfold", "pfam"}, \
+        "all three must have run: a deferred stage is postponed, not dropped"
+    assert not _overlap(when["tmbed"], when["esmfold"]), \
+        "two stages on one 16 GB card is the CUDA OOM this prevents"
+    assert (_overlap(when["pfam"], when["tmbed"])
+            or _overlap(when["pfam"], when["esmfold"])), \
+        "the device is leased, not the machine: a CPU stage must still overlap"
+    assert "waiting for the GPU" in capsys.readouterr().err
+
+
+def test_the_run_says_which_gpu_stages_share_one_device(tmp_path, stub_bin):
+    # an enabled stage that has not started must be explained; the announcement
+    # is the first half of that, the per-stage "waiting for the GPU" line the
+    # second.
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.write_config(run=dict(proj.cfg["run"], topology=True, structure=True))
+    proc = proj.run("--dry-run")
+    assert proc.returncode == 0          # dry run: nothing needs a card
+    proj2 = _searchable(tmp_path, tmp_path / "q")
+    proj2.write_config(run=dict(proj2.cfg["run"], topology=True,
+                                structure=True))
+    proc = proj2.run(expect=1)           # signalp6/tmbed are not installed
+    assert "at most 1 of them runs at a time" in proc.stderr
+    assert "SAME card" in proc.stderr

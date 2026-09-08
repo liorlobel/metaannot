@@ -378,7 +378,115 @@ def test_a_requested_structure_that_was_never_folded_is_distinguishable(
     df = ma.build_annotation(cfg, p)
     assert bool(df["structure_requested"].any())
     assert not bool(df["structure_attempted"].any())
-    assert "requested structures exist" in capsys.readouterr().err
+    # symptom: the FIRST structure run said "0/1913 requested structures
+    # exist ...; the rest were skipped (OOM) or never folded", so a run that
+    # had not folded anything yet read as one that had already lost 1,913
+    # models to the OOM killer.
+    said = _line_about(capsys.readouterr().err, "have been folded yet")
+    assert "INFO" in said and "OOM" not in said
+
+
+def _line_about(err, needle):
+    """The one log line carrying `needle`, so an assertion about its level
+    cannot be satisfied by some other line in the same stage's output."""
+    hit = [l for l in err.splitlines() if needle in l]
+    assert len(hit) == 1, f"expected one line about {needle!r}, got {hit}"
+    return hit[0]
+
+
+def _one_dark_protein(ma, tmp_path, paths_for, name):
+    ps = F.protein_set()
+    cfg, p = paths_for(name)
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / f"{name}.faa"), ps)
+    F.write_emapper(p.emapper, ps)
+    ma.build_annotation(cfg, p, emit_dark=p.dark, emit_dark_all=p.dark_all)
+    return cfg, p
+
+
+def test_an_unfinished_fold_is_reported_as_pending_not_as_lost(
+        ma, tmp_path, paths_for, capsys):
+    cfg, p = _one_dark_protein(ma, tmp_path, paths_for, "pending")
+    ids = [pid for pid, _ in ma.read_fasta(p.dark)]
+    assert len(ids) > 1, "needs a dark bin with something left over"
+    # one model written, no .done marker: esmfold is still running
+    open(f"{p.structures}/{ids[0]}.pdb", "w", encoding="utf-8").close()
+    capsys.readouterr()
+    ma.build_annotation(cfg, p)
+    said = _line_about(capsys.readouterr().err, "esmfold has not finished")
+    assert "pending rather than lost" in said and "OOM" not in said
+
+
+def test_only_a_finished_fold_may_report_models_as_lost(ma, tmp_path,
+                                                       paths_for, capsys):
+    cfg, p = _one_dark_protein(ma, tmp_path, paths_for, "lost")
+    open(p.struct_done, "w", encoding="utf-8").close()
+    capsys.readouterr()
+    ma.build_annotation(cfg, p)
+    said = _line_about(capsys.readouterr().err, "requested structures exist")
+    assert "WARN" in said
+    assert "although esmfold has finished" in said
+    # No failure record, so the message must not pretend to know which of the
+    # two causes it was.
+    assert "cannot be separated" in said
+
+
+def test_the_failure_record_separates_gave_up_from_never_attempted(
+        ma, tmp_path, paths_for, capsys):
+    """esmfold_failed.tsv turns a hedge into a statement.
+
+    A protein ESMFold tried twice and gave up on is a different event from one
+    added to dark.faa after the last fold, and the run used to have to name
+    both in one sentence because nothing recorded which had happened.
+    """
+    cfg, p = _one_dark_protein(ma, tmp_path, paths_for, "record")
+    ids = [pid for pid, _ in ma.read_fasta(p.dark)]
+    assert len(ids) >= 2, "needs at least two dark proteins"
+    open(p.struct_done, "w", encoding="utf-8").close()
+    with open(f"{p.structures}/esmfold_failed.tsv", "w",
+              encoding="utf-8") as fh:
+        fh.write("protein_id\tlength\terror\n")
+        fh.write(f"{ids[0]}\t480\tCUDA driver error: device not ready\n")
+    capsys.readouterr()
+    ma.build_annotation(cfg, p)
+    said = _line_about(capsys.readouterr().err, "requested structures exist")
+    assert "1 were attempted and failed twice" in said
+    assert "esmfold_failed.tsv" in said
+    assert f"{len(ids) - 1} are absent from that list" in said
+    assert "never attempted" in said
+
+
+def test_models_from_an_earlier_larger_dark_set_do_not_silence_the_message(
+        ma, tmp_path, paths_for, capsys):
+    # symptom: the shortfall was measured as len(glob('*.pdb')) against the
+    # number requested. structures/ is not cleared between passes, so models
+    # for proteins that have since left dark.faa were counted as if they were
+    # this pass's answers - and with enough of them the count reached the
+    # request and the message was never printed at all.
+    cfg, p = _one_dark_protein(ma, tmp_path, paths_for, "leftover")
+    requested = [pid for pid, _ in ma.read_fasta(p.dark)]
+    for i in range(len(requested) + 5):
+        leftover = f"{p.structures}/P_gone{i:03d}.pdb"
+        open(leftover, "w", encoding="utf-8").close()
+    open(p.struct_done, "w", encoding="utf-8").close()
+    capsys.readouterr()
+    ma.build_annotation(cfg, p)
+    said = _line_about(capsys.readouterr().err, "requested structures exist")
+    assert f"0/{len(requested)} requested structures" in said, \
+        "a model for a protein that is no longer requested is not an answer"
+
+
+def test_a_protein_over_the_length_cap_is_not_blamed_on_oom(ma, tmp_path,
+                                                            paths_for):
+    # max_len_structure excludes it before ESMFold ever sees it, so it is not
+    # a model that was lost.
+    cfg, p = paths_for("toolong")
+    cfg["max_len_structure"] = 50
+    open(p.struct_done, "w", encoding="utf-8").close()
+    msg, level = ma.structure_shortfall_message(
+        cfg, p, {"P_long": 900, "P_short": 40}, {"P_short"})
+    assert level == "WARN"
+    assert "longer than max_len_structure=50" in msg
+    assert "OOM" not in msg, "length, not memory, explains the only gap"
 
 
 # --- the effector score ----------------------------------------------

@@ -305,6 +305,191 @@ def test_the_design_is_used_when_no_sample_column_list_exists(tmp_path):
     assert sorted(d["sample"]) == sorted(proj.samples)
 
 
+# --- the TMT design: the plex is a batch, not a hypothesis ------------
+def _tmt_project(ma, tmp_path, rows, name="results", **analysis):
+    """A results directory holding only a TMT design_from_input.tsv.
+
+    `rows` is [(sample, plex, group?)]. Returns (cfg, Paths).
+    """
+    import json
+    cfg = json.loads(json.dumps(ma.DEFAULT_CONFIG))
+    cfg["results_dir"] = str(tmp_path / name)
+    cfg["quant_format"] = "fragpipe_tmt"
+    cfg["analysis"].update(analysis)
+    p = ma.Paths(cfg)
+    p.mkdirs()
+    os.makedirs(p.quant_dir, exist_ok=True)
+    cols = ["sample", "plex"] + (["group"] if len(rows[0]) > 2 else [])
+    with open(os.path.join(p.quant_dir, "design_from_input.tsv"), "w",
+              encoding="utf-8") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for r in rows:
+            fh.write("\t".join(str(x) for x in r) + "\n")
+    return cfg, p
+
+
+def _header(out):
+    return open(out, encoding="utf-8").read().split("---")[1]
+
+
+def _chunk(ma, label):
+    """One chunk of the report by name; the label carries its options."""
+    for lab, code in _chunks(ma.RMD_TEMPLATE):
+        if lab.split(",")[0].strip() == label:
+            return code
+    raise AssertionError(f"the report has no chunk named {label}")
+
+
+TMT_CROSSED = [("s1", "TMT1", "a"), ("s2", "TMT1", "b"),
+               ("s3", "TMT2", "a"), ("s4", "TMT2", "b")]
+
+
+def test_a_tmt_run_puts_the_plex_in_the_model_and_contrasts_the_condition(
+        ma, tmp_path):
+    # symptom: the input names the PLEX per sample, not the condition, so the
+    # ordinary default would contrast plex against plex - a batch effect
+    # presented as a hypothesis.
+    cfg, p = _tmt_project(ma, tmp_path, TMT_CROSSED)
+    out = ma.write_report_rmd(cfg, p)
+    h = _header(out)
+    assert re.search(r'design_formula: !r \'"~ 0 \+ group \+ plex"\'', h)
+    assert re.search(r'factor_cols: !r \'"group,plex"\'', h)
+    # the contrast is over the condition, and names no plex
+    m = re.search(r'^  contrasts: !r \'"(.*)"\'', h, re.M)
+    assert m and m.group(1) == "b_vs_a = groupb - groupa", h
+
+
+def test_a_hand_written_tmt_formula_is_left_alone(ma, tmp_path):
+    # a formula the user wrote is their statement of the model.
+    cfg, p = _tmt_project(ma, tmp_path, TMT_CROSSED,
+                          design_formula="~ 0 + group", factor_cols="group")
+    cfg["analysis"]["design_formula"] = "~ group + plex"
+    out = ma.write_report_rmd(cfg, p)
+    assert re.search(r'design_formula: !r \'"~ group \+ plex"\'', _header(out))
+
+
+def test_a_single_plex_run_does_not_get_a_plex_term(ma, tmp_path, capsys):
+    # model.matrix() cannot make a contrast for a one-level factor, and one
+    # plex is not a batch effect.
+    cfg, p = _tmt_project(ma, tmp_path, [("s1", "TMT1", "a"),
+                                         ("s2", "TMT1", "b")])
+    out = ma.write_report_rmd(cfg, p)
+    assert re.search(r'design_formula: !r \'"~ 0 \+ group"\'', _header(out))
+    assert "one level is not a batch effect" in capsys.readouterr().err
+
+
+def test_a_tmt_design_with_no_condition_demands_the_metadata_file(ma,
+                                                                  tmp_path):
+    # symptom: the annotation carries MF#### codes and nothing else, so there
+    # is no condition anywhere. Guessing one from the plex would report a
+    # batch effect as biology; this says exactly what to write instead.
+    cfg, p = _tmt_project(ma, tmp_path, [("MF0030", "TMT1"),
+                                         ("MF0071", "TMT2")])
+    with pytest.raises(ma.StageError) as e:
+        ma.write_report_rmd(cfg, p)
+    msg = str(e.value)
+    assert "no 'group' column" in msg
+    assert "plex is a TMT batch, not a condition" in msg
+    assert "cp " in msg and "design_from_input.tsv metadata.tsv" in msg
+    assert "sample\tplex\tgroup" in msg          # the header to write
+    assert "MF0030\tTMT1\t<condition>" in msg    # a filled-in row
+    assert "metadata: metadata.tsv" in msg
+    assert "tmt.condition_from_name" in msg
+
+
+def test_a_tmt_metadata_file_without_the_plex_is_refused_by_name(ma,
+                                                                 tmp_path):
+    # the formula models the plex; a metadata file that dropped the column
+    # otherwise fails inside the knit, naming the formula and not the fix.
+    cfg, p = _tmt_project(ma, tmp_path, TMT_CROSSED)
+    meta = tmp_path / "meta.tsv"
+    meta.write_text("sample\tgroup\ns1\ta\ns2\tb\ns3\ta\ns4\tb\n",
+                    encoding="utf-8")
+    cfg["analysis"]["metadata"] = str(meta)
+    with pytest.raises(ma.StageError) as e:
+        ma.write_report_rmd(cfg, p)
+    msg = str(e.value)
+    assert "no 'plex' column" in msg
+    assert "design_from_input.tsv" in msg
+
+
+def test_tmt_contrasts_come_from_the_metadata_the_user_wrote(ma, tmp_path):
+    # the recovered design has the plex and often no condition at all; the
+    # condition is in analysis.metadata, so that is where the contrast is.
+    cfg, p = _tmt_project(ma, tmp_path, [("s1", "TMT1"), ("s2", "TMT1"),
+                                         ("s3", "TMT2"), ("s4", "TMT2")])
+    meta = tmp_path / "meta.tsv"
+    meta.write_text("sample\tplex\tgroup\ns1\tTMT1\tresp\ns2\tTMT1\tnon\n"
+                    "s3\tTMT2\tresp\ns4\tTMT2\tnon\n", encoding="utf-8")
+    cfg["analysis"]["metadata"] = str(meta)
+    out = ma.write_report_rmd(cfg, p)
+    m = re.search(r'^  contrasts: !r \'"(.*)"\'', _header(out), re.M)
+    assert m and m.group(1) == "resp_vs_non = groupresp - groupnon"
+
+
+def test_the_label_free_default_design_is_untouched(ma, tmp_path):
+    # the TMT branch must be reachable only from quant_format fragpipe_tmt.
+    cfg, p = _tmt_project(ma, tmp_path, TMT_CROSSED)
+    cfg["quant_format"] = "fragpipe_peptide"
+    out = ma.write_report_rmd(cfg, p)
+    h = _header(out)
+    assert re.search(r'design_formula: !r \'"~ 0 \+ group"\'', h)
+    assert re.search(r'factor_cols: !r \'"group"\'', h)
+
+
+def test_the_report_says_the_plex_is_a_batch_where_it_prints_the_design(ma):
+    # the coefficient list is where a reader decides what the model means.
+    code = _chunk(ma, "design")
+    assert "plex" in code and "BATCH" in code
+    rec = _chunk(ma, "export")
+    assert "design_notes.txt" in rec, \
+        "design_record.txt must carry how the design was made"
+
+
+# --- finding: plex confounded with the condition ----------------------
+def _plex_guard_source(ma):
+    """The report's own plex check, lifted out so a test can run it."""
+    code = _chunk(ma, "design-diagnostics")
+    m = re.search(r"^plex_confounding <- function.*?^\}$", code, re.S | re.M)
+    assert m, "the design-diagnostics chunk no longer defines plex_confounding"
+    return m.group(0)
+
+
+def test_the_report_names_plex_when_it_is_confounded_with_the_condition(ma):
+    # static half: the message has to name the term, because limma's own
+    # symptom is "coefficient plexTMT8 is not estimable".
+    src = _plex_guard_source(ma)
+    assert "perfectly confounded" in src
+    assert "spread over several plexes" in src
+
+
+@needs_r()
+@pytest.mark.parametrize("rows,expect", [
+    # every plex holds one condition: the batch and the biology are one vector
+    ([("s1", "TMT1", "a"), ("s2", "TMT1", "a"),
+      ("s3", "TMT2", "b"), ("s4", "TMT2", "b")], "perfectly confounded"),
+    # each condition crosses both plexes: adjustable, and must not stop
+    ([("s1", "TMT1", "a"), ("s2", "TMT1", "b"),
+      ("s3", "TMT2", "a"), ("s4", "TMT2", "b")], "ok"),
+])
+def test_the_plex_guard_stops_a_confounded_tmt_design(ma, tmp_path, rows,
+                                                      expect):
+    # symptom: a plex nested inside the condition fits, or fails deep in
+    # makeContrasts naming a coefficient rather than the design decision.
+    md = tmp_path / "design.tsv"
+    md.write_text("sample\tplex\tgroup\n"
+                  + "".join(f"{s}\t{p}\t{g}\n" for s, p, g in rows),
+                  encoding="utf-8")
+    code = (_plex_guard_source(ma) +
+            '\nmd <- read.delim(commandArgs(TRUE)[1], stringsAsFactors = TRUE)'
+            '\nplex_confounding(md)\ncat("ok")\n')
+    r = _rscript(code, str(md))
+    out = r.stdout + r.stderr
+    assert expect in out, out
+    if expect != "ok":
+        assert "plex" in out and "TMT1" in out
+
+
 # ----------------------------------------------------------------------
 # R
 # ----------------------------------------------------------------------
@@ -760,3 +945,451 @@ def test_the_report_identifies_samples_from_the_recorded_list(knitted):
     assert re.search(r"sample columns identified from "
                      r"quant/sample_columns\.txt: 8", html), \
         "the report did not use the recorded sample-column list"
+
+
+# --- phase 3: the two filters, the printed design, ratio compression --
+def _prep_filter_source(ma):
+    """The report's own two-filter block, lifted out so a test can run it."""
+    code = _chunk(ma, "prep")
+    m = re.search(r"^keep_valid <- apply.*?^cat\(sprintf\(\"%d/%d groups "
+                  r"retained by both filters.*?\n", code, re.S | re.M)
+    assert m, "the prep chunk no longer contains the two-filter block"
+    return m.group(0)
+
+
+FILTER_PREAMBLE = """
+gate <- function(fmt, ...) cat("GATE:", sprintf(fmt, ...), "\\n")
+note <- function(fmt, ...) cat("NOTE:", sprintf(fmt, ...), "\\n")
+a <- commandArgs(TRUE)
+params <- list(min_valid_per_group = as.integer(a[1]),
+               min_plexes = as.integer(a[2]),
+               group_col_for_filtering = "group")
+design_path0 <- "design_from_input.tsv"
+IS_ISOBARIC <- as.logical(a[3])
+# four samples per plex, two plexes, two conditions crossed over both
+X <- matrix(NA_real_, nrow = 4, ncol = 8,
+            dimnames = list(paste0("P", 1:4), paste0("s", 1:8)))
+PLEX_OF <- setNames(rep(c("TMT1", "TMT2"), each = 4), colnames(X))
+fgrp <- factor(rep(c("a", "a", "b", "b"), 2))
+X["P1", ] <- 1:8                      # every sample, both plexes
+X["P2", 1:4] <- 1:4                   # plex TMT1 only, but 2 per group
+X["P3", c(1, 2, 5, 6)] <- 1           # both plexes, only group 'a'
+X["P4", ] <- 1:8
+if (!IS_ISOBARIC) PLEX_OF <- NULL
+"""
+
+
+def _rscript_file(tmp_path, code, *args):
+    """Run R code from a FILE, not from `Rscript -e`.
+
+    `-e` takes the program as a command-line argument, and on Windows a
+    program this long crashes Rscript with an access violation before it runs
+    a line. A file has no such limit and behaves the same everywhere.
+    """
+    path = tmp_path / "snippet.R"
+    path.write_text(code, encoding="utf-8")
+    return subprocess.run(["Rscript", str(path), *[str(a) for a in args]],
+                          capture_output=True, text=True, timeout=900)
+
+
+@needs_r()
+@pytest.mark.parametrize("mv,mp,iso,expect", [
+    # min_valid 2, no plex filter: P3 fails the group count, P2 survives on a
+    # count one batch supplied on its own - which is the thing being reported
+    (2, 1, True, ["min_valid_per_group >= 2 in every level of group: removes 1 of 4",
+                  "min_plexes >= 1: removes 0 of 4",
+                  "GATE: 1 protein(s) pass min_valid_per_group but are "
+                  "quantified in a single plex",
+                  "3/4 groups retained by both filters"]),
+    # min_plexes 2 as well: P2 goes too, and each filter is counted against
+    # the same starting set rather than in sequence
+    (2, 2, True, ["min_valid_per_group >= 2 in every level of group: removes 1 of 4",
+                  "min_plexes >= 2: removes 1 of 4, 1 of which "
+                  "min_valid_per_group would have kept",
+                  "2/4 groups retained by both filters"]),
+    # label-free: there are no plexes and the filter says so instead of
+    # silently passing everything
+    (2, 1, False, ["min_plexes: not applied (no per-sample plex; this is not "
+                   "an isobaric run)",
+                   "3/4 groups retained by both filters"]),
+])
+def test_the_report_applies_both_filters_and_reports_them_separately(
+        ma, tmp_path, mv, mp, iso, expect):
+    # symptom: min_valid_per_group counts SAMPLES, and an isobaric run's
+    # missingness is shaped by the plex, so "3 valid values in every group"
+    # can be satisfied entirely inside one batch and the difference the model
+    # then reports is that batch.
+    r = _rscript_file(tmp_path, FILTER_PREAMBLE + _prep_filter_source(ma),
+                      mv, mp, "TRUE" if iso else "FALSE")
+    out = r.stdout + r.stderr
+    for want in expect:
+        assert want in out, out
+
+
+@needs_r()
+def test_min_plexes_without_a_plex_stops_instead_of_passing_everything(
+        ma, tmp_path):
+    # a filter the user asked for that cannot be applied must not report
+    # itself as satisfied.
+    r = _rscript_file(tmp_path, FILTER_PREAMBLE + _prep_filter_source(ma),
+                      2, 2, "FALSE")
+    out = r.stdout + r.stderr
+    assert "min_plexes is 2" in out and "not isobaric" in out
+
+
+def test_the_report_prints_the_design_it_used_and_the_reference_treatment(ma):
+    # symptom: the log scrolls away, and a report that does not say which
+    # reference treatment produced its numbers cannot be checked afterwards.
+    code = _chunk(ma, "isobaric-design")
+    assert "DESIGN_NOTES" in code and "readLines(DESIGN_NOTES" in code
+    assert "reference treatment" in code
+    assert "COVARIATE" in code and "never a condition" in code
+    assert "samples per plex" in code and "condition x plex" in code
+
+
+def test_the_isobaric_flag_comes_from_the_file_only_the_tmt_reader_writes(ma):
+    # design_notes.txt is written by the isobaric reader and by nothing else,
+    # so a label-free run cannot accidentally take the isobaric branches.
+    code = _chunk(ma, "read-quant")
+    assert 'DESIGN_NOTES <- file.path(RD, "quant", "design_notes.txt")' in code
+    assert "IS_ISOBARIC  <- file.exists(DESIGN_NOTES)" in code
+
+
+def test_ratio_compression_is_stated_as_a_limitation_and_not_corrected(ma):
+    code = _chunk(ma, "caveat-ratio-compression")
+    assert "if (IS_ISOBARIC)" in code            # label-free must not see it
+    assert "Ratio compression" in code
+    assert "LOWER BOUNDS" in code
+    assert "does **not** correct" in code
+    # and nothing anywhere claims to undo it
+    assert "compression_correction" not in ma.RMD_TEMPLATE
+    assert "correct_compression" not in ma.RMD_TEMPLATE
+
+
+def test_min_plexes_is_recorded_beside_the_numbers_it_produced(ma):
+    code = _chunk(ma, "export")
+    assert 'paste("min_plexes:    ", params$min_plexes' in code
+    assert "not an isobaric run; not applied" in code
+
+
+ISOBARIC_PREAMBLE = """
+suppressPackageStartupMessages(library(readr))
+note <- function(fmt, ...) cat("NOTE:", sprintf(fmt, ...), "\\n")
+read_tsv_full <- function(p, ...) readr::read_tsv(p, show_col_types = FALSE)
+a <- commandArgs(TRUE)
+RD <- a[1]
+meta_path <- file.path(RD, "meta.tsv")
+design_path0 <- file.path(RD, "quant", "design_from_input.tsv")
+DESIGN_NOTES <- file.path(RD, "quant", "design_notes.txt")
+IS_ISOBARIC <- file.exists(DESIGN_NOTES)
+meta <- as.data.frame(read_tsv_full(meta_path))
+meta$.sample <- as.character(meta$sample)
+meta$.col <- meta$.sample
+"""
+
+
+@needs_r("readr")
+@pytest.mark.parametrize("with_plex", [True, False])
+def test_the_isobaric_design_chunk_runs_and_prints_what_was_done(
+        ma, tmp_path, with_plex):
+    # symptom: a chunk that only parses can still die at knit time on a
+    # missing column, and this one is the record of every choice the numbers
+    # were made under.
+    q = tmp_path / "quant"
+    q.mkdir()
+    (q / "design_notes.txt").write_text(
+        "input:            FragPipe TMT, 2 plex(es), 4 sample column(s)\n"
+        "condition source: analysis.metadata\n"
+        "within-plex norm: median centring per channel\n"
+        "reference:        covariate (dropped from the design; plex stays "
+        "in the model)\n"
+        "reference channel: TMT1=131C/Pool01, TMT2=131N/Pool02\n",
+        encoding="utf-8")
+    (q / "design_from_input.tsv").write_text(
+        "sample\tplex\tchannel\ns1\tTMT1\t126\ns2\tTMT1\t127N\n"
+        "s3\tTMT2\t126\ns4\tTMT2\t127N\n", encoding="utf-8")
+    cols = "sample\tgroup\tplex\n" if with_plex else "sample\tgroup\n"
+    rows = [("s1", "a", "TMT1"), ("s2", "b", "TMT1"),
+            ("s3", "a", "TMT2"), ("s4", "b", "TMT2")]
+    (tmp_path / "meta.tsv").write_text(
+        cols + "".join(("\t".join(r if with_plex else r[:2])) + "\n"
+                       for r in rows), encoding="utf-8")
+    r = _rscript_file(tmp_path, ISOBARIC_PREAMBLE + _chunk(ma, "isobaric-design"),
+                      str(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    # the record, verbatim, including which reference treatment was applied
+    assert "reference:        covariate" in out
+    assert "NOTE: reference treatment: covariate" in out
+    assert "within-plex norm: median centring per channel" in out
+    # the design itself, and the plex named as what it is
+    assert "samples per plex" in out and "TMT1" in out and "TMT2" in out
+    assert "condition x plex" in out
+    assert "COVARIATE here: a TMT batch, and never a condition" in out
+
+
+@needs_r("readr")
+def test_the_isobaric_chunk_is_inert_without_design_notes(ma, tmp_path):
+    # design_notes.txt is written by the isobaric reader and by nothing else,
+    # so a label-free run must take the other branch rather than fail on a
+    # missing file.
+    (tmp_path / "quant").mkdir()
+    (tmp_path / "meta.tsv").write_text("sample\tgroup\ns1\ta\ns2\tb\n",
+                                       encoding="utf-8")
+    r = _rscript_file(tmp_path, ISOBARIC_PREAMBLE + _chunk(ma, "isobaric-design"),
+                      str(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "Not an isobaric run" in out
+
+
+# --- a whole isobaric run, knitted ------------------------------------
+@pytest.fixture(scope="module")
+def tmt_knitted(tmp_path_factory):
+    """One finished TMT run, knitted once.
+
+    Two plexes with the condition crossed over both, a reference channel in
+    each, and a fifth of the proteins seen in TMT1 only - which is the
+    plex-shaped missingness min_plexes exists for, and the thing
+    min_valid_per_group cannot see.
+    """
+    import random
+    root = tmp_path_factory.mktemp("tmtknit") / "p"
+    os.makedirs(os.path.join(str(root), "input"), exist_ok=True)
+    proteins = F.protein_set(n_extra=40)
+    faa = F.write_fasta(os.path.join(str(root), "input", "proteins.faa"),
+                        proteins)
+    emp = F.write_emapper(
+        os.path.join(str(root), "input", "cat.emapper.annotations"), proteins)
+    plexes = {
+        "TMT1": [("126", "s1"), ("127N", "s2"), ("128N", "s3"),
+                 ("129N", "s4"), ("131C", "Pool01")],
+        "TMT2": [("126", "s5"), ("127N", "s6"), ("128N", "s7"),
+                 ("129N", "s8"), ("131N", "Pool02")],
+    }
+    group = {"s1": "a", "s2": "a", "s3": "b", "s4": "b",
+             "s5": "a", "s6": "a", "s7": "b", "s8": "b"}
+    run_dir = os.path.join(str(root), "input", "run")
+    rng = random.Random(3)
+    for pi, (plex, chans) in enumerate(plexes.items()):
+        rows = []
+        for k, p in enumerate(proteins):
+            if plex != "TMT1" and k % 5 == 0:
+                continue                     # confined to the first plex
+            for j in range(2):
+                base = 20000 * (1 + rng.random())
+                rows.append({
+                    "peptide": f"{p.pid}PEP{j}K".upper().replace("_", ""),
+                    "razor": p.pid,
+                    # (1 + pi) is a plain plex effect for the batch term to
+                    # absorb; the lift is the only real difference
+                    "values": {s: round(base * (1 + pi)
+                                        * (2.0 if (group.get(s) == "b"
+                                                   and k % 7 == 0) else 1.0)
+                                        * (0.8 + 0.4 * rng.random()))
+                               for _c, s in chans}})
+        F.write_tmt_plex(run_dir, plex, chans, rows, seed=7 + pi)
+    meta = os.path.join(str(root), "input", "metadata.tsv")
+    with open(meta, "w", encoding="utf-8") as fh:
+        fh.write("sample\tplex\tgroup\n")
+        for plex, chans in plexes.items():
+            for _c, s in chans:
+                if not s.startswith("Pool"):
+                    fh.write(f"{s}\t{plex}\t{group[s]}\n")
+    proj = build_project(root, proteins=proteins)
+    proj.write_config(quant_table=run_dir, quant_format="fragpipe_tmt",
+                      proteins_faa=faa, emapper_precomputed=[emp],
+                      manifest="",
+                      tmt=dict(reference_name="Pool*",
+                               condition_from_name=""),
+                      analysis=dict(proj.cfg.get("analysis") or {},
+                                    metadata=meta, min_valid_per_group=2,
+                                    min_plexes=2, fdr=0.2, min_lfc=0.2))
+    proj.run()
+    proj.rendered = False
+    if shutil.which("Rscript") and shutil.which("pandoc") and r_has(*R_CORE):
+        run_metaannot("report", "--config", proj.config_path, cwd=proj.root,
+                      timeout=1800)
+        proj.rendered = True
+    return proj
+
+
+@needs_r(*R_CORE)
+def test_an_isobaric_run_knits_and_reports_both_filters(tmt_knitted):
+    # symptom: everything about the TMT path had only ever been checked one
+    # piece at a time; a chunk that parses can still die at knit time.
+    if not tmt_knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    txt = open(tmt_knitted.rpath("analysis", "analyse_metaannot.html"),
+               encoding="utf-8").read()
+    # the design it used, and what was done to get there
+    assert "The isobaric design" in txt
+    assert "reference treatment: covariate" in txt
+    assert "samples per plex" in txt and "condition x plex" in txt
+    assert "COVARIATE here: a TMT batch, and never a condition" in txt
+    # both filters, separately, and the 10 plex-confined proteins are exactly
+    # the ones the sample count could not see
+    assert "min_valid_per_group &gt;= 2 in every level of group: removes 0 of 50" in txt
+    assert ("min_plexes &gt;= 2: removes 10 of 50, 10 of which "
+            "min_valid_per_group would have kept") in txt
+    assert "proteins by number of plexes" in txt
+    assert "40/50 groups retained by both filters" in txt
+    # and the limitation that is stated rather than corrected
+    assert "Ratio compression" in txt and "LOWER BOUNDS" in txt
+
+
+@needs_r(*R_CORE)
+def test_the_isobaric_run_records_its_choices_beside_the_numbers(tmt_knitted):
+    if not tmt_knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    rec = open(tmt_knitted.rpath("analysis", "design_record.txt"),
+               encoding="utf-8").read()
+    assert "design_formula: ~ 0 + group + plex" in rec
+    assert "plex:           in the model as a batch term" in rec
+    assert "within-plex norm: median centring per channel" in rec
+    assert "reference:        covariate" in rec
+    assert "reference channel: TMT1=131C/Pool01, TMT2=131N/Pool02" in rec
+    assert "min_plexes:     2 (protein level, counted across plexes)" in rec
+
+
+# --- phase 4: the planted effect, and the reference in the object ------
+def _planted_project(tmp_path, name="p", n_proteins=8, **over):
+    """A whole project over a two-plex run with a planted effect."""
+    proteins = F.protein_set()
+    root, truth = F.tmt_planted_run(str(tmp_path / "run"), proteins=proteins,
+                                    n_proteins=n_proteins,
+                                    layout=(("a", "a", "b", "b"),
+                                            ("a", "a", "b", "b")))
+    cfg = dict(quant_table=root, quant_format="fragpipe_tmt", manifest="",
+               tmt={"reference_name": "Pool*"})
+    cfg.update(over)
+    proj = build_project(tmp_path / name, proteins=proteins, **cfg)
+    proj.truth = truth
+    return proj
+
+
+LIMMA_RECOVERY = """
+suppressPackageStartupMessages(library(limma))
+a <- commandArgs(TRUE)
+X <- as.matrix(read.delim(a[1], row.names = 1, check.names = FALSE))
+md <- read.delim(a[2], stringsAsFactors = TRUE)
+md <- md[match(colnames(X), as.character(md$sample)), ]
+group <- factor(md$group); plex <- factor(md$plex)
+fit_one <- function(design, coef) {
+  f <- lmFit(X, design)
+  cm <- makeContrasts(contrasts = coef, levels = design)
+  topTable(eBayes(contrasts.fit(f, cm)), number = Inf, sort.by = "none")
+}
+with_plex <- fit_one(model.matrix(~ 0 + group + plex), "groupb - groupa")
+without   <- fit_one(model.matrix(~ 0 + group), "groupb - groupa")
+out <- data.frame(protein = rownames(X),
+                  with_plex = with_plex$logFC, without = without$logFC)
+write.table(out, a[3], sep = "\\t", quote = FALSE, row.names = FALSE)
+"""
+
+
+@needs_r("limma")
+def test_limma_recovers_the_planted_effect_only_with_the_plex_in_the_model(
+        ma, tmp_path):
+    # symptom: the report's default formula for an isobaric run gained
+    # '+ plex', and the case for it cannot be made by reading the formula.
+    # This runs the real model, in limma, on a matrix with a KNOWN 2x effect
+    # and a KNOWN 3x plex loading that are deliberately not orthogonal, and
+    # asks what each formula reports.
+    root, truth = F.tmt_planted_run(str(tmp_path / "run"))
+    cfg = json.loads(json.dumps(ma.DEFAULT_CONFIG))
+    cfg.update(quant_table=root, quant_format="fragpipe_tmt")
+    cfg["tmt"]["reference_name"] = "Pool*"
+    feats, int_cols, design = ma.read_feature_table(root, "fragpipe_tmt", cfg)
+    prot = ma.rollup_features(feats, int_cols, {}, "razor", 0)[0]
+
+    import numpy as np
+    mat = tmp_path / "prot.tsv"
+    out = prot[["group_id"] + int_cols].copy()
+    out[int_cols] = np.log2(out[int_cols].astype(float))
+    out.to_csv(mat, sep="\t", index=False)
+    md = tmp_path / "design.tsv"
+    design.to_csv(md, sep="\t", index=False)
+    res = tmp_path / "fits.tsv"
+    r = _rscript_file(tmp_path, LIMMA_RECOVERY, mat, md, res)
+    assert r.returncode == 0, r.stdout + r.stderr
+    fit = pd.read_csv(res, sep="\t").set_index("protein")
+
+    up = [p for p in truth.regulated if truth.effect_of[p] > 0]
+    down = [p for p in truth.regulated if truth.effect_of[p] < 0]
+    # the model the report writes recovers +1 and -1 log2, as planted
+    assert fit.loc[up, "with_plex"].mean() == pytest.approx(1.0, abs=0.15)
+    assert fit.loc[down, "with_plex"].mean() == pytest.approx(-1.0, abs=0.15)
+    assert abs(fit.loc[sorted(truth.null), "with_plex"]).max() < 0.15
+    # and without the plex term every protein carries half the batch, so the
+    # proteins that truly went DOWN are reported as barely moving and the
+    # ones that did not move at all are reported as up
+    assert fit.loc[sorted(truth.null), "without"].mean() == pytest.approx(
+        0.5 * truth.plex_log2["TMT2"], abs=0.15)
+    assert fit.loc[down, "without"].mean() > -0.4
+
+
+@pytest.fixture(scope="module")
+def tmt_object(tmp_path_factory):
+    """One finished TMT run with the R object built from it."""
+    root = tmp_path_factory.mktemp("tmtobj")
+    proj = _planted_project(root, "p")
+    proj.run()
+    proj.built = False
+    if shutil.which("Rscript") and r_has(*R_BIOC):
+        run_metaannot("object", "--config", proj.config_path, cwd=proj.root,
+                      timeout=900)
+        proj.built = os.path.exists(proj.rpath("metaannot.rds"))
+    return proj
+
+
+@needs_r("SummarizedExperiment", "S4Vectors")
+def test_the_tmt_reference_channel_is_in_neither_the_design_nor_the_coldata(
+        tmt_object):
+    # symptom: colData is what every downstream model reads its samples from,
+    # so a pooled bridge that reached it would acquire a condition, join a
+    # group's mean and be modelled as biology. Under both reference
+    # treatments the pool stops being a sample in the reader; this is the
+    # check that nothing put it back.
+    if not tmt_object.built:
+        pytest.skip("the object was not built")
+    r = _rscript('x <- readRDS(commandArgs(TRUE)[1]); '
+                 'cd <- SummarizedExperiment::colData(x); '
+                 'cat(paste(rownames(cd), collapse=","), "|", '
+                 'paste(colnames(cd), collapse=","))',
+                 tmt_object.rpath("metaannot.rds"))
+    assert r.returncode == 0, r.stderr
+    rows, cols = [s.strip() for s in r.stdout.split("|")]
+    samples = rows.split(",")
+    assert sorted(samples) == sorted(tmt_object.truth.samples)
+    assert not any(s.startswith("Pool") for s in samples)
+    # the plex IS there, because the model needs it as a batch term
+    assert "plex" in cols.split(",")
+
+
+@needs_r("SummarizedExperiment", "S4Vectors", "QFeatures")
+def test_the_tmt_object_links_its_peptide_assay_to_the_proteins(tmt_object):
+    # the peptide assay is the layer that the tmt-report matrices would have
+    # deleted, and the reason this reads the per-plex tables at all. It has
+    # to be present and linked on isobaric input exactly as on label-free.
+    if not tmt_object.built:
+        pytest.skip("the object was not built")
+    if not r_has("QFeatures"):
+        pytest.skip("QFeatures is not installed")
+    r = _rscript('suppressPackageStartupMessages(library(QFeatures)); '
+                 'q <- readRDS(commandArgs(TRUE)[1]); '
+                 'al <- assayLink(q, "proteins"); '
+                 'cat(class(q)[1], paste(names(q), collapse=","), al@fcol, '
+                 'length(al@hits), nrow(q[["peptides"]]), '
+                 'ncol(q[["peptides"]]))',
+                 tmt_object.rpath("metaannot.rds"))
+    assert r.returncode == 0, r.stderr
+    cls, assays, fcol, hits, npep, ncol = r.stdout.split()
+    assert cls == "QFeatures"
+    assert assays == "peptides,proteins"
+    assert fcol == "assigned_protein"          # the assignment metaannot made
+    assert int(hits) > 0
+    # two peptides per protein in the fixture, and the pools are not columns
+    assert int(npep) == 2 * len(tmt_object.truth.null
+                                | tmt_object.truth.regulated)
+    assert int(ncol) == len(tmt_object.truth.samples)

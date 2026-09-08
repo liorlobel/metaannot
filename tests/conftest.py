@@ -133,10 +133,21 @@ if dom:
                                    "200", "10", "200", "0.95", "-"]) + "\n")
 """,
     "diamond": r"""
-import sys, os
+import sys, os, re
 a = sys.argv[1:]
 def val(flag):
     return a[a.index(flag) + 1] if flag in a else None
+if a and a[0] == "dbinfo":
+    # Real dbinfo reports Sequences and Letters; F.write_dmnd puts them in the
+    # first line of the stand-in file so the shape of a database is a test
+    # parameter rather than something diamond has to be installed to know.
+    txt = open(val("-d"), encoding="utf-8", errors="replace").readline()
+    m = re.search(r"sequences=(\d+) letters=(\d+)", txt)
+    n, L = (m.group(1), m.group(2)) if m else ("5000", "1750000")
+    print("          Database type  Diamond database")
+    print("              Sequences  " + n)
+    print("                Letters  " + L)
+    sys.exit(0)
 out = val("-o")
 faa = val("-q")
 ids = [l[1:].split()[0] for l in open(faa, encoding="utf-8") if l.startswith(">")]
@@ -184,6 +195,19 @@ def stub_bin(tmp_path, monkeypatch):
             os.symlink(sys.executable, py)
         except OSError:
             pass
+    if os.name == "nt":
+        # Windows will not run an extension-less file no matter where it sits
+        # on PATH: only the suffixes in PATHEXT are executable. Without a .cmd
+        # beside each stub the whole fixture is inert here, and every test that
+        # depends on it silently reaches for the real tool instead. That makes
+        # the suite pass or fail according to what happens to be installed on
+        # the machine, which is worse than failing outright, so give each stub
+        # a shim rather than skipping these tests on Windows.
+        for name in STUBS:
+            (d / (name + ".cmd")).write_text(
+                "@echo off\r\n"
+                f'"{sys.executable}" "%~dp0{name}" %*\r\n',
+                encoding="utf-8")
     monkeypatch.setenv("PATH", str(d) + os.pathsep + os.environ["PATH"])
     return d
 

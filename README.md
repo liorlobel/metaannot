@@ -49,7 +49,7 @@ An unrecognised key in `config.yaml` is reported with a spelling suggestion
 rather than silently ignored — `run: {unipep: true}` used to leave the stage
 disabled with nothing said. The check stops at the free-form blocks
 (`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`,
-`effector_predictions`), whose keys are user-chosen and cannot be checked, so a
+`diamond_evalues`, `effector_predictions`), whose keys are user-chosen and cannot be checked, so a
 typo there is silent and simply has no effect. Proof-read those blocks by hand.
 The `analysis:` block is **not** free-form and **is** checked: its keys are
 exactly the Rmd's params, so `fdrr: 0.01` is reported rather than written into
@@ -124,13 +124,12 @@ and refuses only when the rows of one sample genuinely disagree about the design
 never existed. It also refuses if two *different* manifest samples resolve to the
 same quant column, which is a real ambiguity rather than a fraction.
 
-TMT is the case that still needs a hand-written design: there the `experiment`
-column is the plex rather than the condition, so the derived contrasts would be
-plex-versus-plex — a batch effect, not a hypothesis. Skip the manifest-derived
-design and write `analysis.metadata` by hand (sample, condition, and any batch
-column), with `analysis.design_formula` to match. Note that the quant side
-refuses isobaric input outright (below), so this only arises if you are
-quantifying the channels elsewhere.
+TMT is the case where the `experiment` column is the plex rather than the
+condition, so a design derived from it would give plex-versus-plex contrasts —
+a batch effect, not a hypothesis. `quant_format: fragpipe_tmt` therefore
+ignores the manifest and says so, and takes the condition from the sample names
+or from `analysis.metadata` instead; see
+[FragPipe TMT](#fragpipe-tmt-isobaric-fragpipe_tmt).
 
 ### Identifiers
 
@@ -286,9 +285,12 @@ still discards everything, which on a real dataset is days of compute.
 | `msstats_csv` | FragPipe **label-free** `MSstats.csv` |
 | `msstats_feature` | `dataProcess()$FeatureLevelData` as TSV |
 | `msstats_protein` | `dataProcess()$ProteinLevelData` as TSV |
+| `fragpipe_tmt` | FragPipe **TMT**: the per-plex `TMTn/` directories (`quant_table` is the run directory, not a file) |
 
-Every route above is **label-free (MS1) quantification**, and every quant input
-is treated as linear intensity.
+Every route above except `fragpipe_tmt` is **label-free (MS1) quantification**,
+and every quant input is treated as linear intensity — reporter intensities
+included, which is why the per-plex tables and not `tmt-report/` are what
+`fragpipe_tmt` reads.
 
 FragPipe writes `0` for "not quantified", not for "measured as zero", so zeros
 in a `fragpipe`/`fragpipe_peptide`/`fragpipe_ion` table are read as **missing**
@@ -296,32 +298,347 @@ by default and the run warns with the cell count. Summed as real zeros they turn
 missingness into fold change. `zero_intensity_is_missing: false` restores the
 old behaviour if you need to reproduce someone else's numbers.
 
-### Limitation: FragPipe TMT output is not supported
+### FragPipe TMT (isobaric): `fragpipe_tmt`
 
-Reporter-ion channels are not read. A TMT run does not write the `combined_*`
-files listed above at all: it writes per-plex `TMTn/{psm,ion,peptide,protein}.tsv`,
-the `tmt-report/` matrices (`abundance_*_MD.tsv`, `ratio_*_MD.tsv`) and a
-TMT-flavoured `msstats.csv`. There is no row in that table a TMT user can
-honestly pick, and pointing the tool at any of these files quantifies the wrong
-column rather than failing:
+Isobaric runs are read by exactly one route, and it is the **per-plex** one:
+each plex's own `ion.tsv` or `peptide.tsv`, mapped to samples through that
+plex's own annotation file and joined here. `quant_table` is then the FragPipe
+run directory — the one holding `TMT1/`, `TMT2/`, … — not a file.
 
-- The per-plex tables are **refused**. Their reporter channels are named
-  `Intensity <sample>` while the column selector keeps only columns *ending* in
-  `Intensity`, so the run would reduce to the single MS1 precursor intensity,
-  pooled over all channels, exit 0, and report **one sample**. The loader now
-  detects that shape — reporter-style columns present, and the only match a bare
-  `Intensity` — and dies naming the channels it found. This refusal is the
-  intended behaviour; do not work around it.
-- `quant_format: fragpipe` on `abundance_protein_MD.tsv` turns the metadata
-  columns (`NumberPSM`, `MaxPepProb`, `ReferenceIntensity`, …) into sample
-  channels.
-- The `tmt-report/` matrices are already log2 and median-centred; they are read
-  as linear and log-transformed a second time.
-- `msstats_csv` on the TMT `msstats.csv` raises a raw pandas `ParserError` on
-  unquoted commas in `Protein.Description`.
+- **Read:** `TMTn/ion.tsv` or `TMTn/peptide.tsv`, `TMTn/<PLEX>_annotation.txt`,
+  and `TMTn/psm.tsv` when `tmt.min_purity` is set.
+- **Not read, and refused by name under every `quant_format`:** the eight
+  `tmt-report/` matrices, the TMT flavour of `MSstats.csv`, and the per-plex
+  `protein.tsv`. Those are the three files a user reaches for first, and each
+  is a worse input than it looks; *The TMT files that are still refused*, at
+  the end of this section, says why for each. Nothing here falls back to any of
+  them — a missing per-plex table is a failure, not a reason to read a
+  different file.
 
-Do not use this tool for reporter-ion quantification until a TMT reader exists.
-Isobaric support is out of scope for this pass.
+The configuration, in full:
+
+```yaml
+quant_format: fragpipe_tmt
+quant_table: /data/run2              # the directory holding TMT1/ .. TMT8/
+tmt:
+  plex_glob: "TMT*"                  # matched case-sensitively on every OS
+  level: ion                         # ion.tsv | peptide.tsv
+  annotation: "{plex}_annotation.txt"   # or a {plex: path} map
+  reference_name: "Pool*"            # or reference_channel: "131C"
+  use_reference_ratios: false        # false = the covariate treatment
+  condition_from_name: auto          # auto | "" | a regex with one group
+  within_plex_normalise: median      # median | none
+  min_plexes: 1                      # FEATURE level, before the roll-up
+  drop_empty_channels: true
+  min_purity: 0                      # 0 = off; needs psm.tsv
+analysis:
+  min_valid_per_group: 3             # counts SAMPLES
+  min_plexes: 1                      # counts PLEXES, protein level
+```
+
+Every key of the `tmt:` block, with its default:
+
+| key | default | what it does |
+|---|---|---|
+| `tmt.plex_glob` | `"TMT*"` | which subdirectories of `quant_table` are plexes. Matched case-sensitively on every OS, so it cannot also pick up `tmt-report/`. Sorted naturally: `TMT10` after `TMT9`. |
+| `tmt.level` | `"ion"` | `ion` reads `ion.tsv` (sequence + modified sequence + charge); `peptide` reads `peptide.tsv` (one row per sequence). |
+| `tmt.annotation` | `"{plex}_annotation.txt"` | the annotation file of each plex, relative to the plex directory. A `{plex: path}` map is also accepted, and a plex missing from that map is an error rather than a fallback to the pattern. |
+| `tmt.reference_name` | `""` (none) | glob on the annotated **sample name** that marks the reference/bridge channel, e.g. `"Pool*"`. |
+| `tmt.reference_channel` | `""` (none) | glob on the **channel** instead, e.g. `"131C"`. Setting both is refused: they can disagree per plex. |
+| `tmt.use_reference_ratios` | `false` | `false` is the covariate treatment (drop the reference, keep `plex` in the model); `true` divides every channel of a plex by that plex's reference. Refused with no reference named. |
+| `tmt.condition_from_name` | `"auto"` | where the condition may come from: `auto` accepts an unambiguous split of the sample names, `""` never derives, anything else is a regex with exactly one capture group. Never the plex. |
+| `tmt.within_plex_normalise` | `"median"` | `median` centres each channel of a plex on the plex's median channel before the roll-up; `none` keeps FragPipe's numbers and warns. |
+| `tmt.min_plexes` | `1` | keep only **features** identified in at least this many plexes, in the reader, before the roll-up. |
+| `tmt.drop_empty_channels` | `true` | drop channels the annotation names `<PLEX>_<CHANNEL>`, which is how FragPipe writes an unassigned one. |
+| `tmt.min_purity` | `0` (off) | drop features whose **median** PSM purity is below this. Reads `psm.tsv`, the only table that has purity at all. |
+
+Two keys outside that block behave differently for `fragpipe_tmt`:
+
+| key | default | for `fragpipe_tmt` |
+|---|---|---|
+| `analysis.min_plexes` | `1` | the **protein**-level companion to `tmt.min_plexes`, applied in the report beside `min_valid_per_group`. Inert without a per-sample plex, so label-free is untouched. |
+| `analysis.design_formula` / `analysis.factor_cols` | `"~ 0 + group"` / `"group"` | with two or more plexes the **defaults** become `"~ 0 + group + plex"` and `"group,plex"`. Only the literal defaults are replaced; a formula you wrote is left exactly as written. |
+
+Each plex is read on its own and the plexes are joined on the feature id — the
+peptide sequence, the modified sequence and the charge at `level: ion`, the
+peptide at `level: peptide` — so the id is comparable across plexes. **A
+feature not identified in a plex is `NA` for every sample of that plex, never
+`0`**: FragPipe's `0` is a real value here (5-16% of reporter cells in a real
+run) and is itself read as missing, so filling one in for "not identified"
+would turn plex-shaped missingness into fold change. Cross-plex overlap is
+low — about 45% of ion keys are shared between two plexes — so the run always
+logs how many features were seen in 1, 2, … n plexes; `min_plexes` filters on
+that count.
+
+Reporter columns are named `Intensity <sample>` after the **annotated sample
+name**, which is what each plex's `<PLEX>_annotation.txt` supplies (FragPipe
+does not write a plain `annotation.txt`). Two things in that file are easy to
+get wrong and are handled explicitly:
+
+- **The reference channel does not sit at a fixed position.** In a real 8-plex
+  design the pool is at `131C` in six plexes and at `131N` in the other two, so
+  `reference_channel` alone cannot describe the run. `reference_name` globs the
+  sample name (`Pool*`), which is the stable signal; set one or the other, and
+  the log says which was used and what it resolved to per plex.
+- **An unassigned channel is named `<PLEX>_<CHANNEL>`** (`TMT7_131C`) in the
+  annotation. Its signal is isotope carry-over, not a sample, so it is dropped
+  by default and the log names it. `drop_empty_channels: false` keeps it.
+
+#### Which designs are read
+
+Every plex is described by its own annotation, and nothing assumes a common
+channel count, a common channel set, or a bridge, so all of these read:
+
+- **Reference-free** — no pool anywhere. Nothing is divided by anything and no
+  channel is held back as a denominator; the `plex` term carries the batch. This is what you get
+  when neither `tmt.reference_name` nor `tmt.reference_channel` is set. A lone
+  channel named `Pool*` is pointed out in the log rather than being treated as
+  a reference behind your back.
+- **Multi-plex without a bridge** — several plexes with no channel in common.
+  Read, and honest as long as each condition appears in more than one plex.
+  What links the plexes is then the plex coefficient and the report's median
+  normalisation: a per-plex mean shift, not the per-protein correction a shared
+  channel would give. A bridge is the better design; its absence is not a
+  reason to refuse the data.
+- **A bridge in every plex** — name it (`reference_name: "Pool*"`) and pick the
+  covariate or the ratio treatment below. Under both it stops being a sample.
+- **Mixed plex sizes** — 16 channels in one plex, 11 in the next, 6 in the
+  third read as one experiment; that exact run was read to check it. Sample
+  names must be unique across the whole run, since they are the columns of the
+  joined matrix, and two plexes claiming one name is refused.
+- **TMTpro 16- and 18-plex, and iTRAQ** — channel labels are strings out of the
+  annotation file and no channel set is hard-coded anywhere, so a TMTpro
+  annotation reads exactly as a TMT-11 one does. Only TMT-11 has been run on
+  real data (8 plexes, 88 channels); a 16-channel annotation was read to check
+  that nothing counts channels, and nothing wider than 16 has been tried.
+- **A single plex** — read. `plex` is then not added to `design_formula`, because
+  one level is not a batch effect, and the cross-plex filters have nothing to do.
+
+#### The designs whose statistics cannot be made honest
+
+These are not supported-with-a-caveat. Two of them stop the run:
+
+- **A condition that does not cross plexes** — one condition per plex. **The run
+  stops**, in the reader when the condition came from the sample names and again
+  in the report's `plex_confounding()` before the model is fitted, with the
+  cross-tabulation printed. The batch and the biology are the same vector, so
+  every fold change would be both; dropping `+ plex` does not fix it, it reports
+  the batch as biology. There is no flag to override this and there should not be.
+- **A model that is rank deficient once `plex` is in it** — the same problem
+  arriving through a hand-written formula. Refused with the non-estimable
+  coefficients named, and the message says that in a TMT run the plex is the
+  batch a condition has to cross.
+- **A condition that crosses only some plexes.** This one fits. The report
+  prints the condition-by-plex table and gates on the empty cells, because the
+  contrast is then carried by whichever plexes hold both levels, and a level
+  present in one plex only is estimated from that plex's batch as much as from
+  its biology. Nothing in the numbers separates the two.
+- **A plex holding a single sample.** Its plex coefficient fits that one channel
+  exactly, so the channel contributes nothing to the condition. The report gates
+  it as a factor level with one sample. Adding such a plex adds no power.
+- **A protein quantified in one plex only.** Its fold change is that plex's batch
+  as much as the condition, and `min_valid_per_group` cannot see it because it
+  counts samples. That is what the two `min_plexes` keys are for, and the report
+  states the exposure whether or not either is set.
+- **Effect sizes compared with label-free ones.** Reporter ratios are compressed
+  toward 1 by co-isolation, metaannot does not correct that, and the compression
+  is worst exactly where this database is weakest — near-identical paralogues in
+  one isolation window. Direction and ranking survive the compression; magnitude
+  does not. A TMT log2 fold change and a DIA one are not the same quantity and
+  must not be pooled or compared.
+
+#### The reference channel is not a sample
+
+A pooled bridge channel is not a biological sample and never enters the design
+as one. Which of the two treatments is used is yours to choose, and both are
+written into `design_record.txt` beside the numbers they produced:
+
+- **covariate** (the default, `use_reference_ratios: false`). The reference is
+  dropped from the sample columns; the plex stays in the model as a batch term
+  and absorbs the plex effect. Nothing is divided, so no value is lost.
+- **ratios** (`use_reference_ratios: true`). Every channel of a plex is divided
+  by that plex's reference and the reference column is dropped. This is the
+  classic bridge design and it removes the plex effect directly, but it assumes
+  the same pool went into every plex, it discards the reference's own variance,
+  and it **propagates the reference's missingness**: a feature with no
+  reference value in a plex becomes `NA` for every channel of that plex. The
+  run reports what that cost, per plex and in total — on the real 8-plex run,
+  6,576 of 1,237,468 values, 0.53% — and warns when it is large.
+
+The result of either is still linear, so log2, the roll-up and the
+median-of-ratios size factor are unchanged.
+
+#### The condition, and the plex in the model
+
+The **condition is not in these files and is never inferred from the plex** —
+a plex is a batch, and a plex-versus-plex contrast is a batch effect presented
+as a hypothesis. `design_from_input.tsv` carries `sample`, `plex` and
+`channel`, plus `group` when a condition could be had honestly. A `manifest` is
+ignored for TMT and says so: a FragPipe TMT manifest names LC-MS runs, and its
+experiment column is the plex.
+
+Two places the condition can come from:
+
+- **The annotated sample names**, when they carry it unambiguously.
+  `condition_from_name: auto` (the default) accepts the part of the name before
+  a separator only when every name has one, every level has at least two
+  samples, and no other separator groups the samples differently; it logs the
+  result as the guess it is. `condition_from_name: ""` never derives; a regular
+  expression with one capture group states the rule explicitly.
+- **`analysis.metadata`**, keyed on sample. This is required whenever the names
+  do not carry the condition — the real dataset's `MF####` codes do not — and
+  the run then stops and prints the exact file to write, starting from
+  `design_from_input.tsv`, which already lists every sample and its plex.
+
+For TMT the default model is **`~ 0 + group + plex`** and `factor_cols` is
+`group,plex`: the condition is the hypothesis and the plex is a nuisance term
+fitted alongside it, so contrasts come out over the condition. A
+`design_formula` you write yourself is left exactly as written, and a
+single-plex run keeps `~ 0 + group` because one level is not a batch effect.
+**A plex perfectly confounded with the condition stops the run**, naming the
+plex and printing the cross-tabulation: with one condition per plex the batch
+and the biology are the same vector and no model separates them.
+
+#### Within-plex normalisation
+
+The channels of one plex are the same LC-MS run, so what differs between them
+is how much peptide was loaded and how completely it was labelled: a
+per-channel constant with no biology in it, which the roll-up would otherwise
+sum straight into the protein. `within_plex_normalise: median` (**the
+default**) divides each channel by its own median and multiplies by the plex's
+median channel, and logs the log2 scale factors it applied. Because the median
+commutes with log2, that is exactly a per-channel median centring, applied one
+plex at a time and before the roll-up rather than after it; because it centres
+on the plex's own median rather than on 1, the values stay linear, which is
+what the size factors need.
+
+The **between-plex** difference is deliberately left alone. That one is the
+batch, and the plex term in the model — or the report's own `normalise:
+median` — is what removes it; taking it out here would hide it from both.
+`within_plex_normalise: none` keeps FragPipe's numbers exactly and says so.
+Either way the choice is written into `design_notes.txt` and from there into
+`design_record.txt`, because a matrix that has been median-centred per channel
+and one that has not are different data and nothing downstream can tell them
+apart by looking.
+
+One case this handles worst is named in the log rather than hidden: the median
+is taken over **observed** values, so a channel whose low end went missing has
+a median above its true centre and is scaled up too little. A channel that is
+both far off the plex scale and much emptier than its neighbours is therefore
+reported as under-corrected — on the real 8-plex run that is three channels of
+eighty-eight, one of them 10.7x off with 42% of its cells missing, which is a
+loading failure rather than an imbalance. An unequal but complete load is
+exactly what this step is for and raises no alarm.
+
+#### `min_plexes`: what `min_valid_per_group` cannot see
+
+`min_valid_per_group` counts **samples**. An isobaric run's missingness is
+shaped by the plex: a protein identified in one plex only is all-`NA` in every
+other, so "3 valid values in every group" can be satisfied entirely inside one
+batch, and the difference the model then reports is that batch. `min_plexes`
+counts **plexes** instead, and both filters are applied:
+
+- `tmt.min_plexes` filters **features**, in the reader, before the roll-up.
+- `analysis.min_plexes` filters **protein groups**, in the report, beside
+  `min_valid_per_group`.
+
+The report counts each filter against the same starting set and prints them
+separately, so it is visible which one bit, along with the histogram of
+proteins by number of plexes. Both default to 1, so no run loses proteins to a
+filter it did not ask for — and with the protein-level filter at 1 the report
+still says how many of the proteins it kept are quantified in a single plex,
+which is the number to set it on. `analysis.min_plexes` is inert without a
+plex column, so label-free runs are unaffected; setting it above 1 where no
+per-sample plex exists stops the report rather than passing everything.
+
+#### `min_purity`, and where purity actually lives
+
+Precursor purity is written **only into `psm.tsv`** — not into `ion.tsv`,
+`peptide.tsv` or `protein.tsv`. `tmt.min_purity` is therefore implemented as a
+join: psm.tsv is read per plex, keyed on the same columns the feature id was
+built from, and a feature is judged by the **median** purity of the PSMs that
+produced it, because its reporter intensities are a sum over those PSMs and no
+single one describes it. `0` (the default) disables the filter and psm.tsv is
+not read at all — and is not a stage input either, so a rewritten psm.tsv does
+not invalidate a cached join that never opened it.
+
+Two consequences are logged rather than assumed. A feature that matches no PSM
+row is **kept** and counted: an unmatched key is a join failure (FragPipe
+leaves `Modified Peptide` empty on rows `ion.tsv` writes a modified sequence
+for; about 1.5% of ion keys in a real plex), and dropping those would look
+exactly like a purity filter working. And this is an approximation of the
+per-PSM filter TMT-Integrator would apply *before* summarising — FragPipe has
+already summed by the time this reader sees the file.
+
+`min_purity` limits how co-isolated the accepted spectra were. It does not
+correct the ratio compression that co-isolation causes, and nothing here does:
+the report states that as a limitation (fold changes are lower bounds, ranking
+is more trustworthy than magnitude) rather than dividing by an estimate of the
+contamination and turning a known bias into an unknown variance.
+
+#### The taxon size factor under a plex effect
+
+The taxon size factor is a median of ratios computed across **all** samples, so
+an isobaric run has to be asked whether the batch got into it. Measured on a
+fixture with no biology at all — the same random draw run twice, once with
+equal plex loading and once with a 7.5x spread between plexes — the plex effect
+lands entirely in the part every taxon shares (recovered 1.575 log2 against a
+true 1.585, and −1.289 against −1.322), which is exactly what a size factor is
+for, and the taxon-by-taxon part is **identical to 9.4e-05 log2**, four orders
+of magnitude below the effect. So a plex effect does not reach a taxon's ratio
+model.
+
+What does reach it is plex-shaped **missingness**. With fewer than
+`taxon_min_proteins_for_factor` members observed in every plex, a taxon loses
+the complete-case reference and falls back to the poscounts variant, whose
+median then mixes proteins referenced inside one plex with proteins referenced
+across all of them; in the same fixture a taxon with 7 of 10 members confined
+to one plex had no size factor at all in the other two and was displaced 1.40
+log2 in the one it lived in, while the unaffected taxa stayed within 0.03. The
+join stage counts those taxa and warns, naming `analysis.min_plexes` and
+`tmt.min_plexes` as the two ways to remove them.
+
+#### The TMT files that are still refused
+
+A TMT run also writes files this tool must not quantify, and each is refused by
+name rather than read:
+
+- The `tmt-report/` matrices are **refused** on their `ReferenceIntensity`
+  column, under every `quant_format`. All eight of them: `abundance_` and
+  `ratio_`, at `gene`, `protein`, `peptide` and `modified-peptide` level — the
+  peptide-level ones carry `Peptide` and `Mapped Proteins` and so look more
+  like readable feature input than the protein ones do, and they are refused
+  just the same. They are already log2 and median-centred, so the log2 step
+  downstream would log them twice; they are already rolled up, so the
+  shared-peptide rule, `peptide_assignment` and `peptide_evidence.tsv` have
+  nothing to work on; and their inference is TMT-Integrator's, which is the
+  inference a strain-redundant metagenome database makes least trustworthy.
+  `fragpipe_tmt` never falls back to them — a missing per-plex table is a
+  failure, not a reason to read a different file.
+- The TMT flavour of `msstats.csv` is **refused** on its `Channel <mass>`
+  columns, recognised from the header before pandas parses the body (unquoted
+  commas in `Protein.Description` used to kill it with a raw tokenising error).
+- A per-plex `ion.tsv`/`peptide.tsv`/`psm.tsv` handed to `fragpipe_peptide` or
+  `fragpipe_ion` is **still refused**, naming the reporter channels it found,
+  and now points at `fragpipe_tmt`. Those formats keep only columns *ending* in
+  `Intensity`, so the run would otherwise reduce to the single MS1 precursor
+  intensity, pooled over all channels, and report one "sample". Do not work
+  around that refusal.
+- A per-plex `protein.tsv` handed to `fragpipe` (the protein-level format) is
+  **refused** on its `Intensity <sample>` columns. It is the one isobaric file
+  that carries neither marker above — no `ReferenceIntensity`, no
+  `Channel <mass>` — and the protein-level column detector takes every numeric
+  column that is not declared metadata, so it would have quantified a SINGLE
+  plex as the whole experiment with `Length`, `Protein Qvalue` and
+  `Razor Intensity` in the matrix beside the channels. The discriminator is the
+  prefix: FragPipe writes `Intensity <sample>` for a reporter channel and
+  `<sample> Intensity` for a label-free run, so a label-free
+  `combined_protein.tsv` is untouched.
+- `fragpipe_tmt` pointed at a single FILE — any of the four per-plex tables, or
+  a `tmt-report/` matrix — is refused naming the file, because `quant_table` is
+  the run **directory** for this format. Pointed at one plex directory it
+  refuses too, naming the `tmt.plex_glob` that matched nothing and listing what
+  is there instead.
 
 `analysis.msstats_comparison` additionally accepts a
 `groupComparison()$ComparisonResult` export, which replaces the abundance model
@@ -405,6 +722,46 @@ in and keep pointing at `/data/db/*.dmnd` — and `merops: null` reaches
 still lists a disabled database as `MANUAL: no path configured`. Give each
 database you do keep an entry in `diamond_weights` or it scores 0 and the run
 warns.
+
+### A database that cannot hit
+
+Two things a DIAMOND database can do that look exactly like "no virulence
+factors here", and that both `doctor` and the `diamond` stage now refuse or
+warn about before the search starts:
+
+* **A file too small to be a database.** A `diamond makedb` that failed leaves
+  a zero-byte `.dmnd` behind. Searching it reports 0 hits, which is
+  indistinguishable in `annotation_final.tsv` from a real absence. Anything
+  under 128 bytes — smaller than DIAMOND's own header — or that
+  `diamond dbinfo` reports as holding no sequences is now a refusal, naming the
+  `diamond makedb` line that rebuilds it. `doctor` reports it as `MISS`.
+
+* **A database whose sequences are too short for the e-value.** BAGEL is 262
+  bacteriocin sequences with a median length of 15 residues. At the pipeline
+  default of `thresholds.diamond_evalue: 1e-10` it returned exactly 0 hits
+  against 38,204 proteins — not a finding about the biology, because the best
+  e-value a perfect 15-residue alignment can reach is about 1e-5. The run now
+  says so, with the number, and names the weight the database is holding while
+  it cannot hit.
+
+The fix for the second one is a per-database e-value:
+
+```yaml
+thresholds:
+  diamond_evalue: 1e-10     # vfdb, merops, card, tadb
+diamond_evalues:
+  bagel: 1e-3               # 15-residue peptides cannot reach 1e-10
+```
+
+`diamond_evalues` overrides `thresholds.diamond_evalue` for that tag alone, in
+the search *and* in the filter `integrate` applies to the hit table, and the
+run logs each database that is searched at a threshold other than the headline
+one. The estimate behind the warning uses DIAMOND's own BLOSUM62 constants
+(Lambda 0.267, K 0.041) against a perfect self-match, so it fires only when a
+hit is essentially impossible, not merely unlikely. The typical sequence length
+comes from `diamond dbinfo`; when diamond is not installed it falls back to a
+source FASTA beside the database or named in `sources.diamond`, and when
+neither is available it says the length is unknown rather than guessing one.
 
 ## The R object
 
@@ -530,7 +887,8 @@ Within stages: DIAMOND runs its databases concurrently (`diamond_workers`,
 sublinear thread scaling makes 4×N/4 faster than 4 sequential N), and hhblits
 parallelises its per-query searches (`hhblits_workers`). Foldseek's multiple
 targets stay **serial on purpose** — a target index is tens to hundreds of GB
-and two at once will thrash. ESMFold is GPU-bound and serial by nature.
+and two at once will thrash. ESMFold is GPU-bound and serial by nature; see
+"The GPU is leased, not shared" below for why it does not run beside `tmbed`.
 
 The scheduler's own overhead is negligible next to the search tools. No
 benchmark script or speed-up measurement ships with this file, so no figure is
@@ -538,6 +896,201 @@ quoted here.
 
 **Peak memory scales with `stage_workers`.** Four hmmsearch jobs against
 Pfam-A alongside InterProScan is the usual squeeze. `doctor` says so.
+
+### The GPU is leased, not shared
+
+CPU and RAM are split between the stages running at a time; the GPU is not
+divisible in the same way. `tmbed` held 15.5 GB of a 16 GB card and ESMFold
+peaked at 13.3 GB on a single short sequence, so with `run.topology` and
+`run.structure` both on they do not fit together — and the one that loses dies
+of a CUDA OOM that names no cause. Stages marked as needing the GPU (`tmbed`,
+`esmfold`) therefore take an exclusive lease, and only `gpu_workers` of them
+run at once:
+
+```yaml
+gpu_workers: 1     # GPU stages at a time; CPU-only stages keep running
+```
+
+The rest of the pipeline is *not* serialised: every CPU-only stage is
+dispatched in the same round as before. A stage that is waiting says so, so an
+enabled stage that has not started is explained rather than mysterious:
+
+```
+[  312.0s] WARN  --- esmfold: waiting for the GPU — tmbed is using it and
+                     gpu_workers is 1. It starts when that stage finishes;
+                     everything else carries on meanwhile.
+```
+
+`gpu_workers` is a **lease count, not a device map.** Every GPU stage is pinned
+to the single `gpu_device`, so on a two-card machine raising it to 2 runs two
+stages on the *same* card rather than one per card. One stage per device is not
+implemented; the limit here is policy, not hardware.
+
+### When a model is missing
+
+`structure_requested` says a protein was on the fold work-list;
+`structure_attempted` says a `.pdb` for it exists. When the second falls short
+of the first the run says which of three things happened, because they are not
+the same event:
+
+| what the log says | what it means |
+| --- | --- |
+| `INFO … none of the N proteins in dark.faa have been folded yet` | `esmfold` has not run: no `.done` marker, no `plddt.tsv`, no models. Nothing has been lost; the pass carries no structural evidence. |
+| `WARN … esmfold has not finished` | Models exist but the stage did not complete. The rest are pending — rerun `esmfold`, which resumes. |
+| `WARN … requested structures exist … although esmfold has finished` | The only case where a model can be missing for a bad reason. Proteins over `max_len_structure` were never submitted and are counted separately; only the remainder is put down to OOM. |
+
+The first structure run of the real dataset printed *"0/1913 requested
+structures exist …; the rest were skipped (OOM) or never folded"* while the
+directory was empty because nothing had been folded **yet** — which reads as
+1,913 models lost to the OOM killer.
+
+**A skipped protein is now a record, not an inference.** A protein whose two
+fold attempts both fail is written to `results/structures/esmfold_failed.tsv`
+with its length and the error, so it can be told apart from one added to
+`dark.faa` after the last fold. `esmfold` also logs `WARN skipping <id>` as it
+happens. The count itself is taken over the proteins this pass requested
+rather than over every `.pdb` in the directory, so models left from an
+earlier, larger `dark.faa` cannot mask a shortfall — but when `finalise` takes
+its "no structure or profile evidence, reusing the first pass" path, no
+shortfall message is printed at all.
+
+### The length a card can actually fold
+
+ESMFold's cost does not rise smoothly with length. It rises smoothly until the
+working set stops fitting in VRAM, and then falls off a cliff. Measured over
+1,819 folds on one 16 GB card:
+
+| sequence length | median fold time |
+| --- | --- |
+| 450-470 aa | 20.7 s |
+| 470-478 aa | 22.1 s |
+| **481 aa** | **140 s** |
+| 486-491 aa | 949 s, then 2,053 s |
+| 495-510 aa | ~305 s |
+
+A 0.6% increase in length cost 6x, and shortly after that 90x. **Nothing
+reports an out-of-memory error**, because the driver pages device memory to
+host RAM rather than failing — so the run does not stop, it stops being
+finishable, and the only outward sign is that a stage which was going to take
+an hour is now going to take a week.
+
+So the fold work-list is capped by the memory that is actually free, measured
+once the weights are resident:
+
+```
+max_len = sqrt((free_vram - esmfold_vram_reserve_gb) / esmfold_bytes_per_residue_pair)
+```
+
+Peak footprint above the weights is dominated by terms quadratic in length —
+the pair representation and the triangular attention over it — hence the
+square root. `esmfold_bytes_per_residue_pair` is empirical, calibrated so the
+measurement above (478 aa at 4.8 GB free) comes out at exactly 478. It is a
+config key because one card is not a law:
+
+```yaml
+esmfold_vram_cap: true                  # false: use max_len_structure alone
+esmfold_bytes_per_residue_pair: 20200   # raise = more conservative
+esmfold_vram_reserve_gb: 0.5            # left for the driver and the display
+```
+
+Whichever of this and `max_len_structure` is tighter wins, and the log says
+which. Sequences above the cap are reported as **never attempted**, not as
+failures — fold them on a card with more memory, in the cloud, or on CPU, and
+drop the models into `results/structures/` before rerunning `foldseek`.
+
+It can get worse than slow. On the machine these numbers came from, folding
+above the cliff also produced repeated `CUDA driver error: device not ready`
+faults and then took the whole host down twice inside eleven minutes with a
+hypervisor bugcheck — the GPU there is reached through a virtualisation layer
+(WSL2), and sustained paging across it is what broke. That is a defect in
+somebody else's code and not something this tool can fix, but staying under
+the cliff avoids it. For the same reason, a stage with nothing left to fold
+now returns **without loading the weights at all**, rather than uploading
+~11 GB to the card and then discovering it had no work.
+
+### When the card fails rather than the protein
+
+Not every fold failure is an out-of-memory. A long sequence at a large
+`esmfold_chunk_size` can run a single attention kernel for long enough that
+the display driver resets the device under it, which arrives as
+`CUDA driver error: device not ready` — a plain `RuntimeError`, not an
+`OutOfMemoryError`. Both answer to the same remedy, so both are retried once
+at half the chunk size, and a sequence that fails twice is skipped rather than
+taken as a reason to abandon the stage.
+
+Every `.pdb` is written as it is folded, so a card that dies at protein 1,800
+of 1,900 has cost the tail and nothing else; rerunning `esmfold` resumes.
+What a rerun cannot fix is a card that has stopped responding altogether, and
+walking the remaining list to fail every one takes hours to produce nothing.
+So after `esmfold_max_consecutive_failures` failures in a row (default 5) the
+stage stops and says how many structures it has:
+
+```yaml
+esmfold_max_consecutive_failures: 5     # in a row = a wedged card, not hard proteins
+esmfold_allow_partial: false            # true: go on with what folded
+```
+
+With `esmfold_allow_partial: true` the stage finishes with the structures it
+has and Foldseek searches those. That is a real reduction in evidence, not a
+neutral setting: a protein with no structure hit may simply never have been
+folded. Leave it off unless the alternative is no structural evidence at all.
+
+### Telling a live stage from a hung one
+
+Every minute, a running tool's newest line of stderr is echoed under its stage
+tag with how long it has been going:
+
+```
+[ 9421.3s] INFO       tmbed | tmbed running 2h36m | 61%|######    | 23310/38204 [2:36:04<1:39:41]
+```
+
+Set `progress_interval_s` to change the interval, or to `0` to turn it off:
+
+```yaml
+progress_interval_s: 60   # seconds between progress lines; 0 = silent
+```
+
+Only the newest line is kept, not the output: stdout still goes to
+`/dev/null`, because InterProScan and friends emit tens of MB of chatter, and
+stderr is held in a small ring whose only other use is the tail quoted when a
+tool fails. That tail is unchanged. Before this, tmbed could run for 2 h 36 min
+and InterProScan for 2.9 h with nothing between the command and its failure,
+and the only way to tell either apart from a hang was to watch its CPU ticks
+accumulate in `/proc`. Tools that write a `tqdm` bar (tmbed, InterProScan,
+ESMFold's own loop) are the ones this shows; a tool that writes nothing still
+gets `no output yet on stderr` on the same schedule, which is the heartbeat.
+
+Log lines cannot themselves kill a run. Tool output is decoded with
+`errors="replace"`, so a description can carry U+FFFD, and printing one to a
+Windows console in cp1252 raises `UnicodeEncodeError` — on the log line rather
+than on the work, hours in. `stdout` and `stderr` are reconfigured to UTF-8
+with `errors="replace"` at startup, and each write falls back to replacing
+what the stream cannot encode.
+
+**What the progress line is not.** It is the tool's own newest line of stderr,
+verbatim — not a parsed percentage — so nothing here estimates time remaining,
+and a tool that prints a spinner or a fixed banner repeats it every interval.
+Three limits are worth knowing before relying on it:
+
+* **Only stderr is watched.** stdout still goes to `/dev/null`, so a tool that
+  reports progress there gets `no output yet on stderr` and nothing more. That
+  heartbeat proves the process is alive; it says nothing about how far it has
+  got.
+* **Only external commands are watched.** `integrate`, `finalise`, `join`, the
+  quant readers and the emapper join do their work in-process and emit no
+  progress lines however long they take, so a silent stretch during those is
+  not evidence of a hang either way.
+* **Progress is not a checkpoint.** Watching a stage does not make it
+  resumable. `esmfold` and `hhblits` resume, because they work one protein at a
+  time and skip what is already on disk (`<id>.pdb`, `<id>.hhr`). Every stage
+  that shells out to one long command — `hmmsearch` for `pfam`, `dbcan` and
+  `ncbifam`, InterProScan, KOfamScan, `tmbed`, DIAMOND, `jackhmmer`, Foldseek,
+  MMseqs2 — starts again from the beginning if it is killed at 90%, and a stage
+  recorded as `running` when the process died is always recomputed rather than
+  adopted.
+
+`progress_interval_s` is applied at the start of `run` (and `all`), so a
+`doctor --fix` download reports at the 60 s default whatever the config says.
 
 ## What has actually been run
 
