@@ -202,6 +202,177 @@ def write_tmt_peptide_table(path, proteins, channels, seed=4):
     return path
 
 
+def write_tmt_plex(root, plex, channels, rows, level="ion", seed=5,
+                   annotation_name="{plex}_annotation.txt",
+                   columns_named="sample", write_annotation=True, psm=None):
+    """One FragPipe TMT plex directory: <plex>/ion.tsv (or peptide.tsv) plus
+    <plex>/<plex>_annotation.txt.
+
+    `channels` is [(channel, sample)] in the annotation's own order. The
+    reporter columns are named 'Intensity <sample>' after it — the PREFIX
+    form, which is exactly what the label-free suffix rule cannot see — and a
+    bare MS1 'Intensity' sits alongside them, as FragPipe writes.
+    `rows` is [{peptide, razor, mapped?, values?}]; values is {sample: number}
+    for the cells that must be exact, the rest random.
+    """
+    rng = random.Random(seed)
+    d = os.path.join(root, plex)
+    os.makedirs(d, exist_ok=True)
+    if write_annotation:
+        with open(os.path.join(d, annotation_name.format(plex=plex)), "w",
+                  encoding="utf-8") as fh:
+            for ch, s in channels:
+                fh.write(f"{ch} {s}\n")
+    key = (["Peptide Sequence", "Modified Sequence", "Charge"]
+           if level == "ion" else ["Peptide"])
+    heads = [(ch if columns_named == "channel" else s) for ch, s in channels]
+    cols = key + ["Protein", "Protein ID", "Mapped Proteins", "Intensity"] + \
+        [f"Intensity {h}" for h in heads]
+    with open(os.path.join(d, f"{level}.tsv"), "w", encoding="utf-8") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for r in rows:
+            pep = r["peptide"]
+            rec = ([pep, f"n[230]{pep}", "2"] if level == "ion" else [pep]) + [
+                r["razor"], r["razor"] + " hypothetical protein",
+                ",".join(r.get("mapped", [])), str(rng.randint(1000, 9000))]
+            vals = r.get("values") or {}
+            for ch, s in channels:
+                v = vals.get(s, vals.get(ch))
+                rec.append(str(rng.randint(10000, 90000) if v is None else v))
+            fh.write("\t".join(rec) + "\n")
+    if psm is not None:
+        write_tmt_psm(d, rows, psm, level=level, channels=channels)
+    return d
+
+
+def write_tmt_psm(plex_dir, rows, purity, level="ion", channels=()):
+    """<plex>/psm.tsv, the only FragPipe table with a Purity column.
+
+    `purity` is {peptide: purity} or {peptide: [purity, ...]} — one row per
+    listed value, so a feature can be given several PSMs of different purity
+    and the reader's aggregate can be tested rather than assumed. A peptide
+    absent from the map gets no PSM row at all, which is the unmatched-key
+    case. The key columns are psm.tsv's own names ('Peptide', 'Modified
+    Peptide'), not ion.tsv's, and the reporter channels sit here too — this
+    is one row per SPECTRUM, so it is a table a quant reader must refuse
+    rather than summarise.
+    """
+    rng = random.Random(9)
+    cols = ["Peptide", "Modified Peptide", "Charge", "Purity", "Protein",
+            "Intensity"] + [f"Intensity {s}" for _c, s in channels]
+    with open(os.path.join(plex_dir, "psm.tsv"), "w", encoding="utf-8") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for r in rows:
+            pep = r["peptide"]
+            if pep not in purity:
+                continue
+            vals = purity[pep]
+            for v in (vals if isinstance(vals, (list, tuple)) else [vals]):
+                mod = f"n[230]{pep}" if level == "ion" else pep
+                fh.write("\t".join(
+                    [pep, mod, "2", str(v), r["razor"], "1000"]
+                    + [str(rng.randint(1000, 9000)) for _ in channels]) + "\n")
+    return os.path.join(plex_dir, "psm.tsv")
+
+
+# The metadata columns TMT-Integrator writes in front of the channels, per
+# report level, copied from the real run. They differ enough that the
+# peptide-level matrices carry 'Peptide' and 'Mapped Proteins' and so look
+# more like readable feature-level input than the protein ones do; what every
+# level shares — and what the refusal is keyed on — is ReferenceIntensity.
+TMT_REPORT_META = {
+    "gene": ["Index", "NumberPSM", "ProteinID", "MaxPepProb"],
+    "protein": ["Index", "NumberPSM", "Gene", "MaxPepProb", "Protein",
+                "Protein ID", "Entry Name", "Protein Description", "Organism",
+                "Indistinguishable Proteins"],
+    "peptide": ["Index", "Gene", "ProteinID", "Peptide", "SequenceWindow",
+                "Start", "End", "MaxPepProb", "Spectrum Number", "Protein",
+                "Entry Name", "Protein Description", "Mapped Genes",
+                "Mapped Proteins"],
+    "modified-peptide": ["Index", "Gene", "ProteinID", "Peptide",
+                         "Assigned Modification", "SequenceWindow", "Start",
+                         "End", "MaxPepProb", "Spectrum Number", "Protein",
+                         "Entry Name", "Protein Description", "Mapped Genes",
+                         "Mapped Proteins"],
+}
+
+
+def write_tmt_report_matrix(path, samples, rows=("P_ko_path", "P_dark1"),
+                            level="protein"):
+    """A tmt-report/{abundance,ratio}_<level>_MD.tsv: log2, median-centred,
+    already rolled up by TMT-Integrator, and carrying the ReferenceIntensity
+    column that gives it away.
+
+    `level` is one of TMT_REPORT_META; the real run writes all four at both
+    kinds, and the metadata columns in front of the channels differ per level.
+    """
+    rng = random.Random(6)
+    meta = TMT_REPORT_META[level]
+    cols = meta + ["ReferenceIntensity"] + list(samples)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for pid in rows:
+            fill = {"Index": pid, "Protein": pid, "ProteinID": pid,
+                    "Protein ID": pid, "Peptide": "PEPTIDEK",
+                    "NumberPSM": "7", "MaxPepProb": "0.99",
+                    "Spectrum Number": "3", "Start": "1", "End": "8"}
+            fh.write("\t".join([fill.get(c, "") for c in meta] + ["18.4"] +
+                               [f"{rng.uniform(-2, 2):.4f}"
+                                for _ in samples]) + "\n")
+    return path
+
+
+def write_tmt_protein_table(path, proteins, channels, seed=8):
+    """A per-plex TMTn/protein.tsv.
+
+    The one isobaric file that carries neither of the markers the tmt-report
+    matrices and the TMT msstats.csv are recognised by: no ReferenceIntensity
+    and no 'Channel <mass>'. Its reporter columns are the PREFIX form
+    ('Intensity Pool01'), and beside them sit numeric metadata columns that
+    are NOT in FRAGPIPE_META ('Length', 'Protein Qvalue', 'Razor Intensity'),
+    which is what a protein-level column detector would sweep into the matrix.
+    `channels` is [(channel, sample)]; only the sample names reach the header.
+    """
+    rng = random.Random(seed)
+    cols = ["Protein", "Protein ID", "Entry Name", "Gene", "Length",
+            "Is Decoy", "Is Contaminant", "Organism", "Protein Description",
+            "Protein Existence", "Coverage", "Protein Probability",
+            "Top Peptide Probability", "Protein Qvalue", "Total Peptides",
+            "Unique Peptides", "Razor Peptides", "Total Spectral Count",
+            "Unique Spectral Count", "Razor Spectral Count", "Total Intensity",
+            "Unique Intensity", "Razor Intensity", "Indistinguishable Proteins"
+            ] + [f"Intensity {s}" for _c, s in channels]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for p in proteins:
+            tot = rng.randint(100000, 900000)
+            fh.write("\t".join(
+                [p.pid, f"{p.pid} {p.description}", "", "", str(len(p.seq)),
+                 "false", "false", "", p.description or "", "5", "12.3",
+                 "0.99", "0.99", "0.001", "4", "3", "4", "9", "7", "9",
+                 str(tot), str(tot), str(tot), ""]
+                + [str(rng.randint(10000, 90000)) for _ in channels]) + "\n")
+    return path
+
+
+def write_tmt_msstats_csv(path, channels=("126", "127N", "131C")):
+    """The TMT flavour of msstats.csv: one row per PSM, channels in
+    'Channel <mass>' columns, and an unquoted comma in Protein.Description
+    that kills the C parser before any column can be inspected."""
+    cols = ["Spectrum.Name", "Peptide.Sequence", "Charge", "Protein",
+            "Protein.Description", "Purity", "Intensity"] + \
+        [f"Channel {c}" for c in channels]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(",".join(cols) + "\n")
+        fh.write(",".join(["run.1.1.2", "PEPTIDEK", "2", "P_ko_path",
+                           "phosphoglucomutase, putative", "0.85", "9500"] +
+                          ["1000.0"] * len(channels)) + "\n")
+    return path
+
+
 def write_manifest(path, entries):
     """entries: list of (file, experiment, bioreplicate, data_type)."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -292,6 +463,23 @@ def write_hmm_library(path, models):
             fh.write(f"DESC  {desc}\n")
             fh.write("LENG  100\n//\n")
     return path
+
+
+def write_dmnd(path, sequences=5000, letters=1750000):
+    """A stand-in DIAMOND database file.
+
+    Not just a marker any more: metaannot refuses a .dmnd that is smaller than
+    a DIAMOND header (a failed makedb leaves a zero-byte one) and reads the
+    typical sequence length out of `diamond dbinfo` to tell whether the
+    configured e-value is reachable at all. The stub `diamond` in conftest
+    reads the two counters back out of this file, so a test can build a
+    database of any shape without diamond being installed.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"#stub-dmnd sequences={sequences} letters={letters}\n")
+        fh.write("x" * 512 + "\n")           # past _DMND_MIN_BYTES
+    return str(path)
 
 
 def write_diamond(path, hits):
@@ -529,6 +717,124 @@ def ground_truth_taxon_shift(n_members=12, n_regulated=3, n_per_group=6,
     return df, GroundTruth(samples=samples, groups=groups, taxon_of=taxon_of,
                            truly_regulated=regulated, passengers=passengers,
                            shift_log2=shift_log2, frame=df)
+
+
+@dataclass
+class TmtTruth:
+    """What was planted into a synthetic TMT run, so a test can assert the
+    number that came back rather than that something came back."""
+    root: str
+    samples: list                # every sample column, in plex order
+    group_of: dict
+    plex_of: dict
+    reference_of: dict           # plex -> its pooled reference sample
+    regulated: set               # proteins carrying the condition effect
+    null: set                    # proteins carrying none
+    confined: set                # proteins written into the first plex only
+    effect_log2: float
+    effect_of: dict              # protein -> its planted log2 fold change
+    plex_log2: dict              # plex -> its loading, log2
+    peptides_of: dict            # protein -> its peptide sequences
+
+
+def tmt_planted_run(root, proteins=None, n_proteins=30, n_regulated=6,
+                    effect_log2=1.0, plex_log2=(0.0, 1.5849625007211562),
+                    n_confined=0, layout=(("a", "a", "a", "b"),
+                                          ("a", "b", "b", "b")),
+                    peptides_per_protein=2, seed=31, noise=0.05,
+                    channel_load=False):
+    """A two-plex FragPipe TMT run with a KNOWN condition effect and a KNOWN
+    plex effect, deliberately UNBALANCED between the two.
+
+    `layout` gives each plex's conditions in channel order. The default puts
+    3 'a' and 1 'b' in the first plex and the reverse in the second: every
+    condition is still in both plexes, so the design is estimable, but the
+    two are no longer orthogonal — which is the only arrangement in which
+    modelling the plex and ignoring it give different answers. Ignoring it
+    costs (n_b/n - n_a/n) * plex effect; modelling it costs nothing.
+
+    Each plex carries a pooled reference channel whose value is built from the
+    GRAND mean over every sample, not from that plex's own channels: a master
+    pool aliquoted into all plexes is what the real run has, and it is the
+    only pool that cancels exactly when the ratio route divides by it. The
+    reference sits at a different channel in each plex, as in the real data.
+
+    The condition effect is planted SYMMETRICALLY, half the regulated proteins
+    up and half down, because within-plex median centring (and the report's
+    own normalisation) assumes the typical protein does not move: an all-up
+    effect would shift every 'b' channel's median and be partly normalised
+    away, which is a property of median normalisation and not of this reader.
+
+    Returns (root, TmtTruth). Values are linear intensities, as FragPipe
+    writes them.
+    """
+    import math
+
+    rng = random.Random(seed)
+    ids = ([p.pid if isinstance(p, Protein) else str(p) for p in proteins]
+           if proteins is not None else [f"P{i:02d}" for i in range(n_proteins)])
+    ids = ids[:n_proteins]
+    regulated = set(ids[:n_regulated])
+    effect_of = {pid: (0.0 if pid not in regulated else
+                       (effect_log2 if i % 2 == 0 else -effect_log2))
+                 for i, pid in enumerate(ids)}
+    confined = {f"P_conf{i:02d}" for i in range(n_confined)}
+    peps = {pid: [f"{pid}PEP{j}K".upper().replace("_", "")
+                  for j in range(peptides_per_protein)]
+            for pid in list(ids) + sorted(confined)}
+    base = {pep: 20000 * math.exp(rng.gauss(0, 0.5))
+            for pid in peps for pep in peps[pid]}
+
+    chans = ("126", "127N", "128N", "129N")
+    plexes = [f"TMT{i + 1}" for i in range(len(layout))]
+    # 131C in the first plex, 131N in the second: the reference is not at a
+    # fixed position in the real dataset either.
+    ref_chan = ["131C", "131N"]
+    group_of, plex_of, reference_of, samples = {}, {}, {}, []
+    ann = {}
+    for pi, (plex, groups) in enumerate(zip(plexes, layout)):
+        rows = [(chans[j], f"{g}_{pi + 1}{j + 1}") for j, g in enumerate(groups)]
+        for _c, s in rows:
+            group_of[s] = s.split("_")[0]
+            plex_of[s] = plex
+            samples.append(s)
+        pool = f"Pool{pi + 1:02d}"
+        reference_of[plex] = pool
+        ann[plex] = rows + [(ref_chan[pi % len(ref_chan)], pool)]
+
+    # One loading factor per channel, which is what within-plex median
+    # centring is there to remove; the pool gets one too.
+    load = {s: (2.0 ** rng.uniform(-1, 1) if channel_load else 1.0)
+            for plex in ann for _c, s in ann[plex]}
+    # The master pool's composition: the grand mean over every sample, which
+    # is the same material in every plex and so cancels exactly under ratios.
+    def kbar(up):
+        return sum(2.0 ** (up if group_of[s] == "b" else 0.0)
+                   for s in samples) / len(samples)
+
+    for pi, plex in enumerate(plexes):
+        scale = 2.0 ** plex_log2[pi]
+        rows = []
+        for pid in list(ids) + (sorted(confined) if pi == 0 else []):
+            up = effect_of.get(pid, 0.0)
+            for pep in peps[pid]:
+                vals = {}
+                for _c, s in ann[plex]:
+                    if s.startswith("Pool"):
+                        true = base[pep] * kbar(up)
+                    else:
+                        true = base[pep] * (2.0 ** (up if group_of[s] == "b"
+                                                    else 0.0))
+                    vals[s] = round(true * scale * load[s]
+                                    * 2.0 ** rng.gauss(0, noise))
+                rows.append({"peptide": pep, "razor": pid, "values": vals})
+        write_tmt_plex(root, plex, ann[plex], rows, seed=seed + pi)
+    return root, TmtTruth(
+        root=root, samples=samples, group_of=group_of, plex_of=plex_of,
+        reference_of=reference_of, regulated=regulated,
+        null=set(ids) - regulated, confined=confined,
+        effect_log2=effect_log2, effect_of=effect_of,
+        plex_log2=dict(zip(plexes, plex_log2)), peptides_of=peps)
 
 
 # ----------------------------------------------------------------------

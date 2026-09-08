@@ -644,7 +644,13 @@ evaluates a document with the working directory set to its own folder.
 | `another metaannot is already running here` | a second run on the same results directory | wait for it; `--force-unlock` only if you are certain the other is gone |
 | `cannot run: [...] produced nothing and were not selected` | `--only`/`--from` skipped a stage this one needs | rerun without the selection, or add the named stages to it |
 | `deadlock: [...] can never become ready` | the scheduler has stages left but none whose dependencies are all satisfied, and nothing is still running | the message names the stuck stages and, per stage, which dependencies are unsatisfied. Normally that means those deps were excluded by `--only`/`--from`: add them to the selection, or drop the selection. If they *were* selected this is a bug in the stage graph, not a config error — keep the message |
+| a stage has said nothing for hours | it is working, or it is hung — you cannot tell from silence alone | every `progress_interval_s` seconds (60 by default) the newest line the tool wrote to stderr is echoed with its elapsed time; `no output yet on stderr` is the heartbeat from a tool that prints nothing. Set `progress_interval_s: 0` to switch it off |
+| `have been folded yet` after `integrate` | `esmfold` has not run | **not** a loss: nothing has been folded, so this pass simply carries no structural evidence. It is INFO, not WARN |
+| `requested structures exist` … `were skipped (OOM) or never folded` | `esmfold` finished and models are still missing | proteins over `max_len_structure` are counted separately in the same line; the remainder are OOM skips (`skipping <id>` in the esmfold log) or proteins added to `dark.faa` after the last fold |
 | a stage runs even though its `run.<stage>` flag is false | it was named with `--only` | intended — `--only` is a clearer statement of intent than a flag left off for another machine, and the run warns. This is how the GPU box runs `tmbed`/`esmfold` against the server's config |
+| `waiting for the GPU — tmbed is using it` | `esmfold` and `tmbed` both need the card | expected, not stuck. Each wants essentially a whole GPU (15.5 GB and 13.3 GB of a 16 GB device were observed), so they are leased one at a time; every CPU-only stage keeps running. `gpu_workers` raises the count, but they all still share the single `gpu_device` |
+| `refusing to search a DIAMOND database that cannot answer` | a `.dmnd` that is empty, truncated, or holds no sequences | a failed `diamond makedb` leaves one behind, and searching it reports 0 hits — the same output as a real absence. Rebuild it with the `diamond makedb` line the message prints, or drop the tag with `<tag>: ""` |
+| `incapable of a hit before it starts` | the database's sequences are too short for the configured e-value | a 15-residue peptide cannot reach `1e-10`, so that search's 0 hits say nothing about the biology. Give the tag its own threshold under `diamond_evalues:`, or record that this database needs different settings. The warning also names the `diamond_weights` entry that claims the database can score |
 
 ---
 
@@ -657,7 +663,7 @@ evaluates a document with the working directory set to its own folder.
 | diamond | hours | `-b` × 6 GB per job | databases run concurrently |
 | interpro | **longest** | large JVM heap | disable on the first pass |
 | cluster | minutes–hours | `--split-memory-limit` | |
-| tmbed / esmfold | GPU-bound | 16 GB VRAM | laptop only |
+| tmbed / esmfold | GPU-bound | 16 GB VRAM | laptop only; one at a time (`gpu_workers`) |
 | foldseek | hours | large | serial across targets on purpose |
 | integrate / finalise / join | minutes | ~1 GB per 100k proteins | |
 

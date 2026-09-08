@@ -166,8 +166,8 @@ def test_the_readme_shared_peptide_section_lists_every_mode(ma):
 def test_the_documented_quant_formats_are_the_real_ones(ma):
     txt = _text(README)
     documented = set(re.findall(r"`(diann|fragpipe|fragpipe_peptide|"
-                                r"fragpipe_ion|msstats_csv|msstats_feature|"
-                                r"msstats_protein)`", txt))
+                                r"fragpipe_ion|fragpipe_tmt|msstats_csv|"
+                                r"msstats_feature|msstats_protein)`", txt))
     assert documented == ma.ALL_FORMATS
 
 

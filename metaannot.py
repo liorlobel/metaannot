@@ -53,11 +53,13 @@ import argparse
 import atexit
 import concurrent.futures
 import contextlib
+import fnmatch
 import glob
 import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -67,7 +69,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 try:
     import numpy as np
@@ -91,6 +93,9 @@ DEFAULT_CONFIG = {
     # msstats_csv                 FragPipe MSstats.csv (long, feature level)
     # msstats_feature             MSstats dataProcess()$FeatureLevelData
     # msstats_protein             MSstats dataProcess()$ProteinLevelData
+    # fragpipe_tmt                FragPipe TMT: the per-plex TMTn/ directories
+    #                             (quant_table is then the RUN DIRECTORY that
+    #                             holds them, not a file). See the tmt: block.
     "quant_format": "diann",
     # FragPipe .fp-manifest. When set, sample names, conditions and
     # bioreplicates all come from it: quant columns are renamed to the
@@ -162,6 +167,84 @@ DEFAULT_CONFIG = {
     "export_feature_quant": True,
     "feature_intensity_suffix": "Intensity",
     "feature_exclude_suffixes": ["MaxLFQ Intensity", "Spectral Count"],
+    # quant_format 'fragpipe_tmt' only. Reporter intensities are read from the
+    # PER-PLEX tables, never from tmt-report/ (see read_fragpipe_tmt for why).
+    "tmt": {
+        # Plex directories inside quant_table. Sorted naturally, so TMT10
+        # follows TMT9 rather than TMT1.
+        "plex_glob": "TMT*",
+        # Which per-plex table: ion.tsv keeps the modified sequence and the
+        # charge state apart, peptide.tsv is one row per sequence.
+        "level": "ion",                     # ion | peptide
+        # FragPipe writes '<PLEX>_annotation.txt' (TMT1/TMT1_annotation.txt),
+        # never a plain 'annotation.txt'. A {plex: path} map overrides the
+        # pattern when the files live somewhere else.
+        "annotation": "{plex}_annotation.txt",
+        # The reference/bridge channel, resolved PER PLEX because it does not
+        # sit at a fixed position: in a real 8-plex design the pool is at 131C
+        # in six plexes and at 131N in the other two, so no single channel
+        # names it. reference_name globs the ANNOTATED SAMPLE NAME ('Pool*'),
+        # which is the stable signal; reference_channel globs the channel
+        # ('131C'). Set one, not both.
+        "reference_name": "",
+        "reference_channel": "",
+        # How the reference is treated. False (the default) is the COVARIATE
+        # treatment: the reference is dropped from the sample columns, because
+        # a pooled bridge is not a biological sample and would otherwise get a
+        # condition and a row in the design; the plex stays in the model to
+        # absorb the batch. True is the RATIOS treatment: every channel of a
+        # plex is divided by that plex's reference before the roll-up, which
+        # removes the plex effect directly (the classic bridge design) but
+        # assumes the same pool went into every plex and throws away the
+        # reference's own variance. It also propagates the reference's
+        # missingness: a feature with no reference value in a plex becomes NA
+        # for that whole plex, and the reader reports how many values that
+        # cost. Either way the reference is never a modelled sample.
+        "use_reference_ratios": False,
+        # Where the CONDITION comes from. The plex is a batch and is never
+        # used as one, so without this the condition has to be written by
+        # hand into analysis.metadata.
+        #   "auto" - try to split the annotated sample names ("resp_01" ->
+        #            "resp"), and accept the split only when it is
+        #            unambiguous; otherwise say so and require the metadata.
+        #   ""     - never derive; always require analysis.metadata.
+        #   regex  - a regular expression with one capture group, applied to
+        #            each sample name; the capture is the condition.
+        "condition_from_name": "auto",
+        # Keep only features identified in at least this many plexes. 1 keeps
+        # everything, which is the honest default: cross-plex overlap is low
+        # (~45% of ion keys between two plexes), so raising this trades
+        # features for a fuller matrix.
+        # This is the FEATURE-level filter, applied here before the roll-up.
+        # analysis.min_plexes is the PROTEIN-level one, applied in the report
+        # beside min_valid_per_group; they are different questions and both
+        # are reported.
+        "min_plexes": 1,
+        # Bring the channels of one plex to a common scale before the join.
+        # Channels differ by how much peptide was loaded and how completely it
+        # was labelled, which is a per-channel constant carrying no biology,
+        # and the roll-up sums features across it. "median" divides each
+        # channel by its own median and multiplies by the plex's median
+        # channel, so the values stay linear (the size factors need that), the
+        # step is exactly a per-channel median centring after the report's
+        # log2, and the BETWEEN-plex difference is deliberately left alone for
+        # the plex term to absorb. "none" leaves FragPipe's numbers untouched.
+        "within_plex_normalise": "median",   # median | none
+        # FragPipe names an unassigned channel '<PLEX>_<CHANNEL>' in the
+        # annotation. That is not a sample: its signal is isotope-impurity
+        # carry-over from the neighbouring channels.
+        "drop_empty_channels": True,
+        # Drop features whose precursor was too co-isolated to trust. Purity
+        # is written ONLY into psm.tsv, so this is implemented by reading that
+        # file and aggregating it onto the feature key: a feature is judged by
+        # the MEDIAN purity of the PSMs that produced it, because its reporter
+        # intensities are a sum over those PSMs and no single one describes
+        # it. 0 disables the filter and psm.tsv is not read at all. A feature
+        # that matches no PSM row is KEPT and counted, never dropped — an
+        # unmatched key is a join failure, not a dirty spectrum. This limits
+        # how much co-isolation contributed; it does not correct for it.
+        "min_purity": 0,
+    },
     # Intensity columns are auto-detected (numeric, not a known metadata
     # column) and always logged. Override when auto-detection is wrong —
     # an unrecognised numeric metadata column would otherwise be summed as
@@ -203,6 +286,15 @@ DEFAULT_CONFIG = {
     "immunity_max_gap": 60,   # bp between the two CDS
 
     "threads": 8,
+    # How often run_cmd echoes the newest line a running tool has written to
+    # stderr, in seconds. 0 turns it off. tmbed ran for 2 h 36 min and
+    # InterProScan for 2.9 h with nothing on the log, because stderr was
+    # captured and only quoted on failure: the only way to tell either apart
+    # from a hang was to watch its CPU ticks accumulate in /proc. Both write a
+    # tqdm bar to stderr the whole time, so one line a minute is the
+    # difference between a silent process and a progress bar. Nothing is
+    # hoarded - see run_cmd.
+    "progress_interval_s": 60,
     # How many independent stages may run at once. Each gets threads //
     # stage_workers CPUs. Parallel stages multiply peak memory.
     "stage_workers": 4,
@@ -244,9 +336,47 @@ DEFAULT_CONFIG = {
         },
     },
     "gpu_device": 0,
+    # How many GPU stages may run at once. The CPU and RAM budgets are split
+    # between concurrent stages; the GPU was not modelled at all, and tmbed and
+    # esmfold each want essentially a whole card — tmbed held 15.5 GB of a
+    # 16 GB device and ESMFold peaked at 13.3 GB on a single short sequence.
+    # With run.topology and run.structure both on they cannot share it, and
+    # the loser dies of an OOM that names no cause.
+    # This is a LEASE COUNT, not a device map: every GPU stage is pinned to the
+    # single `gpu_device` above, so raising this on a two-card machine runs two
+    # stages on the SAME card rather than one per card. Per-device assignment
+    # is not implemented; the limit here is a policy, not the hardware.
+    "gpu_workers": 1,
     "max_len_structure": 700,
     "esmfold_chunk_size": 64,
     "max_dark_structures": 2000,
+    # A CUDA fault partway through folding is not a reason to throw away the
+    # structures already on disk. Every PDB is checkpointed as it is written,
+    # so a failure at protein 1800 of 1900 has cost nothing but the tail.
+    # With this on, ESMFold skips the sequences it cannot fold, records them,
+    # and lets Foldseek search what did fold. Off, it stops and says how many
+    # it has, so a rerun resumes rather than a partial result passing silently.
+    "esmfold_allow_partial": False,
+    # Cap the fold work-list by the card's ACTUAL free VRAM, measured once the
+    # weights are resident. ESMFold does not raise an OOM when it stops
+    # fitting - the driver pages device memory to host RAM and the fold simply
+    # becomes one to two orders of magnitude slower, so a run does not fail,
+    # it stops being finishable. See vram_fit_length for the measurements.
+    "esmfold_vram_cap": True,
+    # Empirical, and calibrated to reproduce one measurement exactly: on a
+    # 16 GB card holding the 11.2 GB fp32 trunk, 4.8 GB was free and 478 aa
+    # was the longest length that still folded at the smooth rate. With the
+    # 0.5 GB reserve below, this coefficient puts the cap at that 478. It is a
+    # config key because that is one card, not a law: raise it to be more
+    # conservative, lower it if a card demonstrably folds longer sequences at
+    # a smooth rate.
+    "esmfold_bytes_per_residue_pair": 20200,
+    # Left free for the driver, the display and fragmentation.
+    "esmfold_vram_reserve_gb": 0.5,
+    # Consecutive failures that mean the device is wedged rather than the
+    # sequence being hard. Folding does not recover from that on its own, so
+    # stop instead of walking the rest of the list failing every one.
+    "esmfold_max_consecutive_failures": 5,
 
     "run": {
         "eggnog": True, "pfam": True, "dbcan": True, "diamond": True,
@@ -357,6 +487,18 @@ DEFAULT_CONFIG = {
         "msstats_label": "",
         "min_features": 0,
         "min_valid_per_group": 3,
+        # Protein-level companion to min_valid_per_group, for isobaric input.
+        # min_valid_per_group counts SAMPLES, and an isobaric run's
+        # missingness is shaped by the plex: a protein identified in one plex
+        # only is all-NA in every other, so "3 valid values in every group"
+        # can be satisfied entirely inside one batch and the difference the
+        # model then reports is that batch. This counts PLEXES instead. 1 is
+        # the default so that no run loses proteins to a filter it never
+        # asked for; the report always says how many of the retained proteins
+        # live in a single plex, so the number to set this on is in the
+        # report whether or not the filter bites. Inert without a plex
+        # column, so label-free runs are unaffected.
+        "min_plexes": 1,
         "drop_zero_variance": False,
         "group_col_for_filtering": "group",
         "normalise": "median",
@@ -382,6 +524,13 @@ DEFAULT_CONFIG = {
     "signalp_batch_size": 0,      # 0 = tool default
     "tmbed_batch_size": 0,        # residues per batch; 0 = tool default
     "tmbed_use_gpu": "auto",      # auto = GPU with CPU fallback | true | false
+    # Proteins longer than this are excluded from tmbed and listed in
+    # results/topology/tmbed_excluded.tsv. ProtT5's attention is
+    # length-squared, so cost per sequence is roughly (len^2 x 32 x 4) bytes:
+    # 1.1 GB at 3000 residues, 141 GB at titin's 34,350. One such sequence
+    # aborts the stage on any device, hours in, with nothing written. 0
+    # disables the cap and restores the old behaviour.
+    "tmbed_max_len": 3000,
     "interpro_applications": "Pfam,NCBIfam,Gene3D,SUPERFAMILY,PANTHER,SMART,CDD,PIRSF",
     "hhblits_iterations": 2,
     "hhblits_workers": 4,
@@ -396,6 +545,14 @@ DEFAULT_CONFIG = {
     "effector_prediction_weight": 3,
 
     "diamond_weights": {"vfdb": 4, "tadb": 3, "bagel": 3, "merops": 2, "card": 0},
+    # Per-database e-value, overriding thresholds.diamond_evalue for that tag
+    # alone. One threshold cannot fit every database: BAGEL is 262 bacteriocin
+    # sequences with a median length of 15 residues, and no 15-residue
+    # alignment can reach 1e-10, so at the pipeline default that search was
+    # incapable of a hit before it started and its 0 hits against 38,204
+    # proteins said nothing about the biology. Empty = one threshold for all.
+    #   diamond_evalues: {bagel: 1e-3}
+    "diamond_evalues": {},
 
     "thresholds": {
         "diamond_evalue": 1e-10,
@@ -529,7 +686,7 @@ def deep_merge(base, override, prefix=""):
 # are exactly the Rmd's params, so `min_lfC` or `design_formla` is a typo that
 # used to run the wrong statistics with nothing said.
 FREEFORM = {"tool_args", "effector_predictions", "diamond_weights",
-            "db.diamond", "sources.diamond"}
+            "diamond_evalues", "db.diamond", "sources.diamond"}
 
 
 def unknown_keys(user, default, prefix=""):
@@ -713,15 +870,58 @@ def set_log_context(name):
     _CTX.stage = name
 
 
+def configure_console_streams():
+    """Make stdout/stderr survive a character the console cannot encode.
+
+    Tool output is decoded with errors="replace" (see opener), which puts
+    U+FFFD into descriptions. Python on Windows writes stdout in the console
+    code page - cp1252 here - and printing U+FFFD to a cp1252 stream raises
+    UnicodeEncodeError. That is not hypothetical: it happened while printing a
+    parsed table. A stage that logs a protein description containing one
+    replacement character could therefore abort a run that had been going for
+    hours, on the LOG LINE rather than on the work.
+
+    UTF-8 first, because that is what the log FILE already is and what a
+    modern Windows console (PEP 528) and every POSIX terminal want; falling
+    back to leaving the encoding alone and only relaxing the error handler,
+    which still cannot raise. Both are best effort: a stream that pytest or a
+    caller replaced may not be reconfigurable at all, which is why log()
+    additionally writes defensively.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        for kwargs in ({"encoding": "utf-8", "errors": "replace"},
+                       {"errors": "replace"}):
+            try:
+                reconfigure(**kwargs)
+                break
+            except (ValueError, OSError, AttributeError, TypeError):
+                continue
+
+
+def _write_safely(stream, text):
+    """write(), but a character the stream cannot encode costs that character
+    rather than the run. configure_console_streams normally makes this
+    unreachable; it stays because the streams are not always ours to
+    reconfigure and the logging path must never be what kills a stage."""
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(enc, "replace").decode(enc, "replace"))
+
+
 def log(msg, level="INFO"):
     tag = getattr(_CTX, "stage", "")
     prefix = f"[{time.time()-_START:7.1f}s] {level:5s} " + (f"{tag:>10s} | " if tag else "")
     with _LOGLOCK:
         for i, part in enumerate(str(msg).split("\n")):
             line = prefix + part if i == 0 else " " * len(prefix) + part
-            sys.stderr.write(line + "\n")
+            _write_safely(sys.stderr, line + "\n")
             if _LOGFH:
-                _LOGFH.write(line + "\n")
+                _write_safely(_LOGFH, line + "\n")
         sys.stderr.flush()
         if _LOGFH:
             _LOGFH.flush()
@@ -794,20 +994,161 @@ def have(tool):
     return shutil.which(tool) is not None
 
 
+def resolve_tool(name):
+    """Turn a tool name into the absolute path PATH says it is.
+
+    On POSIX this changes nothing: execvp would have found the same file.
+    On Windows it is load-bearing. CreateProcess, which is what subprocess
+    uses without a shell, does its own PATH search and only ever appends
+    ".exe" - it ignores PATHEXT. So a ".cmd" or ".bat" earlier on PATH loses
+    to an ".exe" later on it, and the tool that runs is not the tool
+    shutil.which reported. Resolving here means one answer to "which binary is
+    this", used by the availability check, by the logged command line and by
+    the process that actually starts.
+
+    An absolute path, or a name PATH cannot resolve, is handed back unchanged
+    so the caller still fails with its own not-found message.
+    """
+    if not isinstance(name, str) or os.sep in name or (os.altsep and os.altsep in name):
+        return name
+    return shutil.which(name) or name
+
+
+# Seconds between progress lines from a running tool; 0 disables. Set from
+# config.progress_interval_s at the start of a run, because run_cmd is called
+# from every stage and threading a cfg through all of them would touch code
+# that has nothing to do with logging.
+_PROGRESS_INTERVAL = float(DEFAULT_CONFIG["progress_interval_s"])
+# Stderr lines kept while a command runs. Bounded on purpose: the failure tail
+# has only ever quoted the last 15, and the reason stdout goes to devnull -
+# not buffering tens of MB of chatter - applies here too.
+_STDERR_KEEP = 200
+# CSI escapes, which tqdm uses to colour the bar and to erase the line.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def set_progress_interval(seconds):
+    global _PROGRESS_INTERVAL
+    _PROGRESS_INTERVAL = max(0.0, float(seconds or 0))
+
+
+def _elapsed_str(seconds):
+    s = int(seconds)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else \
+        f"{s // 60}m{s % 60:02d}s"
+
+
+def _progress_line(text, width=160):
+    """One printable line out of whatever a tool last wrote.
+
+    tqdm redraws in place with carriage returns and erases with CSI codes, so
+    the raw text is a wall of partial redraws rather than a message. Universal
+    newlines have already turned each \\r into its own line by the time we get
+    here, so what is left is to drop the escape codes, the stray control
+    characters and any excess width.
+    """
+    text = _ANSI_RE.sub("", text)
+    # Two passes, not one: a tab is not printable, so filtering before
+    # translating deleted it and glued the columns of a table together.
+    text = "".join(" " if c in "\t\x08\x0b\x0c" else c for c in text)
+    text = "".join(c for c in text if c == " " or c.isprintable()).strip()
+    return text[:width - 1] + "…" if len(text) > width else text
+
+
 def run_cmd(cmd, cwd=None, env=None):
     """Run a command, raising with the tail of stderr on failure.
 
     stdout goes to /dev/null: InterProScan and friends emit tens of MB of
     progress chatter, and buffering it in memory bought nothing.
+
+    stderr is read as it arrives into a bounded ring instead of being
+    collected in one go at the end, and every progress_interval_s seconds the
+    newest line is echoed with the command and how long it has been running.
+    Nothing is hoarded - the ring holds _STDERR_KEEP lines, far more than the
+    15 the failure tail quotes - so the reasoning above still holds.
+
+    The silence this fixes was real: tmbed ran 2 h 36 min and then died,
+    twice, and InterProScan 2.9 h, with the log saying nothing between the
+    command and the failure. Both write a tqdm bar to stderr the entire time;
+    none of it reached the operator, so the only way to tell a live stage from
+    a hung one was to watch its CPU ticks in /proc. The tutorial tells people
+    to expect 1-3 DAY runs.
+
+    Return value ("") and failure behaviour (RuntimeError quoting the tail)
+    are deliberately unchanged: every stage depends on both.
     """
     log("$ " + " ".join(str(c) for c in cmd))
+    name = os.path.basename(str(cmd[0]))
+    started = time.time()
+    kept = deque(maxlen=_STDERR_KEEP)
+    # A deque raises if it is mutated while being iterated, and the reader
+    # thread appends to this one continuously, so every read of it is a
+    # snapshot taken under the lock.
+    kept_lock = threading.Lock()
+    stage = getattr(_CTX, "stage", "")
+
+    def pump(stream):
+        # The reader thread inherits nothing from threading.local, so the
+        # stage tag is carried over by hand or these lines lose their owner
+        # exactly when several stages are running at once.
+        set_log_context(stage)
+        try:
+            for line in iter(stream.readline, ""):
+                with kept_lock:
+                    kept.append(line.rstrip("\n"))
+        except (ValueError, OSError):
+            pass          # pipe closed under us; the exit status still speaks
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def newest_line():
+        with kept_lock:
+            snapshot = list(kept)
+        for raw in reversed(snapshot):
+            clean = _progress_line(raw)
+            if clean:
+                return clean
+        return ""
+
     with open(os.devnull, "w") as null:
-        p = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
-                           stdout=null, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        tail = "\n".join((p.stderr or "").strip().splitlines()[-15:])
+        # errors="replace" for the same reason opener() uses it: a tool that
+        # writes latin-1 to stderr must not turn into a UnicodeDecodeError
+        # that hides its actual failure.
+        argv = [str(c) for c in cmd]
+        argv[0] = resolve_tool(argv[0])
+        proc = subprocess.Popen(argv, cwd=cwd, env=env,
+                                stdout=null, stderr=subprocess.PIPE,
+                                text=True, errors="replace")
+        reader = threading.Thread(target=pump, args=(proc.stderr,),
+                                  daemon=True)
+        reader.start()
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=_PROGRESS_INTERVAL or None)
+                    break
+                except subprocess.TimeoutExpired:
+                    newest = newest_line()
+                    log(f"{name} running {_elapsed_str(time.time() - started)}"
+                        + (f" | {newest}" if newest else
+                           " | no output yet on stderr"))
+        except BaseException:
+            # What subprocess.run did on Ctrl-C: do not leave a GPU job or an
+            # InterProScan behind, still running, after the pipeline exits.
+            proc.kill()
+            proc.wait()
+            raise
+        reader.join(timeout=5)
+
+    if proc.returncode != 0:
+        with kept_lock:
+            blob = "\n".join(kept)
+        tail = "\n".join(blob.strip().splitlines()[-15:])
         raise RuntimeError(
-            f"{cmd[0]} exited {p.returncode}\n--- stderr tail ---\n{tail}")
+            f"{cmd[0]} exited {proc.returncode}\n--- stderr tail ---\n{tail}")
     return ""
 
 
@@ -1439,7 +1780,7 @@ def parse_cluster(path):
 def parse_context(path):
     if not os.path.exists(path) or not nonempty(path):
         return {}
-    df = pd.read_csv(path, sep="\t")
+    df = pd.read_csv(path, sep="\t", encoding="utf-8", encoding_errors="replace")
     if "protein_id" not in df.columns:
         return {}
     df = df.set_index("protein_id")
@@ -1546,12 +1887,12 @@ def _read_prediction_table(path, name):
     with opener(path) as fh:
         first = fh.readline().rstrip("\n")
     if "\t" in first:
-        return pd.read_csv(path, sep="\t", dtype=str)
+        return pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8", encoding_errors="replace")
     if "," in first:
-        return pd.read_csv(path, sep=",", dtype=str)
+        return pd.read_csv(path, sep=",", dtype=str, encoding="utf-8", encoding_errors="replace")
     log(f"{name}: {path} has no tab or comma on its first line; reading it as "
         "a headerless one-column list of protein ids", "WARN")
-    return pd.read_csv(path, sep="\t", header=None, names=["id"], dtype=str)
+    return pd.read_csv(path, sep="\t", header=None, names=["id"], dtype=str, encoding="utf-8", encoding_errors="replace")
 
 
 def parse_external_predictions(spec, index):
@@ -1926,6 +2267,188 @@ def stage_dbcan(cfg, p):
                 + [cfg["db"]["dbcan_hmm"], cfg["proteins_faa"]])
 
 
+# DIAMOND prints its own scoring constants on every makedb run: "Scoring
+# parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)". They are
+# what turns a raw alignment score into a bit score, and therefore what decides
+# whether a hit of a given length can reach a given e-value at all.
+_DMND_LAMBDA, _DMND_K = 0.267, 0.041
+# Mean of the BLOSUM62 diagonal (116/20). A perfect self-match of an
+# average-composition peptide scores this per residue and nothing scores more
+# over a whole sequence, so the estimate below is optimistic on purpose: it is
+# the BEST an alignment of that length could ever do, not a typical one.
+_BLOSUM62_MEAN_DIAGONAL = 5.8
+# Query length for the estimate. Long on purpose - the e-value scales with it,
+# so a generous query makes the check err towards saying nothing.
+_EVALUE_QUERY_LEN = 1000
+# `diamond makedb` on a single 11-residue sequence writes 143 bytes, so a file
+# below this is smaller than DIAMOND's own header and cannot be a database at
+# all. Observed: a failed makedb left a ZERO-BYTE .dmnd on disk, and searching
+# it reports no hits - indistinguishable in the output from a real absence of
+# virulence factors.
+_DMND_MIN_BYTES = 128
+
+
+def diamond_evalue_for(cfg, tag):
+    """The e-value this DIAMOND database is searched at.
+
+    Per-database because one threshold cannot fit both a virulence-factor
+    database of 350-residue proteins and a bacteriocin database whose median
+    sequence is 15 residues; see diamond_evalues in the config.
+    """
+    over = (cfg.get("diamond_evalues") or {})
+    raw = over[tag] if tag in over else cfg["thresholds"]["diamond_evalue"]
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        where = (f"diamond_evalues.{tag}" if tag in over
+                 else "thresholds.diamond_evalue")
+        die(f"{where} must be a number, not {raw!r}")
+
+
+def best_possible_evalue(letters, typical_len):
+    """The smallest e-value a hit against this database could ever reach.
+
+    E = m*n*2**-S', with S' the bit score. Feeding it a perfect self-match of
+    the database's typical sequence length answers a question the pipeline was
+    never asking before the run: is this search capable of a hit at all?
+    """
+    if not letters or not typical_len or typical_len <= 0:
+        return None
+    bits = (_DMND_LAMBDA * _BLOSUM62_MEAN_DIAGONAL * float(typical_len)
+            - math.log(_DMND_K)) / math.log(2.0)
+    try:
+        return _EVALUE_QUERY_LEN * float(letters) * 2.0 ** -bits
+    except OverflowError:
+        return 0.0            # long sequences: any e-value is reachable
+
+
+def _fasta_lengths(path, cap=200000):
+    """Sequence lengths in a FASTA, for the median. Capped: the point is the
+    shape of the database, and reading a 100 GB UniRef to learn it is not."""
+    out, cur = [], 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    if cur:
+                        out.append(cur)
+                    if len(out) >= cap:
+                        return out
+                    cur = 0
+                else:
+                    cur += len(line.strip())
+    except OSError:
+        return out
+    if cur:
+        out.append(cur)
+    return out
+
+
+def diamond_db_profile(cfg, tag, path):
+    """(typical_len, letters, provenance) for a DIAMOND database.
+
+    `diamond dbinfo` is the only thing that can read a .dmnd, and it reports
+    Sequences and Letters, so the typical length it yields is the mean. When
+    diamond is not installed or the file predates dbinfo, fall back to a source
+    FASTA the config names or that `doctor --fix` staged beside the database,
+    where the median is available. When neither is, return (None, None, why)
+    and say so rather than guessing a length the check would then act on.
+    """
+    why = ""
+    if have("diamond"):
+        r = None
+        try:
+            r = subprocess.run([resolve_tool("diamond"), "dbinfo", "-d", path],
+                               capture_output=True, text=True, timeout=120,
+                               encoding="utf-8", errors="replace")
+        except (OSError, subprocess.SubprocessError) as e:
+            why = f"diamond dbinfo failed to run ({e})"
+        if r is not None:
+            got = {}
+            for line in (r.stdout or "").splitlines():
+                k, _, v = line.strip().partition("  ")
+                v = v.strip()
+                if k in ("Sequences", "Letters") and v.isdigit():
+                    got[k] = int(v)
+            if "Sequences" in got and "Letters" in got:
+                n, letters = got["Sequences"], got["Letters"]
+                return ((letters / n if n else 0), letters,
+                        f"mean of {n} sequences / {letters} letters, from "
+                        "`diamond dbinfo`")
+            why = "`diamond dbinfo` reported no Sequences/Letters for this file"
+    else:
+        why = "diamond is not installed, so the .dmnd cannot be read"
+
+    stem = os.path.splitext(path)[0]
+    src = ((cfg.get("sources") or {}).get("diamond") or {}).get(tag, "")
+    # .fas is the name doctor --fix stages beside the database; a sources entry
+    # that is a local path rather than a URL is the other way a config records
+    # where the sequences came from.
+    cands = ([src] if src and os.path.isfile(src) else []) +         [stem + ext for ext in (".fas", ".faa", ".fasta")]
+    for cand in cands:
+        if not os.path.isfile(cand):
+            continue
+        lens = sorted(_fasta_lengths(cand))
+        if lens:
+            return (lens[len(lens) // 2], sum(lens),
+                    f"median of {len(lens)} sequences in {cand}")
+    return (None, None,
+            why + ", and no source FASTA is on disk beside it or named in "
+            f"sources.diamond.{tag}")
+
+
+def diamond_db_check(cfg, tag, path):
+    """(refusal, warning) for one configured DIAMOND database; either may be
+    None. A missing file is the caller's business, not this function's.
+
+    Both of these were real. A `diamond makedb` that had failed left a
+    zero-byte .dmnd, which the stage would have searched, reporting no hits -
+    the same output as a real absence of virulence factors. And BAGEL built
+    correctly, 262 sequences of median length 15, then returned exactly 0 hits
+    against 38,204 proteins at --evalue 1e-10, because a 15-residue peptide
+    cannot reach 1e-10: the search was incapable of a hit before it started.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, None
+    stem = os.path.splitext(path)[0]
+    if size < _DMND_MIN_BYTES:
+        return (f"{tag}: {path} is {size} bytes, smaller than a DIAMOND "
+                "header - a failed `diamond makedb` leaves a file like this, "
+                "and searching it reports 0 hits, which reads in the output "
+                "exactly like a real absence. Rebuild it: diamond makedb "
+                f"--in <fasta> -d {stem}"), None
+
+    typical, letters, prov = diamond_db_profile(cfg, tag, path)
+    if letters is not None and (letters == 0 or not typical):
+        return (f"{tag}: {path} holds no sequences ({prov}). Searching it "
+                "would report 0 hits, which is indistinguishable from a real "
+                f"absence. Rebuild it: diamond makedb --in <fasta> -d {stem}"), None
+    ev = diamond_evalue_for(cfg, tag)
+    if typical is None:
+        return None, (f"{tag}: {prov}, so nothing here can tell whether "
+                      f"--evalue {ev:g} is reachable for this database. If it "
+                      "returns 0 hits, that may be the threshold rather than "
+                      "the biology.")
+    best = best_possible_evalue(letters, typical)
+    if best is None or best <= ev:
+        return None, None
+    weight = (cfg.get("diamond_weights") or {}).get(tag)
+    # A database that cannot hit is also holding a scoring weight that says it
+    # can contribute to the effector ranking.
+    note = (f" It also carries diamond_weights {tag}: {weight}, which claims "
+            "it can contribute to the score.") if weight else ""
+    return None, (
+        f"{tag}: sequences here are about {typical:.0f} residues ({prov}), and "
+        f"the best e-value even a perfect alignment that long could reach is "
+        f"~{best:.0e} - above the configured --evalue {ev:g}. This search is "
+        "incapable of a hit before it starts, so 0 hits will say nothing about "
+        f"the biology. Set a per-database e-value (diamond_evalues: "
+        f"{{{tag}: 1e-3}}), or record that this database needs different "
+        f"settings than the rest.{note}")
+
+
 def stage_diamond(cfg, p):
     if not have("diamond"):
         die("diamond not found (conda install -c bioconda diamond)")
@@ -1941,9 +2464,34 @@ def stage_diamond(cfg, p):
     if not jobs:
         open(p.diamond_done, "w", encoding="utf-8").close()
         return
+
+    # A database that cannot answer is worse than one that is missing: the
+    # missing one is reported above, the broken one returns 0 hits, and 0 hits
+    # is what a real absence of virulence factors looks like too. Both halves
+    # of this were observed on one run - a zero-byte .dmnd left by a failed
+    # makedb, and BAGEL searched at an e-value no 15-residue peptide can reach.
+    refusals = []
+    for tag, path in jobs:
+        bad, warn = diamond_db_check(cfg, tag, path)
+        if bad:
+            refusals.append(bad)
+        elif warn:
+            log(warn, "WARN")
+    if refusals:
+        die("refusing to search a DIAMOND database that cannot answer:\n  "
+            + "\n  ".join(refusals))
+
     # Several small databases in parallel beat one after another: DIAMOND's
     # thread scaling is sublinear, so 4 jobs at N/4 threads finish sooner than
     # 4 jobs at N threads in sequence.
+    base_ev = float(cfg["thresholds"]["diamond_evalue"])
+    for tag, _path in jobs:
+        ev = diamond_evalue_for(cfg, tag)
+        if ev != base_ev:
+            log(f"{tag}: searching at --evalue {ev:g} from diamond_evalues, "
+                f"not the thresholds.diamond_evalue {base_ev:g} the other "
+                "databases use")
+
     workers = min(len(jobs), max(1, int(cfg.get("diamond_workers", 4))))
     per = max(1, int(cfg["threads"]) // workers)
     log(f"{len(jobs)} database(s), {workers} at a time x {per} threads")
@@ -1964,7 +2512,7 @@ def stage_diamond(cfg, p):
         with atomic_out(f"{p.diamond_dir}/{tag}.tsv") as tmp:
             run_cmd(["diamond", "blastp", "-q", cfg["proteins_faa"],
                      "-d", dbpath, "-o", tmp, "--very-sensitive",
-                     "-e", cfg["thresholds"]["diamond_evalue"],
+                     "-e", f"{diamond_evalue_for(cfg, tag):g}",
                      "--max-target-seqs", 5, "--threads", per, "--quiet"]
                     + mem + tool_args(cfg, "diamond")
                     + ["--outfmt", "6", "qseqid", "sseqid", "pident",
@@ -2045,8 +2593,38 @@ def stage_tmbed(cfg, p):
     if want == "auto":
         log("tmbed: GPU preferred, CPU fallback allowed "
             "(set tmbed_use_gpu: true to make a missing GPU fatal)")
+    # One over-long protein kills the whole stage, and no device setting saves
+    # it. TMbed embeds with ProtT5, whose attention score matrix is
+    # length-squared x heads: titin, at 34,350 residues, asks for 141 GB in a
+    # single allocation. Observed twice on real data — 8.79 GiB refused on a
+    # 16 GB card, then 151 GB refused on a 94 GB host under --cpu-fallback —
+    # each time after hours of work that TMbed writes only at the end, so
+    # nothing was recoverable. Cap the input instead, and record what was cut
+    # rather than letting the exclusion pass unnoticed.
+    faa = cfg["proteins_faa"]
+    cap = int(cfg.get("tmbed_max_len", 0) or 0)
+    if cap:
+        long_ones = [(pid, len(seq)) for pid, seq in read_fasta(faa)
+                     if len(seq) > cap]
+        if long_ones:
+            os.makedirs(os.path.dirname(p.tmbed) or ".", exist_ok=True)
+            faa = f"{p.tmbed}.capped.faa"
+            with open(faa, "w", encoding="utf-8") as fh:
+                for pid, seq in read_fasta(cfg["proteins_faa"]):
+                    if len(seq) <= cap:
+                        fh.write(f">{pid}\n{seq}\n")
+            excl = f"{os.path.dirname(p.tmbed)}/tmbed_excluded.tsv"
+            with open(excl, "w", encoding="utf-8") as fh:
+                fh.write("protein_id\tlength\n")
+                for pid, n in sorted(long_ones, key=lambda x: -x[1]):
+                    fh.write(f"{pid}\t{n}\n")
+            log(f"tmbed: {len(long_ones)} protein(s) longer than "
+                f"tmbed_max_len={cap} are excluded; ProtT5 attention is "
+                f"length-squared and the longest here ({long_ones and max(n for _, n in long_ones)} aa) "
+                f"would need more memory than any device present. They get no "
+                f"topology evidence and are listed in {excl}", "WARN")
     with atomic_out(p.tmbed) as tmp:
-        cmd = ["tmbed", "predict", "-f", cfg["proteins_faa"], "-p", tmp,
+        cmd = ["tmbed", "predict", "-f", faa, "-p", tmp,
                "--out-format", "0"] + gpu
         bs = int(cfg.get("tmbed_batch_size", 0) or 0)
         if bs:
@@ -2727,6 +3305,85 @@ def ncbifam_family_desc(cfg, p):
     return d
 
 
+def structure_shortfall_message(cfg, p, requested_lengths, have_pdb):
+    """(text, level) for "fewer models than we asked for".
+
+    On the very FIRST structure run this said
+
+        WARN 0/1913 requested structures exist in .../results/structures;
+             the rest were skipped (OOM) or never folded
+
+    which is a correct sentence in the wrong situation: the directory was
+    empty because nothing had been folded YET, and a reader reasonably
+    concluded the run had already lost 1,913 models to the OOM killer. The
+    three causes are not the same event and must not share a sentence:
+
+      never folded   no .done marker, no plddt.tsv, no models - the esmfold
+                     stage has not run, so nothing has been lost and this is
+                     not a warning at all;
+      still folding  models exist but no .done marker - an interrupted or
+                     not-yet-finished pass, so the rest are pending;
+      lost           esmfold finished and models are still missing. Even here
+                     OOM is only named for the ones length does not already
+                     explain, because max_len_structure excludes a protein
+                     from folding before ESMFold sees it.
+    """
+    n_req = len(requested_lengths)
+    missing = [pid for pid in requested_lengths if pid not in have_pdb]
+    n_got = n_req - len(missing)
+    cap = int(cfg.get("max_len_structure") or 0)
+    too_long = sum(1 for pid in missing if cap and requested_lengths[pid] > cap)
+    finished = os.path.exists(p.struct_done)
+    # Any of the three is proof that folding has happened at least once;
+    # .done alone is not, because it is written at the END of the stage.
+    started = finished or n_got > 0 or nonempty(f"{p.structures}/plddt.tsv")
+
+    if not started:
+        return (f"none of the {n_req} proteins in {p.dark} have been folded "
+                f"yet: {p.structures} is empty and the esmfold stage has not "
+                f"run (no {p.struct_done}, no plddt.tsv). Nothing has been "
+                "lost - this pass simply has no structural evidence, so "
+                "structure_attempted is False for every protein.", "INFO")
+    if not finished:
+        return (f"{n_got}/{n_req} requested structures exist in "
+                f"{p.structures}, and esmfold has not finished (no "
+                f"{p.struct_done}), so the {len(missing)} missing are still "
+                "pending rather than lost; rerun the esmfold stage.", "WARN")
+
+    parts = [f"{n_got}/{n_req} requested structures exist in {p.structures} "
+             "although esmfold has finished"]
+    if too_long:
+        parts.append(f"{too_long} are longer than max_len_structure={cap} and "
+                     "were never submitted")
+    rest = len(missing) - too_long
+    if rest:
+        # esmfold_failed.tsv is the record of what it actually gave up on, so
+        # the two causes no longer have to share one hedged sentence. Missing
+        # proteins that are NOT in it were added to dark.faa after the last
+        # fold and were never attempted, which is a different thing entirely.
+        tried = set()
+        fail_tbl = f"{p.structures}/esmfold_failed.tsv"
+        if os.path.exists(fail_tbl):
+            with contextlib.suppress(OSError):
+                with opener(fail_tbl) as fh:
+                    next(fh, None)
+                    tried = {l.split("	")[0] for l in fh if l.strip()}
+        gave_up = sum(1 for pid in missing if pid in tried)
+        if gave_up:
+            parts.append(f"{gave_up} were attempted and failed twice, listed "
+                         f"with the error in {fail_tbl}")
+        never = rest - gave_up
+        if never and tried:
+            parts.append(f"{never} are absent from that list, so they were "
+                         "added to dark.faa after the last fold and never "
+                         "attempted")
+        elif never:
+            parts.append(f"{never} were skipped or never folded - there is no "
+                         f"{os.path.basename(fail_tbl)}, so this run predates "
+                         "the failure record and the two cannot be separated")
+    return ("; ".join(parts), "WARN")
+
+
 def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     th, w = cfg["thresholds"], cfg["weights"]
 
@@ -3034,7 +3691,7 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
 
     # ---- external effector predictions
     if os.path.exists(p.effectors):
-        ep = pd.read_csv(p.effectors, sep="\t")
+        ep = pd.read_csv(p.effectors, sep="\t", encoding="utf-8", encoding_errors="replace")
         if "protein_id" in ep.columns and len(ep.columns) > 1:
             ep["protein_id"] = ep["protein_id"].astype(str)
             ep = ep.set_index("protein_id")
@@ -3055,7 +3712,7 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # ---- fold groups from self-clustering the unannotated structures
     df["fold_cluster"], df["fold_cluster_size"] = "", 0
     if os.path.exists(p.fold_clusters):
-        fc = pd.read_csv(p.fold_clusters, sep="\t")
+        fc = pd.read_csv(p.fold_clusters, sep="\t", encoding="utf-8", encoding_errors="replace")
         m = dict(zip(fc["member"].astype(str), fc["rep"].astype(str)))
         sz = fc.groupby("rep").size()
         df["fold_cluster"] = from_dict(m, idx)
@@ -3070,7 +3727,10 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
         if tag not in dia_weights:
             log(f"no diamond_weights entry for '{tag}'; hits count as annotation "
                 "but contribute 0 to the score", "WARN")
-        hits = parse_diamond(path, th["diamond_evalue"],
+        # The same per-database e-value the search used: filtering the table
+        # back down to thresholds.diamond_evalue here would quietly undo a
+        # diamond_evalues entry and leave the user's setting doing nothing.
+        hits = parse_diamond(path, diamond_evalue_for(cfg, tag),
                              th["diamond_min_qcov"], th["diamond_min_pident"])
         df[f"{tag}_hit"] = from_dict({k: v[0] for k, v in hits.items()}, idx)
         df[f"{tag}_pident"] = from_dict(
@@ -3151,16 +3811,24 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # made "we folded it and found nothing" indistinguishable from "we never
     # folded it" — the one distinction the bins exist to keep honest.
     df["structure_requested"] = False
+    req_len = {}
     if os.path.exists(p.dark):
-        tried = {pid for pid, _ in read_fasta(p.dark)}
-        df["structure_requested"] = idx.isin(tried)
+        # Lengths, not just ids: max_len_structure excludes a long protein
+        # from folding before ESMFold ever sees it, so it is one of the
+        # reasons a model can be missing without anything having gone wrong.
+        req_len = {pid: len(seq) for pid, seq in read_fasta(p.dark)}
+        df["structure_requested"] = idx.isin(set(req_len))
     have_pdb = {os.path.basename(f)[:-4]
                 for f in glob.glob(f"{p.structures}/*.pdb")}
     df["structure_attempted"] = idx.isin(have_pdb)
-    n_req, n_got = int(df["structure_requested"].sum()), len(have_pdb)
-    if n_req and n_got < n_req:
-        log(f"{n_got}/{n_req} requested structures exist in {p.structures}; "
-            "the rest were skipped (OOM) or never folded", "WARN")
+    # Requested AND in this table: p.structures can hold models for proteins
+    # that are no longer in dark.faa, and counting those made the shortfall
+    # look smaller than it was (len(have_pdb) could even exceed the number
+    # requested, silencing the message entirely).
+    req_len = {pid: n for pid, n in req_len.items()
+               if pid in set(idx[df["structure_requested"]])}
+    if req_len and not set(req_len) <= have_pdb:
+        log(*structure_shortfall_message(cfg, p, req_len, have_pdb))
 
     # ---- genomic context
     ctx = parse_context(p.context)
@@ -3497,11 +4165,11 @@ def stage_integrate_final(cfg, p):
         # Every identifier-like column must be read as str. Pinning only
         # protein_id let a numeric seed_taxid round-trip through float64 and
         # be written back as "821.0", which matches nothing downstream.
-        _head = pd.read_csv(p.pass1, sep="\t", nrows=0)
+        _head = pd.read_csv(p.pass1, sep="\t", nrows=0, encoding="utf-8", encoding_errors="replace")
         _str_cols = {c: str for c in _head.columns
                      if c in set(ANN_STR_COLS) or c == "protein_id"}
         df = pd.read_csv(p.pass1, sep="\t", low_memory=False,
-                         dtype=_str_cols).set_index("protein_id")
+                         dtype=_str_cols, encoding="utf-8", encoding_errors="replace").set_index("protein_id")
         if os.path.exists(p.dark):
             tried = {pid for pid, _ in read_fasta(p.dark)}
             df["structure_requested"] = df.index.isin(tried)
@@ -3548,10 +4216,96 @@ def read_plddt(structures):
     return out
 
 
+def vram_fit_length(cfg, torch):
+    """The longest sequence this card can fold without oversubscribing, or None.
+
+    Call this AFTER the weights are resident, so what it measures is the
+    headroom that is actually left rather than the size of the card.
+
+    Why this exists. ESMFold's cost does not rise smoothly with length; it
+    rises smoothly until the working set stops fitting in VRAM and then falls
+    off a cliff. Measured over 1,819 folds on one 16 GB card: 22.1 s median at
+    470-478 aa, then 140 s at 481 aa and up to 2,053 s by 491 aa. A 0.6%
+    increase in length cost 6x, and shortly after that 90x. Nothing reports an
+    OOM, because the driver quietly pages device memory to host RAM instead of
+    failing - so the run does not stop, it just stops being finishable, and the
+    only outward sign is that a stage which was going to take an hour is now
+    going to take a week.
+
+    It gets worse than slow. On the machine this was measured on, folding above
+    that cliff also produced repeated `CUDA driver error: device not ready`
+    faults and then took the whole host down twice with a hypervisor bugcheck
+    inside eleven minutes - the GPU there is reached through a virtualisation
+    layer, and sustained paging across it is what broke. That is a defect in
+    somebody else's code and not something this tool can fix, but staying under
+    the cliff avoids it entirely, which is the point of this function.
+
+    The estimate. Peak footprint above the resident weights is dominated by
+    terms quadratic in length (the pair representation and the triangular
+    attention that runs over it), so
+
+        max_len = sqrt(headroom / bytes_per_residue_pair)
+
+    `esmfold_bytes_per_residue_pair` is EMPIRICAL, calibrated so that the
+    measured 478 aa / 4.8 GB observation comes out exactly at 478, and it is a
+    config key precisely because one card is not a law of nature. Raise it to
+    be more conservative, lower it if your card demonstrably folds longer
+    sequences at a smooth rate, or set `esmfold_vram_cap: false` to switch the
+    whole check off and go back to `max_len_structure` alone.
+    """
+    if not cfg.get("esmfold_vram_cap", True):
+        return None
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except Exception as e:                                  # noqa: BLE001
+        # Old torch, or a build where mem_get_info is absent. Not a reason to
+        # fail the stage - just say the guard is off rather than pretend it ran.
+        log(f"esmfold: cannot read free VRAM ({type(e).__name__}), so the "
+            "length cap falls back to max_len_structure alone", "WARN")
+        return None
+    reserve = float(cfg.get("esmfold_vram_reserve_gb", 0.5)) * 1024 ** 3
+    per_pair = float(cfg.get("esmfold_bytes_per_residue_pair", 21000))
+    headroom = free - reserve
+    if headroom <= 0 or per_pair <= 0:
+        log(f"esmfold: only {free / 1024 ** 3:.1f} GB of VRAM is free after "
+            f"loading the weights, which is under the {reserve / 1024 ** 3:.1f} "
+            "GB reserve; folding anything at all will oversubscribe this card",
+            "WARN")
+        return 0
+    n = int((headroom / per_pair) ** 0.5)
+    log(f"esmfold: {free / 1024 ** 3:.1f} of {total / 1024 ** 3:.1f} GB VRAM "
+        f"free with the weights resident, so sequences up to {n} aa fit "
+        "without paging to host memory. Past that, folds slow by one to two "
+        "orders of magnitude with no OOM raised (esmfold_vram_cap: false "
+        "turns this off; esmfold_bytes_per_residue_pair recalibrates it)")
+    return n
+
+
 def stage_esmfold(cfg, p):
     os.makedirs(p.structures, exist_ok=True)
     if not nonempty(p.dark):
         log("no unannotated proteins to fold, skipping")
+        open(p.struct_done, "w", encoding="utf-8").close()
+        return
+
+    # Decide whether there is ANY work before touching the GPU. Loading the
+    # weights puts ~11 GB on the card, and on a machine where the GPU is
+    # reached through a virtualisation layer that upload is itself a risk: a
+    # resumed run whose whole remaining work-list is already folded, or is
+    # excluded by max_len_structure, used to load the model in full and then
+    # discover it had nothing to do. The VRAM cap below still needs the
+    # weights resident to measure headroom, so only the STATIC limit can be
+    # applied this early - which is exactly the one that answers "is this
+    # stage already finished?".
+    static_cap = int(cfg["max_len_structure"])
+    pending = [q for q, t in read_fasta(p.dark)
+               if len(t) <= static_cap
+               and not os.path.exists(f"{p.structures}/{q}.pdb")]
+    if not pending:
+        n_have = len(glob.glob(f"{p.structures}/*.pdb"))
+        log(f"esmfold: every sequence at or under max_len_structure="
+            f"{static_cap} is already folded ({n_have} model(s) on disk), so "
+            "the GPU is not touched at all")
         open(p.struct_done, "w", encoding="utf-8").close()
         return
     # CUDA_VISIBLE_DEVICES is read once, when the CUDA runtime initialises.
@@ -3563,23 +4317,137 @@ def stage_esmfold(cfg, p):
             "folding may not land on the requested GPU", "WARN")
     try:
         import torch
-        import esm
     except ImportError as e:
-        die(f"ESMFold needs torch and fair-esm[esmfold] ({e}). "
-            "Install them, or set run.structure: false.")
+        die(f"ESMFold needs torch ({e}). Install it, or set "
+            "run.structure: false.")
     if not torch.cuda.is_available():
         die(f"no CUDA device visible (gpu_device={cfg['gpu_device']}); ESMFold "
             "on CPU is impractical at this scale. Set run.structure: false, or "
             "run this stage on the GPU box and rsync results/structures back.")
 
-    model = esm.pretrained.esmfold_v1().eval().cuda()
-    base_chunk = cfg["esmfold_chunk_size"]
-    model.set_chunk_size(base_chunk)
+    # Two ways to get the same weights. fair-esm is the reference
+    # implementation, but its esmfold extra needs openfold built from a pinned
+    # 2022 commit whose CUDA kernels do not compile against a current toolkit
+    # at all — on an sm_120 card there is no version of it that works.
+    # transformers ships the same facebook/esmfold_v1 weights with openfold's
+    # needed parts vendored, exposes the same infer_pdb(seq) -> pdb string,
+    # and builds on modern torch. Prefer fair-esm when it is importable so
+    # nothing changes for an existing install; fall back rather than fail.
+    model, backend = None, ""
+    try:
+        import esm
+        model = esm.pretrained.esmfold_v1().eval().cuda()
+        backend = "fair-esm"
+    except Exception as e_esm:
+        try:
+            from transformers import EsmForProteinFolding
+            model = EsmForProteinFolding.from_pretrained(
+                "facebook/esmfold_v1", low_cpu_mem_usage=True).eval().cuda()
+            backend = "transformers"
+        except Exception as e_hf:
+            die("ESMFold needs either fair-esm[esmfold] or transformers.\n"
+                f"  fair-esm:     {type(e_esm).__name__}: {e_esm}\n"
+                f"  transformers: {type(e_hf).__name__}: {e_hf}\n"
+                "Install one, or set run.structure: false.")
+    log(f"esmfold: {backend} backend on "
+        f"{torch.cuda.get_device_name(0)}")
 
-    seqs = [(q, s) for q, s in read_fasta(p.dark)
-            if len(s) <= cfg["max_len_structure"]]
+    base_chunk = cfg["esmfold_chunk_size"]
+
+    def set_chunk(n):
+        """Chunked attention is what keeps a long sequence inside VRAM.
+
+        fair-esm puts set_chunk_size on the model; transformers puts it on the
+        folding trunk. If neither exists the OOM retry below still works, it
+        just cannot make the second attempt cheaper, so say so once.
+        """
+        for obj in (model, getattr(model, "trunk", None),
+                    getattr(model, "esm_folding_trunk", None)):
+            f = getattr(obj, "set_chunk_size", None) if obj is not None else None
+            if callable(f):
+                f(n)
+                return True
+        return False
+
+    if not set_chunk(base_chunk):
+        log("this ESMFold build exposes no set_chunk_size, so esmfold_chunk_size "
+            "has no effect and an OOM retry cannot lower it", "WARN")
+
+    def normalise_plddt(pdb):
+        """Put pLDDT on the 0-100 scale every other part of this tool assumes.
+
+        fair-esm writes pLDDT into the B-factor column as 0-100; transformers
+        writes the same quantity as 0-1. thresholds.esmfold_min_plddt is 70,
+        so under the transformers backend every model would score below the
+        gate and the entire structure stage would be silently discarded — the
+        worst kind of failure, because the PDBs exist and look fine. Detect
+        the scale from the data rather than from the backend name, so a build
+        that changes convention is still handled.
+        """
+        vals = [l[60:66] for l in pdb.splitlines() if l.startswith(("ATOM", "HETATM"))]
+        try:
+            hi = max(float(v) for v in vals if v.strip())
+        except ValueError:
+            return pdb
+        if hi > 1.5:
+            return pdb
+        out = []
+        for l in pdb.splitlines(True):
+            if l.startswith(("ATOM", "HETATM")) and len(l) >= 66:
+                try:
+                    l = f"{l[:60]}{float(l[60:66]) * 100:6.2f}{l[66:]}"
+                except ValueError:
+                    pass
+            out.append(l)
+        return "".join(out)
+
+    # Same trap the interpro stage already handles, in a stage that did not.
+    # A Prodigal/Prokka ORF can carry a trailing '*' for the stop codon, and
+    # ESMFold rejects the sequence outright: "Invalid character in the
+    # sequence: *". Observed on real data at protein 350 of 1912, three hours
+    # into a run, killing the stage over 7 sequences out of 1912. A stop is
+    # not a residue, so it is dropped; anything else outside the standard 20
+    # becomes X, which ESMFold accepts and which says "unknown residue"
+    # rather than inventing one.
+    _STD = set("ACDEFGHIKLMNPQRSTVWY")
+
+    def foldable(s):
+        body = s[:-1] if s.endswith("*") else s
+        return "".join(c if c in _STD else "X" for c in body.upper())
+
+    cap, cap_why = int(cfg["max_len_structure"]), "max_len_structure"
+    vram_cap = vram_fit_length(cfg, torch)
+    if vram_cap is not None and vram_cap < cap:
+        cap, cap_why = vram_cap, "the card's free VRAM"
+
+    raw = [(q, s) for q, s in read_fasta(p.dark)
+           if len(s) <= cap]
+    seqs, n_fixed = [], 0
+    for q, s in raw:
+        f = foldable(s)
+        if f != s:
+            n_fixed += 1
+        if f:
+            seqs.append((q, f))
+    if n_fixed:
+        log(f"esmfold: {n_fixed}/{len(raw)} sequence(s) carried a stop codon or "
+            "a non-standard residue; folding a cleaned copy (stop dropped, "
+            "anything else outside the standard 20 replaced with X). ESMFold "
+            "refuses the raw sequence and the stage would die on it", "WARN")
     seqs.sort(key=lambda x: len(x[1]))
-    log(f"esmfold: folding {len(seqs)} sequences")
+
+    over = [(q, len(t)) for q, t in read_fasta(p.dark) if len(t) > cap]
+    if over:
+        longest = max(l for _, l in over)
+        log(f"esmfold: {len(over)} sequence(s) are longer than {cap} aa "
+            f"(up to {longest}) and will NOT be folded; the limit came from "
+            f"{cap_why}. They are reported as never attempted, not as "
+            "failures - fold them on a card with more memory, in the cloud, "
+            "or on CPU, and drop the models into "
+            f"{p.structures} before rerunning foldseek", "WARN")
+    log(f"esmfold: folding {len(seqs)} sequences, shortest first, at "
+        f"chunk_size={base_chunk}")
+    t_fold = time.time()
 
     plddt_path = f"{p.structures}/plddt.tsv"
     # Resuming is the normal mode for this stage, so the table is appended to,
@@ -3589,7 +4457,9 @@ def stage_esmfold(cfg, p):
     # always covers results/structures/.
     seen = set(read_plddt(p.structures))
     fresh = not nonempty(plddt_path)
-    done = skipped = 0
+    done = skipped = consecutive = 0
+    failed, wedged = [], False
+    max_consecutive = cfg["esmfold_max_consecutive_failures"]
     with open(plddt_path, "a", encoding="utf-8") as ph:
         if fresh:
             ph.write("protein_id\tlength\tmean_plddt\n")
@@ -3606,29 +4476,65 @@ def stage_esmfold(cfg, p):
                     seen.add(pid)
                 continue
             pdb, chunk = None, base_chunk
+            why = ""
             for attempt in (0, 1):
                 try:
                     with torch.no_grad():
-                        pdb = model.infer_pdb(seq)
+                        pdb = normalise_plddt(model.infer_pdb(seq))
                     break
                 except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                    # Torch before 1.13, and OOM raised inside cuDNN/cuBLAS,
-                    # report a plain RuntimeError. Anything else is a real
-                    # error and must not be swallowed as an OOM.
-                    if not isinstance(e, torch.cuda.OutOfMemoryError) \
-                            and "out of memory" not in str(e).lower():
-                        raise
-                    torch.cuda.empty_cache()
+                    # Two different faults land here and both answer to a
+                    # smaller chunk. OOM is the obvious one: torch before
+                    # 1.13, and OOM raised inside cuDNN/cuBLAS, report it as a
+                    # plain RuntimeError. The other is the driver watchdog. A
+                    # long sequence at a large chunk runs one attention kernel
+                    # for long enough that the display driver resets the card
+                    # mid-fold, which surfaces as "CUDA driver error: device
+                    # not ready", not as an OOM. Halving the chunk shortens
+                    # each kernel and clears it, so both faults get the same
+                    # treatment and neither is re-raised: one hard sequence
+                    # must not cost the whole stage.
+                    oom = isinstance(e, torch.cuda.OutOfMemoryError)                         or "out of memory" in str(e).lower()
+                    kind = "OOM" if oom else "CUDA fault"
+                    why = str(e).splitlines()[0][:120]
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        # A wedged device refuses even this. The consecutive
+                        # counter below is what stops the run, not this.
+                        pass
                     if attempt == 0:
                         chunk = max(8, chunk // 2)
-                        model.set_chunk_size(chunk)
-                        log(f"OOM on {pid} (len {len(seq)}), retry at "
+                        set_chunk(chunk)
+                        log(f"{kind} on {pid} (len {len(seq)}), retry at "
                             f"chunk_size={chunk}", "WARN")
                     else:
-                        log(f"skipping {pid}", "WARN")
-            model.set_chunk_size(base_chunk)
+                        log(f"skipping {pid} (len {len(seq)}): {why}", "WARN")
+            set_chunk(base_chunk)
+            # Hand the cached blocks back between sequences. Folding is a
+            # variable-shape workload - the work-list runs from tens of
+            # residues to hundreds - so the caching allocator ends up holding
+            # blocks shaped for the last sequence rather than the next one.
+            # Releasing them costs one synchronisation per protein, which is
+            # nothing beside a fold that takes minutes, and it keeps the
+            # reserve from sitting at the card's capacity where the next OOM
+            # retry has no room to drop the chunk size into.
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
             if pdb is None:
+                failed.append((pid, len(seq), why))
+                consecutive += 1
+                if consecutive >= max_consecutive:
+                    # Every sequence failing in a row is a card that has
+                    # stopped working, not a run of hard proteins. Walking the
+                    # rest of the list would take hours to produce nothing.
+                    log(f"esmfold: {consecutive} sequences failed in a row, "
+                        "which reads as a wedged GPU rather than hard "
+                        "sequences; stopping here", "ERROR")
+                    wedged = True
+                    break
                 continue
+            consecutive = 0
             with open(out_pdb, "w", encoding="utf-8") as fh:
                 fh.write(pdb)
             mp = mean_plddt(pdb)
@@ -3637,13 +4543,53 @@ def stage_esmfold(cfg, p):
             ph.flush()
             seen.add(pid)
             done += 1
-            if done % 25 == 0:
-                log(f"esmfold: {done + skipped}/{len(seqs)}")
-    open(p.struct_done, "w", encoding="utf-8").close()
+            # Rate and ETA, not just a count. Folding time rises steeply with
+            # length and the work-list is sorted shortest first, so a count
+            # alone says nothing about how long the rest will take - and when
+            # a run slowed by a factor of ten partway through, the log gave no
+            # sign of it and the slowdown had to be read off file timestamps.
+            # Every 10, because at the long end of a real dark set one protein
+            # can take minutes and 25 of them is hours between lines.
+            if done % 10 == 0:
+                rate = (time.time() - t_fold) / done
+                left = len(seqs) - (done + skipped)
+                log(f"esmfold: {done + skipped}/{len(seqs)}, "
+                    f"{len(seq)} aa at chunk_size={base_chunk}, "
+                    f"{rate:.0f}s each, ~{left * rate / 3600:.1f}h for the "
+                    f"remaining {left}")
     # Both counters, because a resumed run folds nothing and "0 structures"
     # reads like a failure.
     log(f"esmfold: {done} new, {skipped} already present, "
         f"{done + skipped} structures in {p.structures}")
+
+    if failed:
+        # Name the casualties in a file rather than only in the log, so the
+        # shortfall survives into the results directory and can be read back
+        # by whoever asks why a protein has no structure evidence.
+        miss = f"{p.structures}/esmfold_failed.tsv"
+        with open(miss, "w", encoding="utf-8") as fh:
+            fh.write("protein_id\tlength\terror\n")
+            for pid, ln, why in failed:
+                fh.write(f"{pid}\t{ln}\t{why}\n")
+        log(f"esmfold: {len(failed)} sequence(s) could not be folded; "
+            f"listed in {miss}", "WARN")
+
+    if wedged and not cfg["esmfold_allow_partial"]:
+        die(f"esmfold stopped after {max_consecutive} consecutive failures "
+            f"with {done + skipped} of {len(seqs)} structures written.\n"
+            "  Every PDB already written is kept, so rerunning resumes from "
+            "there rather than starting over.\n"
+            "  A card that has stopped responding usually needs the machine "
+            "or the WSL session restarted, not another attempt.\n"
+            "  To go on with the structures already folded instead, set "
+            "esmfold_allow_partial: true.")
+    if wedged:
+        log("esmfold: continuing with a partial structure set because "
+            "esmfold_allow_partial is on; Foldseek will search only what was "
+            "folded, so absent structure evidence here means not attempted, "
+            "not absent", "WARN")
+
+    open(p.struct_done, "w", encoding="utf-8").close()
 
 
 def stage_foldseek(cfg, p):
@@ -3720,7 +4666,16 @@ def stage_foldseek(cfg, p):
     # Swiss-Prot or PDB hit. Label every row with its target database instead.
     # The field list is named once so the header written below always describes
     # the columns actually requested.
-    fs_fields = "query,target,fident,alnlen,evalue,bits,prob,alntmscore,lddt,theader"
+    # Ask for the columns the analysis actually needs, not the legacy ten.
+    # FOLDSEEK_COLS says as much in its own comment and the stage was ignoring
+    # it: without qtmscore the TM gate silently falls back to alntmscore,
+    # which is normalised by the ALIGNMENT, so a 40-residue local match inside
+    # a 300-residue query can score 0.6 while the two proteins share almost no
+    # fold; and without qlen the coverage backstop cannot be applied at all.
+    # finalise even printed "re-run the foldseek stage to get qtmscore and
+    # qlen", which was advice the stage could not take, because re-running
+    # asked for the same ten columns again.
+    fs_fields = ",".join(FOLDSEEK_COLS)
     parts, seen = [], {}
     for i, tgt in enumerate(targets):
         if not glob.glob(str(tgt) + "*"):
@@ -3740,11 +4695,32 @@ def stage_foldseek(cfg, p):
         seen[lab] = tgt
         outp = f"{p.R}/foldseek/hits_{i}.tsv"
         tmpd = f"{p.R}/foldseek/tmp{i}"
-        run_cmd(["foldseek", "easy-search", query, tgt, outp,
-                 tmpd, "--format-output", fs_fields,
-                 "-e", cfg["thresholds"]["foldseek_evalue"],
-                 "--max-seqs", 300, "--threads", cfg["threads"], "-v", 1]
-                + fs_mem + tool_args(cfg, "foldseek"))
+        def search(fields):
+            run_cmd(["foldseek", "easy-search", query, tgt, outp,
+                     tmpd, "--format-output", fields,
+                     "-e", cfg["thresholds"]["foldseek_evalue"],
+                     "--max-seqs", 300, "--threads", cfg["threads"], "-v", 1]
+                    + fs_mem + tool_args(cfg, "foldseek"))
+
+        try:
+            search(fs_fields)
+        except StageError:
+            # qtmscore, ttmscore and the length columns are not in every
+            # Foldseek release. Fall back rather than fail, but say what was
+            # lost - a run that quietly drops to the weaker gate and never
+            # mentions it is how the old behaviour went unnoticed.
+            if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY):
+                raise
+            log("foldseek rejected the full --format-output list, so this "
+                "build has no qtmscore/qlen; falling back to the legacy "
+                "columns. The TM gate will use alntmscore, which is "
+                "normalised by the alignment rather than the query, and no "
+                "coverage filter can be applied — a short local match can "
+                "pass it. Upgrade Foldseek to restore the stricter gate.",
+                "WARN")
+            fs_fields = ",".join(FOLDSEEK_COLS_LEGACY)
+            shutil.rmtree(tmpd, ignore_errors=True)
+            search(fs_fields)
         # Against AFDB50 this scratch tree is tens to hundreds of GB, and it
         # used to be left behind once per target.
         shutil.rmtree(tmpd, ignore_errors=True)
@@ -3794,7 +4770,7 @@ def stage_foldseek(cfg, p):
             cl = f"{p.R}/foldseek/selfclu_cluster.tsv"
             if nonempty(cl):
                 d = pd.read_csv(cl, sep="\t", header=None,
-                                names=["rep", "member"])
+                                names=["rep", "member"], encoding="utf-8", encoding_errors="replace")
                 # Same normalisation as parse_foldseek: Foldseek may append a
                 # chain name (`X.pdb_A`), and stripping only the extension
                 # there leaves ids that match nothing in the protein index.
@@ -4068,7 +5044,7 @@ def unipept_http(peptides, cfg):
 def read_unipept_result(path):
     """Ingest pept2lca output from the CLI or a previous run. Tolerant of
     csv/tsv and of the v1/v2 column spellings."""
-    df = pd.read_csv(path, sep=None, engine="python")
+    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8", encoding_errors="replace")
     ren = {"peptide": "peptide", "Peptide": "peptide",
            "taxon_id": "taxon_id", "taxon_name": "taxon_name",
            "taxon_rank": "taxon_rank"}
@@ -4212,7 +5188,7 @@ def stage_unipept(cfg, p):
     cache, cached = {}, 0
     if os.path.exists(p.unipept_cache) and os.path.getsize(p.unipept_cache) > 0:
         try:
-            c = pd.read_csv(p.unipept_cache, sep="\t")
+            c = pd.read_csv(p.unipept_cache, sep="\t", encoding="utf-8", encoding_errors="replace")
         except pd.errors.EmptyDataError:
             c = None
         if c is None or "peptide" not in c.columns:
@@ -4330,7 +5306,7 @@ def stage_taxonomy(cfg, p):
     fmt = cfg["quant_format"]
     if fmt not in FEATURE_FORMATS:
         die("the taxonomy comparison needs peptide-level input")
-    ann = pd.read_csv(p.final, sep="\t", dtype=str, low_memory=False)
+    ann = pd.read_csv(p.final, sep="\t", dtype=str, low_memory=False, encoding="utf-8", encoding_errors="replace")
     ann = ann.rename(columns={ann.columns[0]: "protein_id"})
     # dtype=str still leaves float NaN in empty cells, and str(nan) is the
     # truthy string 'nan'. Without this every protein with no eggNOG hit — most
@@ -4480,7 +5456,8 @@ def stage_taxonomy(cfg, p):
     log(f"taxonomy: wrote {p.taxonomy_comparison}")
 
 
-FEATURE_FORMATS = {"fragpipe_peptide", "fragpipe_ion", "msstats_csv",
+FEATURE_FORMATS = {"fragpipe_peptide", "fragpipe_ion", "fragpipe_tmt",
+                   "msstats_csv",
                    "msstats_feature"}
 PROTEIN_FORMATS = {"diann", "fragpipe", "msstats_protein"}
 ALL_FORMATS = FEATURE_FORMATS | PROTEIN_FORMATS
@@ -4528,6 +5505,10 @@ def read_delim_table(path, **kw):
     sep = max(("\t", ",", ";", "|"), key=head.count)
     if head.count(sep) == 0:
         sep = "," if path.lower().endswith(".csv") else "\t"
+    # setdefault, not a literal keyword: **kw is the caller's, and passing
+    # encoding twice is a TypeError rather than a preference.
+    kw.setdefault("encoding", "utf-8")
+    kw.setdefault("encoding_errors", "replace")
     return pd.read_csv(path, sep=sep, low_memory=False, **kw)
 
 
@@ -4537,12 +5518,995 @@ def excluded_prefixes(cfg):
                  or ["rev_", "decoy_", "contam_", "Cont_", "CON__"])
 
 
+# ======================================================================
+# FragPipe TMT (isobaric): the per-plex tables
+# ======================================================================
+# Read TMTn/{ion,peptide}.tsv, and deliberately NOT tmt-report/. The
+# tmt-report matrices are already log2 and median-centred, so the log2 step
+# downstream would take the log of a log; they are protein level, which
+# deletes the shared-peptide rule, peptide_assignment, peptide_evidence.tsv
+# and the peptide assay of the R object — the layer this tool exists for
+# against a strain-redundant metagenome database; and they carry
+# TMT-Integrator's own protein inference, which is exactly the inference such
+# a database makes least trustworthy. Per-plex reporter intensities are
+# LINEAR, so the existing log2 path, the roll-up and the median-of-ratios
+# size factor apply to them unchanged.
+
+TMT_LEVEL_FILES = {"ion": "ion.tsv", "peptide": "peptide.tsv"}
+
+
+def natural_key(s):
+    """Sort key that puts TMT10 after TMT9 rather than after TMT1."""
+    return [(1, int(t)) if t.isdigit() else (0, t.lower())
+            for t in re.split(r"(\d+)", str(s)) if t != ""]
+
+
+def header_columns(path):
+    """Column names from the header line alone.
+
+    "What is this file?" has to be answerable without parsing its body: the
+    TMT flavour of msstats.csv carries unquoted commas in Protein.Description
+    and dies in the C parser with a tokenising error that names neither TMT
+    nor the file, so the recogniser has to run before pandas does.
+    """
+    with open(path, "r", newline="", errors="replace", encoding="utf-8") as fh:
+        head = fh.readline()
+    sep = max(("\t", ",", ";", "|"), key=head.count)
+    if head.count(sep) == 0:
+        sep = "," if path.lower().endswith(".csv") else "\t"
+    return [c.strip().strip('"') for c in head.rstrip("\r\n").split(sep)]
+
+
+def refuse_isobaric_matrix(path, cols):
+    """Refuse the two TMT files that no reader here can honestly read.
+
+    Both are quantitative, both look plausible, and both are wrong in a way
+    that produces numbers instead of an error: the tmt-report matrices are
+    already log2 and median-centred (this tool would log them a second time)
+    and carry TMT-Integrator's protein inference, and the TMT msstats.csv
+    holds one row per PSM with the channels in 'Channel <mass>' columns, which
+    no format here maps to samples. Naming what was found is the point: the
+    user reached for the file that looked most like a matrix.
+    """
+    cols = [str(c) for c in cols]
+    if "ReferenceIntensity" in cols:
+        die(f"{path}: this is a TMT-Integrator tmt-report matrix (it has a "
+            "'ReferenceIntensity' column). Its values are already log2 and "
+            "median-centred, so quantifying them here would log-transform "
+            "them a second time; it is protein level, so the shared-peptide "
+            "rule, peptide_assignment and peptide_evidence.tsv have nothing "
+            "to work on; and its protein inference is TMT-Integrator's, which "
+            "is the inference a strain-redundant metagenome database makes "
+            "least trustworthy. Set quant_format: fragpipe_tmt and point "
+            "quant_table at the run directory holding the per-plex TMTn/ "
+            "folders, whose reporter intensities are linear.")
+    chan = [c for c in cols if re.fullmatch(r"Channel[ _.]\S+", c)]
+    if chan:
+        die(f"{path}: this is the TMT flavour of msstats.csv — one row per "
+            f"PSM, with {len(chan)} reporter channel(s) in columns named "
+            f"like {chan[:3]}, which carry the label mass and not a sample "
+            "name. quant_format 'msstats_csv' expects the label-free export "
+            "(a single 'Intensity' column per run) and would either fail to "
+            "parse this file or quantify the wrong column. Set "
+            "quant_format: fragpipe_tmt and point quant_table at the run "
+            "directory holding the per-plex TMTn/ folders.")
+
+
+def refuse_per_plex_reporter_table(path, cols, token="Intensity"):
+    """Refuse a PROTEIN-level table whose intensities are reporter channels.
+
+    Only for the protein-level formats. A per-plex TMTn/protein.tsv is the one
+    isobaric file nothing else catches: it has no ReferenceIntensity and no
+    'Channel <mass>' column, and the protein-level column detector takes every
+    numeric column that is not declared metadata — so it quantifies ONE plex
+    as if it were the experiment, with 'Length', 'Protein Qvalue' and 'Razor
+    Intensity' sitting in the matrix beside the channels, and says nothing.
+
+    The signature is the PREFIX form: FragPipe names a reporter column
+    '<token> <sample>' and a label-free column '<sample> <token>', so a
+    combined_protein.tsv can never match this and label-free input is
+    untouched.
+    """
+    rep = [str(c) for c in cols
+           if re.fullmatch(re.escape(token) + r" \S.*", str(c))]
+    if not rep:
+        return
+    die(f"{path}: this is a per-plex FragPipe TMT table, not a label-free "
+        f"protein table. {len(rep)} reporter-ion column(s) named "
+        f"'{token} <sample>' are present, e.g. {rep[:3]}, which is how "
+        "FragPipe names an isobaric channel. Quantifying it at protein level "
+        "would report a SINGLE plex as the whole experiment, sweep the "
+        f"numeric metadata beside it (Length, Protein Qvalue, Razor {token}) "
+        "into the matrix as if those were samples, and lose the peptide layer "
+        "the shared-peptide rule needs. Set quant_format: fragpipe_tmt and "
+        "point quant_table at the run directory holding the per-plex TMTn/ "
+        "folders; it reads every plex and joins them at feature level.")
+
+
+def read_tmt_annotation(path, plex):
+    """-> [(channel, sample), ...] in file order.
+
+    FragPipe writes '<channel> <sample>' per line, e.g. '131C Pool01'. The
+    sample name is what the reporter COLUMNS are named after, so it, not the
+    channel, is the identifier the rest of this reader keys on.
+    """
+    rows = []
+    with opener(path) as fh:
+        for lineno, line in enumerate(fh, 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split(None, 1)
+            if len(parts) < 2:
+                die(f"{path}:{lineno}: '{s[:60]}' names a channel but no "
+                    "sample. A FragPipe TMT annotation is '<channel> "
+                    "<sample>' per line, e.g. '131C Pool01'.")
+            rows.append((parts[0], parts[1].strip()))
+    if not rows:
+        die(f"{path}: empty; expected one '<channel> <sample>' line per "
+            f"channel of plex {plex}")
+    for what, vals in (("channel", [c for c, _ in rows]),
+                       ("sample name", [s for _, s in rows])):
+        dup = sorted({v for v in vals if vals.count(v) > 1})
+        if dup:
+            die(f"{path}: {what} {dup} appears more than once, so the "
+                f"channels of plex {plex} cannot be mapped to samples")
+    return rows
+
+
+def tmt_plex_dirs(root, cfg):
+    """-> [(plex, directory), ...], naturally sorted."""
+    t = cfg.get("tmt") or {}
+    pat = str(t.get("plex_glob") or "TMT*")
+    hits = glob.glob(pat if os.path.isabs(pat) else os.path.join(root, pat))
+    # fnmatchcase on top of glob: glob follows the FILESYSTEM's case rules, so
+    # on Windows (and on a case-insensitive mac volume) 'TMT*' also matched
+    # the sibling 'tmt-report' directory and the run died on the plex that
+    # never existed. The pattern has to mean the same thing on every platform.
+    base = lambda h: os.path.basename(h.rstrip("/\\"))
+    dirs = sorted((h for h in hits
+                   if os.path.isdir(h)
+                   and fnmatch.fnmatchcase(base(h), os.path.basename(pat))),
+                  key=lambda h: natural_key(base(h)))
+    if not dirs:
+        here = sorted(os.listdir(root))[:12] if os.path.isdir(root) else []
+        die(f"no plex directory matches tmt.plex_glob '{pat}' under {root}. "
+            f"{root} contains: {here}. quant_format 'fragpipe_tmt' reads the "
+            "per-plex FragPipe output directories (TMT1/, TMT2/, ...), so "
+            "quant_table must be the run directory that holds them.")
+    return [(base(d), d) for d in dirs]
+
+
+def tmt_annotation_path(plex, pdir, cfg):
+    """The annotation file of one plex.
+
+    FragPipe names it <PLEX>_annotation.txt (TMT1/TMT1_annotation.txt) and
+    never a plain annotation.txt, which is what a first guess reaches for.
+    """
+    t = cfg.get("tmt") or {}
+    ann = t.get("annotation") or "{plex}_annotation.txt"
+    if isinstance(ann, dict):
+        # An explicit map is an explicit statement: a plex missing from it is
+        # a mistake to report, not a reason to guess the pattern back.
+        if plex not in ann:
+            die(f"tmt.annotation is a map and has no entry for plex '{plex}' "
+                f"(it lists {sorted(ann)}). Add one, or use the "
+                "'{plex}_annotation.txt' pattern form.")
+        cand = str(ann[plex])
+        if not os.path.isabs(cand) and not os.path.exists(cand):
+            cand = os.path.join(pdir, cand)
+    else:
+        cand = str(ann).replace("{plex}", plex)
+        if not os.path.isabs(cand) and os.path.dirname(cand) == "":
+            cand = os.path.join(pdir, cand)
+    if not os.path.exists(cand):
+        near = sorted(f for f in os.listdir(pdir) if "annotation" in f.lower())
+        die(f"plex {plex} has no annotation file: {cand} does not exist. "
+            f"{pdir} contains {near or 'no annotation-like file'}. FragPipe "
+            "writes '<PLEX>_annotation.txt', not 'annotation.txt'; set "
+            "tmt.annotation to the right pattern, or to a {plex: path} map. "
+            "Without it the reporter columns cannot be mapped to samples.")
+    return cand
+
+
+def quant_inputs(cfg):
+    """The quant file(s) a stage signature must digest: [quant_table] for
+    every format but fragpipe_tmt, whose input is a directory of them.
+
+    The signature digests a directory by its size and mtime, and neither
+    changes when FragPipe rewrites a table inside it — so listing
+    quant_table would leave the join stage cached across a re-search. Listing
+    the tables and annotations themselves makes the cache honest. Tolerant by
+    design: this runs before any stage, on a config that may not point
+    anywhere yet.
+    """
+    root = cfg.get("quant_table") or ""
+    if cfg.get("quant_format") != "fragpipe_tmt":
+        return [root]
+    t = cfg.get("tmt") or {}
+    fname = TMT_LEVEL_FILES.get(str(t.get("level") or "ion").lower(), "ion.tsv")
+    # psm.tsv is an input only when min_purity actually reads it; listing it
+    # unconditionally would invalidate every cached join the moment FragPipe
+    # rewrote a file the run never opened.
+    want_psm = float(t.get("min_purity") or 0) > 0
+    try:
+        out = []
+        for plex, pdir in tmt_plex_dirs(root, cfg):
+            out.append(os.path.join(pdir, fname))
+            if want_psm:
+                out.append(os.path.join(pdir, "psm.tsv"))
+            with contextlib.suppress(StageError):
+                out.append(tmt_annotation_path(plex, pdir, cfg))
+        return sorted(out)
+    except (StageError, OSError):
+        return [root]
+
+
+def _tmt_map_reporter_columns(path, df, ann, token):
+    """-> (columns, sample names, 'sample name'|'channel').
+
+    FragPipe names the reporter columns after the ANNOTATED SAMPLE
+    ('Intensity Pool01'), which is the prefix form the label-free suffix rule
+    cannot see. A run annotated after the fact can still carry the channel
+    ('Intensity 131C'), so both are accepted — but which one was used is
+    logged, because the sample names in the output come from it.
+    """
+    prefix = token + " "
+    present = [c for c in df.columns if str(c).startswith(prefix)]
+    for how, keys in (("sample name", [s for _, s in ann]),
+                      ("channel", [c for c, _ in ann])):
+        want = [prefix + k for k in keys]
+        if all(w in df.columns for w in want):
+            extra = [c for c in present if c not in want]
+            if extra:
+                die(f"{path}: {len(extra)} reporter column(s) {extra[:4]} are "
+                    f"not in the annotation, which lists {len(keys)} "
+                    f"{how}(s) {keys[:4]}. The annotation does not describe "
+                    "this file, so its channels cannot be mapped to samples.")
+            return want, [s for _, s in ann], how
+    die(f"{path}: the reporter columns cannot be mapped to samples. The "
+        f"annotation lists {len(ann)} channels "
+        f"{[f'{c}={s}' for c, s in ann][:4]}, and the columns starting "
+        f"'{prefix}' are {present[:6] or 'none at all'}. FragPipe names them "
+        f"'{token} <sample>' after the annotated sample; check that the "
+        "annotation belongs to this plex.")
+    return None, None, None                       # unreachable; die() raises
+
+
+# psm.tsv names the same three things as ion.tsv, with two different column
+# names. Kept as a map rather than hard-coded so the key the purity join uses
+# is literally the key the feature ids were built from.
+_TMT_PSM_COLUMNS = {"Peptide Sequence": "Peptide",
+                    "Modified Sequence": "Modified Peptide"}
+
+
+def tmt_psm_purity(pdir, plex, key):
+    """-> Series feature_id -> MEDIAN precursor purity of its PSMs.
+
+    Purity exists only in psm.tsv (ion.tsv, peptide.tsv and protein.tsv have
+    no such column), so a purity filter at feature level is a join, and the
+    median is the aggregate that fits what the join produces: a feature's
+    reporter intensities are a SUM over its PSMs, so no single PSM's purity
+    describes it, and the median says whether the typical contributing
+    spectrum was clean. It is an approximation of the per-PSM filter
+    TMT-Integrator would apply before summarising — FragPipe has already
+    summed by the time this reader sees the file — and it is reported as one.
+    """
+    path = os.path.join(pdir, "psm.tsv")
+    if not os.path.exists(path):
+        die(f"tmt.min_purity is set, but plex {plex} has no psm.tsv: {path} "
+            "does not exist. Purity is written only into psm.tsv, so the "
+            "filter cannot be applied without it. Remove tmt.min_purity, or "
+            "point quant_table at a run directory that still has its PSM "
+            "tables.")
+    df = read_delim_table(path)
+    if "Purity" not in df.columns:
+        die(f"{path}: no 'Purity' column, so tmt.min_purity cannot be "
+            f"applied. It has: {list(df.columns)[:12]}...")
+    cols = []
+    for k in key:
+        c = _TMT_PSM_COLUMNS.get(k, k)
+        if c not in df.columns:
+            die(f"{path}: no '{c}' column, so its purities cannot be keyed "
+                f"onto the {k} of the feature table. psm.tsv has: "
+                f"{list(df.columns)[:12]}...")
+        cols.append(c)
+    pur = pd.to_numeric(df["Purity"], errors="coerce")
+    return pur.groupby(join_cols(df, cols)).median()
+
+
+def read_fragpipe_tmt(root, cfg):
+    """-> (features, int_cols, design), from the per-plex FragPipe TMT output.
+
+    Exactly the shape read_feature_table returns for a label-free table —
+    feature_id, peptide, razor_protein, candidates, one column per sample —
+    so the roll-up, the shared-peptide rule and everything downstream are
+    untouched. design carries a plex column as well.
+    """
+    t = cfg.get("tmt") or {}
+    level = str(t.get("level") or "ion").lower()
+    if level not in TMT_LEVEL_FILES:
+        die(f"tmt.level must be 'ion' or 'peptide', got '{level}'")
+    fname = TMT_LEVEL_FILES[level]
+    try:
+        min_purity = float(t.get("min_purity") or 0)
+    except (TypeError, ValueError):
+        die(f"tmt.min_purity must be a number between 0 and 1, got "
+            f"{t.get('min_purity')!r}")
+    if not 0 <= min_purity <= 1:
+        die(f"tmt.min_purity must be between 0 and 1 (FragPipe's Purity is a "
+            f"fraction), got {min_purity}")
+    raw_norm = t.get("within_plex_normalise", "median")
+    norm = str("median" if raw_norm is None else raw_norm).lower()
+    if norm not in ("median", "none"):
+        die(f"tmt.within_plex_normalise must be 'median' or 'none', got "
+            f"{raw_norm!r}")
+    if os.path.isfile(root):
+        refuse_isobaric_matrix(root, header_columns(root))
+        die(f"quant_format 'fragpipe_tmt' reads the per-plex FragPipe "
+            f"directories, so quant_table must be the run directory that "
+            f"holds them (the one with {t.get('plex_glob') or 'TMT*'} "
+            f"subdirectories), not the single file {root}.")
+    if not os.path.isdir(root):
+        die(f"quant_table not found: {root}. quant_format 'fragpipe_tmt' "
+            "expects the FragPipe run directory holding the per-plex TMTn/ "
+            "folders.")
+    if cfg.get("manifest"):
+        # The TMT manifest lists LC-MS RUNS, and its experiment column is the
+        # PLEX. Renaming channels from it is impossible and taking its
+        # experiment as the condition would be inferring the condition from
+        # the plex, which is exactly the wrong answer.
+        log("tmt: `manifest` is ignored for quant_format 'fragpipe_tmt'. A "
+            "FragPipe TMT manifest names LC-MS runs, not reporter channels, "
+            "and its experiment column is the plex — using it as a condition "
+            "would infer the condition from the batch. Sample names come from "
+            "each plex's annotation file.", "WARN")
+
+    plexes = tmt_plex_dirs(root, cfg)
+    pref = excluded_prefixes(cfg)
+    # The same word FragPipe uses in the label-free tables, used here as a
+    # PREFIX ("Intensity Pool01") instead of a suffix ("Pool01 Intensity").
+    token = cfg.get("feature_intensity_suffix", "Intensity")
+    ref_name = str(t.get("reference_name") or "")
+    ref_chan = str(t.get("reference_channel") or "")
+    if ref_name and ref_chan:
+        die(f"tmt.reference_name ('{ref_name}') and tmt.reference_channel "
+            f"('{ref_chan}') are both set, and they can disagree per plex. "
+            "Set one: the sample name is the stable signal when the reference "
+            "moves between channels.")
+    use_ratios = bool(t.get("use_reference_ratios", False))
+    if use_ratios and not (ref_name or ref_chan):
+        die("tmt.use_reference_ratios is on but no reference is named. Set "
+            "tmt.reference_name (a glob on the annotated sample name, e.g. "
+            "'Pool*') or tmt.reference_channel (e.g. '131C').")
+    drop_empty = bool(t.get("drop_empty_channels", True))
+    zero_missing = bool(cfg.get("zero_intensity_is_missing", True))
+
+    meta = {}          # feature_id -> dict(peptide, razor, candidates, plexes)
+    frames, design_rows, owner = [], [], {}
+    int_cols, n_zero, n_rows = [], 0, 0
+    refs = []                       # (plex, channel, sample) of the reference
+    ratio_had = ratio_lost = 0      # values before / values lost to the divide
+    pur_drop = pur_unknown = pur_seen = 0    # tmt.min_purity bookkeeping
+    norm_lo, norm_hi = [], []       # log2 of the within-plex channel factors
+    for plex, pdir in plexes:
+        path = os.path.join(pdir, fname)
+        if not os.path.exists(path):
+            # No fallback to tmt-report/: a missing per-plex table means this
+            # run is not the one being described, and quantifying a different
+            # file to fill the hole would be undetectable in the output.
+            die(f"plex {plex} has no {fname}: {path} does not exist "
+                f"(tmt.level is '{level}'). {pdir} contains "
+                f"{sorted(f for f in os.listdir(pdir) if f.endswith('.tsv'))}.")
+        refuse_isobaric_matrix(path, header_columns(path))
+        ann = read_tmt_annotation(tmt_annotation_path(plex, pdir, cfg), plex)
+        df = read_delim_table(path)
+        cols, samples, how = _tmt_map_reporter_columns(path, df, ann, token)
+        nonnum = [c for c in cols if not pd.api.types.is_numeric_dtype(df[c])]
+        if nonnum:
+            die(f"{path}: reporter column(s) {nonnum[:4]} are not numeric, so "
+                "they are not reporter intensities")
+
+        # ---- identity: same rule as the label-free reader -------------
+        prot = "Protein" if "Protein" in df.columns else "Protein ID"
+        if prot not in df.columns:
+            die(f"{path}: no 'Protein' or 'Protein ID' column; is this a "
+                "FragPipe per-plex ion.tsv/peptide.tsv?")
+        bad = pd.Series(False, index=df.index)
+        for c in ("Is Decoy", "Is Contaminant"):
+            if c in df.columns:
+                bad |= df[c].astype(str).str.lower().isin(["true", "1", "yes"])
+        if pref:
+            bad |= df[prot].astype(str).map(first_token).str.startswith(pref)
+        if bool(bad.any()):
+            log(f"tmt {plex}: {int(bad.sum())} decoy/contaminant row(s) "
+                f"dropped from {path}", "WARN")
+            df = df.loc[~bad].reset_index(drop=True)
+
+        if level == "ion":
+            # All three, not "modified sequence or sequence": the feature id
+            # has to be comparable ACROSS plexes, and only ~45% of ion keys
+            # are shared between two plexes, so the outer join is only as
+            # good as this key.
+            key = [c for c in ("Peptide Sequence", "Modified Sequence",
+                               "Charge") if c in df.columns]
+        else:
+            key = [c for c in ("Peptide Sequence", "Peptide")
+                   if c in df.columns][:1]
+        if not key:
+            die(f"{path}: no peptide sequence column")
+        fid = join_cols(df, key)
+        pep_col = [c for c in ("Peptide Sequence", "Peptide")
+                   if c in df.columns][:1]
+        pep = (df[pep_col[0]].astype(str).fillna("") if pep_col
+               else pd.Series([""] * len(df), index=df.index))
+        # FragPipe leaves 'Peptide Sequence' empty on some ion rows while
+        # 'Modified Sequence' is filled. Those rows still identify a peptide,
+        # and the taxonomy stages read this column, so recover it rather than
+        # sending an empty string to Unipept.
+        if "Modified Sequence" in df.columns:
+            empty = pep.eq("") | pep.eq("nan")
+            if bool(empty.any()):
+                ms = df["Modified Sequence"].astype(str).fillna("")
+                pep = pep.mask(empty, ms.map(strip_modifications))
+                log(f"tmt {plex}: {int(empty.sum())} row(s) have no "
+                    "'Peptide Sequence'; the sequence was recovered from "
+                    "'Modified Sequence'", "WARN")
+        # A row with neither a sequence nor a modified sequence identifies
+        # nothing, and every such row seen so far is all-zero filler. Left in,
+        # they all collapse onto one feature id and merge into each other.
+        blank = fid.str.replace("_", "", regex=False).str.strip().eq("")
+        if bool(blank.any()):
+            log(f"tmt {plex}: {int(blank.sum())} row(s) carry no peptide "
+                "identity at all (no sequence and no modified sequence) and "
+                "were dropped", "WARN")
+            keep = ~blank
+            df, fid, pep = (df.loc[keep].reset_index(drop=True),
+                            fid[keep].reset_index(drop=True),
+                            pep[keep].reset_index(drop=True))
+
+        # ---- co-isolation: the only place purity exists is psm.tsv -----
+        if min_purity > 0:
+            med = fid.map(tmt_psm_purity(pdir, plex, key))
+            unknown = med.isna()
+            low = med.lt(min_purity).fillna(False)
+            pur_seen += len(fid)
+            pur_drop += int(low.sum())
+            pur_unknown += int(unknown.sum())
+            if bool(unknown.any()):
+                # Kept, not dropped: a feature no PSM row matches is a join
+                # failure (FragPipe leaves 'Modified Peptide' empty on rows
+                # ion.tsv writes a modified sequence for), and deleting IDs
+                # for that would look exactly like a purity filter working.
+                log(f"tmt {plex}: {int(unknown.sum())} of {len(fid)} feature(s) "
+                    "match no row of psm.tsv, so their purity is unknown; "
+                    "they are KEPT — an unmatched key is a join failure, not "
+                    "a co-isolated precursor", "WARN")
+            log(f"tmt {plex}: min_purity={min_purity} drops "
+                f"{int(low.sum())} of {len(fid)} feature(s) whose MEDIAN PSM "
+                "purity is below it")
+            keep = ~low
+            df, fid, pep = (df.loc[keep].reset_index(drop=True),
+                            fid[keep].reset_index(drop=True),
+                            pep[keep].reset_index(drop=True))
+
+        razor = df[prot].astype(str).map(first_token)
+        mapped = (df["Mapped Proteins"] if "Mapped Proteins" in df.columns
+                  else pd.Series([""] * len(df), index=df.index))
+        if "Mapped Proteins" not in df.columns:
+            log(f"tmt {plex}: no 'Mapped Proteins' column, so every feature "
+                "is treated as unique to its razor protein and shared-peptide "
+                "filtering is inactive", "WARN")
+
+        vals = df[cols].copy()
+        vals.columns = samples
+        if zero_missing:
+            nz = int((vals == 0).sum().sum())
+            n_zero += nz
+            n_rows += vals.size
+            vals = vals.where(vals != 0)
+
+        # ---- one row per feature within the plex ----------------------
+        vals.index = pd.Index(fid, name="feature_id")
+        dup = int(fid.duplicated().sum())
+        if dup:
+            log(f"tmt {plex}: {dup} row(s) repeat a feature id and were "
+                "summed; the reindex the outer join needs cannot carry a "
+                "duplicated key", "WARN")
+            vals = vals.groupby(level=0, sort=False).sum(min_count=1)
+        for f, r, m, pp in zip(fid, razor, mapped, pep):
+            rec = meta.get(f)
+            cand = [r] + [x for x in split_ids(m) if not x.startswith(pref)]
+            if rec is None:
+                meta[f] = {"peptide": pp, "razor": r,
+                           "cand": dict.fromkeys(cand),
+                           "razors": {r: 1}, "plexes": {plex: 1}}
+            else:
+                rec["cand"].update(dict.fromkeys(cand))
+                rec["razors"][r] = 1
+                rec["plexes"][plex] = 1
+
+        # ---- channels that are not samples ----------------------------
+        # FragPipe names an unassigned channel <PLEX>_<CHANNEL> in the
+        # annotation. Its signal is isotope carry-over, not a sample.
+        empty_ch = [(c, s) for c, s in ann if s == f"{plex}_{c}"]
+        keep_samples = [s for _, s in ann]
+        if empty_ch and drop_empty:
+            log(f"tmt {plex}: {len(empty_ch)} channel(s) "
+                f"{[c for c, _ in empty_ch]} carry the placeholder name "
+                f"{[s for _, s in empty_ch]}, which is how FragPipe writes an "
+                "unassigned channel; dropped (set tmt.drop_empty_channels "
+                "false to keep them)", "WARN")
+            keep_samples = [s for s in keep_samples
+                            if s not in {s2 for _, s2 in empty_ch}]
+        elif empty_ch:
+            log(f"tmt {plex}: {len(empty_ch)} unassigned channel(s) "
+                f"{[s for _, s in empty_ch]} kept as samples "
+                "(tmt.drop_empty_channels is false); their signal is isotope "
+                "carry-over, not a sample", "WARN")
+
+        chan_of = {s: c for c, s in ann}
+
+        # ---- within-plex normalisation, before anything is joined -----
+        # The channels of one plex are the same LC-MS run, so what differs
+        # between them is how much peptide was loaded and how completely it
+        # was labelled: a per-channel constant with no biology in it, which
+        # the roll-up would otherwise sum straight into the protein.
+        # Centring on the plex's own median channel rather than on 1 keeps the
+        # values linear and leaves the BETWEEN-plex difference untouched —
+        # that one is the batch the plex term (or the report's own median
+        # normalisation) is there to absorb, and removing it here would hide
+        # it from both. median() commutes with log2, so this is exactly the
+        # per-channel median centring the report would do, applied one plex at
+        # a time and before the roll-up rather than after it.
+        if norm == "median" and keep_samples:
+            med = vals[keep_samples].median(axis=0, skipna=True)
+            usable = med[med.gt(0) & med.notna()]
+            dead = [s for s in keep_samples if s not in usable.index]
+            if dead:
+                log(f"tmt {plex}: channel(s) {dead} have no positive median "
+                    "and were left unscaled by the within-plex normalisation",
+                    "WARN")
+            if len(usable):
+                fac = float(usable.median()) / usable
+                vals[usable.index] = vals[usable.index].mul(fac, axis=1)
+                lg = np.log2(fac.astype(float))
+                norm_lo.append(float(lg.min()))
+                norm_hi.append(float(lg.max()))
+                log(f"tmt {plex}: within-plex median centring applied to "
+                    f"{len(usable)} channel(s); scale factors log2 "
+                    f"{lg.min():+.2f}..{lg.max():+.2f} (set "
+                    "tmt.within_plex_normalise: none to keep FragPipe's "
+                    "numbers)")
+                # A channel that is both far off scale AND much emptier than
+                # its neighbours is the case this step handles WORST: the
+                # median is taken over OBSERVED values only, so a channel
+                # whose low end went missing has a median sitting above its
+                # true centre and is scaled up too little. An unequal but
+                # complete load is exactly what median centring is for and is
+                # not worth a warning; this combination is.
+                gaps = vals[usable.index].isna().mean()
+                thin = [s for s in usable.index
+                        if abs(float(lg[s])) > 1.0
+                        and float(gaps[s]) > float(gaps.median()) + 0.10]
+                if thin:
+                    log(f"tmt {plex}: channel(s) " + ", ".join(
+                        f"{s} ({chan_of.get(s, '?')}) scaled "
+                        f"{2 ** float(lg[s]):.2f}x with "
+                        f"{100 * float(gaps[s]):.0f}% missing"
+                        for s in thin) + f" are far off the plex scale AND "
+                        f"much emptier than the rest (typical "
+                        f"{100 * float(gaps.median()):.0f}%). The median is "
+                        "taken over observed values, so these are "
+                        "UNDER-corrected; check the loading before trusting "
+                        "them, or drop them from the annotation", "WARN")
+        elif norm == "none" and len(plexes) > 1:
+            log(f"tmt {plex}: tmt.within_plex_normalise is 'none', so the "
+                "channels of this plex keep whatever loading difference they "
+                "were labelled with; the roll-up sums across them", "WARN")
+
+        # ---- the reference channel, resolved per plex -----------------
+        ref = ""
+        if ref_name or ref_chan:
+            if ref_name:
+                hit = [s for s in keep_samples
+                       if fnmatch.fnmatchcase(s, ref_name)]
+                what = f"tmt.reference_name '{ref_name}'"
+            else:
+                hit = [s for s in keep_samples
+                       if fnmatch.fnmatchcase(chan_of[s], ref_chan)]
+                what = f"tmt.reference_channel '{ref_chan}'"
+            if len(hit) != 1:
+                die(f"plex {plex}: {what} matches {len(hit)} of its channels "
+                    f"{hit or ''}, not exactly one. Its channels are "
+                    f"{[f'{c}={s}' for c, s in ann]}. The reference is not at "
+                    "a fixed position in every plex, so name it by the sample "
+                    "name (tmt.reference_name, e.g. 'Pool*') when the channel "
+                    "moves.")
+            ref = hit[0]
+            refs.append((plex, chan_of[ref], ref))
+        else:
+            # Nothing configured. Say so where it can be acted on rather than
+            # quietly quantifying a bridge channel as if it were a sample.
+            pool = [s for s in keep_samples if s.lower().startswith("pool")]
+            if len(pool) == 1:
+                log(f"tmt {plex}: channel {chan_of[pool[0]]} is named "
+                    f"'{pool[0]}', which looks like a reference/bridge "
+                    "channel. It is being quantified as an ordinary sample; "
+                    "set tmt.reference_name: 'Pool*' to mark it, and "
+                    "tmt.use_reference_ratios: true to divide by it", "WARN")
+
+        if use_ratios:
+            denom = vals[ref]
+            n_bad = int(denom.isna().sum())
+            others = [s for s in keep_samples if s != ref]
+            # Counted before and after the divide, not from the feature count:
+            # the features with no reference are mostly sparse ones, so the
+            # share of FEATURES lost and the share of VALUES lost differ by an
+            # order of magnitude, and only the second says whether this
+            # treatment quietly emptied the matrix.
+            was = int(vals[others].notna().sum().sum())
+            vals = vals.div(denom, axis=0)
+            now = int(vals[others].notna().sum().sum())
+            ratio_had += was
+            ratio_lost += was - now
+            keep_samples = others
+            log(f"tmt {plex}: every channel divided by the reference "
+                f"'{ref}' ({chan_of[ref]}); the reference column itself is "
+                f"dropped, and {n_bad} feature(s) with no reference value "
+                f"became missing in this plex, costing {was - now} of {was} "
+                "value(s)")
+        elif ref:
+            # The covariate treatment. A pooled bridge is not a biological
+            # sample: left in the sample columns it acquires a condition in
+            # the design, joins a group's mean, and shifts the size factors
+            # towards a pool that is in every plex by construction.
+            keep_samples = [s for s in keep_samples if s != ref]
+            log(f"tmt {plex}: reference channel is '{ref}' ({chan_of[ref]}); "
+                "dropped from the sample columns because it is a pooled "
+                "bridge, not a biological sample (the covariate treatment: "
+                "the plex stays in the model). Set tmt.use_reference_ratios "
+                "true to divide every channel by it instead")
+
+        for s in keep_samples:
+            if s in owner:
+                die(f"plexes {owner[s]} and {plex} both claim the sample name "
+                    f"'{s}'. Sample names are the columns of the joined "
+                    "matrix, so two plexes cannot share one; fix the "
+                    "annotation files.")
+            owner[s] = plex
+            # No reference row: under either treatment the reference is not a
+            # sample column, and the report matches every design row to a
+            # column of the quant matrix and stops when one is missing.
+            design_rows.append({"sample": s, "plex": plex,
+                                "channel": chan_of[s]})
+        int_cols += keep_samples
+        frames.append(vals[keep_samples])
+        log(f"tmt {plex}: {len(vals)} {level} feature(s), {len(ann)} channels "
+            f"mapped by {how} -> {len(keep_samples)} sample column(s)")
+
+    # ---- the outer join across plexes --------------------------------
+    # reindex, not merge: a feature not identified in a plex must be NA for
+    # every sample of that plex, never 0. Zero is a measurement here (and
+    # FragPipe writes plenty of them), so filling one in for "not identified"
+    # would turn structured, plex-shaped missingness into fold change.
+    idx = pd.Index(list(meta), name="feature_id")
+    mat = pd.concat([f.reindex(idx) for f in frames], axis=1)
+    feats = pd.DataFrame({
+        "feature_id": list(meta),
+        "peptide": [m["peptide"] for m in meta.values()],
+        "razor_protein": [m["razor"] for m in meta.values()]})
+    feats["candidates"] = [list(m["cand"]) for m in meta.values()]
+    seen = pd.Series([len(m["plexes"]) for m in meta.values()])
+    hist = " ".join(f"{n}:{c}" for n, c in sorted(seen.value_counts().items()))
+    log(f"tmt: {len(feats)} feature(s) over {len(plexes)} plexes and "
+        f"{len(int_cols)} samples; features identified in N plexes -> {hist}")
+    if zero_missing and n_zero:
+        log(f"tmt: {n_zero} of {n_rows} reporter cell(s) "
+            f"({100.0 * n_zero / max(n_rows, 1):.1f}%) are 0, which FragPipe "
+            "writes for 'not quantified'; treated as missing (set "
+            "zero_intensity_is_missing false to keep them)", "WARN")
+    conflict = sum(1 for m in meta.values() if len(m["razors"]) > 1)
+    if conflict:
+        log(f"tmt: {conflict} feature(s) have a different razor protein in "
+            "different plexes; the first plex that saw the feature wins and "
+            "the candidate lists are unioned, so the shared-peptide rule sees "
+            "every protein any plex mapped the feature to", "WARN")
+
+    if min_purity > 0:
+        log(f"tmt: min_purity={min_purity} dropped {pur_drop} of {pur_seen} "
+            f"per-plex feature row(s) ({100.0 * pur_drop / max(pur_seen, 1):.1f}%) "
+            f"on the median purity of their PSMs; {pur_unknown} matched no "
+            "PSM row and were kept. This limits co-isolation; it does not "
+            "correct the ratio compression co-isolation causes")
+
+    minp = int(t.get("min_plexes") or 1)
+    if minp > 1:
+        keep = (seen >= minp).to_numpy()
+        log(f"tmt: min_plexes={minp} drops {int((~keep).sum())} of "
+            f"{len(feats)} feature(s) identified in fewer plexes")
+        feats, mat = feats.loc[keep].reset_index(drop=True), mat.loc[keep]
+    feats = pd.concat([feats, mat.reset_index(drop=True)], axis=1)
+
+    if use_ratios:
+        pct = 100.0 * ratio_lost / max(ratio_had, 1)
+        log(f"tmt: use_reference_ratios cost {ratio_lost} of {ratio_had} "
+            f"non-reference value(s) ({pct:.2f}%), which had no reference in "
+            "their own plex and so became missing for that whole plex",
+            "WARN" if pct >= 5 else "INFO")
+        if pct >= 25:
+            # Not fatal — the user asked for ratios — but at this rate the
+            # ratio matrix is a different, much sparser experiment than the
+            # intensity matrix, and that has to be said before the roll-up
+            # rather than inferred from a thin result.
+            log(f"tmt: {pct:.1f}% of the measured values are gone, so the "
+                "ratio matrix is substantially sparser than the intensities. "
+                "The covariate treatment (tmt.use_reference_ratios: false, "
+                "plex in design_formula) keeps them and models the plex "
+                "instead", "WARN")
+
+    design = pd.DataFrame(design_rows)
+    # The condition is NOT in these files and is never taken from the plex,
+    # which is a batch: a plex-versus-plex contrast is a batch effect
+    # presented as a hypothesis. It is either derivable from the sample names
+    # or the user's to write down, and which of the two happened is recorded.
+    design, cond_note = _tmt_add_condition(design, cfg)
+    notes = ["input:            FragPipe TMT, "
+             f"{len(plexes)} plex(es), {len(int_cols)} sample column(s)",
+             f"condition source: {cond_note}"]
+    # The normalisation belongs beside the numbers, not only in a log that
+    # scrolls away: a matrix that has been median-centred per channel and one
+    # that has not are different data, and nothing downstream can tell them
+    # apart by looking.
+    notes.append("within-plex norm: " + (
+        f"median centring per channel, log2 factors "
+        f"{min(norm_lo):+.2f}..{max(norm_hi):+.2f} over {len(plexes)} plex(es)"
+        if norm == "median" and norm_lo else
+        "median centring per channel (no channel could be scaled)"
+        if norm == "median" else
+        "none (tmt.within_plex_normalise: none) — channels carry their "
+        "loading differences into the roll-up"))
+    if min_purity > 0:
+        notes.append(
+            f"purity filter:    median PSM purity >= {min_purity} "
+            f"(from psm.tsv); {pur_drop} of {pur_seen} feature(s) dropped, "
+            f"{pur_unknown} unjudged and kept")
+    notes.append(f"feature min_plexes: {int(t.get('min_plexes') or 1)} "
+                 "(feature level, before the roll-up)")
+    if refs:
+        notes.append("reference:        " + (
+            "ratios (every channel divided by its plex reference; "
+            f"{ratio_lost}/{ratio_had} value(s) lost to a missing reference)"
+            if use_ratios else
+            "covariate (dropped from the design; plex stays in the model)"))
+        notes.append("reference channel: " + ", ".join(
+            f"{p}={c}/{s}" for p, c, s in refs))
+    else:
+        notes.append("reference:        none named (tmt.reference_name / "
+                     "tmt.reference_channel are unset)")
+    # attrs, not a return value: every caller of read_feature_table unpacks a
+    # 3-tuple, and widening that signature for one format would touch every
+    # label-free path.
+    design.attrs["design_notes"] = notes
+    return feats, int_cols, design
+
+
+# Separators a sample name might carry its condition in front of. "." is
+# included because FragPipe run names often use it, but a bare digit after the
+# split is a replicate index, never a condition.
+_TMT_NAME_SEPS = ("_", "-", ".")
+
+
+def _tmt_split_condition(samples):
+    """-> (mapping, how) for an UNAMBIGUOUS name split, else (None, why).
+
+    Only a split that partitions every sample into at least two levels of at
+    least two samples each is accepted, and only when no other separator gives
+    a DIFFERENT partition. Anything looser invents a hypothesis: "MF0030" and
+    "MF0071" would become one condition per sample, and "resp-1_a" would mean
+    two different things depending on which separator was tried first.
+    """
+    found = {}
+    for sep in _TMT_NAME_SEPS:
+        if not all(sep in s for s in samples):
+            continue
+        m = {s: s.split(sep)[0] for s in samples}
+        lv = sorted(set(m.values()))
+        if len(lv) < 2 or any(not x or x.isdigit() for x in lv):
+            continue
+        if any(sum(1 for v in m.values() if v == x) < 2 for x in lv):
+            continue
+        found[sep] = m
+    if not found:
+        return None, ("no separator (" + ", ".join(_TMT_NAME_SEPS) + ") splits "
+                      "every sample name into two or more conditions of two "
+                      "or more samples")
+    # Compared as PARTITIONS, not as label maps: "a-x_1" and "a-x_2" fall
+    # together whichever separator is used, and only a split that groups the
+    # samples differently is a real ambiguity about what the condition is.
+    parts = {frozenset(frozenset(s for s in m if m[s] == lv)
+                       for lv in set(m.values())) for m in found.values()}
+    if len(parts) > 1:
+        return None, ("the sample names group differently on " +
+                      ", ".join(f"'{s}'" for s in found) +
+                      ", so which part of the name is the condition is "
+                      "ambiguous")
+    sep = next(s for s in _TMT_NAME_SEPS if s in found)
+    return found[sep], f"the sample name before the first '{sep}'"
+
+
+def _tmt_add_condition(design, cfg):
+    """Add a `group` column to the TMT design when it can be had honestly.
+
+    -> (design, note). The note goes into design_record.txt, because a
+    condition that was DERIVED and one that was WRITTEN DOWN are not the same
+    kind of claim and the table on disk cannot tell them apart afterwards.
+    """
+    spec = str((cfg.get("tmt") or {}).get("condition_from_name", "auto"))
+    samples = [str(s) for s in design["sample"]]
+
+    def _metadata_note():
+        """What to tell the reader about supplying the condition themselves.
+
+        The advice used to be 'supply it in analysis.metadata' whether or not
+        analysis.metadata was already set and already covered every sample -
+        which reads as a defect when it is only a division of labour: the
+        design recovered from the input carries what the input knows, and the
+        metadata is merged later, at report time. Saying so is the difference
+        between a warning and a false alarm.
+        """
+        a = cfg.get("analysis") or {}
+        path = a.get("metadata") or ""
+        if not path:
+            return ("supply it in analysis.metadata, keyed on sample")
+        if not os.path.exists(path):
+            return (f"analysis.metadata is set to {path}, which does not "
+                    "exist; the report will have no condition either")
+        col = a.get("sample_col") or "sample"
+        try:
+            md = read_delim_table(path)
+        except Exception:                                   # noqa: BLE001
+            return (f"analysis.metadata ({path}) could not be read here, so "
+                    "whether it supplies the condition is unknown")
+        if col not in md.columns:
+            return (f"analysis.metadata ({path}) has no '{col}' column "
+                    f"(analysis.sample_col), only {list(md.columns)[:6]}")
+        have = set(md[col].astype(str))
+        miss = [s for s in samples if s not in have]
+        if miss:
+            return (f"analysis.metadata ({path}) is keyed on '{col}' but "
+                    f"does not name {len(miss)} of these samples "
+                    f"({miss[:4]}), so the report will drop them")
+        return (f"analysis.metadata ({path}) does name every sample, so the "
+                "report supplies the condition; this affects only "
+                "design_from_input.tsv, which records what the INPUT knew")
+    if not spec:
+        log("tmt: tmt.condition_from_name is empty, so no condition is "
+            f"derived from the sample names; {_metadata_note()}", "WARN")
+        return design, "not derived (tmt.condition_from_name is empty)"
+    if spec == "auto":
+        mapping, how = _tmt_split_condition(samples)
+        if mapping is None:
+            log(f"tmt: the condition could not be derived from the sample "
+                f"names ({how}), so the design has no group column. It is NOT "
+                f"taken from the plex, which is a batch: {_metadata_note()}",
+                "WARN")
+            return design, f"not derived ({how})"
+    else:
+        try:
+            rx = re.compile(spec)
+        except re.error as e:
+            die(f"tmt.condition_from_name is neither 'auto', empty, nor a "
+                f"valid regular expression: {e}")
+        if rx.groups != 1:
+            die(f"tmt.condition_from_name '{spec}' has {rx.groups} capture "
+                "groups; it needs exactly one, and that group is the "
+                "condition.")
+        hit = {s: rx.search(s) for s in samples}
+        miss = [s for s, m in hit.items() if not m or not m.group(1)]
+        if miss:
+            die(f"tmt.condition_from_name '{spec}' captures nothing in "
+                f"{len(miss)} of {len(samples)} sample name(s), e.g. "
+                f"{miss[:5]}. Every sample needs a condition, so fix the "
+                "pattern or write analysis.metadata by hand.")
+        mapping = {s: hit[s].group(1) for s in samples}
+        how = f"tmt.condition_from_name '{spec}'"
+    design = design.copy()
+    design["group"] = [mapping[s] for s in samples]
+    sizes = design.groupby("group").size().to_dict()
+    log(f"tmt: condition derived from {how}: {sizes}. This is a GUESS from "
+        "the annotation's sample names — check it, or set analysis.metadata "
+        "to state the condition explicitly", "WARN")
+    tab = design.groupby(["plex", "group"]).size().unstack(fill_value=0)
+    if len(tab) > 1 and (tab > 0).sum(axis=1).max() == 1:
+        die("the condition derived from the sample names is perfectly "
+            "confounded with the plex: each of the "
+            f"{len(tab)} plexes contains exactly one condition "
+            f"({dict(zip(tab.index, tab.idxmax(axis=1)))}). The plex is a TMT "
+            "batch, so no model can tell the batch from the biology and any "
+            "fold change would be both. Either the derivation is wrong (set "
+            "tmt.condition_from_name or analysis.metadata), or the experiment "
+            "cannot answer this question — a TMT design needs each condition "
+            "spread over several plexes.")
+    return design, f"derived from {how}"
+
+
+def read_fragpipe_tmt_peptides(root, cfg):
+    """The identification half of read_fragpipe_tmt: peptides + candidates.
+
+    Same contract as read_feature_peptides — no intensity is touched — so the
+    taxonomy stages still run on a TMT project whose channels this reader
+    would refuse (an annotation that does not match, a plex without one).
+    """
+    t = cfg.get("tmt") or {}
+    level = str(t.get("level") or "ion").lower()
+    if level not in TMT_LEVEL_FILES:
+        die(f"tmt.level must be 'ion' or 'peptide', got '{level}'")
+    if not os.path.isdir(root):
+        die(f"quant_table not found: {root}. quant_format 'fragpipe_tmt' "
+            "expects the FragPipe run directory holding the per-plex TMTn/ "
+            "folders.")
+    pref = excluded_prefixes(cfg)
+    out = []
+    for plex, pdir in tmt_plex_dirs(root, cfg):
+        path = os.path.join(pdir, TMT_LEVEL_FILES[level])
+        if not os.path.exists(path):
+            die(f"plex {plex} has no {TMT_LEVEL_FILES[level]}: {path}")
+        refuse_isobaric_matrix(path, header_columns(path))
+        df = read_delim_table(path)
+        prot = "Protein" if "Protein" in df.columns else "Protein ID"
+        if prot not in df.columns:
+            die(f"{path}: no 'Protein' or 'Protein ID' column")
+        bad = pd.Series(False, index=df.index)
+        for c in ("Is Decoy", "Is Contaminant"):
+            if c in df.columns:
+                bad |= df[c].astype(str).str.lower().isin(["true", "1", "yes"])
+        if pref:
+            bad |= df[prot].astype(str).map(first_token).str.startswith(pref)
+        df = df.loc[~bad].reset_index(drop=True)
+        pep_col = [c for c in ("Peptide Sequence", "Peptide")
+                   if c in df.columns][:1]
+        if not pep_col:
+            die(f"{path}: no peptide sequence column")
+        pep = df[pep_col[0]].astype(str).fillna("")
+        if "Modified Sequence" in df.columns:
+            empty = pep.eq("") | pep.eq("nan")
+            if bool(empty.any()):
+                ms = df["Modified Sequence"].astype(str).fillna("")
+                pep = pep.mask(empty, ms.map(strip_modifications))
+        razor = df[prot].astype(str).map(first_token)
+        mapped = (df["Mapped Proteins"] if "Mapped Proteins" in df.columns
+                  else pd.Series([""] * len(df), index=df.index))
+        one = pd.DataFrame({"peptide": pep, "razor_protein": razor})
+        one["candidates"] = [[r] + [x for x in split_ids(m)
+                                    if not x.startswith(pref)]
+                             for r, m in zip(razor, mapped)]
+        out.append(one[one["peptide"].ne("")])
+    res = pd.concat(out, ignore_index=True)
+    # One row per (peptide, protein): the same peptide is identified in
+    # several plexes, and the callers count rows.
+    res["_k"] = res["peptide"] + "\t" + res["razor_protein"]
+    res = res[~res["_k"].duplicated()].drop(columns="_k").reset_index(drop=True)
+    log(f"tmt: {len(res)} distinct (peptide, razor protein) pair(s) across "
+        f"{len(out)} plexes")
+    return res
+
+
 def read_feature_table(path, fmt, cfg):
     """-> (features, int_cols, design)
 
     features: feature_id, razor_protein, candidates (list of str), + int cols
     design:   sample/condition/replicate table recovered from the input, or None
     """
+    if fmt == "fragpipe_tmt":
+        # Not a single table: one per plex, joined here rather than by a
+        # search engine. Same return shape all the same.
+        return read_fragpipe_tmt(path, cfg)
+    # Recognised from the header alone, before pandas parses the body: the TMT
+    # msstats.csv dies in the C parser on unquoted commas in
+    # Protein.Description, and a tmt-report matrix parses perfectly and is
+    # already log2. Both have to be named, not guessed at downstream.
+    refuse_isobaric_matrix(path, header_columns(path))
     df = read_delim_table(path)
     design = None
 
@@ -4602,10 +6566,13 @@ def read_feature_table(path, fmt, cfg):
                 f"'{suffix} <sample>' are present, e.g. {reporter[:3]}, and "
                 f"the only column matching '<sample> {suffix}' is the bare "
                 f"MS1 '{suffix}', which is one precursor value pooled over "
-                "all channels. metaannot does not read reporter-ion "
-                "channels: quantifying this file would report a single "
-                "sample and be silently wrong. Use a label-free or DIA-NN "
-                "input, or quantify the channels elsewhere first.")
+                f"all channels. quant_format '{fmt}' does not read "
+                "reporter-ion channels: quantifying this file would report a "
+                "single sample and be silently wrong. Set quant_format: "
+                "fragpipe_tmt and point quant_table at the run directory "
+                "holding the per-plex TMTn/ folders, which reads the channels "
+                "of every plex and joins them; or use a label-free or DIA-NN "
+                "input.")
         rename = {}
         if cfg.get("manifest"):
             m = read_manifest(cfg["manifest"])
@@ -4746,6 +6713,9 @@ def read_feature_peptides(path, fmt, cfg):
     column was perfectly readable. Decoy/contaminant filtering is kept: those
     rows must not become taxon votes.
     """
+    if fmt == "fragpipe_tmt":
+        return read_fragpipe_tmt_peptides(path, cfg)
+    refuse_isobaric_matrix(path, header_columns(path))
     df = read_delim_table(path)
     pref = excluded_prefixes(cfg)
 
@@ -5067,8 +7037,13 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
     for c in ("n_features_used", "n_unique", "n_taxon_unique",
               "n_family_unique", "n_features_dropped"):
         ev[c] = ev[c].fillna(0).astype(int)
-    ev = ev.reset_index().rename(columns={"_assigned": "protein_id",
-                                          "index": "protein_id"})
+    # Named, not renamed afterwards: the outer join above takes its index name
+    # from whichever side is non-empty, so with NO feature assigned at all
+    # (every peptide shared across taxa — the case a strain-redundant database
+    # produces) the index arrived as 'razor_protein' and the rename raised
+    # KeyError('protein_id') instead of writing an empty evidence table.
+    ev.index.name = "protein_id"
+    ev = ev.reset_index()
     ev["protein_id"] = ev["protein_id"].astype(str)
     # A protein quantified mostly from features it shares with same-taxon (or,
     # under taxon_or_family_unique, same-family) neighbours is a weaker
@@ -5190,7 +7165,7 @@ def resolve_taxonomy(cfg, p, ann):
         log(f"taxonomy_source is '{src}' but {p.taxonomy_comparison} is absent; "
             "falling back to eggnog", "WARN")
         return collapse_taxon_rank(cfg, egg)
-    comp = pd.read_csv(p.taxonomy_comparison, sep="\t", dtype=str)
+    comp = pd.read_csv(p.taxonomy_comparison, sep="\t", dtype=str, encoding="utf-8", encoding_errors="replace")
     if src == "unipept":
         out = dict(zip(comp["protein_id"], comp["unipept_taxid"].fillna("")))
         n = sum(1 for v in out.values() if v and v != "nan")
@@ -5276,6 +7251,43 @@ def taxon_size_factors(df, tax_col, int_cols, min_proteins):
     return pd.DataFrame(rows)
 
 
+def tmt_size_factor_plex_exposure(tx, tax_col, int_cols, plex_of, min_proteins):
+    """-> (n_exposed, n_taxa): taxa whose size factor rests on plex-confined
+    proteins.
+
+    The taxon size factor is a median of ratios over all samples, so the
+    question worth asking of an isobaric run is not whether it carries the
+    plex — a per-sample loading shift is exactly what a size factor is for,
+    and it is shared by every taxon — but whether plex-shaped MISSINGNESS
+    changes it taxon by taxon. It can: with fewer than `min_proteins` members
+    observed in every plex, taxon_size_factors() loses its complete-case
+    reference and falls to the poscounts variant, whose median then mixes
+    proteins whose reference was computed inside one plex with proteins whose
+    reference spans them all. Measured on a fixture (see the tests): the
+    taxon-specific part of the factor is plex-free to 0.08 log2 for
+    well-observed taxa, and is pulled 0.77 log2 in one plex for a taxon with
+    half its proteins confined to it.
+    """
+    by_plex = {}
+    for c in int_cols:
+        by_plex.setdefault(plex_of.get(c, ""), []).append(c)
+    if len(by_plex) < 2:
+        return 0, 0
+    exposed = total = 0
+    for _, g in tx.groupby(tax_col, sort=False):
+        if len(g) < min_proteins:
+            continue                      # already on the sum fallback
+        total += 1
+        m = g[int_cols].apply(pd.to_numeric, errors="coerce")
+        m = m.where(m > 0)
+        complete = np.ones(len(m), dtype=bool)
+        for cs in by_plex.values():
+            complete &= m[cs].notna().any(axis=1).to_numpy()
+        if int(complete.sum()) < min_proteins:
+            exposed += 1
+    return exposed, total
+
+
 def stage_join(cfg, p):
     qpath, fmt = cfg["quant_table"], cfg["quant_format"]
     if not os.path.exists(qpath):
@@ -5283,6 +7295,16 @@ def stage_join(cfg, p):
         return
     if fmt not in ALL_FORMATS:
         die(f"quant_format must be one of {sorted(ALL_FORMATS)}, got '{fmt}'")
+    # A tmt-report matrix reads perfectly as a wide protein table and is
+    # already log2, so nothing downstream would ever notice. Name it here.
+    if fmt in PROTEIN_FORMATS and os.path.isfile(qpath):
+        refuse_isobaric_matrix(qpath, header_columns(qpath))
+        # And the per-plex protein.tsv, which carries neither of that
+        # function's two markers and would otherwise be quantified as a
+        # label-free protein table — one plex reported as the experiment.
+        refuse_per_plex_reporter_table(
+            qpath, header_columns(qpath),
+            cfg.get("feature_intensity_suffix", "Intensity"))
     # A roll-up method only means something where there is something to roll
     # up. Ignored quietly, a config saying median_polish next to a DIA-NN
     # protein matrix would describe numbers the search engine produced.
@@ -5298,9 +7320,9 @@ def stage_join(cfg, p):
             "would use it. Set rollup_method: sum, or point quant_table at a "
             "peptide/ion table.")
 
-    head = pd.read_csv(p.final, sep="\t", nrows=0)
+    head = pd.read_csv(p.final, sep="\t", nrows=0, encoding="utf-8", encoding_errors="replace")
     dtypes = {c: str for c in ANN_STR_COLS if c in head.columns}
-    ann = pd.read_csv(p.final, sep="\t", dtype=dtypes, low_memory=False)
+    ann = pd.read_csv(p.final, sep="\t", dtype=dtypes, low_memory=False, encoding="utf-8", encoding_errors="replace")
     ann = ann.rename(columns={ann.columns[0]: "protein_id"})
     required = ["protein_id", "bin"]
     missing_cols = [c for c in required if c not in ann.columns]
@@ -5392,6 +7414,17 @@ def stage_join(cfg, p):
                 design.to_csv(tmp, sep="\t", index=False)
             log(f"join: recovered a design from the input -> "
                 f"{p.quant_dir}/design_from_input.tsv")
+            # How the design was arrived at, next to the design itself. The
+            # report copies these lines into design_record.txt, because a
+            # table of samples cannot say where its condition came from or
+            # what happened to a reference channel that is no longer in it.
+            notes = list(design.attrs.get("design_notes") or ())
+            if notes:
+                with atomic_out(f"{p.quant_dir}/design_notes.txt") as tmp:
+                    with open(tmp, "w", encoding="utf-8") as fh:
+                        fh.write("\n".join(notes) + "\n")
+                log(f"join: how that design was made -> "
+                    f"{p.quant_dir}/design_notes.txt")
         id_col, member_cols = "group_id", ["group_id"]
         meta, int_cols = ["group_id"], int_cols_f
     elif fmt == "msstats_protein":
@@ -5430,7 +7463,7 @@ def stage_join(cfg, p):
             "imputed low-abundance values are exactly where the KO-less "
             "fraction sits", "WARN")
     else:
-        q = pd.read_csv(qpath, sep="\t", low_memory=False)
+        q = pd.read_csv(qpath, sep="\t", low_memory=False, encoding="utf-8", encoding_errors="replace")
 
     if fmt == "diann":
         id_col = "Protein.Group"
@@ -5648,7 +7681,7 @@ def stage_join(cfg, p):
         # dtype=str, as in resolve_taxonomy: without it unipept_taxid comes
         # back float and lands in annotated_quant.tsv as "821.0" next to a
         # string effective_taxid, so the two never join.
-        c = pd.read_csv(p.taxonomy_comparison, sep="\t", dtype=str)
+        c = pd.read_csv(p.taxonomy_comparison, sep="\t", dtype=str, encoding="utf-8", encoding_errors="replace")
         c = c[[x for x in cmp_cols if x in c.columns]].rename(
             columns={"protein_id": "group_id", "verdict": "taxonomy_verdict"})
         out = out.merge(c, on="group_id", how="left", suffixes=("", "_tax"))
@@ -5742,6 +7775,37 @@ def stage_join(cfg, p):
                     "one changing protein sets its own reference; raise "
                     "taxon_rank or analysis.taxon_min_proteins if the ratio "
                     "model matters", "WARN")
+            # The size factor is computed across ALL samples, so an isobaric
+            # run has to be asked whether the plex got into it. A common
+            # loading shift does, and should — that is what a size factor is.
+            # What must not pass unremarked is the taxon-by-taxon part, which
+            # plex-shaped missingness can move (see
+            # tmt_size_factor_plex_exposure).
+            dpath = f"{p.quant_dir}/design_from_input.tsv"
+            if fmt == "fragpipe_tmt" and os.path.exists(dpath):
+                dz = pd.read_csv(dpath, sep="\t", dtype=str, encoding="utf-8",
+                                 encoding_errors="replace")
+                if "plex" in dz.columns:
+                    n_exp, n_tot = tmt_size_factor_plex_exposure(
+                        tx, tax_col, int_cols,
+                        dict(zip(dz["sample"], dz["plex"])),
+                        int(cfg.get("taxon_min_proteins_for_factor", 4)))
+                    if n_exp:
+                        log(f"{n_exp}/{n_tot} taxon(s) have fewer than "
+                            "taxon_min_proteins_for_factor protein(s) "
+                            "observed in EVERY plex, so their size factor "
+                            "falls back to the poscounts variant and mixes "
+                            "plex-confined proteins with cross-plex ones; "
+                            "that is where a plex effect can reach the "
+                            "taxon-specific part of the factor. Raise "
+                            "analysis.min_plexes (protein level) or "
+                            "tmt.min_plexes (feature level) if the ratio "
+                            "model matters for those taxa", "WARN")
+                    else:
+                        log(f"all {n_tot} taxon(s) with enough proteins have "
+                            "taxon_min_proteins_for_factor of them observed "
+                            "in every plex, so the size factors rest on a "
+                            "plex-complete reference")
 
     vis_col = "kegg_enrichment_visible" if "kegg_enrichment_visible" in out.columns \
         else ("kegg_enrichment_visible_ann" if "kegg_enrichment_visible_ann"
@@ -5846,13 +7910,17 @@ STAGES = [
     dict(name="diamond", empty_ok=True, enabled="diamond",
          out=lambda p: [p.diamond_done],
          inp=lambda c, p: [c["proteins_faa"]] + list((c["db"].get("diamond") or {}).values()),
-         keys=["db.diamond", "thresholds.diamond_evalue"], deps=[], fn=stage_diamond),
+         keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues"],
+         deps=[], fn=stage_diamond),
     dict(name="signalp", enabled="topology", out=lambda p: [p.signalp],
          inp=lambda c, p: [c["proteins_faa"]], keys=["signalp_mode"],
          deps=[], fn=stage_signalp),
-    dict(name="tmbed", enabled="topology", out=lambda p: [p.tmbed],
+    # gpu=True: this stage takes an exclusive lease on gpu_device. tmbed held
+    # 15.5 GB of a 16 GB card; see gpu_workers.
+    dict(name="tmbed", enabled="topology", gpu=True, out=lambda p: [p.tmbed],
          inp=lambda c, p: [c["proteins_faa"]],
-         keys=["gpu_device", "tmbed_use_gpu"], deps=[], fn=stage_tmbed),
+         keys=["gpu_device", "tmbed_use_gpu", "tmbed_max_len",
+               "tmbed_batch_size"], deps=[], fn=stage_tmbed),
     dict(name="cluster", enabled="cluster", out=lambda p: [p.cluster],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["thresholds.cluster_min_seq_id", "thresholds.cluster_coverage"],
@@ -5888,7 +7956,8 @@ STAGES = [
                            p.ncbifam, p.kofam, p.interpro, p.effectors,
                            p.diamond_done] + sorted(
                                glob.glob(f"{p.diamond_dir}/*.tsv")),
-         keys=["thresholds", "weights", "diamond_weights", "anchor_pfams",
+         keys=["thresholds", "weights", "diamond_weights",
+               "diamond_evalues", "anchor_pfams",
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",
                "ncbifam_uninformative_test"],
@@ -5902,9 +7971,15 @@ STAGES = [
     dict(name="hhblits", empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
          inp=lambda c, p: [p.dark_all, c["db"].get("hhblits_db", "")],
          keys=["db.hhblits_db", "hhblits_iterations"], deps=['integrate'], fn=stage_hhblits),
-    dict(name="esmfold", empty_ok=True, enabled="structure", out=lambda p: [p.struct_done],
+    # gpu=True: ESMFold peaked at 13.3 GB on a single short sequence, so it
+    # cannot share a 16 GB card with tmbed; see gpu_workers.
+    dict(name="esmfold", empty_ok=True, enabled="structure", gpu=True,
+         out=lambda p: [p.struct_done],
          inp=lambda c, p: [p.dark],
-         keys=["max_len_structure", "esmfold_chunk_size"],
+         keys=["max_len_structure", "esmfold_chunk_size",
+               "esmfold_allow_partial", "esmfold_max_consecutive_failures",
+               "esmfold_vram_cap", "esmfold_bytes_per_residue_pair",
+               "esmfold_vram_reserve_gb"],
          deps=['integrate'], fn=stage_esmfold),
     dict(name="foldseek", empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
          inp=lambda c, p: [p.struct_done],
@@ -5919,28 +7994,30 @@ STAGES = [
          inp=lambda c, p: [p.pass1, p.foldseek, p.context, p.fold_clusters,
                            p.ncbifam, p.kofam, p.interpro, p.effectors,
                            p.hhr_done, p.jackhmmer],
-         keys=["thresholds", "weights", "diamond_weights", "anchor_pfams",
+         keys=["thresholds", "weights", "diamond_weights",
+               "diamond_evalues", "anchor_pfams",
                "toxin_fold_patterns", "ncbifam_uninformative_test",
                "foldseek_target_priority"],
          deps=['integrate', 'jackhmmer', 'hhblits', 'foldseek', 'context'], fn=stage_integrate_final),
     dict(name="unipept", enabled="unipept", out=lambda p: [p.unipept_lca],
-         inp=lambda c, p: [c["quant_table"], (c.get("unipept") or {}).get("result", "")],
-         keys=UNIPEPT_KEYS + ["quant_table", "quant_format",
+         inp=lambda c, p: quant_inputs(c) + [(c.get("unipept") or {}).get("result", "")],
+         keys=UNIPEPT_KEYS + ["quant_table", "quant_format", "tmt",
                "peptide_only_reader", "exclude_id_prefixes"],
          deps=[], fn=stage_unipept),
     dict(name="taxonomy", enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
-         inp=lambda c, p: [p.unipept_lca, p.final, c["quant_table"]],
+         inp=lambda c, p: [p.unipept_lca, p.final] + quant_inputs(c),
          keys=UNIPEPT_KEYS + ["db.ncbi_taxonomy", "peptide_only_reader",
-               "exclude_id_prefixes"],
+               "exclude_id_prefixes", "quant_format", "tmt"],
          deps=['unipept', 'finalise'], fn=stage_taxonomy),
     dict(name="join", enabled="join",
          out=lambda p: [f"{p.quant_dir}/annotated_quant.tsv"],
          # taxonomy_comparison is a real input: join merges its columns and
          # resolves effective_taxid from it. Omitting it left annotated_quant
          # stale whenever the taxonomy stage rebuilt its verdicts.
-         inp=lambda c, p: [p.final, c["quant_table"], p.taxonomy_comparison,
+         inp=lambda c, p: [p.final, *quant_inputs(c), p.taxonomy_comparison,
                            c.get("manifest") or ""],
-         keys=["quant_table", "quant_format", "manifest", "taxonomy_source",
+         keys=["quant_table", "quant_format", "tmt", "manifest",
+               "taxonomy_source",
                "taxon_rank", "peptide_assignment", "rollup_method",
                "min_features_per_protein",
                "zero_intensity_is_missing", "exclude_id_prefixes",
@@ -5950,6 +8027,34 @@ STAGES = [
          deps=['finalise', 'taxonomy'], fn=stage_join),
 ]
 STAGE_NAMES = [s["name"] for s in STAGES]
+
+
+def gpu_lease(ready, running, slots, needs_gpu):
+    """Which of one round's ready stages may start, given what is running.
+
+    Independent stages run concurrently and the CPU and RAM budgets are split
+    between them, but the GPU was not modelled at all: tmbed held 15.5 GB of a
+    16 GB card and ESMFold peaked at 13.3 GB on a single short sequence, so
+    with run.topology and run.structure both on they cannot fit together and
+    whichever loses dies of a CUDA OOM that names no cause. On the run this
+    comes from they only avoided each other by accident, because they happened
+    to be in separate invocations.
+
+    This leases the device, not the machine: every CPU-only stage passes
+    through untouched, so the pipeline is not serialised to achieve it.
+    Returns (dispatch, waiting).
+    """
+    free = max(0, slots - sum(1 for n in running if needs_gpu(n)))
+    dispatch, waiting = [], []
+    for name in ready:
+        if not needs_gpu(name):
+            dispatch.append(name)
+        elif free:
+            free -= 1
+            dispatch.append(name)
+        else:
+            waiting.append(name)
+    return dispatch, waiting
 
 
 def detect_ram_gb():
@@ -6058,9 +8163,10 @@ class ResultsLock:
     damage is silent: both report success and the outputs are interleaved.
     """
 
-    def __init__(self, path, force=False):
+    def __init__(self, path, force=False, empty_grace=60.0):
         self.path = path
         self.force = force
+        self.empty_grace = float(empty_grace)
         self.held = False
 
     def _holder_is_alive(self, info):
@@ -6088,6 +8194,21 @@ class ResultsLock:
             return True                   # PermissionError: it exists
         return True
 
+    def _empty_and_settled(self):
+        """A zero-byte lock old enough that no live writer could still owe it.
+
+        `lock_empty_grace_s` is the width of the only window in which an empty
+        lock is legitimate: between another run's O_EXCL create and its write.
+        That is microseconds of work, so a minute is already enormous slack,
+        and anything past it is a corpse.
+        """
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return False
+        return (st.st_size == 0
+                and time.time() - st.st_mtime > self.empty_grace)
+
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
@@ -6105,6 +8226,27 @@ class ResultsLock:
                 except (OSError, ValueError):
                     info = {}
                 pid, host = info.get("pid"), info.get("host", "")
+                if self._empty_and_settled() and not self.force:
+                    # A zero-byte lock is not a garbled lock, it is one whose
+                    # writer died between the O_EXCL create and the write. A
+                    # real writer closes that gap in microseconds, so an empty
+                    # file that has sat unchanged for minutes cannot be a live
+                    # run - it is what a power loss, an OOM kill or a host
+                    # bugcheck leaves behind. Treating it as "unprovable, so
+                    # assume alive" made a crashed run permanently
+                    # unresumable without --force-unlock, which is exactly
+                    # backwards: a hard crash is when reclaiming has to work.
+                    # The age check is what keeps the genuine race safe.
+                    log(f"removing a zero-byte lock left at "
+                        f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(os.path.getmtime(self.path)))}"
+                        "; its writer died between creating the file and "
+                        "writing to it, which is what a crash or a power loss "
+                        "leaves behind", "WARN")
+                    try:
+                        os.remove(self.path)
+                    except OSError:
+                        pass
+                    continue
                 if self._holder_is_alive(info) and not self.force:
                     die(f"another metaannot is already running here "
                         f"(pid {pid} on {host or '?'}, started "
@@ -6715,6 +8857,14 @@ if (!length(candidate_samples)) {
              "     Check them before filling in any metadata."))
 }
 note("sample columns identified from %s: %d", sample_src, length(candidate_samples))
+
+# design_notes.txt is written by the isobaric reader and by nothing else, so
+# its presence is what tells the report that these columns are TMT reporter
+# channels rather than LC-MS runs. That changes three things below: the
+# missingness is plex-shaped (see min_plexes), the plex has to be named as a
+# batch wherever the design is printed, and the fold changes are compressed.
+DESIGN_NOTES <- file.path(RD, "quant", "design_notes.txt")
+IS_ISOBARIC  <- file.exists(DESIGN_NOTES)
 ```
 
 ```{r metadata-template}
@@ -6816,6 +8966,71 @@ cat(sprintf("%d protein groups, %d samples\n", nrow(aq), nrow(meta)))
 meta %>% select(-.col) %>% head(20)
 ```
 
+## The isobaric design
+
+```{r isobaric-design}
+# The per-sample plex, from ONE source for the whole document: the model, the
+# plex filter and this printout must not be able to disagree about which
+# batch a sample was in. meta first (the user may have written it themselves),
+# then the design metaannot recovered from the input.
+PLEX_OF <- NULL
+if (IS_ISOBARIC) {
+  if ("plex" %in% names(meta)) {
+    PLEX_OF <- setNames(as.character(meta$plex), meta$.col)
+    plex_src <- meta_path
+  } else if (file.exists(design_path0)) {
+    d0 <- read_tsv_full(design_path0, c("sample", "plex"))
+    if (all(c("sample", "plex") %in% names(d0))) {
+      PLEX_OF <- setNames(as.character(d0$plex),
+                          as.character(d0$sample))[meta$.sample]
+      names(PLEX_OF) <- meta$.col
+      plex_src <- design_path0
+    }
+  }
+  if (!is.null(PLEX_OF) && anyNA(PLEX_OF)) {
+    note(paste("%d sample(s) have no plex in %s, so the plex is not usable",
+               "as a batch here"), sum(is.na(PLEX_OF)), plex_src)
+    PLEX_OF <- NULL
+  }
+}
+
+if (!IS_ISOBARIC) {
+  cat("Not an isobaric run: no quant/design_notes.txt, so the sample columns",
+      "are\nLC-MS runs and there is no plex.\n")
+} else {
+  cat("metaannot read isobaric (TMT) input. What it did, verbatim from\n",
+      DESIGN_NOTES, ":\n\n", sep = "")
+  # Printed, not summarised: the reference treatment, where the condition came
+  # from and whether the channels were median-centred are choices the numbers
+  # cannot be read without, and the log they were made in is long gone by the
+  # time anyone reads the report.
+  cat(paste0("    ", readLines(DESIGN_NOTES, warn = FALSE)), sep = "\n")
+  cat("\n")
+  ref_line <- grep("^reference", readLines(DESIGN_NOTES, warn = FALSE),
+                   value = TRUE)
+  if (length(ref_line))
+    note("reference treatment: %s",
+         trimws(sub("^reference[^:]*:", "", ref_line[1])))
+
+  if (is.null(PLEX_OF)) {
+    note(paste("no plex column in %s, so this report cannot name the batch.",
+               "Copy 'plex' across from\n      %s, keyed on sample."),
+         meta_path, design_path0)
+  } else {
+    cat("\nsamples per plex:\n")
+    print(table(plex = PLEX_OF[meta$.col]))
+    if ("group" %in% names(meta)) {
+      cat("\ncondition x plex (a diagonal-only table means the two cannot be",
+          "\nseparated; the design diagnostics below stop on it):\n")
+      print(table(group = meta$group, plex = PLEX_OF[meta$.col]))
+    }
+    note(paste("the plex is a COVARIATE here: a TMT batch, and never a condition.",
+               "Contrasts are formed over\n      the condition, and metaannot",
+               "does not infer the condition from the plex."))
+  }
+}
+```
+
 ## The model, before anything is fitted
 
 ```{r design}
@@ -6832,6 +9047,14 @@ if (any(!complete.cases(md)))
        "fill them in or drop those samples from the metadata", call. = FALSE)
 md <- droplevels(md)
 
+# An isobaric run models the plex as a batch. With one plex there is no batch
+# to model, and model.matrix() would fail with "contrasts can be applied only
+# to factors with 2 or more levels", which does not say which term it means.
+if ("plex" %in% vars && is.factor(md$plex) && nlevels(md$plex) < 2)
+  stop("design_formula models 'plex' but every sample is in plex '",
+       levels(md$plex)[1], "'. One plex is not a batch effect: drop '+ plex' ",
+       "from design_formula.", call. = FALSE)
+
 design <- model.matrix(form, data = md)
 rownames(design) <- meta$.col
 colnames(design) <- make.names(colnames(design))
@@ -6839,6 +9062,12 @@ colnames(design) <- make.names(colnames(design))
 cat("coefficient names available to `contrasts`:\n")
 print(colnames(design))
 cat("\n")
+if ("plex" %in% vars)
+  note(paste("'plex' is in the model as a TMT BATCH term, not as a",
+             "hypothesis: the condition is\n      estimated within plex, and",
+             "the plex coefficients are nuisance parameters.\n      Contrasts",
+             "are formed over the condition; a plex-versus-plex contrast",
+             "would be\n      a batch effect reported as biology."))
 as_tibble(design) %>% head(12)
 ```
 
@@ -6848,6 +9077,33 @@ A confounded or rank-deficient design fails deep inside `makeContrasts` with
 an unhelpful error, or worse, fits and returns nonsense. Checked here instead.
 
 ```{r design-diagnostics}
+# Checked BEFORE the rank, because rank deficiency is how this shows up and
+# "coefficient plexTMT8 is not estimable" names the symptom, not the mistake.
+# A TMT plex is a batch: when every plex holds exactly one level of the
+# condition, the batch and the biology are the same vector and no model
+# separates them.
+plex_confounding <- function(md, batch = "plex") {
+  if (!batch %in% names(md) || !is.factor(md[[batch]])) return(invisible(NULL))
+  b <- droplevels(md[[batch]])
+  if (nlevels(b) < 2) return(invisible(NULL))
+  fc <- setdiff(names(md)[vapply(md, is.factor, logical(1))], batch)
+  for (f in fc) {
+    tt <- table(b, droplevels(md[[f]]), dnn = c(batch, f))
+    if (nlevels(droplevels(md[[f]])) > 1 && all(rowSums(tt > 0) == 1))
+      stop("'", batch, "' is perfectly confounded with '", f, "': each of the ",
+           nlevels(b), " ", batch, "es holds exactly one level of '", f,
+           "'.\n", paste(capture.output(print(tt)), collapse = "\n"),
+           "\n\nThe ", batch, " is a batch, so the batch effect and the ",
+           "condition are the same\nvector and no model can separate them: ",
+           "every fold change would be both.\nA TMT design needs each ",
+           "condition spread over several plexes. Dropping '+ ", batch,
+           "'\nfrom design_formula does not fix it — it reports the batch ",
+           "effect as biology.", call. = FALSE)
+  }
+  invisible(NULL)
+}
+plex_confounding(md)
+
 r <- qr(design)$rank
 gate("design: %d samples, %d coefficients, rank %d%s",
      nrow(design), ncol(design), r,
@@ -6858,7 +9114,12 @@ if (r < ncol(design)) {
        paste(ne, collapse = ", "),
        "\nUsually a covariate is perfectly confounded with the condition ",
        "(every treated\nsample in batch 1, every control in batch 2). No model ",
-       "can separate those.", call. = FALSE)
+       "can separate those.",
+       if ("plex" %in% vars)
+         paste0("\n'plex' is in this model: in a TMT run the plex is that ",
+                "batch, and a condition\nthat does not cross plexes cannot be ",
+                "adjusted for it.") else "",
+       call. = FALSE)
 }
 if (nrow(design) - r < 1)
   stop("0 residual degrees of freedom: ", nrow(design), " samples and ", r,
@@ -7313,12 +9574,56 @@ if (params$min_valid_per_group > min(smallest))
 
 # isTRUE(): tapply over a factor with an unused level returns NA, all(NA) is
 # NA, and X[NA, ] silently produces a row of NAs rather than dropping it.
-keep <- apply(X, 1, function(r)
+keep_valid <- apply(X, 1, function(r)
   isTRUE(all(tapply(is.finite(r), fgrp, sum) >= params$min_valid_per_group)))
-keep[is.na(keep)] <- FALSE
-cat(sprintf("%d/%d groups retained (>= %d valid values in every level of %s)\n",
-            sum(keep), nrow(X), params$min_valid_per_group,
-            params$group_col_for_filtering))
+keep_valid[is.na(keep_valid)] <- FALSE
+
+# min_valid_per_group counts SAMPLES, and that is not enough for an isobaric
+# run. Missingness there is structured by plex: a protein identified in one
+# plex only is all-NA in every other, so "3 valid values in every group" can
+# be satisfied entirely inside one batch, and the difference the model then
+# reports is that batch. min_plexes counts PLEXES instead. The two ask
+# different questions, so both are applied and each is reported on its own.
+pbatch <- if (IS_ISOBARIC && !is.null(PLEX_OF)) PLEX_OF[colnames(X)] else NULL
+if (params$min_plexes > 1 && is.null(pbatch))
+  stop("min_plexes is ", params$min_plexes, " but no per-sample plex is ",
+       "available: ", if (!IS_ISOBARIC)
+         "this run is not isobaric (no quant/design_notes.txt), so there are no plexes"
+       else paste0("neither the metadata nor ", design_path0, " gives every ",
+                   "sample a plex"),
+       ".\n  Set analysis.min_plexes: 1, or add a 'plex' column keyed on ",
+       "sample.", call. = FALSE)
+n_plex <- if (is.null(pbatch)) rep(NA_integer_, nrow(X)) else
+  apply(X, 1, function(r) length(unique(pbatch[is.finite(r)])))
+keep_plex <- if (is.null(pbatch)) rep(TRUE, nrow(X)) else
+  n_plex >= params$min_plexes
+
+# Separately, so it is visible which filter bit. Counted against the same
+# starting set rather than in sequence: "min_plexes removed 40" has to mean
+# 40 proteins, not "40 of whatever min_valid_per_group left".
+cat(sprintf("min_valid_per_group >= %d in every level of %s: removes %d of %d\n",
+            params$min_valid_per_group, params$group_col_for_filtering,
+            sum(!keep_valid), nrow(X)))
+if (is.null(pbatch)) {
+  cat(sprintf("min_plexes: not applied (no per-sample plex%s)\n",
+              if (IS_ISOBARIC) "" else "; this is not an isobaric run"))
+} else {
+  cat(sprintf("min_plexes >= %d: removes %d of %d, %d of which min_valid_per_group would have kept\n",
+              params$min_plexes, sum(!keep_plex), nrow(X),
+              sum(!keep_plex & keep_valid)))
+  cat("\nproteins by number of plexes they are quantified in:\n")
+  print(table(plexes = n_plex))
+  # The number that says whether the filter is worth setting, printed whether
+  # or not it is set: with min_plexes at 1 these proteins passed on a sample
+  # count that one batch supplied on its own.
+  confined <- sum(n_plex <= 1 & keep_valid & keep_plex)
+  if (params$min_plexes < 2 && length(unique(pbatch)) > 1 && confined > 0)
+    gate(paste("%d protein(s) pass min_valid_per_group but are quantified in a",
+               "single plex — their group difference is inside one batch.",
+               "Set analysis.min_plexes: 2 to drop them"), confined)
+}
+keep <- keep_valid & keep_plex
+cat(sprintf("%d/%d groups retained by both filters\n", sum(keep), nrow(X)))
 X   <- X[keep, , drop = FALSE]
 aqk <- aq[keep, , drop = FALSE]
 
@@ -8011,9 +10316,17 @@ if (!is.null(enr_pfam$abundance))
 if (!is.null(enr_pfam$ratio))
   write_tsv(enr_pfam$ratio, file.path(OUT, "enrichment_pfam_ratio.tsv"))
 
+# Kept next to the numbers it produced: the log scrolls away, and a
+# design_record.txt that does not say where the condition came from, or what
+# was done with a reference channel, cannot be checked afterwards.
+notes_path <- file.path(RD, "quant", "design_notes.txt")
 writeLines(c(
   paste("design_formula:", params$design_formula),
   paste("coefficients:  ", paste(colnames(design), collapse = ", ")),
+  if ("plex" %in% all.vars(as.formula(params$design_formula)))
+    paste("plex:           in the model as a batch term;",
+          "contrasts are over the condition") else NULL,
+  if (file.exists(notes_path)) readLines(notes_path, warn = FALSE) else NULL,
   paste("block:         ", if (nzchar(params$block_col)) params$block_col else "none"),
   paste("abundance model:", if (USE_MS) paste("MSstats:", params$msstats_comparison)
         else "limma"),
@@ -8024,6 +10337,10 @@ writeLines(c(
   paste("primary contrast:", PRIMARY),
   paste("normalise:     ", params$normalise),
   paste("min_valid:     ", params$min_valid_per_group),
+  paste("min_plexes:    ", params$min_plexes,
+        if (!IS_ISOBARIC) "(not an isobaric run; not applied)"
+        else if (is.null(PLEX_OF)) "(no per-sample plex; not applied)"
+        else "(protein level, counted across plexes)"),
   paste("FDR / min_lfc: ", params$fdr, "/", params$min_lfc),
   paste("adjusted model:", if (adj_attempted) "fitted" else "not run")
 ), file.path(OUT, "design_record.txt"))
@@ -8051,6 +10368,32 @@ if (n_small > 0) {
   cat(" No quantified group here is <= 100 aa, so\n  bacteriocins, TA toxins",
       " and RiPPs were effectively never in the search space\n  and their",
       " absence is not evidence of absence.\n\n", sep = "")
+}
+```
+
+```{r caveat-ratio-compression, results='asis'}
+# Printed only for isobaric input, because it is false for label-free: this is
+# a property of measuring several samples in ONE MS2 scan.
+if (IS_ISOBARIC) {
+  cat("- **Ratio compression, uncorrected.** Reporter ions are read from a\n",
+      "  spectrum whose precursor window admitted more than one peptide, so\n",
+      "  every channel carries some signal from co-isolated species that do\n",
+      "  not share the true fold change. The measured ratio is therefore\n",
+      "  pulled toward 1: log2 fold changes here are LOWER BOUNDS on the\n",
+      "  real ones, and the shrinkage is not a constant — it is worse for\n",
+      "  low-abundance proteins, in crowded windows, and in exactly the\n",
+      "  strain-redundant regions of a metagenome database where one\n",
+      "  peptide's neighbours are its own near-identical paralogues.\n",
+      "  metaannot does **not** correct for it: there is no interference\n",
+      "  model and no purity-weighted rescaling here, because every such\n",
+      "  correction divides by an estimate of the contamination and turns a\n",
+      "  known bias into an unknown variance. The consequences are that\n",
+      "  direction and ranking are more trustworthy than magnitude, that\n",
+      "  `min_lfc` is a stricter filter on these data than on label-free\n",
+      "  data, and that an effect size read off this report should not be\n",
+      "  compared with one from a label-free experiment. `tmt.min_purity`\n",
+      "  limits how co-isolated the accepted spectra were; it does not undo\n",
+      "  the compression in the ones that pass.\n\n", sep = "")
 }
 ```
 
@@ -8197,7 +10540,7 @@ def auto_contrasts(design_path, formula, factor_cols=""):
     """
     if not os.path.exists(design_path):
         return ""
-    d = pd.read_csv(design_path, sep="\t")
+    d = pd.read_csv(design_path, sep="\t", encoding="utf-8", encoding_errors="replace")
     terms = _formula_terms(formula)
     factors = [c.strip() for c in str(factor_cols or "").split(",") if c.strip()]
     cands = [t for t in terms if t in d.columns]
@@ -8334,6 +10677,94 @@ def _render_params_block(a):
     return block
 
 
+def _tmt_report_design(cfg, a, design_auto):
+    """Point the report's model at the condition, with the plex as a batch.
+
+    A TMT design has one structural difference from every label-free one this
+    tool reads: the thing the input names per sample is the PLEX, and the plex
+    is a batch. Left to the ordinary defaults the contrasts would come out
+    plex-versus-plex — a batch effect presented as a hypothesis — so the
+    default formula gains `+ plex`, and a condition that is nowhere to be
+    found is refused rather than approximated.
+
+    Only the DEFAULTS are changed. A formula the user wrote is their
+    statement of the model and is left exactly as written.
+    """
+    d = None
+    if os.path.exists(design_auto):
+        d = pd.read_csv(design_auto, sep="\t", dtype=str,
+                        encoding="utf-8", encoding_errors="replace")
+    plexes = sorted(set(d["plex"].dropna())) if (
+        d is not None and "plex" in d.columns) else []
+    defaults = DEFAULT_CONFIG["analysis"]
+    if len(plexes) > 1:
+        if a.get("design_formula") == defaults["design_formula"]:
+            a["design_formula"] = "~ 0 + group + plex"
+            log(f"report: {len(plexes)} TMT plexes, so design_formula is "
+                f"'{a['design_formula']}' — the condition is the hypothesis "
+                "and the plex is a batch term that absorbs it. Set "
+                "analysis.design_formula to override")
+        if a.get("factor_cols") == defaults["factor_cols"]:
+            a["factor_cols"] = "group,plex"
+            log(f"report: factor_cols is '{a['factor_cols']}', so the plex is "
+                "typed as a factor; an untyped plex code like '1' would be "
+                "fitted as a continuous slope through the batches")
+    elif plexes:
+        # model.matrix() cannot make a contrast for a one-level factor, so a
+        # single-plex run must not carry the term at all.
+        log(f"report: a single plex ({plexes[0]}), so plex is not added to "
+            "design_formula — one level is not a batch effect", "WARN")
+
+    terms = _formula_terms(a.get("design_formula", ""))
+    meta_path = a.get("metadata") or design_auto
+    same = os.path.abspath(meta_path) == os.path.abspath(design_auto)
+    have = None
+    if os.path.exists(meta_path):
+        have = list(pd.read_csv(meta_path, sep="\t", nrows=0,
+                                encoding="utf-8",
+                                encoding_errors="replace").columns)
+    if have is None or "group" not in terms:
+        return
+    rows = []
+    if d is not None:
+        cols = [c for c in ("sample", "plex", "channel") if c in d.columns]
+        rows = [d[cols].iloc[i].tolist() for i in range(min(2, len(d)))]
+        head = "\t".join(cols + ["group"])
+    else:
+        head = "sample\tplex\tgroup"
+    if "group" not in have:
+        die("the FragPipe TMT files do not carry the condition, and none was "
+            f"derived from the sample names, so {meta_path} has no 'group' "
+            "column and there is nothing to contrast. The plex is a TMT "
+            "batch, not a condition, and metaannot will not use it as one — a "
+            "plex-versus-plex contrast is a batch effect presented as a "
+            "hypothesis.\n\n"
+            "Write the conditions down. The recovered design is the head "
+            "start, since it already names every sample and its plex:\n\n"
+            f"    cp {design_auto} metadata.tsv\n\n"
+            "then add a 'group' column, one condition per sample:\n\n"
+            f"    {head}\n" +
+            "".join(f"    {chr(9).join(map(str, r))}\t<condition>\n"
+                    for r in rows) +
+            f"    ...  ({len(d) if d is not None else 0} sample(s) in all)\n\n"
+            "and set, in the config:\n\n"
+            "    analysis:\n"
+            "      metadata: metadata.tsv\n"
+            f"      design_formula: \"{a.get('design_formula', '')}\"\n"
+            f"      factor_cols: \"{a.get('factor_cols', '')}\"\n\n"
+            "If the condition IS in the annotated sample names, set "
+            "tmt.condition_from_name to a regular expression with one capture "
+            "group and re-run the join stage instead.")
+    if "plex" in terms and "plex" not in have:
+        die(f"design_formula '{a.get('design_formula')}' models the plex, but "
+            f"{meta_path} has no 'plex' column (it has: {have}). The plex is "
+            "the batch a TMT experiment has to be adjusted for, and it is "
+            f"recorded per sample in {design_auto}" +
+            ("" if same else " — copy that column across, keyed on sample") +
+            ". Or drop '+ plex' from analysis.design_formula, which reports "
+            "the batch effect as biology.")
+
+
 def write_report_rmd(cfg, p):
     a = dict(cfg.get("analysis") or {})
     missing = [k for k in template_params()
@@ -8347,8 +10778,25 @@ def write_report_rmd(cfg, p):
     design_auto = f"{p.quant_dir}/design_from_input.tsv"
     if not a.get("metadata"):
         a["metadata"] = design_auto
+    # Before the contrasts are derived, not after: for TMT the formula decides
+    # which column they are taken over, and the default one would take them
+    # over the plex.
+    if str(cfg.get("quant_format", "")) == "fragpipe_tmt":
+        _tmt_report_design(cfg, a, design_auto)
     if not a.get("contrasts"):
-        a["contrasts"] = auto_contrasts(design_auto, a.get("design_formula", ""),
+        src = design_auto
+        # TMT only, and only because of where the condition lives: the
+        # recovered design carries the plex, and the condition is often only
+        # in the hand-written metadata, so deriving from the design would find
+        # no group and silently produce no contrast. Label-free keeps reading
+        # the recovered design, as it always has.
+        if (str(cfg.get("quant_format", "")) == "fragpipe_tmt"
+                and a.get("metadata") and os.path.exists(a["metadata"])
+                and os.path.abspath(a["metadata"]) != os.path.abspath(design_auto)):
+            src = a["metadata"]
+            log(f"report: contrasts will be derived from analysis.metadata "
+                f"({src}), which is where a TMT run's condition is written")
+        a["contrasts"] = auto_contrasts(src, a.get("design_formula", ""),
                                         a.get("factor_cols", ""))
         if a["contrasts"]:
             log(f"report: contrasts derived from the design -> {a['contrasts']}")
@@ -8924,6 +11372,24 @@ def cmd_doctor(args):
             print(f"  {'WARN':6s} diamond_weights missing for "
                   f"{sorted(unweighted)}; those hits still count as annotation "
                   "but score 0 in the effector ranking")
+        # Existence is not usability. A failed `diamond makedb` leaves a
+        # zero-byte .dmnd that passes every check above, and a database of
+        # 15-residue peptides passes them all while being unable to reach the
+        # configured e-value. Both return 0 hits, and 0 hits is also what a
+        # real absence looks like, so doctor is the last place either can be
+        # caught before hours of searching say nothing.
+        for tag, path in sorted((cfg["db"].get("diamond") or {}).items()):
+            if not path or not os.path.exists(path):
+                continue          # already reported as MISS above
+            try:
+                bad, warn = diamond_db_check(cfg, tag, path)
+            except StageError as e:      # a non-numeric diamond_evalues entry
+                ok, bad, warn = False, f"{tag}: {e}", None
+            if bad:
+                ok = False
+                print(f"  {'MISS':6s} {bad}")
+            elif warn:
+                print(f"  {'WARN':6s} {warn}")
 
     spec = cfg.get("effector_predictions") or {}
     if cfg["run"].get("effectors"):
@@ -8937,6 +11403,108 @@ def cmd_doctor(args):
             ok &= good
             print(f"  {'OK' if good else 'MISS':6s} {name}: "
                   f"{f or '(no file set in effector_predictions)'}")
+
+    if cfg["quant_format"] == "fragpipe_tmt":
+        # Without this block doctor says nothing at all about a TMT run: the
+        # only TMT line it printed lived inside `== manifest ==`, and a TMT
+        # config normally sets no manifest. So the one layout this format is
+        # most particular about - a run directory of per-plex folders, each
+        # with its own annotation file - went unchecked until the run itself
+        # died on it.
+        print("== tmt ==")
+        root = cfg.get("quant_table") or ""
+        t = cfg.get("tmt") or {}
+        lvl = str(t.get("level") or "ion").lower()
+        fname = TMT_LEVEL_FILES.get(lvl, "ion.tsv")
+        ref_name = str(t.get("reference_name") or "")
+        ref_chan = str(t.get("reference_channel") or "")
+        if ref_name and ref_chan:
+            ok = False
+            print(f"  {'MISS':6s} tmt.reference_name ('{ref_name}') and "
+                  f"tmt.reference_channel ('{ref_chan}') are both set and can "
+                  "disagree per plex; set one")
+        if os.path.isfile(root):
+            ok = False
+            print(f"  {'MISS':6s} quant_table is a file: {root}. This format "
+                  "reads the run DIRECTORY holding the per-plex folders, "
+                  "because a tmt-report matrix has already collapsed the "
+                  "peptides this tool needs")
+        elif not os.path.isdir(root):
+            ok = False
+            print(f"  {'MISS':6s} quant_table not found: {root}")
+        else:
+            try:
+                plexes = tmt_plex_dirs(root, cfg)
+            except StageError as e:
+                ok, plexes = False, []
+                print(f"  {'MISS':6s} {e}")
+            if plexes:
+                print(f"  {'OK':6s} {len(plexes)} plex(es): "
+                      f"{[n for n, _ in plexes]}")
+            sizes, seen_names, ref_hits = {}, {}, []
+            for plex, pdir in plexes:
+                lvl_path = os.path.join(pdir, fname)
+                if not os.path.exists(lvl_path):
+                    ok = False
+                    print(f"  {'MISS':6s} {plex}: no {fname} (tmt.level "
+                          f"'{lvl}'); {pdir} holds "
+                          f"{sorted(os.listdir(pdir))[:8]}")
+                try:
+                    apath = tmt_annotation_path(plex, pdir, cfg)
+                    rows = read_tmt_annotation(apath, plex)
+                except StageError as e:
+                    ok = False
+                    print(f"  {'MISS':6s} {plex}: {e}")
+                    continue
+                sizes[plex] = len(rows)
+                for chan, samp in rows:
+                    seen_names.setdefault(samp, []).append(plex)
+                    if ref_name and fnmatch.fnmatch(samp, ref_name):
+                        ref_hits.append((plex, chan, samp))
+                    elif ref_chan and chan == ref_chan:
+                        ref_hits.append((plex, chan, samp))
+            if sizes:
+                dist = sorted(set(sizes.values()))
+                if len(dist) > 1:
+                    # Not fatal - the reader handles ragged plexes - but it is
+                    # the kind of thing that is a typo far more often than it
+                    # is the design.
+                    print(f"  {'WARN':6s} plexes differ in channel count "
+                          f"{dist}: "
+                          f"{ {k: v for k, v in sorted(sizes.items())} }")
+                else:
+                    print(f"  {'OK':6s} {dist[0]} channels in every plex, "
+                          f"{sum(sizes.values())} in total")
+            dupes = {n: pl for n, pl in seen_names.items() if len(pl) > 1}
+            if dupes:
+                # One sample split across plexes is a fraction or a bridge and
+                # is fine; the reader keys on the name, so say which they are.
+                shown = dict(sorted(dupes.items())[:4])
+                print(f"  {'WARN':6s} {len(dupes)} sample name(s) appear in "
+                      f"more than one plex: {shown}. They will be treated as "
+                      "one sample measured in each")
+            if ref_name or ref_chan:
+                which = f"reference_name '{ref_name}'" if ref_name                     else f"reference_channel '{ref_chan}'"
+                missing = sorted({n for n, _ in plexes}
+                                 - {pl for pl, _, _ in ref_hits})
+                if missing:
+                    ok = False
+                    print(f"  {'MISS':6s} tmt.{which} matches nothing in "
+                          f"{len(missing)} plex(es): {missing[:6]}. A "
+                          "reference absent from a plex leaves that plex "
+                          "without a denominator")
+                else:
+                    print(f"  {'OK':6s} tmt.{which} resolves in every plex")
+            elif bool(t.get("use_reference_ratios", False)):
+                ok = False
+                print(f"  {'MISS':6s} tmt.use_reference_ratios is on but "
+                      "neither tmt.reference_name nor tmt.reference_channel "
+                      "is set")
+            else:
+                print(f"  {'WARN':6s} no reference channel named, so plexes "
+                      "are compared on within-plex normalised intensity "
+                      "alone; set tmt.reference_name if this design has a "
+                      "bridge")
 
     if cfg.get("manifest"):
         print("== manifest ==")
@@ -8955,10 +11523,15 @@ def cmd_doctor(args):
             if m is not None:
                 print(f"  {'OK':6s} {len(m)} runs, groups: "
                       f"{sorted(m['experiment'].unique())}")
-            if m is not None and os.path.exists(cfg["quant_table"]):
+            if m is not None and cfg["quant_format"] == "fragpipe_tmt":
+                print(f"  {'WARN':6s} quant_format is 'fragpipe_tmt', so the "
+                      "manifest is not used: sample names come from each "
+                      "plex's annotation file, and a TMT manifest's "
+                      "experiment column is the plex, not a condition")
+            elif m is not None and os.path.isfile(cfg["quant_table"]):
                 try:
                     head = pd.read_csv(cfg["quant_table"], sep=None,
-                                       engine="python", nrows=0)
+                                       engine="python", nrows=0, encoding="utf-8", encoding_errors="replace")
                     sfx = (" Intensity" if cfg["quant_format"].startswith("fragpipe")
                            else "")
                     cand = [c for c in head.columns
@@ -9075,7 +11648,7 @@ def cmd_doctor(args):
                % ",".join(f'"{n}"' for n in want))
         print("== R ==")
         try:
-            r = subprocess.run(["Rscript", "-e", chk], capture_output=True,
+            r = subprocess.run([resolve_tool("Rscript"), "-e", chk], capture_output=True,
                                text=True, timeout=180)
             seen = {}
             for tok in (r.stdout or "").split():
@@ -9220,7 +11793,7 @@ def cmd_subset(args):
         with opener(args.quant) as fh:
             want = {l.strip() for l in fh if l.strip()}
     else:
-        q = pd.read_csv(args.quant, sep="\t", low_memory=False)
+        q = pd.read_csv(args.quant, sep="\t", low_memory=False, encoding="utf-8", encoding_errors="replace")
         if args.format == "diann":
             cands = ["Protein.Group", "Protein.Ids", "Protein.Names"]
         else:
@@ -9271,6 +11844,11 @@ def cmd_run(args):
         cfg["threads"] = args.threads
     if getattr(args, "ram", None) is not None:
         cfg["ram_gb"] = parse_ram(args.ram)
+    try:
+        set_progress_interval(cfg["progress_interval_s"])
+    except (TypeError, ValueError):
+        die(f"progress_interval_s must be a number of seconds (0 disables), "
+            f"not {cfg['progress_interval_s']!r}")
     # Absolute, as load_config already makes the config's own paths: the cache
     # must not see 'results' and './results' as two different projects.
     if args.faa:
@@ -9425,6 +12003,11 @@ def cmd_run(args):
 
     # ---- schedule over the DAG ------------------------------------------
     workers = 1 if args.serial else max(1, int(cfg.get("stage_workers", 4)))
+    try:
+        gpu_slots = max(1, int(cfg.get("gpu_workers", 1) or 1))
+    except (TypeError, ValueError):
+        die(f"gpu_workers must be a whole number of GPU stages, not "
+            f"{cfg.get('gpu_workers')!r}")
     total_cpu = max(1, int(cfg["threads"]))
     total_ram = parse_ram(cfg.get("ram_gb"))   # the config may say '64G' too
     if not total_ram:
@@ -9439,6 +12022,18 @@ def cmd_run(args):
         log(f"{total_ram} GB across {workers} stages leaves under 1 GB each; "
             "using 1 GB per stage, but lower stage_workers or use --serial",
             "WARN")
+    # Same "will it actually run" test decide() uses, so the announcement is
+    # not made about a stage the run is not going to reach: enabled, or named
+    # with --only, which is how the GPU box runs these against a server config.
+    gpu_stages = [st["name"] for st in STAGES if st.get("gpu")
+                  and st["name"] in selected
+                  and (cfg["run"].get(st["enabled"], False)
+                       or st["name"] in only_set)]
+    if workers > 1 and len(gpu_stages) > gpu_slots:
+        log(f"{', '.join(gpu_stages)} all use gpu_device {cfg['gpu_device']}, "
+            f"so at most {gpu_slots} of them runs at a time; CPU-only stages "
+            "keep running alongside. Raising gpu_workers puts them on the "
+            "SAME card, not one per card.")
     if workers > 1:
         log(f"scheduling up to {workers} stages at a time, sharing "
             f"{total_cpu} cpu"
@@ -9517,8 +12112,12 @@ def cmd_run(args):
             return name, None, e, 0.0
         return name, signature(st, cfg, p), None, time.time() - t0
 
+    def needs_gpu(name):
+        return bool(by_name[name].get("gpu"))
+
     remaining = [st["name"] for st in STAGES]
     alloc = {}                    # future -> (cpu, ram) committed to a stage
+    gpu_waiting = set()           # said once per stage, not once per round
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {}
         while (remaining or futures) and not failure:
@@ -9563,6 +12162,23 @@ def cmd_run(args):
                         f"{' '.join(unmet)} to the selection."))
                     continue
                 run_now.append(name)
+            # The GPU is not divisible the way the CPU and RAM budgets are, so
+            # it is leased rather than shared. A deferred stage stays in
+            # `remaining` and is reconsidered next round; it never occupies a
+            # worker while it waits.
+            held = [n for n in futures.values() if needs_gpu(n)]
+            run_now, waiting = gpu_lease(run_now, futures.values(), gpu_slots,
+                                         needs_gpu)
+            for name in waiting:
+                # Once per stage, not once per round: an enabled stage that has
+                # not started should be explained, not repeated at.
+                if name not in gpu_waiting:
+                    gpu_waiting.add(name)
+                    log(f"--- {name}: waiting for the GPU — "
+                        f"{', '.join(held) or 'another stage'} is using it "
+                        f"and gpu_workers is {gpu_slots}. It starts when that "
+                        "stage finishes; everything else carries on "
+                        "meanwhile.")
             # Dispatched only once every ready stage has been decided, so the
             # share each one gets is measured against the stages that really
             # start alongside it.
@@ -9633,6 +12249,9 @@ def cmd_run(args):
 
 
 def main():
+    # Before anything can log: a description carrying one U+FFFD used to be
+    # able to kill a multi-hour run on a cp1252 console.
+    configure_console_streams()
     ap = argparse.ArgumentParser(
         prog="metaannot",
         description="Single-file metaproteome functional annotation pipeline.",
