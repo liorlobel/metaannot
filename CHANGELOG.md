@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-09-08
+
+Isobaric quantification, a cross-source agreement check, and the removal of a
+stage that asked the user to do the work somewhere else. Validated on two real
+datasets: the UC antibiotics label-free run end to end (38,204 proteins, all
+sixteen applicable stages, report and R object built from it), and Pittsburgh
+ICB-melanoma FragPipe TMT (8 plexes, 455,571 proteins).
+
+`SIGNATURE_VERSION` stays at **1**. Nothing here changes what a *search* stage's
+output means, so a resumed run keeps its InterProScan, KOfam and ESMFold
+compute — which is the whole reason that number is not tied to `__version__`.
+
+**Upgrading from 0.2.0.** Three things to know:
+
+- **Re-run `foldseek` if you have results from 0.2.0.** The stage now asks for
+  `qtmscore` and `qlen`, and without them the TM gate silently falls back to
+  `alntmscore` — normalised by the alignment rather than the query, so a short
+  local match inside a long protein can pass. `finalise` detects the old
+  10-column table and says so, and unlike in 0.2.0 the advice now works. On the
+  UC run the stricter gate moved `3s_structure_only` from 246 to 141: **43% of
+  those calls were artefacts of the weaker gate.**
+- `finalise` will re-run by itself, because `toxin_fold_patterns` changed.
+  That is cheap and is what you want — the VFDB re-weighting and the repaired
+  `toxin_fold` both land there.
+- A config carrying `run.effectors`, `effector_predictions` or
+  `effector_prediction_weight` still loads. Those keys are named as removed,
+  with the reason, and `doctor` exits zero on them.
 
 ### Added
 
