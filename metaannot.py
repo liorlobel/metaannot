@@ -8153,8 +8153,18 @@ def gpu_lease(ready, running, slots, needs_gpu):
 
 
 def detect_ram_gb():
+    """Physical RAM in GB, or 0 when it cannot be determined.
+
+    Three probes, because no one of them covers the platforms this runs on.
+    sysconf works on Linux; macOS DEFINES _SC_PHYS_PAGES but sysconf returns
+    EINVAL for it, and Darwin has no /proc, so both of the first two fall
+    through there and the budget silently became 0 - meaning every stage ran
+    with no memory allocation at all on a Mac. hw.memsize is the Darwin answer.
+    """
     try:
-        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
+        pages = os.sysconf("SC_PHYS_PAGES")
+        if pages and pages > 0:
+            return int(os.sysconf("SC_PAGE_SIZE") * pages / 2**30)
     except (ValueError, OSError, AttributeError):
         pass
     try:
@@ -8164,6 +8174,37 @@ def detect_ram_gb():
                     return int(int(line.split()[1]) / 2**20)
     except OSError:
         pass
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                 capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip().isdigit():
+                return int(int(out.stdout.strip()) / 2**30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if os.name == "nt":
+        # The pipeline stages need POSIX, but doctor, report and object all run
+        # on Windows directly, and they read the same budget.
+        try:
+            import ctypes
+
+            class _MEMSTAT(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _MEMSTAT()
+            st.dwLength = ctypes.sizeof(_MEMSTAT)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys / 2**30)
+        except Exception:                                   # noqa: BLE001
+            pass
     return 0
 
 

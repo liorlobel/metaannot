@@ -689,3 +689,39 @@ def test_doctor_reads_a_suffixed_ram_budget_without_a_traceback(tmp_path):
     assert "Traceback" not in proc.stderr
     assert "could not read a memory size" in proc.stdout
     assert "== resources ==" in proc.stdout
+
+
+# ----------------------------------------------------------------------
+# RAM detection has to work on every platform the tool runs any part of
+# ----------------------------------------------------------------------
+def test_ram_detection_answers_on_this_platform(ma):
+    """It used to return 0 anywhere without /proc: macOS defines
+    _SC_PHYS_PAGES but sysconf returns EINVAL for it, and Darwin has no /proc,
+    so both probes fell through and the memory budget silently became 0 — every
+    stage then ran with no allocation at all. Windows has neither and runs
+    doctor, report and object directly."""
+    gb = ma.detect_ram_gb()
+    assert gb > 0, "no probe answered on this platform"
+    assert gb < 100_000, f"implausible: {gb} GB"
+
+
+def test_ram_detection_falls_back_rather_than_raising(ma, monkeypatch):
+    """Every probe failing must give 0, not a traceback: the caller treats 0 as
+    'could not detect' and asks the user for --ram."""
+    import builtins
+    # raising=False because os.sysconf does not exist on Windows at all, which
+    # is half the reason this function needed a third probe.
+    monkeypatch.setattr(ma.os, "sysconf",
+                        lambda *_: (_ for _ in ()).throw(OSError("nope")),
+                        raising=False)
+    monkeypatch.setattr(ma.sys, "platform", "sunos5")
+    monkeypatch.setattr(ma.os, "name", "posix")
+    real_open = builtins.open
+
+    def no_proc(path, *a, **k):
+        if str(path).startswith("/proc"):
+            raise OSError("no /proc here")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", no_proc)
+    assert ma.detect_ram_gb() == 0
