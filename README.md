@@ -1342,8 +1342,8 @@ wrapper, which collects stderr and quotes it only on failure.
 
 **On real data:** one label-free dataset, end to end — a FragPipe
 `combined_peptide.tsv` plus its `.fp-manifest` plus a precomputed eggNOG table,
-38,204 proteins, 122,278 features, 36 samples, 6 groups. Sixteen of the
-twenty-two stages ran on that input: `emapper` (reuse), `pfam`, `dbcan`,
+38,204 proteins, 122,278 features, 36 samples, 6 groups. Fifteen of the
+twenty-one stages ran on that input: `emapper` (reuse), `pfam`, `dbcan`,
 `diamond` over five databases (VFDB, MEROPS, CARD, TADB3, BAGEL4), `cluster`
 (MMseqs2), `ncbifam`, `kofam`, `interpro`, `signalp` (SignalP 6), `tmbed`,
 `esmfold`, `foldseek`, `integrate`, `finalise` and `join`.
