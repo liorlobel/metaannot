@@ -200,6 +200,22 @@ filter `integrate` applies to the hit table — filtering the table back down to
 the global threshold would have left the setting doing nothing. Each database
 searched at a threshold other than the headline one says so in the log.
 
+**`results/source_agreement.tsv`, and an `ncbifam_accs` column.** Coverage
+overlap and concordance are different questions, and the tool answered only the
+first. `finalise` now compares every pair of columns that shares an identifier
+namespace — Pfam by hmmsearch against Pfam inside InterProScan, the same for
+NCBIfam, eggNOG KOs against KOfamScan's, and Pfam names against eggNOG's —
+counting identical, overlapping and disjoint calls and recording which side is
+the superset when they differ. The report gains a section for it.
+
+The NCBIfam comparison was impossible before, because `ncbifam_hits` kept only
+family NAMES while InterProScan reports ACCESSIONS: comparing them scored 97.2%
+"conflict" between two searches of one library. The accession was in the
+`hmmsearch` tblout all along and was simply discarded; keeping it as
+`ncbifam_accs` turns that into 100% agreement over the same 12,677 proteins.
+A near-total disjoint rate is now reported as the namespace mismatch it almost
+always is, rather than as a finding.
+
 **`esmfold_vram_cap`, `esmfold_bytes_per_residue_pair`, `esmfold_vram_reserve_gb`.**
 The fold work-list is now capped by the VRAM actually free once the weights are
 resident, not only by the fixed `max_len_structure`. ESMFold does not raise an

@@ -1264,6 +1264,9 @@ class Paths:
         self.fold_clusters = f"{R}/foldseek/fold_clusters.tsv"
         self.final = f"{R}/annotation_final.tsv"
         self.summary = f"{R}/bin_summary.tsv"
+        # Whether the evidence sources that reach the same protein agree
+        # about it, which coverage numbers alone cannot say.
+        self.agreement = f"{R}/source_agreement.tsv"
         self.quant_dir = f"{R}/quant"
         self.ncbifam = f"{R}/hmm/ncbifam.tblout"
         # Cache of NAME/ACC -> DESC read out of the NCBIfam HMM library. The
@@ -3523,11 +3526,24 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # exists to prevent. hmmsearch --tblout reports the description of the
     # TARGET (our protein), never of the query HMM, so the family DESC has to
     # come from the library itself.
-    df["ncbifam_hits"], df["ncbifam_uninformative"] = "", False
+    df["ncbifam_hits"] = ""
+    df["ncbifam_accs"] = ""
+    df["ncbifam_uninformative"] = False
     if os.path.exists(p.ncbifam):
         nf = parse_hmm_tblout(p.ncbifam)
         df["ncbifam_hits"] = from_dict(
             {k: ";".join(sorted({h[0] for h in v})) for k, v in nf.items()}, idx)
+        # The accession, kept for the same reason pfam_accs is. Without it the
+        # only record of an NCBIfam call is its family NAME, and a name cannot
+        # be matched against InterProScan's NCBIfam member database, which
+        # reports accessions - so two searches of the SAME library looked 97%
+        # discordant when they in fact agreed. The tblout already carried it;
+        # this column just stops throwing it away. Version suffix stripped, as
+        # for Pfam, so NF033709.1 and NF033709 are one family.
+        df["ncbifam_accs"] = from_dict(
+            {k: ";".join(sorted({h[1].split(".")[0] for h in v
+                                 if h[1] and h[1] != "-"}))
+             for k, v in nf.items()}, idx)
         if nf and not cfg.get("ncbifam_uninformative_test", True):
             log("ncbifam_uninformative_test is off: every NCBIfam hit counts "
                 "as sequence annotation, including 'hypothetical protein' "
@@ -4182,12 +4198,166 @@ def stage_integrate_final(cfg, p):
     with atomic_out(p.final) as tmp:
         df.to_csv(tmp, sep="\t")
     write_summary(df, p.summary)
+    write_source_agreement(df, p.agreement)
     log(f"wrote {p.final}")
 
 
 # ======================================================================
 # stage: structure
 # ======================================================================
+# Pairs of columns that live in the SAME identifier namespace, and can
+# therefore be compared directly rather than merely counted together. Each
+# entry is (label, how to read side A, how to read side B, what it tests).
+# A tuple ("interpro_sigs", "Pfam") means "the Pfam: entries inside
+# interpro_sigs"; a bare string is a whole column.
+AGREEMENT_PAIRS = [
+    ("pfam: hmmsearch vs interproscan",
+     "pfam_accs", ("interpro_sigs", "Pfam"),
+     "the same Pfam-A library searched by two implementations"),
+    ("ncbifam: hmmsearch vs interproscan",
+     "ncbifam_accs", ("interpro_sigs", "NCBIfam"),
+     "the same NCBIfam library searched by two implementations"),
+    ("ko: eggnog vs kofamscan",
+     "ko", "kofam_ko",
+     "orthology by DIAMOND search against orthology by per-family HMM"),
+    ("pfam names: hmmsearch vs eggnog",
+     "pfam_hits", "pfams_emapper",
+     "domains found directly against domains carried by the eggNOG ortholog"),
+]
+
+
+def _agreement_sets(df, spec):
+    """One column, or one member database inside interpro_sigs, as id sets.
+
+    Version suffixes are dropped and the `ko:` prefix eggNOG writes is
+    stripped, because an identifier that differs only in its decoration is the
+    same identifier and counting it as a disagreement would be an artefact of
+    formatting rather than a finding.
+    """
+    if isinstance(spec, tuple):
+        col, prefix = spec
+        if col not in df.columns:
+            return None
+        pref = prefix + ":"
+
+        def read(v):
+            if not isinstance(v, str) or not v.strip():
+                return frozenset()
+            return frozenset(x.strip()[len(pref):].split(".")[0]
+                             for x in v.split(";")
+                             if x.strip().startswith(pref))
+        return df[col].map(read)
+    if spec not in df.columns:
+        return None
+
+    def read(v):
+        if not isinstance(v, str) or not v.strip():
+            return frozenset()
+        out = set()
+        for x in re.split(r"[;,]", v):
+            x = x.strip()
+            if x.lower().startswith("ko:"):
+                x = x[3:]
+            x = x.split(".")[0]
+            if x and x != "-":
+                out.add(x)
+        return frozenset(out)
+    return df[spec].map(read)
+
+
+def source_agreement(df):
+    """Do the sources that reach the same protein AGREE about it?
+
+    Coverage overlap and concordance are different questions, and only the
+    second one tells you whether the evidence is corroborated. Two searches of
+    the same library reaching 34,000 proteins in common says nothing until you
+    ask whether they name the same families. This computes that, per pair.
+
+    The distinction that matters most in the output is `disjoint`: both sides
+    called something and they share nothing. A handful of those is ordinary
+    (a paralogue boundary, a threshold near a family edge). A rate near 100%
+    is almost never real disagreement - it means the two columns are in
+    different namespaces and nothing is being compared at all. That is not
+    hypothetical: NCBIfam family NAMES were being compared against
+    InterProScan NCBIfam ACCESSIONS, which read as 97% conflict between two
+    searches of one library that in fact agreed.
+    """
+    rows = []
+    for label, aspec, bspec, about in AGREEMENT_PAIRS:
+        a, b = _agreement_sets(df, aspec), _agreement_sets(df, bspec)
+        if a is None or b is None:
+            continue
+        ha, hb = a.map(bool), b.map(bool)
+        both = ha & hb
+        n = int(both.sum())
+        if not n:
+            continue
+        ident = part = disj = a_sup = b_sup = mutual = 0
+        for x, y in zip(a[both], b[both]):
+            if x == y:
+                ident += 1
+            elif x & y:
+                part += 1
+                if x > y:
+                    a_sup += 1
+                elif x < y:
+                    b_sup += 1
+                else:
+                    mutual += 1
+            else:
+                disj += 1
+        rows.append(dict(
+            comparison=label, tests=about,
+            a=aspec if isinstance(aspec, str) else ":".join(aspec),
+            b=bspec if isinstance(bspec, str) else ":".join(bspec),
+            a_only=int((ha & ~hb).sum()), b_only=int((hb & ~ha).sum()),
+            both=n, identical=ident, overlapping=part, disjoint=disj,
+            a_superset=a_sup, b_superset=b_sup, mutually_exclusive=mutual,
+            pct_agree=round(100.0 * (ident + part) / n, 1),
+            pct_disjoint=round(100.0 * disj / n, 1)))
+    return pd.DataFrame(rows)
+
+
+def write_source_agreement(df, path):
+    """Write the concordance table and say what it found."""
+    tab = source_agreement(df)
+    cols = ["comparison", "tests", "a", "b", "a_only", "b_only", "both",
+            "identical", "overlapping", "disjoint", "a_superset",
+            "b_superset", "mutually_exclusive", "pct_agree", "pct_disjoint"]
+    if tab.empty:
+        # Written anyway, with its header. "No two sources here share a
+        # namespace" is a real answer, and a declared output that is only
+        # sometimes created makes the stage look unfinished and rerun forever.
+        tab = pd.DataFrame(columns=cols)
+    with atomic_out(path) as tmp:
+        tab.to_csv(tmp, sep="	", index=False)
+    if tab.empty:
+        log("agreement | no two sources share an identifier namespace in this "
+            f"run, so there is nothing to cross-check; wrote {path} empty")
+        return
+    for _, r in tab.iterrows():
+        line = (f"agreement | {r['comparison']}: {r['both']} protein(s) called "
+                f"by both, {r['pct_agree']}% agree "
+                f"({r['identical']} identical, {r['overlapping']} overlapping), "
+                f"{r['disjoint']} disjoint")
+        # Near-total disjointness between two views of one library is a
+        # namespace mismatch far more often than it is a real disagreement,
+        # so say which it looks like rather than reporting a number that
+        # invites the wrong conclusion.
+        if r["both"] >= 50 and r["pct_disjoint"] >= 90:
+            log(f"{line}. {r['pct_disjoint']}% disjoint between two views of "
+                f"{r['tests']} is not a credible rate of real disagreement - "
+                f"check that {r['a']} and {r['b']} carry the same kind of "
+                "identifier (names against accessions compare as total "
+                "conflict)", "WARN")
+        elif r["pct_disjoint"] >= 20:
+            log(line + " — high enough to be worth reading before trusting "
+                "either source alone", "WARN")
+        else:
+            log(line)
+    log(f"wrote {path}")
+
+
 def mean_plddt(pdb_text):
     """Mean CA B-factor of an ESMFold model, which is where it stores pLDDT.
     None when the model carries no CA atoms."""
@@ -7990,7 +8160,8 @@ STAGES = [
                "thresholds.foldseek_cluster_tmscore",
                "thresholds.foldseek_cluster_coverage"],
          deps=['esmfold'], fn=stage_foldseek),
-    dict(name="finalise", enabled=None, out=lambda p: [p.final, p.summary],
+    dict(name="finalise", enabled=None,
+         out=lambda p: [p.final, p.summary, p.agreement],
          inp=lambda c, p: [p.pass1, p.foldseek, p.context, p.fold_clusters,
                            p.ncbifam, p.kofam, p.interpro, p.effectors,
                            p.hhr_done, p.jackhmmer],
@@ -9340,6 +9511,54 @@ if (all(is.na(src)) || all(src == "", na.rm = TRUE)) {
           scale_y_continuous(labels = function(x) paste0(100 * x, "%")) +
           labs(x = NULL, y = NULL, fill = NULL, title = "KO provenance by bin") +
           theme(axis.text.x = element_text(angle = 25, hjust = 1)))
+}
+```
+
+## Do the sources agree, or merely overlap?
+
+Two sources reaching the same protein is not the same as the two of them
+agreeing about it, and only the second tells you the evidence is corroborated.
+Each row below compares a pair that shares an identifier namespace, so the
+comparison is between the calls themselves rather than between coverage counts.
+
+Read `disjoint` first: both sides called something and they share nothing. A
+few of those are ordinary — a paralogue boundary, a threshold near the edge of
+a family. A rate near 100% is almost never real disagreement; it means the two
+columns hold different kinds of identifier and nothing is being compared.
+
+```{r source-agreement}
+ag_path <- file.path(RD, "source_agreement.tsv")
+agree <- if (file.exists(ag_path)) read_tsv_full(ag_path) else NULL
+if (is.null(agree) || nrow(agree) == 0) {
+  note(paste("no two sources in this run share an identifier namespace,",
+             "so none of them can be cross-checked against another"))
+} else {
+  print(agree[, c("comparison", "both", "identical", "overlapping",
+                  "disjoint", "pct_agree")])
+  for (i in seq_len(nrow(agree))) {
+    r <- agree[i, ]
+    if (as.integer(r$both) >= 50 && r$pct_disjoint >= 90) {
+      gate(paste("%s: %.1f%% disjoint. That is not a credible rate of real",
+                 "disagreement between two views of %s -- check that %s and %s",
+                 "carry the same kind of identifier"),
+           r$comparison, r$pct_disjoint, r$tests, r$a, r$b)
+    } else if (r$pct_disjoint >= 20) {
+      gate("%s: %.1f%% of shared calls disagree outright; read those before trusting either source alone",
+           r$comparison, r$pct_disjoint)
+    } else {
+      # note() is itself a sprintf wrapper, so pre-formatting here would
+      # format twice and the % in "97.4% agree" would have no argument left.
+      note("%s: %.1f%% agree over %d shared protein(s)",
+           r$comparison, r$pct_agree, as.integer(r$both))
+    }
+  }
+  one_sided <- agree[agree$overlapping > 0 &
+                     (agree$a_superset == agree$overlapping |
+                      agree$b_superset == agree$overlapping), , drop = FALSE]
+  if (nrow(one_sided))
+    note(paste("where the two differ, one side is consistently the more",
+               "sensitive rather than the two contradicting each other:",
+               paste(one_sided$comparison, collapse = "; ")))
 }
 ```
 
