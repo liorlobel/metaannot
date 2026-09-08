@@ -56,11 +56,11 @@ exactly the Rmd's params, so `fdrr: 0.01` is reported rather than written into
 the Rmd header as a spurious param while `fdr: 0.05` stays quietly in force.
 Read the `== config ==` block of `doctor` before a run you intend to publish.
 
-Do not paste a second top-level `run:` or `db:` key into a config that already
-has one. `yaml.safe_load` keeps only the last mapping with a given key, so the
-earlier block is discarded, every setting in it reverts to the default, and the
-key check cannot see it because the dict has already collapsed. Edit the
-existing block instead.
+A second top-level `run:` or `db:` key in a config that already has one is
+refused. YAML itself would retain only the later mapping and silently throw the
+earlier block away, so `load_config` installs a no-duplicate loader: the run
+exits naming the duplicate key and both line numbers instead. Merge the two
+into a single block.
 
 Requires python3 + pandas + pyyaml. R is needed only for the report; external
 tools only by the stages that use them. `doctor` says which are missing.
@@ -68,9 +68,18 @@ tools only by the stages that use them. `doctor` says which are missing.
 ## Tests
 
 ```bash
-pip install pytest && pytest -q          # about 100 seconds
+pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
+
+A healthy default run is about **589 passed, 35 skipped, 8 xfailed, 33
+deselected**, in two to four minutes depending on the machine. On Windows four
+of those come back as failures instead: a path test asserting forward slashes,
+a `doctor --fix` recipe emitting `mkdir -p`, a SIGINT test, and stale-lock
+reclamation, which `_holder_is_alive` deliberately disables on Windows because
+`os.kill(pid, 0)` there calls `TerminateProcess` — asking whether the holder is
+alive would kill it. All four are POSIX assumptions in the tests, not defects
+in the tool.
 
 Offline, and needs none of the external tools: where a stage shells out to
 hmmsearch, DIAMOND or MMseqs2 the binary is a stub on `PATH` that writes a
@@ -83,7 +92,12 @@ Each test is named for the defect it protects against and carries a one-line
 comment stating the symptom, because most of them exist to stop something
 coming back rather than to describe an intended feature. A handful are
 `xfail(strict)`: those name guards that are still missing, so a fix turns them
-green instead of being forgotten.
+green instead of being forgotten — and because they are strict, a fix that
+lands without removing the marker fails the suite rather than passing quietly.
+The ones open today are live defects the tool documents rather than hides: an
+`annotation_pass1.tsv` that is not reproducible across a resume, a Unipept
+lineage truncated at the first blank rank, and a `pept2lca` file matching
+nothing dying with a bare `'verdict'`.
 
 ## A worked example
 
@@ -92,8 +106,10 @@ server: eight configs plus a four-step runbook (`subset` → `doctor` → run in
 collect). Its paths and dataset names are one lab's, so it is a template rather than
 something to run as-is, but it is the shape of a multi-dataset run and it records the
 decisions such a run has to make — which stages are on and *why each of the others is
-off*, why `min_features_per_protein` is left at 1, what the identifier check found before
-anything long started, and what the whole thing is expected to cost.
+off*, why `min_features_per_protein` is left at 1, which three things to check before
+anything long starts (the tool version on the server, the mount point every
+path assumes, and the database paths that are inferred rather than confirmed),
+and what the whole thing is expected to cost.
 
 ## Start from a FragPipe manifest
 
@@ -111,8 +127,13 @@ derives the pairwise contrasts. Nothing else is hand-written.
 It tries `experiment_bioreplicate`, then `experiment`, then the file basename
 against the quant columns, and `doctor` reports whether every manifest run
 matched a quant column before a long run rather than failing after one, listing
-up to five unmatched runs and four candidate columns. It does not print the
-full mapping.
+up to five unmatched runs and, separately, up to four quant columns that no
+manifest row claims. It does not print the full mapping.
+
+The manifest is also the sample list, not just a rename table. A quant column
+that no manifest row claims is **dropped**, so a run left out of the manifest
+is a sample left out of the results — which is why `doctor` reports that second
+list before anything long starts.
 
 **A manifest is one row per raw file, not per sample.** A fractionated
 acquisition therefore repeats a sample name across its fraction rows — which is
@@ -163,9 +184,23 @@ Every identified protein is binned on the evidence that actually exists for it:
 | `2_ko_orphan` | KO, but no specific pathway map |
 | `3_annotated_no_ko` | no KO; informative Pfam (hmmsearch **or** eggNOG's own `PFAMs`) / NCBIfam / InterPro / CAZy / dbCAN / VFDB / MEROPS / CARD / TADB / BAGEL |
 | `3d_duf_only` | no KO; only domain evidence is a DUF |
-| `3p_profile_only` | rescued by profile-profile or iterative profile search |
-| `3s_structure_only` | no sequence annotation; confident Foldseek hit |
+| `3s_structure_only` | no KO and no sequence annotation; confident Foldseek hit to a target that is itself described |
+| `3p_profile_only` | no KO, no sequence annotation, no DUF and no fold; only a remote HHblits/jackhmmer profile hit, and only where the hit's target is not itself uncharacterised |
 | `4_dark` | no evidence |
+
+**A hit to an uncharacterised target is not a rescue.** `3s_structure_only` and
+`3p_profile_only` need more than a hit that clears the thresholds — the
+target's *description* has to say something. A description matching `^DUF\d`,
+`^UPF\d`, `unknown function`, `uncharacteri…`, `hypothetical`, `family not
+named`, `predicted protein` or `putative protein` (case-insensitive; the same
+test that decides whether a Pfam or NCBIfam hit is informative) is demoted: the
+protein keeps its `foldseek_*` / `hh_*` columns but stays in `4_dark`, or in
+`3d_duf_only` if it has a DUF. The run logs the count as a single WARN over
+both sources, so quote it next to any 3s/3p number. One exemption, which can
+only shrink the rescue claim rather than inflate it: an **empty** description
+keeps its evidence, so a bare AlphaFold accession is not demoted — on the
+default AFDB50 target the demotion therefore fires rarely, for want of any text
+to test.
 
 That is the complete set; `annotation_final.tsv`, `bin_summary.tsv` and the
 report's factor levels use exactly these seven strings. The tests are applied in
@@ -175,9 +210,12 @@ DUF-only protein stays in `3d_duf_only` however good its fold or profile hit is
 held back so the 3s/3p rescue numbers are read with that in mind.
 
 **eggNOG's own `PFAMs` column counts as domain evidence.** Binning on the
-`pfam` stage's `hmmsearch` hits alone meant that with `run.pfam: false` a
-protein eggNOG had already assigned a domain to was reported as having no
-evidence; on the UC metaproteome that was 36% of the dark bin. An eggNOG Pfam
+`pfam` stage's `hmmsearch` hits alone meant that with `run. On an early eggNOG-only pass of the UC
+metaproteome — before the search stages were run, so not the completed UC run
+quoted later in this file — 6,271 of 17,377 dark proteins (36%) carried an
+eggNOG Pfam: the dark bin was inflated by a missing join rather than by
+biology. The fix is in, so that figure is a record of the defect rather than
+something a current run reproduces; in the completed UC run `4_dark` is 3.8%. An eggNOG Pfam
 whose only accession is a DUF/UPF lands the protein in `3d_duf_only` rather than
 `3_annotated_no_ko`, on the same rule as an `hmmsearch` DUF. So expect a smaller
 `4_dark` than earlier versions of this tool produced, for a join reason rather
@@ -198,13 +236,17 @@ emapper → pfam → dbcan → diamond → signalp → tmbed → cluster
         → finalise → unipept → taxonomy → join
 ```
 
-A fresh `init` config turns on **six** of them: `eggnog`, `pfam`, `dbcan`,
-`diamond`, `cluster` and `join`. `integrate` and `finalise` have no flag and
-always run. Everything else is **off** — `topology` (SignalP 6 + TMbed),
-`structure` (ESMFold + Foldseek), `context`, `ncbifam`, `kofam`, `interpro`,
-`hhblits`, `jackhmmer`, `smorf`, `effectors`, `unipept`, `taxonomy` — because
-switching each on is a decision about hardware, a licence or a large database
-that is not ours to make for you.
+A fresh `init` config turns on **six** `run:` flags: `eggnog` (which runs the
+`emapper` stage), `pfam`, `dbcan`, `diamond`, `cluster` and `join`. `integrate`
+and `finalise` have no flag and always run. Everything else is **off** —
+`topology` (the `signalp` and `tmbed` stages), `structure` (`esmfold` and
+`foldseek`), `context`, `ncbifam`, `kofam`, `interpro`, `hhblits`, `jackhmmer`,
+`smorf`, `unipept`, `taxonomy` — because switching each on is a decision about
+hardware, a licence or a large database that is not ours to make for you.
+
+`--only` and `--from` take **stage** names, not `run:` flag names: `--only
+signalp` works, `--only topology` does not. Naming a stage that its flag has
+disabled runs it anyway, which is the point of the option.
 
 So `python metaannot.py all` on a fresh config still needs Pfam-A, the dbCAN
 HMMs, the DIAMOND databases and either eggNOG-mapper or an
@@ -214,8 +256,18 @@ stages you left enabled.
 
 ### Added evidence
 
-- **`ncbifam`** — NCBIfam/TIGRFAM HMMs. Cheapest coverage gain: one more
-  `hmmsearch`.
+- **`ncbifam`** — NCBIfam/TIGRFAM HMMs. The stage itself is one more
+  `hmmsearch` (`thresholds.ncbifam_cutoff`, default `--cut_tc`), so it is the
+  cheapest coverage gain here — but it is not only a coverage gain. `integrate`
+  reads each family's `DESC` out of `db.ncbifam_hmm` itself and caches it,
+  because `hmmsearch --tblout` records the description of the *target* protein
+  and never of the query HMM. A protein whose NCBIfam families **all** describe
+  nothing — DUF, UPF, hypothetical, uncharacterised — is marked
+  `ncbifam_uninformative` and does not leave `4_dark` on that evidence, the
+  same test the Pfam DUF rule applies. Set `ncbifam_uninformative_test: false`
+  to count every hit as annotation. The accession is kept alongside the family
+  name as `ncbifam_accs`, which is what makes the call comparable with
+  InterProScan's NCBIfam member database.
 - **`kofam`** — KOfamScan. A *control*, not just coverage. eggNOG assigns KOs
   by DIAMOND search; KOfam uses per-family HMMs with adaptive thresholds. The
   run reports how many proteins KOfam rescues from the KO-less bins and how
@@ -230,9 +282,14 @@ stages you left enabled.
 - **`hhblits` / `jackhmmer`** — profile-profile and iterative profile search,
   run on the unannotated bins only. This is the real answer to "more sensitive
   than BLAST"; a hit creates the `3p_profile_only` bin. BLASTp is not included.
-  Note what that leaves: the DIAMOND stage searches targeted databases only
-  (VFDB, MEROPS, CARD, TADB, BAGEL) with `--max-target-seqs 5`, so it is not a
-  general homology search. The only general-reference search here is
+  Note what that leaves: with the default configuration the DIAMOND stage
+  searches only the targeted databases listed under `db.diamond` (VFDB, MEROPS,
+  CARD, TADB, BAGEL) with `--max-target-seqs 5`, so it is not a general
+  homology search. `db.diamond` is free-form — add a tag and the stage searches
+  it, and `integrate` picks it up by globbing `results/diamond/*.tsv` with no
+  code change. A tag with no matching `diamond_weights` entry still counts as
+  annotation, so it can lift a protein out of `4_dark` while contributing
+  nothing to the export score, and the run warns when that happens. The only general-reference search here is
   `jackhmmer` against UniRef50, which is off by default and must be enabled
   explicitly.
 - **`context`** — genomic neighbourhood. Needs a `gff` whose identifiers match
@@ -243,19 +300,27 @@ stages you left enabled.
   `contigs_fna`. Note the direction: this produces ORFs that must be **added
   to the search database and the MS data re-searched**. Nothing on the annotation side recovers peptides that
   were never in the search space.
-- **`effectors`** — ingest for Bastion3/4/6, EffectiveDB, T4SEpp, SecretomeP.
-  One generic reader (`{file, id_col, score_col, threshold}` — there is no
-  per-predictor `weight`; every predictor over threshold contributes a flat
-  `effector_prediction_weight`) rather than five bespoke parsers for tools
-  that are web services. Matters because many
-  bacterial effectors have no signal peptide and the `surface_or_secreted`
-  filter misses them.
 
 Foldseek now searches several targets (`foldseek_extra_targets` — PDB and
 Swiss-Prot carry far better annotation than mostly-unreviewed AFDB50) and
 clusters the unannotated structures **against each other**. Fifty dark
 proteins sharing a fold is a much stronger signal than fifty singletons, and
 needs no reference database.
+
+Both halves run on a **pLDDT-gated subset** of those structures.
+`thresholds.esmfold_min_plddt` (default 70) is applied *before* the search: a
+45-pLDDT model of a short dark ORF matching a fold at TM 0.5 is noise, and a
+hit here is what promotes a protein out of `4_dark` into `3s_structure_only`,
+so low-confidence models are never searched rather than filtered afterwards.
+Survivors are linked into `{results}/foldseek/query_hq` and the log says how
+many of how many passed. On the real UC run that was 993 of 1,821.
+
+The search asks for `qtmscore` and `qlen`, not only `alntmscore`. That matters:
+`alntmscore` is normalised by the *alignment*, so a 40-residue local match
+inside a 300-residue query can score 0.6 while the two proteins share almost no
+fold. A Foldseek build too old to report the query-normalised score falls back
+to the legacy columns and says so — the gate then loosens, and the run tells
+you it has.
 
 The context stage also detects polysaccharide utilisation loci: several
 CAZymes plus a SusC/SusD-like importer in one neighbourhood. That is what
@@ -288,9 +353,19 @@ still discards everything, which on a real dataset is days of compute.
 | `fragpipe_tmt` | FragPipe **TMT**: the per-plex `TMTn/` directories (`quant_table` is the run directory, not a file) |
 
 Every route above except `fragpipe_tmt` is **label-free (MS1) quantification**,
-and every quant input is treated as linear intensity — reporter intensities
-included, which is why the per-plex tables and not `tmt-report/` are what
-`fragpipe_tmt` reads.
+and everything downstream — the roll-up, the taxon sums, the size factor, the
+log2 step — works on **linear** intensity. Most routes supply it directly. The
+two `dataProcess()` routes need a word: `msstats_protein` reads
+`LogIntensities` (or `ABUNDANCE`), which is log2, and de-logs it silently —
+MSstats' own normalisation is baked into those values and survives the
+transform, so your numbers are normalised whether or not you wanted that.
+`msstats_feature` prefers `INTENSITY` when the file has it; that column is raw,
+linear and *not* normalised, so `dataProcess()`'s normalisation is absent from
+the run. Only when `INTENSITY` is missing does it fall back to `ABUNDANCE`,
+de-log it and warn. Which column your export carries therefore decides whether
+MSstats' normalisation is in your numbers, and there is no key to override the
+choice. Reporter intensities are linear too, which is why the per-plex tables
+and not `tmt-report/` are what `fragpipe_tmt` reads.
 
 FragPipe writes `0` for "not quantified", not for "measured as zero", so zeros
 in a `fragpipe`/`fragpipe_peptide`/`fragpipe_ion` table are read as **missing**
@@ -655,11 +730,29 @@ database, so `peptide_assignment` is explicit:
   of one organism still quantifies that organism; one shared across taxa
   quantifies neither. A candidate with **no** taxonomy makes a feature
   `shared_unknown_taxon`, never taxon-unique.
+- `taxon_or_family_unique` — as `taxon_unique`, plus features whose candidates
+  cannot be compared by taxon at all because at least one has none, but which
+  all share one MMseqs `family_id`. A family is a sequence cluster at
+  `cluster_min_seq_id`, **not** an organism, so the intensity is attributed to
+  one representative of the cluster. Opt-in only: it needs `run.cluster` on —
+  metaannot refuses the mode if `family_id` is missing, and refuses again if no
+  family has more than one member, since with the cluster stage off every
+  family is a singleton and the rule could never fire. Those features are
+  recorded as their own `family_unique` class and the run logs the count, as a
+  WARN when any feature was kept that way and INFO when none. It does not
+  rescue features whose candidates resolve to two *different* taxa; those stay
+  `shared` and are dropped.
 - `razor` — FragPipe's own behaviour. Arbitrary here; useful for measuring how
   much it changes the answer.
 
-`peptide_evidence.tsv` records per protein how many features were unique,
-taxon-unique and dropped.
+`peptide_evidence.tsv` has one row per protein and nine columns:
+`protein_id`, `n_features_used`, `n_unique`, `n_taxon_unique`,
+`n_family_unique`, `n_features_dropped`, `taxon_unique_dominated`,
+`rollup_method` and `peptide_assignment`. The last two record how the numbers
+were made, because a `sum` run and a `median_polish` run are otherwise
+indistinguishable once the log is gone. `taxon_unique_dominated` flags proteins
+resting more on shared-but-taxon-unique features than on their own unique ones
+— the ones whose intensity is most sensitive to the assignment rule you chose.
 
 MSstats-format inputs carry only the razor protein per feature, so
 shared-peptide filtering is unavailable from them; metaannot says so.
@@ -686,7 +779,7 @@ unipept.ugent.be web export is **not** an accepted input: it is name-based and
 lacks the taxid columns entirely.
 
 Set these inside the blocks your config already has — do not paste a second
-top-level `run:` or `db:` key (see above; YAML keeps only the last one):
+top-level `run:` or `db:` key (see above; a duplicate key is refused):
 
 ```yaml
 run:                              # in the existing run: block
@@ -694,18 +787,29 @@ run:                              # in the existing run: block
   taxonomy: true
 unipept: {result: "pept2lca.csv", split_missed_cleavages: true}
 db:                               # in the existing db: block
-  ncbi_taxonomy: "/data/db/taxdump"          # nodes.dmp + names.dmp
+  ncbi_taxonomy: "/data/db/taxdump"          # nodes/names/merged/delnodes.dmp
 taxonomy_source: "concordant"                # eggnog | unipept | concordant
 ```
 
 Per protein the consensus is the deepest rank where a majority of its peptides
 agree — not the LCA of the LCAs, which one spurious peptide would drag to the
 root. `concordant` keeps a taxon only where **both** methods produced a taxid
-and agreed at genus or below. Proteins where either method simply had no answer
-(`unipept_missing`, `eggnog_missing`, an unresolved or merged taxid, no peptide
-LCA, or fewer than `consensus_min_peptides` peptides) are blanked as well, not
-only those that disagree, so the taxon-based steps can cover far fewer proteins
-than you expect. Check the verdict counts in `taxonomy_comparison.tsv`.
+and either the two taxids are the same (verdict `identical`, which is bare
+taxid equality — no rank test is applied to it) or their lineages agree down to
+genus or species (`concordant`). Everything else is blanked, not only the
+disagreements: `unipept_missing`, `eggnog_missing`, a seed taxid that resolves
+to nothing even after `merged.dmp` (`eggnog_unresolved` — a taxid that merely
+*merged* is followed to its current node and compared normally),
+`concordant_above_genus`, `no_common_rank`, no peptide LCA, or fewer than
+`consensus_min_peptides` peptides. So the taxon-based steps can cover far fewer
+proteins than you expect.
+
+`db.ncbi_taxonomy` is not optional for this, even though it defaults to empty.
+Without a taxdump there is no lineage to compare and every verdict collapses to
+`identical` or `differ_no_lineage`, so `concordant` degrades to exact taxid
+identity and blanks everything else — including the cases it exists to keep,
+such as eggNOG *E. faecalis* against a Unipept LCA of genus *Enterococcus*. The
+run only WARNs. Check the verdict counts in `taxonomy_comparison.tsv`.
 
 ## Databases
 
@@ -715,13 +819,28 @@ diamond makedb --in VFDB_setA_pro.fas -d /data/db/vfdb_core     # and MEROPS, CA
 foldseek databases Alphafold/UniProt50 /data/db/foldseek/afdb50 tmp
 ```
 
-To disable a default DIAMOND database, set its value to an **empty string**
-(`merops: ""`). Deleting the key has no effect — the defaults are merged back
-in and keep pointing at `/data/db/*.dmnd` — and `merops: null` reaches
-`os.path.exists(None)` in the diamond stage and raises a TypeError. `doctor`
-still lists a disabled database as `MANUAL: no path configured`. Give each
-database you do keep an entry in `diamond_weights` or it scores 0 and the run
-warns.
+`db.diamond` and `sources.diamond` **replace** the built-in defaults rather
+than merging into them. Whatever you write under `db.diamond` is the complete
+list for the run, and the run names what you dropped:
+
+```
+WARN config: db.diamond lists ['vfdb'], so the default entries
+     ['bagel', 'card', 'merops', 'tadb'] are NOT used
+```
+
+So to drop one database, **list the ones you keep**. Setting an entry to `""`
+or `null` also drops it, silently, before any stage or `doctor` sees it — but
+only within the block you supply. Writing a block whose only key is
+`merops: ""` therefore leaves **no** DIAMOND databases at all: merops is
+dropped as falsy and the other four were never merged back in. The run does not
+fail; the stage logs `no diamond databases configured, nothing to do` and
+`annotation_final.tsv` comes out with no virulence, protease, AMR,
+toxin-antitoxin or bacteriocin evidence — indistinguishable from a real
+absence. A database dropped either way does not appear in `doctor` at all; it
+is **not** reported as `MANUAL: no path configured`.
+
+Give each database you do keep an entry in `diamond_weights` or it scores 0 and
+the run warns.
 
 ### A database that cannot hit
 
@@ -759,9 +878,14 @@ run logs each database that is searched at a threshold other than the headline
 one. The estimate behind the warning uses DIAMOND's own BLOSUM62 constants
 (Lambda 0.267, K 0.041) against a perfect self-match, so it fires only when a
 hit is essentially impossible, not merely unlikely. The typical sequence length
-comes from `diamond dbinfo`; when diamond is not installed it falls back to a
-source FASTA beside the database or named in `sources.diamond`, and when
-neither is available it says the length is unknown rather than guessing one.
+comes from `diamond dbinfo`, which reports Sequences and Letters, so the length
+it yields is the **mean**. Whenever dbinfo cannot answer — diamond is not
+installed, the call fails, or the `.dmnd` is too old to report those fields —
+the check falls back to a source FASTA beside the database or named in
+`sources.diamond`, and when neither is available it says the length is unknown
+rather than guessing one. A mean hides the distribution, so a database of
+mostly-long sequences with a short tail can pass this check while its short
+entries remain unreachable at the configured threshold.
 
 ## The R object
 
@@ -779,11 +903,24 @@ qf                                     # peptides -> proteins
 assay(qf, "proteins")                  # intensities, proteins x samples
 rowData(qf[["proteins"]])$bin          # annotation evidence bin
 rowData(qf[["proteins"]])$effector_score
-rowData(qf[["peptides"]])$assignment_class  # unique / taxon_unique / shared
-colData(qf)                            # the design, from your manifest
+rowData(qf[["peptides"]])$assignment_class  # five values, see below
+colData(qf)                            # the design in quant/design_from_input.tsv
 metadata(qf)$taxon_size_factors
 metadata(qf)$normalisation_risk
 ```
+
+`assignment_class` takes five values: `unique`, `taxon_unique`,
+`family_unique`, `shared` and `shared_unknown_taxon`. `family_unique` appears
+only under `peptide_assignment: taxon_or_family_unique`, where a feature whose
+candidates could not be compared by taxon was kept because they all share one
+MMseqs `family_id` — a sequence cluster, not an organism.
+
+`colData` is read from `results/quant/design_from_input.tsv` and from nothing
+else: the manifest for a label-free FragPipe or DIA-NN run, `Condition` and
+`BioReplicate` off the long table for the MSstats formats, and `sample`, `plex`
+and `channel` for `fragpipe_tmt` — plus `group` only when it could be derived,
+which for TMT usually means it comes from `analysis.metadata` at report time
+rather than from the input.
 
 The link between the assays records the assignment metaannot actually made,
 not one re-derived in R, so the shared-peptide decisions stay inspectable
@@ -807,13 +944,30 @@ problem; the object then carries a protein assay only.
 `metaannot.py report` writes the Rmd into `results/analysis/` with its params
 filled in from the config, then renders it if `Rscript` is available. Two
 models are fitted: protein abundance, and abundance relative to the source
-organism. The taxon reference is the median of ratios across **all** proteins
-assigned to that taxon, the protein being tested included, so a taxon carried
-by only a few proteins partly regresses against itself. Below
-`taxon_min_proteins_for_factor` proteins the factor degrades to a plain sum and
-is not trustworthy — treat calls for taxa with fewer than about six proteins as
-provisional. Note that this Python threshold and the R usability threshold
-`analysis.taxon_min_proteins` are separate keys and are not kept in step.
+organism. The taxon reference is a median of ratios, not a sum, and it is
+DESeq2's: the per-protein reference is the mean across samples computed over
+the taxon's proteins observed in **every** sample, and the median is taken over
+those same complete-case proteins, so the reference does not move with the
+sample set. The protein being tested is not left out, so a taxon carried by
+only a few complete proteins partly regresses against itself. When too few of a
+taxon's proteins are complete, the poscounts variant is used instead — each
+protein referenced against its own observed samples — and a sample whose median
+would then rest on fewer than `taxon_min_proteins_for_factor` ratios is left
+blank rather than guessed. The factor degrades to a plain sum when the taxon
+has fewer than `taxon_min_proteins_for_factor` proteins at all (4 by default),
+when neither variant is supported, or when poscounts leaves no usable sample;
+the join log and the report each print how many taxa landed there.
+
+Just above the threshold is not safe either — the median then rests on as few
+as four ratios, so the protein being tested is a quarter of its own reference.
+Treat calls resting on a taxon near the threshold as provisional, and read the
+number out of your own run rather than a fixed protein count. This Python
+threshold and the R usability threshold `analysis.taxon_min_proteins` are
+separate keys, but the defaults deliberately hold them equal at 4 and nothing
+enforces it. Keep them equal: the report's "reference is the plain sum" flag is
+only evaluated over taxa the R threshold already admitted, so setting
+`analysis.taxon_min_proteins` higher drops exactly the taxa that flag exists to
+mark.
 Proteins whose significance disappears under the second model were tracking
 their organism, not being regulated.
 
@@ -827,11 +981,20 @@ differential-abundance table before concluding either. See `docs/signalp-6.md`.
 
 ## Parallelism
 
-Stages form a dependency graph and independent ones run concurrently. Every
-stage up to `integrate` depends only on the protein FASTA, so hmmsearch,
-DIAMOND, InterProScan, KOfamScan, SignalP and the rest run together instead of
-one after another; `jackhmmer`, `hhblits` and `esmfold` then run together after
-it.
+Stages form a dependency graph and independent ones run concurrently. Almost
+every stage before `integrate` consumes no other stage's output — just the
+protein FASTA and its own reference database — so eggNOG-mapper, hmmsearch,
+DIAMOND, InterProScan, KOfamScan, SignalP, TMbed and MMseqs2 all dispatch in
+the first wave. `context` is the exception that actually waits: it reads the
+annotations produced by `emapper`, `pfam`, `signalp` and `dbcan` (plus the
+`gff`), so it cannot start until all four have finished. `jackhmmer`, `hhblits`
+and `esmfold` then run after `integrate`, because their input is the dark set
+it writes.
+
+Concurrency is capped by `stage_workers`, so the first wave is a queue rather
+than a stampede: with the default 3, the longest stage in the table order
+starts only when a slot frees. On a large proteome that matters — InterProScan
+paces everything, and it begins last if the table puts it last.
 
 ```yaml
 threads: 32
@@ -839,12 +1002,16 @@ stage_workers: 4      # 4 stages at once, 8 cpu each
 ram_gb: 128           # 32 GB each; 0 = 80% of detected RAM
 ```
 
-`--threads` and `--ram` override both from the command line. The suffixed
-spellings (`64G`, `64GB`, `512M`) are accepted by the `--ram` **flag only**;
-`ram_gb` in config.yaml must be a plain integer number of gigabytes
-(`ram_gb: 64`), and a suffixed value there raises a ValueError traceback. Note
-that `init` writes the config with `yaml.safe_dump`, which drops the comments
-that explain these units, so the generated file shows a bare `ram_gb: 0`.
+`--threads` and `--ram` override both from the command line on `run` and `all`
+(`doctor` reads only the config). The memory budget takes the same spellings in
+both places, because the flag and the config key go through the same parser: a
+bare number of gigabytes (`64`), or a suffixed size (`64G`, `64GB`, `512M`,
+`1T`). So `ram_gb: 64G` in config.yaml is valid. A size below 1 GB rounds up
+rather than down, since `0` is reserved to mean "auto-detect 80% of detected
+RAM", and a value that is not a size at all exits with a message rather than a
+traceback. Note that `init` writes the config with `yaml.safe_dump`, which
+drops the comments that explain these units, so the generated file shows a bare
+`ram_gb: 0`.
 
 ### Where the memory budget goes
 
@@ -876,12 +1043,34 @@ tool_args:
 ```
 
 A results directory takes a lock for the run, so two processes cannot
-interleave their writes; a lock from a dead process is reclaimed
-automatically. A stage whose dependencies were excluded by `--only`/`--from`
-refuses rather than producing a confident answer from inputs that do not exist.
+interleave their writes. Reclamation is deliberately conservative: a lock is
+removed automatically only when it names a pid **on this host that is provably
+gone**. A lock written on another host, one owned by another user, a garbled
+lock file, and *every* lock on Windows — where `os.kill(pid, 0)` calls
+`TerminateProcess`, so asking whether the holder is alive would kill it — all
+read as live. Trampling a live run is silent corruption; refusing is a message.
+So an ordinary crashed run on Windows exits with `another metaannot is already
+running here` and needs `--force-unlock`, which is the escape hatch for a
+holder you are certain is gone.
 
-`--serial` forces one at a time. Parallel and serial execution are *intended*
-to produce identical output; no shipped test verifies this.
+The one exception is a **zero-byte** lock — what a power loss, an OOM kill or a
+host bugcheck leaves behind between the `O_EXCL` create and the write. A real
+writer closes that gap in microseconds, so an empty lock that has sat unchanged
+for more than a minute cannot belong to a live run, and it is removed on sight
+with a WARN naming when it was left. A freshly created empty lock still blocks,
+so the genuine race stays safe.
+
+A stage whose dependencies were excluded by `--only`/`--from` refuses rather
+than producing a confident answer from inputs that do not exist.
+
+`--serial` forces one at a time. Parallel and serial runs are verified to
+produce the same output: `tests/test_outputs.py` digests a parallel run against
+a `--serial` run for every `quant_format`, and for the `protein_unique`,
+`taxon_unique` and `razor` assignment modes; `tests/test_scheduler.py` compares
+every file under `results/` byte-for-byte between the two.
+`taxon_or_family_unique` is not in that sweep. The full
+`quant_format` × `peptide_assignment` cross-product carries the `slow` mark and
+is excluded from the default run.
 
 Within stages: DIAMOND runs its databases concurrently (`diamond_workers`,
 sublinear thread scaling makes 4×N/4 faster than 4 sequential N), and hhblits
@@ -916,7 +1105,7 @@ dispatched in the same round as before. A stage that is waiting says so, so an
 enabled stage that has not started is explained rather than mysterious:
 
 ```
-[  312.0s] WARN  --- esmfold: waiting for the GPU — tmbed is using it and
+[  312.0s] INFO  --- esmfold: waiting for the GPU — tmbed is using it and
                      gpu_workers is 1. It starts when that stage finishes;
                      everything else carries on meanwhile.
 ```
@@ -925,6 +1114,14 @@ enabled stage that has not started is explained rather than mysterious:
 to the single `gpu_device`, so on a two-card machine raising it to 2 runs two
 stages on the *same* card rather than one per card. One stage per device is not
 implemented; the limit here is policy, not hardware.
+
+**The lease follows the stage, not the device.** `gpu=True` is a fixed
+property of the stage table, not a probe of what the stage does at run time.
+`tmbed` takes the lease whether or not it ends up on the GPU — with
+`tmbed_use_gpu: false`, or on a machine with no CUDA device, it still holds the
+slot that would otherwise let `esmfold` start. If you are running tmbed on CPU
+deliberately, raise `gpu_workers` so the lease stops serialising two stages
+that are no longer competing.
 
 ### When a model is missing
 
@@ -937,7 +1134,7 @@ the same event:
 | --- | --- |
 | `INFO … none of the N proteins in dark.faa have been folded yet` | `esmfold` has not run: no `.done` marker, no `plddt.tsv`, no models. Nothing has been lost; the pass carries no structural evidence. |
 | `WARN … esmfold has not finished` | Models exist but the stage did not complete. The rest are pending — rerun `esmfold`, which resumes. |
-| `WARN … requested structures exist … although esmfold has finished` | The only case where a model can be missing for a bad reason. Proteins over `max_len_structure` were never submitted and are counted separately; only the remainder is put down to OOM. |
+| `WARN … requested structures exist … although esmfold has finished` | The only case where a model can be missing for a bad reason, and the message names its causes rather than guessing one. Proteins longer than `max_len_structure` are counted separately as never submitted — that count uses the **static** limit only, so a protein excluded by the tighter VRAM cap falls into the remainder instead. The remainder is then split by `results/structures/esmfold_failed.tsv`: proteins listed there were attempted and failed twice, with the error in the table; proteins absent from it were added to `dark.faa` after the last fold and were never attempted at all. |
 
 The first structure run of the real dataset printed *"0/1913 requested
 structures exist …; the rest were skipped (OOM) or never folded"* while the
@@ -1133,58 +1330,143 @@ Three limits are worth knowing before relying on it:
   recorded as `running` when the process died is always recomputed rather than
   adopted.
 
-`progress_interval_s` is applied at the start of `run` (and `all`), so a
-`doctor --fix` download reports at the 60 s default whatever the config says.
+`progress_interval_s` is read once, at the start of `run` (and `all`), and
+nothing else reads it, because nothing else calls the wrapper that watches a
+running tool. `doctor --fix` does not use this machinery at all: it runs each
+recipe through the shell with the terminal attached, so you see curl's or
+conda's own progress rather than a metaannot heartbeat. Standalone `report` and
+`object` are outside it too — they shell out to Rscript through their own
+wrapper, which collects stderr and quotes it only on failure.
 
 ## What has actually been run
 
 **On real data:** one label-free dataset, end to end — a FragPipe
 `combined_peptide.tsv` plus its `.fp-manifest` plus a precomputed eggNOG table,
-38,204 proteins, 122,278 features. The stages that ran were `emapper` (reuse),
-`integrate`, `finalise` and `join`: manifest parsing, the id join, the
-shared-peptide rule, binning, the roll-up and the design recovery. That is the
-path most runs take before any search tool starts, and it works.
+38,204 proteins, 122,278 features, 36 samples, 6 groups. Sixteen of the
+twenty-two stages ran on that input: `emapper` (reuse), `pfam`, `dbcan`,
+`diamond` over five databases (VFDB, MEROPS, CARD, TADB3, BAGEL4), `cluster`
+(MMseqs2), `ncbifam`, `kofam`, `interpro`, `signalp` (SignalP 6), `tmbed`,
+`esmfold`, `foldseek`, `integrate`, `finalise` and `join`.
 
-**Not on real data:** every external search stage was disabled in that run, so
-hmmsearch, DIAMOND, InterProScan, KOfamScan, HHblits, jackhmmer, ESMFold,
-Foldseek, SignalP/TMbed and the Unipept API remain unexercised outside their
-output parsers. `3s_structure_only` and `3p_profile_only` have never been
-populated from a real search.
+Final bins: `1_ko_pathway` 47.6%, `2_ko_orphan` 28.2%, `3_annotated_no_ko`
+19.0%, `3d_duf_only` 1.0%, `3s_structure_only` 0.4% (141 proteins), `4_dark`
+3.8%. Dark rescue took 9,731 proteins dark on eggNOG alone down to 1,462 —
+8,686 rescued, of which KOfam alone supplied a KO to 8,129 that eggNOG missed.
+ESMFold built 1,821 models, 993 of them passed the pLDDT gate, and Foldseek
+returned 21,791 hits over PDB and AlphaFold Swiss-Prot plus 664 self-clustered
+fold groups.
 
-**Report and R object: synthetic data only.** The report **knits** to HTML with
-figures and tables and the object builds, under R 4.3, pandoc 3.1, rmarkdown,
-limma, SummarizedExperiment and the tidyverse. The QFeatures assay-link branch
-— the headline deliverable of the object script — has not been exercised; it
-sits inside two nested `try(..., silent = TRUE)` calls and on failure prints a
-hard-coded "QFeatures version differs" regardless of the real error and degrades
-to a SummarizedExperiment. Check the class of the object you get back.
+A FragPipe TMT run is in progress on a second dataset — 8 plexes, 88 channels,
+75 biological samples, 74,051 features, 455,571 proteins, eggNOG coverage
+98.4% — and a 3-plex subset of it has already completed end to end including
+the report. So `quant_format: fragpipe_tmt` is not a paper path.
 
-No test file, benchmark script, synthetic generator or fixture ships with this
-file, so none of the above is reproducible from what you have.
+**Not on real data:** `smorf`, `context`, `hhblits`, `jackhmmer`, `unipept` and
+`taxonomy` — all off by default — have still never run. So the profile
+searches, the Unipept API and the peptide-LCA taxonomy comparison remain
+unexercised outside their output parsers, and `3p_profile_only` has never been
+produced by any run: it is fed only by `hh_hit` and `jackhmmer_hit`, so it
+stays empty until one of those two stages runs. `3s_structure_only` **has**
+been populated — 141 proteins, from the Foldseek search above.
+
+**Report and R object: built from the real run.** Both were produced from the
+38,204-protein dataset above on R 4.6.1 — the report knits to HTML with figures
+and tables, and `object` returns a QFeatures of about 12.5 MB with linked
+`peptides` and `proteins` assays. Nothing in the tool pins an R version; R 4.3
+with pandoc 3.1 was simply the earlier validation environment. The object
+script can still degrade in two independent places and each names the real
+error rather than guessing: if `addAssayLink` fails you still get a QFeatures,
+both assays present but unlinked, logged as `assay link not added (<the real
+condition>)`; only a failure of the QFeatures constructor itself falls back to
+a SummarizedExperiment, with the peptide assay in `metadata()$peptides`. Check
+the class of the object you get back.
+
+A test suite does ship, in `tests/` — `conftest.py`, `fixtures.py` and thirteen
+test modules — so the plumbing described here is reproducible offline from what
+you have; see **Tests** above. What does not ship is a benchmark script, and
+the datasets themselves are not redistributable, so the run figures above
+cannot be re-derived.
 
 ## Scale
 
-No benchmark data accompanies this file, so no wall-time or peak-memory figure
-is quoted. The hot paths are vectorised — protein-group explosion, bin
-assignment and effector scoring are array operations, not row-wise `apply` —
-and sequences are not retained after the single FASTA pass, so memory scales
-with protein count rather than total residues. Reading a large quant table on
-the delimiter-sniffing path (`sep=None, engine="python"`) is the expensive step
-and a full run makes three such reads; budget on the order of a gigabyte and
-tens of seconds per read at 400k features.
+Wall times are measured, and the tool measures them itself. Every stage that
+actually **runs** records its duration as `seconds` in
+`results/.metaannot_state.json` — also embedded in the R object as
+`metadata(obj)$metaannot$state` — so your own run reports its own numbers. A
+stage that is *adopted* or *skipped* on a resume records none.
 
-Scratch is **not cleaned up**: each Foldseek target search leaves
-`{results}/foldseek/tmp{i}`, self-clustering leaves `{results}/foldseek/tmpc`,
-and `cluster` leaves `{results}/cluster/tmp`. Against AFDB50 that is tens to
-hundreds of GB. Delete them yourself when the run is done.
+One label-free run, 38,204 proteins, on a single workstation, with stages
+running concurrently, so these are shares of a parallel run rather than
+single-stage benchmarks:
+
+| stage | wall time |
+| --- | --- |
+| `interpro` | 2.84 h |
+| `signalp` | 0.93 h |
+| `tmbed` | 0.87 h |
+| `kofam` | 0.49 h |
+| `pfam` | 0.45 h |
+| `ncbifam` | 0.40 h |
+| `foldseek` | 0.02 h |
+| `dbcan` | 0.01 h |
+| `emapper`, `cluster`, `diamond`, `integrate`, `finalise`, `join` | under a minute each |
+
+ESMFold is quoted separately because its cost depends on length rather than on
+protein count: 1,805 folds at or under 478 aa took 1.6 h in total, while the 91
+sequences above that machine's VRAM cliff were projected at 7.4 h on their own.
+See **The length a card can actually fold**.
+
+Those figures scale roughly with protein count. On a 455,571-protein run —
+twelve times the size — expect InterProScan alone to pace the whole thing at
+well over a day.
+
+The hot paths are vectorised: protein-group explosion, bin assignment and
+export scoring are array operations, not row-wise `apply`, and sequences are
+not retained after the single FASTA pass, so memory scales with protein count
+rather than total residues.
+
+Quant tables are read by `read_delim_table`, which takes the delimiter from the
+header line alone and hands the body to pandas' C parser. The old
+delimiter-sniffing path (`sep=None, engine="python"`) is gone from every quant
+read — roughly 18× slower and 4–6× the memory for no benefit, since the first
+line already says which delimiter this is. It survives only for the Unipept
+result file and a header-only peek in `doctor`. Reading is no longer the
+dominant cost.
+
+Scratch is **partly** cleaned up. The two trees that can reach hundreds of GB
+are removed by the run itself: each Foldseek target search deletes its
+`{results}/foldseek/tmp{i}` when the search returns, and self-clustering
+deletes `{results}/foldseek/tmpc`, so scratch peaks at one target's tree rather
+than the sum over targets — but that peak is real: against AFDB50 budget tens
+to hundreds of GB of free space for the duration of the stage. A Foldseek that
+is killed, or that exits non-zero, still leaves the tree it died in.
+
+What survives a clean run is smaller and fixed in kind: `{results}/kofam/tmp`
+is the largest leftover at 229 MB on a 38k-protein run;
+`{results}/interpro/query.faa` is the sanitised copy of the whole proteome
+InterProScan is actually searched against, ~14 MB at 38k proteins and scaling
+with it; `{results}/cluster/tmp` and `{results}/interpro/tmp` are created and
+never removed but MMseqs2 and InterProScan empty them themselves, so they
+survive as empty directories; `{results}/foldseek/query_hq` is a hardlink farm
+of the pLDDT-passing models, so it costs no real space. Budget a few hundred
+MB, not hundreds of GB.
 
 ## Three things to check before believing any of it
 
-1. **Gene calling.** Prodigal in meta mode has a hard floor of 90 nt and
-   reduced sensitivity below about 100 codons, so unless the search database
-   was augmented with a dedicated smORF call, bacteriocins, TA toxins and RiPPs
-   were largely absent from the search space. Check whether your database has a
-   smORF tier before quoting this caveat — the report prints it unconditionally.
+1. **Gene calling.** Prodigal in meta mode has a hard floor of 90 nt and calls
+   genes below about 100 aa with reduced sensitivity rather than discarding
+   them, so without a smORF-augmented database bacteriocins, TA toxins and
+   RiPPs are under-sampled rather than absent — and their absence from your
+   results is not evidence of absence. The report does not print this as a
+   blanket: it counts quantified groups at or under 100 aa and uses the
+   "effectively never in the search space" wording only when that count is
+   zero, printing the count and a softer warning otherwise. That count is a
+   proxy for what the database contained, not a check of it, so still confirm
+   whether yours has a smORF tier. Going further needs a **re-search, not a
+   re-annotation**: `run.smorf: true` with `contigs_fna` set calls small ORFs
+   into `results/smorf/smorf_proteins.faa`, which you must append to your MS
+   search database and search the raw data against again yourself. No
+   downstream stage consumes that file.
 2. **Group and taxonomy conflicts.** `group_conflicts.tsv` and
    `taxonomy_comparison.tsv`. KO-less proteins are strain-specific, so theirs
    are the least trustworthy.
