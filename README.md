@@ -48,8 +48,8 @@ days of compute.
 An unrecognised key in `config.yaml` is reported with a spelling suggestion
 rather than silently ignored — `run: {unipep: true}` used to leave the stage
 disabled with nothing said. The check stops at the free-form blocks
-(`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`,
-`diamond_evalues`, `effector_predictions`), whose keys are user-chosen and cannot be checked, so a
+(`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`, `vfdb_category_weights`,
+`diamond_evalues`), whose keys are user-chosen and cannot be checked, so a
 typo there is silent and simply has no effect. Proof-read those blocks by hand.
 The `analysis:` block is **not** free-form and **is** checked: its keys are
 exactly the Rmd's params, so `fdrr: 0.01` is reported rather than written into
@@ -193,7 +193,7 @@ in practice a KO with no pathway map at all — a module-only or unmapped KO.
 
 ```
 emapper → pfam → dbcan → diamond → signalp → tmbed → cluster
-        → ncbifam → kofam → interpro → smorf → effectors → context
+        → ncbifam → kofam → interpro → smorf → context
         → integrate → jackhmmer → hhblits → esmfold → foldseek
         → finalise → unipept → taxonomy → join
 ```

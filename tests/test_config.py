@@ -35,7 +35,6 @@ def test_misspelled_analysis_key_is_reported(ma, tmp_path, capsys):
 @pytest.mark.parametrize("block,key", [
     ("tool_args", "hmmsearch"),
     ("diamond_weights", "my_own_db"),
-    ("effector_predictions", "bastion6"),
 ])
 def test_freeform_blocks_do_not_warn_about_their_own_keys(ma, tmp_path,
                                                           block, key):

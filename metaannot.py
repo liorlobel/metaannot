@@ -397,7 +397,6 @@ DEFAULT_CONFIG = {
         "hhblits": False,     # profile-profile, the real answer to "past BLAST"
         "jackhmmer": False,   # iterative profile search, cheaper alternative
         "smorf": False,       # small-ORF calling on contigs (see the warning)
-        "effectors": False,   # ingest external effector predictions
     },
 
     "db": {
@@ -538,13 +537,23 @@ DEFAULT_CONFIG = {
     "jackhmmer_iterations": 3,
     "smorf_mode": "meta",         # smorf meta = assembly | single = isolate
 
-    # External effector predictors. Each entry names a results file you
-    # produced elsewhere (Bastion3/4/6, EffectiveDB, T4SEpp, SecretomeP).
-    #   name: {file, id_col, score_col, threshold, weight}
-    "effector_predictions": {},
-    "effector_prediction_weight": 3,
 
     "diamond_weights": {"vfdb": 4, "tadb": 3, "bagel": 3, "merops": 2, "card": 0},
+    # VFDB's own category, by its stable numeric code. A hit whose category is
+    # not listed falls back to diamond_weights.vfdb. Empty disables the split
+    # and every VFDB hit scores the flat weight, which is the old behaviour.
+    #   VFC0086 effector delivery system   VFC0235 exotoxin
+    #   VFC0001 adherence                  VFC0204 motility
+    #   VFC0258 immune modulation          VFC0272 nutritional/metabolic
+    #   VFC0282 stress survival            VFC0301 regulation
+    "vfdb_category_weights": {
+        "VFC0086": 4, "VFC0235": 4,          # exported effectors and toxins
+        "VFC0001": 3,                        # adherence: surface, host-facing
+        "VFC0204": 2,                        # motility
+        "VFC0258": 2,                        # immune modulation: broad
+        "VFC0282": 1, "VFC0301": 1,          # stress, regulation: mostly cytoplasmic
+        "VFC0272": 1,                        # housekeeping in a virulence coat
+    },
     # Per-database e-value, overriding thresholds.diamond_evalue for that tag
     # alone. One threshold cannot fit every database: BAGEL is 262 bacteriocin
     # sequences with a median length of 15 residues, and no 15-residue
@@ -630,12 +639,22 @@ DEFAULT_CONFIG = {
     # "deaminase", "phospholipase", "patatin" and "hemolysin" hit cytidine
     # deaminases, patatin-like housekeeping lipases and hemolysin-III, each
     # scoring the largest single effector weight, so they are spelled out.
+    # This list scored 0 of 38,204 proteins on a real gut metaproteome while
+    # carrying the joint-largest weight in the table, so the additions below
+    # are the families that were actually missing rather than a widening of
+    # the ones already here. "holotoxin" is listed explicitly because the
+    # whole-word rule means "Tc toxin" cannot match inside it, which is how
+    # PDB 2vse - a genuine Tc-family holotoxin - was missed. The contact-
+    # dependent and T6SS families matter most for gut commensals, which carry
+    # CDI and LXG systems far more often than they carry classical exotoxins.
     "toxin_fold_patterns": [
         "aerolysin", "MACPF", "cholesterol-dependent cytolysin",
         "perfringolysin", "ADP-ribosyltransferase", "ADP-ribosylating",
         "RTX", "alpha-hemolysin", "alpha-haemolysin", "hemolysin BL",
-        "leukocidin", "Tc toxin", "pore-forming", "colicin", "pyocin",
-        "VgrG", "Rhs", "MARTX", "delta-endotoxin", "cytolysin",
+        "leukocidin", "Tc toxin", "holotoxin", "pore-forming", "colicin",
+        "pyocin", "VgrG", "Rhs", "MARTX", "delta-endotoxin", "cytolysin",
+        "insecticidal toxin", "nuclease toxin", "contact-dependent",
+        "CdiA", "LXG", "Ntox", "zeta toxin", "pierisin",
     ],
 
     "anchor_pfams": ["PF00395", "PF01473", "PF00746", "PF13715",
@@ -685,7 +704,7 @@ def deep_merge(base, override, prefix=""):
 # typo rather than an addition. `analysis` is deliberately NOT here: its keys
 # are exactly the Rmd's params, so `min_lfC` or `design_formla` is a typo that
 # used to run the wrong statistics with nothing said.
-FREEFORM = {"tool_args", "effector_predictions", "diamond_weights",
+FREEFORM = {"tool_args", "diamond_weights", "vfdb_category_weights",
             "diamond_evalues", "db.diamond", "sources.diamond"}
 
 
@@ -733,11 +752,38 @@ def nearest_config_key(bad):
     return f" — did you mean '{near[0]}'?" if near else ""
 
 
+# Keys this tool used to accept. Without this, a config carrying one reads as a
+# TYPO - unknown_keys reports it and nearest_config_key helpfully suggests the
+# closest surviving name - and the user goes looking for their own mistake
+# instead of learning the key was deliberately removed. Delete an entry once
+# the release that removed it is old news; this is not a deprecation framework.
+RETIRED_KEYS = {
+    "run.effectors":
+        "the effectors stage was removed: it ingested predictions from "
+        "Bastion/EffectiveDB/T4SEpp, web services this tool has no way to "
+        "invoke, and every one of them is now unreachable. Nothing is lost - "
+        "the stage contributed nothing unless you configured it, and the "
+        "score never depended on it. See CHANGELOG.",
+    "effector_predictions":
+        "removed with the effectors stage; there is nothing left to ingest. "
+        "A pred_* column you join in yourself still reaches the shortlist as "
+        "a column. See CHANGELOG.",
+    "effector_prediction_weight":
+        "removed with the effectors stage. See CHANGELOG.",
+}
+
+
 def report_unknown_keys(user, path):
     bad = unknown_keys(user, DEFAULT_CONFIG)
     if not bad:
         return []
     for b in bad:
+        if b in RETIRED_KEYS:
+            # Named as removed, and deliberately WITHOUT a "did you mean"
+            # suggestion: there is no key to mean instead.
+            log(f"{path}: '{b}' is no longer a setting - {RETIRED_KEYS[b]}",
+                "WARN")
+            continue
         # `or "."` so the sentence ends once, whether or not there is a
         # suggestion: "...key 'x' — did you mean 'y'? It is being ignored."
         log(f"{path}: unrecognised key '{b}'"
@@ -794,9 +840,6 @@ def resolve_paths(cfg, base):
     u = cfg.get("unipept") or {}
     if u.get("result"):
         u["result"] = R(u["result"])
-    for d in (cfg.get("effector_predictions") or {}).values():
-        if isinstance(d, dict) and d.get("file"):
-            d["file"] = R(d["file"])
     a = cfg.get("analysis") or {}
     for k in ("metadata", "msstats_comparison"):
         if a.get(k):
@@ -1278,7 +1321,6 @@ class Paths:
         self.hhr_done = f"{R}/hhblits/.done"
         self.jackhmmer = f"{R}/hmm/jackhmmer.tblout"
         self.smorf_faa = f"{R}/smorf/smorf_proteins.faa"
-        self.effectors = f"{R}/effector_predictions.tsv"
         self.unipept_peptides = f"{R}/unipept/peptides.txt"
         self.unipept_cache = f"{R}/unipept/pept2lca_cache.tsv"
         self.unipept_lca = f"{R}/unipept/pept2lca.tsv"
@@ -1878,119 +1920,6 @@ def parse_hhr_dir(d, min_prob):
     return out
 
 
-def _read_prediction_table(path, name):
-    """Delimiter from the first line, never csv.Sniffer.
-
-    `sep=None` asks the sniffer to guess, and on the documented simplest input
-    — one protein id per line, no delimiter at all — it picks an arbitrary
-    character out of the ids themselves (a file of OIDECCNN_00001-style ids
-    splits on '0'), so the id column becomes a fragment and every protein ends
-    up a negative.
-    """
-    with opener(path) as fh:
-        first = fh.readline().rstrip("\n")
-    if "\t" in first:
-        return pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8", encoding_errors="replace")
-    if "," in first:
-        return pd.read_csv(path, sep=",", dtype=str, encoding="utf-8", encoding_errors="replace")
-    log(f"{name}: {path} has no tab or comma on its first line; reading it as "
-        "a headerless one-column list of protein ids", "WARN")
-    return pd.read_csv(path, sep="\t", header=None, names=["id"], dtype=str, encoding="utf-8", encoding_errors="replace")
-
-
-def parse_external_predictions(spec, index):
-    """Ingest predictions from tools that are web services or awkward local
-    installs — Bastion3/4/6, EffectiveDB, T4SEpp, SecretomeP. One generic
-    reader beats five bespoke parsers for tools that cannot be tested here.
-
-    spec: {name: {file, id_col, score_col, threshold, [positive_values],
-                  [all_positive]}}
-    """
-    cols = {}
-    for name, d in (spec or {}).items():
-        path = d.get("file", "")
-        if not path:
-            continue
-        if not os.path.exists(path):
-            log(f"effector prediction file missing, skipping: {name} -> {path}",
-                "WARN")
-            continue
-        df = _read_prediction_table(path, name)
-        idc = d.get("id_col") or df.columns[0]
-        if idc not in df.columns:
-            log(f"{name}: id_col '{idc}' not in {path}; columns are "
-                f"{list(df.columns)[:8]}", "WARN")
-            continue
-        df[idc] = df[idc].astype(str)
-        # One column is tested, named by score_col (or label_col as an alias).
-        # Numeric predictors use `threshold`; categorical ones use
-        # `positive_values`. Previously positive_values was tested against a
-        # None column when score_col was omitted, so it matched nothing.
-        sc = d.get("score_col") or d.get("label_col")
-        pos = d.get("positive_values")
-        # The "the file is a list of positives" mode has to be asked for. It
-        # used to be the fallthrough for any spec without a usable score_col,
-        # and Bastion/EffectiveDB/T4SEpp/SecretomeP all list negatives too, so
-        # a typo silently gave every scanned protein the effector weight.
-        all_pos = bool(d.get("all_positive"))
-        if sc and sc not in df.columns:
-            die(f"{name}: effector_predictions column '{sc}' is not in {path}; "
-                f"columns are {list(df.columns)[:8]}. Fix the column name — "
-                "reading the file as a list of positives instead would mark "
-                "every listed protein an effector.")
-        if pos and not sc:
-            die(f"{name}: positive_values needs score_col (or label_col) "
-                "naming the column to test.")
-        score = {}
-        if sc and pos:
-            want = {str(x).strip() for x in pos}
-            hit = df[sc].astype(str).str.strip().isin(want)
-        elif sc:
-            thr = float(d.get("threshold", 0.5))
-            vals = pd.to_numeric(df[sc], errors="coerce")
-            hit = vals >= thr
-            score = dict(zip(df[idc], vals))
-        elif all_pos:
-            if len(df.columns) > 2:
-                log(f"{name}: all_positive on a {len(df.columns)}-column table "
-                    f"({list(df.columns)[:8]}) marks all {len(df)} of its rows "
-                    "as effectors. That looks like a scored predictor output; "
-                    "score_col + threshold (or positive_values) is what you "
-                    "want.", "WARN")
-            hit = pd.Series(True, index=df.index)
-        else:
-            die(f"{name}: effector_predictions needs score_col + threshold "
-                "(numeric predictors) or score_col + positive_values "
-                "(categorical ones). If the file really is a positives-only "
-                "list of ids, say so with all_positive: true.")
-        ids = set(df.loc[hit, idc])
-        # No id-overlap check used to exist here, so a predictor keyed on a
-        # different id style than proteins_faa produced an all-False column,
-        # a reassuring "N positives" line, and no way to tell from the outputs.
-        listed = set(df[idc])
-        overlap = listed & set(index)
-        if not overlap:
-            log(f"{name}: zero id overlap between {path} and the protein set "
-                f"(file has '{next(iter(listed), '')}', fasta has "
-                f"'{index[0] if len(index) else ''}'); every protein would be "
-                "a negative for this predictor. Check id_col, and whether the "
-                "predictor echoed the FASTA description after the id.",
-                "SEVER")
-        elif len(overlap) < 0.10 * len(listed):
-            log(f"{name}: only {len(overlap)} of {len(listed)} listed ids are "
-                "in the protein set; the id styles probably differ", "WARN")
-        cols[f"pred_{name}"] = pd.Series([i in ids for i in index], index=index)
-        if score:
-            cols[f"pred_{name}_score"] = pd.Series(
-                [score.get(i, float("nan")) for i in index], index=index)
-        log(f"effector predictions: {name} -> {len(ids)} positives, "
-            f"{len(ids & set(index))} of them in the protein set")
-    return cols
-
-
-# ======================================================================
-# stage: emapper (reuse a precomputed table, or run eggnog-mapper)
-# ======================================================================
 # A search database is often built by renaming the fasta it came from
 # ("MGYG000001_00023" -> "uhgpSM_MGYG000001_00023", "HUMANHOST_..."), while
 # the eggNOG table still carries the original, unprefixed id. No entry in
@@ -2956,27 +2885,6 @@ def stage_smorf(cfg, p):
         "so their absence is not evidence of absence.", "WARN")
 
 
-def stage_effectors(cfg, p):
-    """Ingest predictions from external effector tools. Written as a generic
-    reader because Bastion3/4/6, EffectiveDB and T4SEpp are web services or
-    bespoke installs that cannot be invoked reliably from here."""
-    spec = cfg.get("effector_predictions") or {}
-    if not spec:
-        log("no effector_predictions configured", "WARN")
-        with atomic_out(p.effectors) as tmp:
-            pd.DataFrame({"protein_id": []}).to_csv(
-                tmp, sep="\t", index=False)
-        return
-    ids = [pid for pid, _ in read_fasta(cfg["proteins_faa"])]
-    idx = pd.Index(ids, name="protein_id")
-    cols = parse_external_predictions(spec, idx)
-    df = pd.DataFrame(cols, index=idx).reset_index() if cols else \
-        pd.DataFrame({"protein_id": ids})
-    with atomic_out(p.effectors) as tmp:
-        df.to_csv(tmp, sep="\t", index=False)
-    log(f"effectors: wrote {p.effectors}")
-
-
 # ======================================================================
 # stage: genomic context
 # ======================================================================
@@ -3705,26 +3613,6 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
                 "FASTA — check that dark_all.faa and the tblout come from "
                 "the same run", "WARN")
 
-    # ---- external effector predictions
-    if os.path.exists(p.effectors):
-        ep = pd.read_csv(p.effectors, sep="\t", encoding="utf-8", encoding_errors="replace")
-        if "protein_id" in ep.columns and len(ep.columns) > 1:
-            ep["protein_id"] = ep["protein_id"].astype(str)
-            ep = ep.set_index("protein_id")
-            ep = ep[~ep.index.duplicated(keep="first")]
-            for c in ep.columns:
-                df[c] = ep[c].reindex(idx)
-    pred_cols = [c for c in df.columns
-                 if c.startswith("pred_") and not c.endswith("_score")]
-    # The config documents a per-predictor `weight` and nothing ever read it,
-    # so five correlated web predictors each added the same flat 3 and could
-    # outweigh every sequence-based term combined. Honour the declared weight;
-    # effector_prediction_weight stays the default for predictors without one.
-    pred_weights = {}
-    for name, d in (cfg.get("effector_predictions") or {}).items():
-        if isinstance(d, dict) and d.get("weight") is not None:
-            pred_weights[f"pred_{name}"] = d["weight"]
-
     # ---- fold groups from self-clustering the unannotated structures
     df["fold_cluster"], df["fold_cluster_size"] = "", 0
     if os.path.exists(p.fold_clusters):
@@ -3806,8 +3694,15 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # inside longer names, each adding the largest single effector weight.
     tox_re = re.compile(r"\b(?:" + "|".join(pats) + r")\b", re.I) if pats \
         else None
-    df["toxin_fold"] = df["foldseek_desc"].map(
-        lambda s: bool(s) and bool(tox_re.search(s))) if tox_re else False
+    # Read hh_desc as well as foldseek_desc. It is free - both columns are
+    # already built - and it lifts the ceiling above the handful of proteins
+    # that got a Foldseek hit at all.
+    def _tox(col):
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df[col].fillna("").astype(str).map(
+            lambda s: bool(s) and bool(tox_re.search(s)))
+    df["toxin_fold"] = (_tox("foldseek_desc") | _tox("hh_desc")) if tox_re         else False
     # AFDB50 entry headers are AlphaFold accessions (AF-<UniProt>-F1-model_v4)
     # with no protein name, so on the default target the toxin term can never
     # fire and a reader takes "no toxin folds" for biology. Say so once.
@@ -4002,28 +3897,61 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # used to score the full weight. Below diamond_strong_pident the weight is
     # halved rather than dropped, so a weak hit still ranks above no hit.
     strong_pid = th.get("diamond_strong_pident", 50)
+    # VFDB is not one kind of evidence. Its own VFC category code says which,
+    # and a flat weight throws that away: on a real gut metaproteome, of 3,308
+    # VFDB hits the two largest categories were "Immune modulation" (965) and
+    # "Nutritional/Metabolic factor" (903, i.e. GroEL, ClpP, GuaA, LPS
+    # biosynthesis) - each collecting the largest DIAMOND weight in the config
+    # - while the categories that actually name an exported effector,
+    # VFC0086 (effector delivery, 232) and VFC0235 (exotoxin, 132), were 11% of
+    # the signal. Keyed on the NUMERIC code, not the prose: VFDB can reword a
+    # category name, it will not renumber it.
+    cat_w = cfg.get("vfdb_category_weights") or {}
     for tag in dia_tags:
         hit_ = df[f"{tag}_hit"].fillna("").ne("")
         pid_ = pd.to_numeric(df[f"{tag}_pident"], errors="coerce").fillna(0)
         wt = dia_weights.get(tag, 0)
-        score += (hit_ & (pid_ >= strong_pid)) * wt
-        score += (hit_ & (pid_ < strong_pid)) * (wt // 2)
+        if tag == "vfdb" and cat_w and f"{tag}_desc" in df.columns:
+            code = df[f"{tag}_desc"].fillna("").astype(str).str.extract(
+                r"\((VFC\d+)\)", expand=False)
+            n_code = int(code.notna().sum())
+            n_hit = int(hit_.sum())
+            if n_hit:
+                # Said once, so a VFDB format change surfaces as a line rather
+                # than as every hit silently taking the fallback weight.
+                log(f"vfdb: {n_code}/{n_hit} hit(s) carry a VFC category code; "
+                    "those are weighted by category, the rest by "
+                    f"diamond_weights.vfdb={wt}")
+            wt_s = code.map(lambda c: cat_w.get(c, wt)).fillna(wt).astype(int)
+        else:
+            wt_s = wt
+        score += (hit_ & (pid_ >= strong_pid)) * wt_s
+        score += (hit_ & (pid_ < strong_pid)) * (wt_s // 2)
     score += (df["cazy"].fillna("").ne("") | df["dbcan_hits"].fillna("").ne("")) * w["cazy_hit"]
     score += B("small_protein") * w["small_protein"]
     score += B("toxin_fold") * w["foldseek_toxin_fold"]
-    for c in pred_cols:
-        score += B(c) * pred_weights.get(
-            c, cfg.get("effector_prediction_weight", 3))
     score += B("context_mge") * w["context_mge_or_secretion"]
     score += B("context_pul") * w.get("context_pul", 1)
     score += B("context_immunity") * w["context_immunity_pair"]
     score += (~hk) * w["no_ko"]
+    # export_score, not effector_score. Every term above asks whether a protein
+    # LEAVES THE CELL or sits on its surface - signal peptide class, beta
+    # barrel, LPXTG or SLH anchor, CAZy, small size, a toxin-like fold, a
+    # mobile-element or secretion neighbourhood, no KO. None of them asks
+    # whether it is an effector of a secretion system, and after the effectors
+    # stage was removed nothing in the tool does. Naming it effector_score
+    # promised a claim the evidence never supported, which on a gut commensal
+    # metaproteome is exactly the claim a reviewer would reject.
+    df["export_score"] = score
+    # The old name, carried one release so existing scripts, notebooks and R
+    # code keep working. Same numbers, not a second opinion. Drop it after the
+    # next release; the column comment above says which one to prefer.
     df["effector_score"] = score
     df["surface_or_secreted"] = (
         df["sp_class"].isin(["SP", "LIPO", "TAT", "TATLIPO", "PILIN"])
         | df["lpxtg"] | df["anchor_domain"] | (df["n_tmb"] > 0))
 
-    df = df.sort_values(["effector_score", "length"], ascending=[False, True])
+    df = df.sort_values(["export_score", "length"], ascending=[False, True])
 
     if emit_dark:
         # Dark AND DUF-only: a DUF names a family, not a function, so those
@@ -4100,7 +4028,7 @@ def write_summary(df, path):
         "pct": (g.size() / len(df) * 100).round(1),
         "n_secreted_or_surface": g["surface_or_secreted"].sum(),
         "n_small": g["small_protein"].sum(),
-        "median_effector_score": g["effector_score"].median(),
+        "median_export_score": g["export_score"].median(),
     })
     # Every bin gets a row, in the order the classifier assigns them.
     # groupby drops a bin with no proteins, so an empty 3s_structure_only was
@@ -4123,7 +4051,7 @@ def write_summary(df, path):
             + "; reported as zero rows so an empty bin is not mistaken for a "
               "stage that never ran")
     s.loc["TOTAL"] = [len(df), 100.0, int(df["surface_or_secreted"].sum()),
-                      int(df["small_protein"].sum()), df["effector_score"].median()]
+                      int(df["small_protein"].sum()), df["export_score"].median()]
     # Assigning the TOTAL row upcast the count columns to float, so the table
     # the tutorial tells people to read reported "92.0 proteins". pct and the
     # median stay float on purpose.
@@ -8107,11 +8035,6 @@ STAGES = [
     dict(name="smorf", empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
          inp=lambda c, p: [c.get("contigs_fna", "")],
          keys=["smorf_mode", "thresholds.smorf_max_len"], deps=[], fn=stage_smorf),
-    dict(name="effectors", enabled="effectors", out=lambda p: [p.effectors],
-         inp=lambda c, p: [c["proteins_faa"]] + [
-             d.get("file", "") for d in
-             (c.get("effector_predictions") or {}).values()],
-         keys=["effector_predictions"], deps=[], fn=stage_effectors),
     dict(name="context", enabled="context", out=lambda p: [p.context],
          inp=lambda c, p: [c.get("gff") or "", p.emapper, p.pfam, p.signalp,
                            p.dbcan],
@@ -8123,7 +8046,7 @@ STAGES = [
          out=lambda p: [p.pass1, p.dark, p.dark_all],
          inp=lambda c, p: [c["proteins_faa"], p.emapper, p.pfam, p.dbcan,
                            p.signalp, p.tmbed, p.cluster, p.context,
-                           p.ncbifam, p.kofam, p.interpro, p.effectors,
+                           p.ncbifam, p.kofam, p.interpro,
                            p.diamond_done] + sorted(
                                glob.glob(f"{p.diamond_dir}/*.tsv")),
          keys=["thresholds", "weights", "diamond_weights",
@@ -8131,7 +8054,7 @@ STAGES = [
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",
                "ncbifam_uninformative_test"],
-         deps=['emapper', 'pfam', 'dbcan', 'diamond', 'signalp', 'tmbed', 'cluster', 'ncbifam', 'kofam', 'interpro', 'effectors', 'context'], fn=stage_integrate_pass1),
+         deps=['emapper', 'pfam', 'dbcan', 'diamond', 'signalp', 'tmbed', 'cluster', 'ncbifam', 'kofam', 'interpro', 'context'], fn=stage_integrate_pass1),
     # dark_all.faa, not dark.faa: the profile searches query the whole
     # unannotated set, the structure work-list is a GPU budget.
     dict(name="jackhmmer", empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
@@ -8163,7 +8086,7 @@ STAGES = [
     dict(name="finalise", enabled=None,
          out=lambda p: [p.final, p.summary, p.agreement],
          inp=lambda c, p: [p.pass1, p.foldseek, p.context, p.fold_clusters,
-                           p.ncbifam, p.kofam, p.interpro, p.effectors,
+                           p.ncbifam, p.kofam, p.interpro,
                            p.hhr_done, p.jackhmmer],
          keys=["thresholds", "weights", "diamond_weights",
                "diamond_evalues", "anchor_pfams",
@@ -8615,7 +8538,7 @@ SFMETA   <- c("effective_taxid", "seed_taxid", "n_proteins", "method")
 # Numeric columns metaannot or FragPipe add that are NOT sample intensities.
 # Kept identical to the report's list: two components disagreeing about what a
 # sample is would build an assay and a model on different matrices.
-ANNOT_NUM <- c("length", "effector_score", "n_tmh", "n_tmb",
+ANNOT_NUM <- c("length", "export_score", "effector_score", "n_tmh", "n_tmb",
                "n_pathway_specific", "foldseek_prob", "foldseek_tm",
                "n_members", "member_rank", "fold_cluster_size",
                "n_features_used", "n_unique", "n_taxon_unique",
@@ -8964,7 +8887,7 @@ aq  <- read_tsv_full(quant_path, as_chr) %>%
 # Columns metaannot or FragPipe add that are numeric but are not sample
 # intensities. Kept in step with build_object.R's ANNOT_NUM: if the two lists
 # disagree, the object and the model are built on different matrices.
-ANNOT_NUMERIC <- c("length", "effector_score", "n_tmh", "n_tmb",
+ANNOT_NUMERIC <- c("length", "export_score", "effector_score", "n_tmh", "n_tmb",
                    "n_pathway_specific", "foldseek_prob", "foldseek_tm",
                    "n_members", "member_rank", "fold_cluster_size",
                    "n_features_used", "n_unique", "n_taxon_unique",
@@ -10290,7 +10213,7 @@ res <- aqk %>%
   transmute(group_id, bin,
             has_ko              = col_or_na(aqk, "has_ko"),
             surface_or_secreted = col_or_na(aqk, "surface_or_secreted"),
-            effector_score      = col_or_na(aqk, "effector_score"),
+            export_score        = col_or_na(aqk, "export_score"),
             sp_class            = col_or_na(aqk, "sp_class"),
             n_tmb               = col_or_na(aqk, "n_tmb"),
             lpxtg               = col_or_na(aqk, "lpxtg"),
@@ -10460,7 +10383,7 @@ reading.
 
 # Effector candidates
 
-Not the top of `effector_score`: significant, no KO, and predicted to reach
+Not the top of `export_score`: significant, no KO, and predicted to reach
 the host. A protein that cannot be exported cannot act on the epithelium
 whatever its fold suggests, so topology gates the list and the score only
 orders it.
@@ -10468,24 +10391,28 @@ orders it.
 ```{r shortlist}
 short <- res %>%
   filter(significant %in% TRUE, has_ko %in% FALSE, surface_or_secreted %in% TRUE) %>%
-  arrange(desc(effector_score), FDR) %>%
+  arrange(desc(export_score), FDR) %>%
   select(group_id, bin, contrast, logFC, FDR, model_used,
          # Both models' calls travel with the row: `significant` is the
          # adjusted call where there was one and the unadjusted call where
          # there was not, so on its own it cannot be compared across rows.
          sig_naive, sig_adj, logFC_naive, FDR_naive, logFC_adj, FDR_adj,
-         effector_score,
+         export_score,
          sp_class, n_tmb, lpxtg, small_protein, toxin_fold, pfam_hits,
          ncbifam_hits, kofam_ko, interpro_ipr, interpro_sigs, hh_hit, hh_prob,
          jackhmmer_hit, fold_cluster,
          fold_cluster_size, context_pul, foldseek_desc, context_flags,
          seed_taxid, unipept_name, taxonomy_verdict,
          taxon_factor_log2FC, taxon_assumption, bin_conflict)
+# metaannot no longer ingests external effector predictions. This survives so
+# that a pred_* column a user joined in themselves still reaches the shortlist
+# as a COLUMN - deliberately not as a term in the score, which is the correct
+# status for somebody else's model.
 pred_cols <- grep("^pred_", names(aqk), value = TRUE)
 if (length(pred_cols)) {
   short <- bind_cols(short, aqk[match(short$group_id, aqk$group_id), pred_cols,
                                drop = FALSE])
-  note("external effector predictions included: %s",
+  note("external prediction column(s) carried through: %s",
        paste(pred_cols, collapse = ", "))
 }
 cat(sprintf("%d candidates (significant, no KO, secreted or surface-exposed)\n", nrow(short)))
@@ -10500,11 +10427,11 @@ head(short, 40)
 
 ```{r shortlist-plot, fig.height=4}
 if (nrow(short)) {
-  ggplot(short, aes(effector_score, -log10(FDR), colour = bin)) +
+  ggplot(short, aes(export_score, -log10(FDR), colour = bin)) +
     geom_point(aes(size = abs(logFC)), alpha = 0.8) +
     scale_colour_manual(values = BIN_COLS, name = NULL) +
     scale_size_continuous(name = "|log2FC|", range = c(1, 5)) +
-    labs(x = "effector priority score", title = "KO-less, secreted, differentially abundant")
+    labs(x = "export score", title = "KO-less, secreted, differentially abundant")
 }
 ```
 
@@ -11524,9 +11451,17 @@ def cmd_doctor(args):
             raw = yaml.safe_load(fh) or {}
         bad = unknown_keys(raw, DEFAULT_CONFIG) if isinstance(raw, dict) else []
         if bad:
-            ok = False
             print("== config ==")
             for b in bad:
+                if b in RETIRED_KEYS:
+                    # A retired key is not a failure: the config predates a
+                    # removal, the setting is inert, and doctor exiting
+                    # non-zero over it would block a run that is otherwise
+                    # correct. Say so and carry on.
+                    print(f"  {'WARN':6s} '{b}' is no longer a setting - "
+                          f"{RETIRED_KEYS[b]}")
+                    continue
+                ok = False
                 print(f"  {'MISS':6s} unrecognised key '{b}'"
                       + (nearest_config_key(b) or ".")
                       + " It is being ignored, so this setting is NOT in "
@@ -11609,19 +11544,6 @@ def cmd_doctor(args):
                 print(f"  {'MISS':6s} {bad}")
             elif warn:
                 print(f"  {'WARN':6s} {warn}")
-
-    spec = cfg.get("effector_predictions") or {}
-    if cfg["run"].get("effectors"):
-        print("== effector predictions ==")
-        if not spec:
-            print(f"  {'WARN':6s} run.effectors is on but "
-                  "effector_predictions is empty; nothing will be ingested")
-        for name, d in spec.items():
-            f = d.get("file", "")
-            good = bool(f) and os.path.exists(f)
-            ok &= good
-            print(f"  {'OK' if good else 'MISS':6s} {name}: "
-                  f"{f or '(no file set in effector_predictions)'}")
 
     if cfg["quant_format"] == "fragpipe_tmt":
         # Without this block doctor says nothing at all about a TMT run: the
