@@ -101,11 +101,16 @@ def test_stages_without_a_run_flag_are_documented_as_always_running(ma):
 
 
 def test_the_documented_default_stage_set_matches_default_config(ma):
-    # README: "A fresh init config turns on six of them: eggnog, pfam, dbcan,
-    # diamond, cluster and join."
+    # README: "A fresh init config turns on six run: flags: eggnog (which runs
+    # the emapper stage), pfam, dbcan, diamond, cluster and join."
     on = {k for k, v in ma.DEFAULT_CONFIG["run"].items() if v}
     assert on == {"eggnog", "pfam", "dbcan", "diamond", "cluster", "join"}
-    assert "turns on **six** of them" in _norm(_text(README))
+    txt = _norm(_text(README))
+    assert "turns on **six**" in txt
+    # The count and the list have to agree, or the prose drifts from the config
+    # one name at a time.
+    for name in on:
+        assert f"`{name}`" in txt, f"{name} is on by default but unlisted"
 
 
 @pytest.mark.parametrize("claim,key,want", [
@@ -148,14 +153,6 @@ def test_every_peptide_assignment_mode_is_documented_somewhere(ma):
                                         "taxon_or_family_unique", "razor"}
 
 
-@pytest.mark.xfail(reason="LIVE DOC GAP: README's 'The shared-peptide rule' "
-                          "section lists protein_unique, taxon_unique and "
-                          "razor but not taxon_or_family_unique, which is a "
-                          "real accepted value of peptide_assignment and the "
-                          "only one that can silently attribute a peptide to "
-                          "one member of a SEQUENCE CLUSTER. It appears only "
-                          "in CHANGELOG.md.",
-                   strict=True)
 def test_the_readme_shared_peptide_section_lists_every_mode(ma):
     txt = _text(README)
     for mode in ma.ASSIGNMENT_MODES:
@@ -264,7 +261,7 @@ def test_the_readme_does_not_claim_untested_things_are_verified():
     # it is what stops a reader treating a search-stage run as production.
     txt = _text(README)
     assert "Not on real data" in txt
-    assert "Report and R object: synthetic data only" in txt
+    assert "Report and R object: built from the real run" in txt
 
 
 def test_the_docs_and_the_tool_agree_on_the_signalp_command_line():
@@ -289,15 +286,6 @@ def test_the_tutorial_bin_reference_numbers_are_internally_consistent():
         f"the quoted bin counts sum to {sum(counts)}, not the 38,204 proteins"
 
 
-@pytest.mark.xfail(reason="LIVE DOC DRIFT: README and TUTORIAL still describe "
-                          "a duplicate top-level `run:` or `db:` key as being "
-                          "SILENTLY collapsed by yaml.safe_load, with the "
-                          "first block discarded. load_config now installs a "
-                          "no-duplicate loader and exits naming the key and "
-                          "both line numbers, so the documented failure mode "
-                          "can no longer happen and the advice reads as if it "
-                          "still can.",
-                   strict=True)
 def test_the_docs_describe_duplicate_keys_as_refused_not_silently_collapsed():
     txt = _norm(_text(README) + " " + _text(TUTORIAL))
     assert "keeps only the last" not in txt

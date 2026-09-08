@@ -123,8 +123,8 @@ two lines that actually change something are `dbcan: false` and
 `pfam: true` and `cluster: true` restate the default, and the rest are already
 off and are written out only so the file says what you decided. `integrate` and
 `finalise` have no flag and always run. Edit this block in place; do not append
-a second top-level `run:` key later in the file, because YAML keeps only the
-last one and silently discards the first.
+a second top-level `run:` key later in the file. A duplicate key is refused —
+the run exits naming the key and both line numbers.
 
 **Relative paths in the config are resolved against the config file**, not the
 current directory, so `metaannot.py run --config /path/to/project/config.yaml`
@@ -398,8 +398,12 @@ python metaannot.py run --config config.yaml --threads 32 --ram 128 \
 Detach with `Ctrl-b d`. Reattach with `tmux attach -t metaannot`.
 
 A results directory takes a lock for the duration. A second run against the
-same directory refuses rather than interleaving its writes; a lock left by a
-dead process is reclaimed automatically.
+same directory refuses rather than interleaving its writes. A lock is reclaimed
+automatically only when it names a pid on this host that is provably gone —
+which on Windows is never, because asking there would kill the process. A
+crashed run may therefore need `--force-unlock`. The exception is a zero-byte
+lock, which is what a power loss or a hard crash leaves behind: those are
+removed on sight once they are more than a minute old.
 
 Monitor from another shell:
 
@@ -506,8 +510,9 @@ block set `unipept: true` and `taxonomy: true`; inside the **existing** `db:`
 block set `ncbi_taxonomy: "/DBROOT/taxdump"`; and at the top level set
 `unipept: {result: "pept2lca.csv"}` and `taxonomy_source: "concordant"`
 (`eggnog | unipept | concordant`). Do not paste a second top-level `run:` or
-`db:` key: YAML keeps only the last one, so your phase 2 settings, including
-`structure: false` and `topology: false`, would be discarded without warning.
+`db:` key: a duplicate key is refused, so rather than quietly discarding your
+phase 2 settings (including `structure: false` and `topology: false`), the run
+exits naming the key and both line numbers.
 
 Then:
 
