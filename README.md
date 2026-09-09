@@ -1233,6 +1233,33 @@ evidence, the percentage dark, and the median export score. `emapper` logs and
 records the same split for its own coverage, which is where the difference is
 starkest.
 
+**The tag is not the key.** A tier tag says which *source* a protein came
+from; the identifier key says what the id actually *is*, and it lives behind
+the tag:
+
+| id | tier tag | identifier key |
+|---|---|---|
+| `uhgpL_MGYG000004906_01237` | `uhgpL_` | `MGYG#_#` |
+| `uhgpSM_MGYG000009567_01280` | `uhgpSM_` | `MGYG#_#` |
+| `OIDECCNN_00158` | `OIDECCNN_` | `#` |
+| `ampS_AMP10.000_478` | `ampS_` | `AMP#.#_#` |
+
+On the real database that is **four tiers over three key spaces**: `uhgpL_`
+and `uhgpSM_` (and the `ent_` entrapment set) all wrap the same MGnify
+`MGYG…` namespace, 31.8M of the search database's 36.6M records. Two tiers
+sharing a key are one namespace under two labels — the same protein appears
+once per tag, one row of a precomputed annotation table annotates all of
+them, and **every** such tag must be in `emapper_strip_id_prefix` or its tier
+loses that table entirely and reports as unannotated. `tier_coverage.tsv`
+carries `key_shape` and `key_shape_pct` columns, the run names any key shared
+by more than one tier, and `emapper` warns while it can still be fixed if one
+sharing tier is listed and another is not.
+
+Digit *runs* are masked rather than digits, because widths vary inside one
+namespace: the Prokka tier runs `OIDECCNN_00001` to `OIDECCNN_1712297` — 5-,
+6- and 7-digit accessions, all one key space. Masking per digit would report
+three.
+
 Tiers are detected, not configured: the prefix is the text up to the first
 `_`, `|`, `:` or `.`. Two cases are declined rather than guessed at — one
 prefix over everything (contig ids all share `k141_`, so splitting says

@@ -1766,3 +1766,43 @@ def test_an_untiered_protein_set_gets_no_tier_rows(ma, tmp_path):
     ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), report,
                        "exact", 0.5, 0.9, 100)
     assert "tier_" not in io.open(report, encoding="utf-8").read()
+
+
+def test_a_tier_left_out_of_strip_id_prefix_is_named_while_it_can_be_fixed(
+        ma, tmp_path, capsys):
+    # symptom: uhgpL_ and uhgpSM_ wrap the SAME MGYG namespace, and one eggNOG
+    # row annotates a protein under every tag it carries. A tag missing from
+    # emapper_strip_id_prefix does not error -- its whole tier simply reports
+    # as unannotated, which reads as biology.
+    both = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(5)]
+    sm = [F.Protein(f"uhgpSM_MGYG00001{i}_0200{i}", "MKV" * 40,
+                    ko="ko:K01234", pathway="ko00010,map00010",
+                    seed_taxid="820") for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), both + sm)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), both + sm,
+                          id_prefix="uhgpL_")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100, strip_prefixes=["uhgpL_"])
+    err = capsys.readouterr().err
+    assert "share the identifier key MGYG#_#" in err
+    assert "uhgpSM_" in err
+    assert "reports as unannotated when it is only unjoined" in err
+
+
+def test_no_such_warning_when_every_sharing_tier_is_listed(ma, tmp_path,
+                                                           capsys):
+    both = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(5)]
+    sm = [F.Protein(f"uhgpSM_MGYG00001{i}_0200{i}", "MKV" * 40,
+                    ko="ko:K01234", pathway="ko00010,map00010",
+                    seed_taxid="820") for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), both + sm)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), both + sm,
+                          id_prefix="uhgpL_")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100,
+                       strip_prefixes=["uhgpL_", "uhgpSM_"])
+    assert "reports as unannotated" not in capsys.readouterr().err

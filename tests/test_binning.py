@@ -866,3 +866,57 @@ def test_the_tier_table_still_works_without_a_config(ma, tmp_path, paths_for):
     cfg, p, df = _tiered(ma, tmp_path, paths_for, "tier_nocfg")
     assert ma.write_tier_coverage(df, p.tier_coverage) is True
     assert os.path.exists(p.tier_coverage)
+
+
+# --- the identifier key under the tier tag ----------------------------
+# symptom: the tier tag says which SOURCE a protein came from; the identifier
+# key says what the id actually is, and it lives behind the tag. On the real
+# database uhgpL_ and uhgpSM_ both wrap MGYG#########_##### -- one namespace
+# under two labels, which is exactly why emapper_strip_id_prefix lists both.
+# Reporting only the tag hides that, and a tag left out of that list loses its
+# whole tier to a plausible-looking coverage number rather than to an error.
+def test_the_key_under_two_tier_tags_is_recognised_as_one(ma):
+    assert ma.id_key_shape("uhgpL_MGYG000004906_01237") == "MGYG#_#"
+    assert ma.id_key_shape("uhgpSM_MGYG000009567_01280") == "MGYG#_#"
+    assert ma.id_key_shape("ent_MGYG000004906_00100") == "MGYG#_#"
+    # ...and is not confused with the other two namespaces in that database
+    assert ma.id_key_shape("OIDECCNN_00158") == "#"
+    assert ma.id_key_shape("ampS_AMP10.000_478") == "AMP#.#_#"
+
+
+def test_a_key_space_with_varying_digit_widths_stays_one_key(ma):
+    # the Prokka tier runs OIDECCNN_00001 to OIDECCNN_1712297: 5-, 6- and
+    # 7-digit accessions, 91,776 / 814,981 / 636,440 of them. Masking per
+    # digit rather than per digit RUN would split one namespace into three.
+    assert len({ma.id_key_shape(f"OIDECCNN_{n}")
+                for n in ("00001", "099999", "1712297")}) == 1
+
+
+def test_an_id_with_no_delimiter_still_has_a_shape(ma):
+    assert ma.id_key_shape("P12345") == "P#"
+
+
+def test_the_tier_table_names_the_key_and_says_which_tiers_share_it(
+        ma, tmp_path, paths_for, capsys):
+    a = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "M" + "A" * 99,
+                   ko="ko:K01234", pathway="ko00010,map00010",
+                   seed_taxid="820") for i in range(4)]
+    b = [F.Protein(f"uhgpSM_MGYG00001{i}_0200{i}", "M" + "C" * 99)
+         for i in range(3)]
+    c = [F.Protein(f"OIDECCNN_{i:05d}", "M" + "D" * 99) for i in range(2)]
+    cfg, p = paths_for("tier_keys")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), a + b + c)
+    F.write_emapper(p.emapper, a)
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    ma.write_tier_coverage(df, p.tier_coverage, cfg)
+    t = pd.read_csv(p.tier_coverage, sep="\t").set_index("tier")
+    assert t.loc["uhgpL_", "key_shape"] == "MGYG#_#"
+    assert t.loc["uhgpSM_", "key_shape"] == "MGYG#_#"
+    assert t.loc["OIDECCNN_", "key_shape"] == "#"
+    assert (t["key_shape_pct"] == 100.0).all()
+    err = capsys.readouterr().err
+    assert "identifier key MGYG#_# is shared by" in err
+    assert "emapper_strip_id_prefix" in err
+    # the tier with a key of its own must not be named as sharing one
+    assert "shared by OIDECCNN_" not in err

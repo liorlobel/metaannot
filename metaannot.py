@@ -2006,6 +2006,34 @@ def id_prefix_candidates(pid, limit=3):
 MAX_ID_TIERS = 12
 
 
+def id_key_shape(pid):
+    """The identifier under a tier tag, with its digit runs masked.
+
+    A merged database has two things worth telling apart and they are easy to
+    confuse. The TIER TAG says which source a protein came from and is what
+    id_tiers reports. The KEY says what the identifier actually is, and it
+    lives BEHIND the tag:
+
+        uhgpL_MGYG000004906_01237   ->  tier uhgpL_    key MGYG#_#
+        uhgpSM_MGYG000009567_01280  ->  tier uhgpSM_   key MGYG#_#
+        OIDECCNN_00158              ->  tier OIDECCNN_ key #
+        ampS_AMP10.000_478          ->  tier ampS_     key AMP#.#_#
+
+    Two tiers sharing a key are the same identifier namespace under two
+    labels, which is exactly the case emapper_strip_id_prefix exists for: one
+    eggNOG row annotates a protein under every tag it appears with, and a tag
+    left out of that list loses its whole tier.
+
+    Digit RUNS are masked, not digits, because widths vary within one
+    namespace: the Prokka tier of the database this was written for runs
+    OIDECCNN_00001 to OIDECCNN_1712297, and 5-, 6- and 7-digit accessions are
+    all one key space. Masking per digit would split it into three.
+    """
+    m = PREFIX_DELIM_RE.search(pid)
+    tail = pid[m.end():] if m else pid
+    return re.sub(r"\d+", "#", tail) or "(empty)"
+
+
 def id_tiers(ids, max_tiers=MAX_ID_TIERS):
     """{prefix: count} when the ids look like a merged database, else {}.
 
@@ -2158,10 +2186,28 @@ def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
             k = i[:m.end()] if m else ""
             if k in hit:
                 hit[k] += 1
+        shape_of = {}
         for pref, n in sorted(tiers.items(), key=lambda kv: -kv[1]):
             tier_cov[pref] = (n, hit[pref])
+            ex = next((i for i in want if i.startswith(pref)), pref)
+            shape_of.setdefault(id_key_shape(ex), []).append(pref)
             log(f"emapper reuse:   {pref or '(no prefix)':20s} "
                 f"{hit[pref]:>8,}/{n:<8,} {100.0 * hit[pref] / n:5.1f}%")
+        # A tier tag left out of emapper_strip_id_prefix while a tier sharing
+        # its key space is in it loses the whole table for that tier, and the
+        # symptom is a plausible-looking coverage number rather than an error.
+        strip = tuple(strip_prefixes or ())
+        for shape, prefs in shape_of.items():
+            if len(prefs) < 2:
+                continue
+            miss = [p for p in prefs if p not in strip]
+            if strip and miss and len(miss) < len(prefs):
+                log(f"emapper reuse: {', '.join(prefs)} share the identifier "
+                    f"key {shape}, but emapper_strip_id_prefix lists only "
+                    f"{[p for p in prefs if p in strip]}. "
+                    f"{', '.join(miss)} will not be bridged to the same "
+                    "table rows, so that tier reports as unannotated when it "
+                    "is only unjoined. Add it.", "WARN")
     if bridged:
         log(f"emapper reuse: {len(bridged)} of those proteins matched only "
             "after emapper_strip_id_prefix was removed from the fasta id")
@@ -4644,12 +4690,29 @@ def write_tier_coverage(df, path, cfg=None):
                     100.0 * sub[col].fillna("").astype(str).ne("").mean(), 1)
         row["pct_dark"] = round(100.0 * sub["bin"].eq("4_dark").mean(), 1)
         row["median_export_score"] = sub["export_score"].median()
+        # The KEY under the tag, not the tag. Reported per tier because two
+        # tiers with the same key are one namespace under two labels.
+        shapes = pd.Series([id_key_shape(q) for q in sub.index]).value_counts()
+        row["key_shape"] = shapes.index[0] if len(shapes) else ""
+        row["key_shape_pct"] = round(
+            100.0 * shapes.iloc[0] / len(sub), 1) if len(shapes) else 0.0
         rows.append(row)
     t = pd.DataFrame(rows).set_index("tier")
     with atomic_out(path) as tmp:
         t.to_csv(tmp, sep="\t")
     log(f"{len(t)} identifier tier(s) in the protein set; coverage per tier "
         f"-> {path}")
+    shared = {}
+    for tier, shape in t["key_shape"].items():
+        shared.setdefault(shape, []).append(tier)
+    for shape, tiers in shared.items():
+        if len(tiers) > 1:
+            log(f"identifier key {shape} is shared by {', '.join(tiers)}: "
+                "these are one namespace under several tags, so the same "
+                "protein can appear once per tag, one row of a precomputed "
+                "annotation table annotates all of them, and EVERY one of "
+                "those tags has to be in emapper_strip_id_prefix or its tier "
+                "loses that table entirely", "WARN")
     for line in t.to_string().splitlines():
         log(line)
     return True
