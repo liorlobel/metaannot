@@ -15,7 +15,7 @@ import sys
 import pytest
 
 import fixtures as F
-from conftest import METAANNOT_PY, build_project, run_metaannot
+from conftest import METAANNOT_PY, _load, build_project, run_metaannot
 
 
 def _searchable(tmp_path, root, **over):
@@ -1121,31 +1121,104 @@ def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
     second = search[1][search[1].index("--format-output") + 1].split(",")
     assert second == ma.FOLDSEEK_COLS_LEGACY
     err = capsys.readouterr().err
-    assert "no qtmscore/ttmscore" in err
+    assert "predates qtmscore/ttmscore" in err
     assert "normalised by the alignment" in err
 
 
-def test_the_foldseek_retry_keeps_the_scratch_tree_so_only_convertalis_reruns(
+def _search_calls(calls):
+    return [c for c in calls if len(c) > 1 and c[1] == "easy-search"]
+
+
+def _tmpdir_of(argv):
+    """easy-search's tmp dir: the 6th positional, i.e. the arg after `out`.
+
+    Found by position rather than by name because easy-search takes it
+    positionally, but bounded by the first flag so a reordered argv fails the
+    test instead of silently creating a directory called '--format-output'.
+    """
+    pos = [a for a in argv[2:] if not a.startswith("-")]
+    return pos[3]
+
+
+def test_the_scratch_tree_is_removed_on_every_exit_not_only_success(
         ma, tmp_path, paths_for, stub_bin, monkeypatch):
-    # symptom: --format-output is consumed by convertalis, which easy-search
-    # runs AFTER the search, so this failure arrives with the whole multi-hour
-    # alignment already done in tmpd. The retry did shutil.rmtree(tmpd) first,
-    # throwing that away and re-running the search to change a formatting
-    # argument. Foldseek skips its search when the tree still holds the
-    # result, so the tree must survive between the two attempts.
-    calls, tmp_alive = [], []
-    inner = _fake_foldseek(calls)
+    # symptom: the cleanup sat after the loop body, so every re-raise - a full
+    # disk, an OOM kill, the undroppable-column path added beside it - left
+    # the tree behind. Against AFDB50 that is tens to hundreds of GB, and
+    # CLAUDE.md already lists results/foldseek/tmp* as never cleaned up.
+    seen = {}
 
     def fake_run(cmd, **kw):
         c = [str(x) for x in cmd]
         if len(c) > 1 and c[1] == "easy-search":
-            tmpd = c[5]
-            # Stand in for the completed alignment the real search leaves.
-            os.makedirs(tmpd, exist_ok=True)
-            marker = os.path.join(tmpd, "result.dbtype")
-            tmp_alive.append(os.path.exists(marker))
-            open(marker, "w").close()
-        return inner(cmd, **kw)
+            d = _tmpdir_of(c)
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "big"), "w").close()
+            seen["tmpd"] = d
+            raise RuntimeError("foldseek exited 1\n--- stderr tail ---\n"
+                               "Error: Could not open database\n")
+        return ""
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run)
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    with pytest.raises(RuntimeError, match="Could not open database"):
+        ma.stage_foldseek(cfg, p)
+    assert seen, "easy-search was never called"
+    assert not os.path.exists(seen["tmpd"]), (
+        "the scratch tree survived a failed search")
+
+
+# Derived from the two column lists, not copied: a field added to BOTH lists
+# later must become a new undroppable case automatically, and a field that
+# stops being droppable must not silently drop out of the parametrization.
+_MA = _load()
+_DROPPABLE = sorted(set(_MA.FOLDSEEK_COLS) - set(_MA.FOLDSEEK_COLS_LEGACY))
+_UNDROPPABLE = sorted(set(_MA.FOLDSEEK_COLS) & set(_MA.FOLDSEEK_COLS_LEGACY))
+
+
+def _reject(field):
+    return (f"foldseek exited 1\n--- stderr tail ---\n"
+            f"Format code {field} does not exist.\n")
+
+
+@pytest.mark.parametrize("field", _UNDROPPABLE)
+def test_a_rejected_column_the_legacy_list_also_asks_for_is_not_retried(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch, field):
+    # symptom: the first version of this gate retried on ANY rejected format
+    # code. FOLDSEEK_COLS_LEGACY is a strict subset of FOLDSEEK_COLS, so only
+    # qlen/tlen/qtmscore/ttmscore can be dropped; a build rejecting one of the
+    # ten fields in BOTH lists fails the retry identically, and the second
+    # error is the one the operator then has to explain.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd",
+                        _fake_foldseek(calls, fail_on_qtmscore=_reject(field)))
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    with pytest.raises(RuntimeError, match="Format code"):
+        ma.stage_foldseek(cfg, p)
+    assert len(_search_calls(calls)) == 1, (
+        f"'{field}' is in the legacy list too, so the retry cannot help")
+    assert "legacy column list asks for as well" in capsys.readouterr().err, (
+        "the operator must be told why it did not fall back")
+
+
+@pytest.mark.parametrize("field", _DROPPABLE)
+def test_every_column_the_legacy_list_drops_does_trigger_the_fallback(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch, field):
+    # symptom: only qtmscore was ever exercised, so narrowing `droppable` to
+    # {"qtmscore"} passed the whole suite - and qlen and tlen sit EARLIER in
+    # FOLDSEEK_COLS than qtmscore, so they are the first codes an old build
+    # rejects.
+    calls = []
+
+    def fake_run(cmd, **kw):
+        c = [str(x) for x in cmd]
+        calls.append(c)
+        if (len(c) > 1 and c[1] == "easy-search"
+                and field in c[c.index("--format-output") + 1].split(",")):
+            raise RuntimeError(_reject(field))
+        return ""
 
     monkeypatch.setattr(ma, "run_cmd", fake_run)
     monkeypatch.setattr(ma, "have", lambda t: True)
@@ -1154,10 +1227,53 @@ def test_the_foldseek_retry_keeps_the_scratch_tree_so_only_convertalis_reruns(
         ma.stage_foldseek(cfg, p)
     except Exception:              # noqa: BLE001
         pass
-    assert len(tmp_alive) == 2, "expected exactly two easy-search attempts"
-    assert tmp_alive[1], (
-        "the scratch tree was cleared between the attempts, so the retry "
-        "re-runs the search instead of just the conversion")
+    search = _search_calls(calls)
+    assert len(search) == 2, f"'{field}' is droppable, so it must fall back"
+    assert search[1][search[1].index("--format-output") + 1].split(",") \
+        == ma.FOLDSEEK_COLS_LEGACY
+    assert f"rejected the format code '{field}'" in capsys.readouterr().err
+
+
+def test_the_phrase_is_not_spliced_across_two_lines_of_stderr(
+        ma, tmp_path, paths_for, stub_bin, monkeypatch):
+    # symptom: with \s+ between the words, a multi-line tail splices unrelated
+    # lines - "<path> does not exist" is stock MMseqs2 wording for a missing
+    # database - and the gate then names a PATH as the rejected column, either
+    # refusing to fall back or buying a pointless second invocation.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd", _fake_foldseek(
+        calls, fail_on_qtmscore="foldseek exited 1\n--- stderr tail ---\n"
+                                "Please choose a valid format code\n"
+                                "/scratch/foldseek/tmp0 does not exist\n"))
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    with pytest.raises(RuntimeError):
+        ma.stage_foldseek(cfg, p)
+    assert len(_search_calls(calls)) == 1, (
+        "a path on a following line was read as the rejected format code")
+
+
+def test_a_rejected_code_in_a_different_wording_still_falls_back(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
+    # symptom: keying the fallback on one exact sentence means a build whose
+    # message differs by a colon loses its structural evidence entirely. The
+    # rejection costs seconds - foldseek validates --format-output before it
+    # creates the temp directory, let alone searches - so the permissive
+    # direction is the cheap one.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd", _fake_foldseek(
+        calls, fail_on_qtmscore="foldseek exited 1\n--- stderr tail ---\n"
+                                "Format code: qtmscore does not exist.\n"))
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    try:
+        ma.stage_foldseek(cfg, p)
+    except Exception:              # noqa: BLE001
+        pass
+    assert len(_search_calls(calls)) == 2, "a rejection must still fall back"
+    # `format code\W*` absorbs the colon, so the field is still named rather
+    # than the message degrading to "a format code it could not name".
+    assert "rejected the format code 'qtmscore'" in capsys.readouterr().err
 
 
 def test_a_foldseek_failure_that_is_not_a_bad_format_code_is_not_retried(

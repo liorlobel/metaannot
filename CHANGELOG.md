@@ -4,8 +4,8 @@
 
 ### Fixed
 
-**Foldseek's legacy-column fallback could never run, and would have paid for
-the search twice if it had.** `stage_foldseek` asks for `qtmscore` and `qlen`
+**Foldseek's legacy-column fallback could never run.**
+`stage_foldseek` asks for `qtmscore` and `qlen`
 and falls back to the ten legacy columns when a build does not have them. It
 caught `StageError`. `run_cmd` raises a plain `RuntimeError` on a non-zero
 exit, and `StageError` is a **subclass** of `RuntimeError` — so the handler
@@ -18,20 +18,31 @@ emits, so it passed over dead code.
 `except StageError` handlers are correct, because nothing on their paths
 reaches `run_cmd`.
 
-**The scratch tree now survives the retry.** `--format-output` is consumed by
-`convertalis`, which `easy-search` runs *after* the search — so this failure
-arrives with the entire multi-hour alignment already done and sitting in
-`tmpd`. The retry began with `shutil.rmtree(tmpd)`, throwing that away and
-re-running the search to change a formatting argument. Foldseek guards its
-search with `notExists "${result}.dbtype"`, so leaving the tree in place means
-the retry re-runs the conversion instead. The cleanup after a successful
-search is unchanged.
+**A rejected format code costs seconds, not the search.** `easy-search`
+validates `--format-output` in `getOutputFormat` (EasyStructureSearch.cpp
+line 42) and does not create its temporary directory until line 59, so
+foldseek exits before it prefilters anything and leaves no tree behind. The
+retry is therefore cheap, and the gate is permissive in the direction that
+matters: a rejection whose wording it cannot parse still falls back rather
+than losing the structural evidence to a changed message.
 
-**Only a rejected format code is retried.** Foldseek prints
-`Format code <field> does not exist.` to stderr and exits 1, and `run_cmd`
-carries that tail in its message. Any other failure — a bad database, a full
-disk, an OOM kill — is re-raised untouched: it has no completed alignment to
-reuse, so a retry would repeat the search to arrive at the same error.
+**Only a rejected format code is retried, and only one the fallback can
+drop.** `FOLDSEEK_COLS_LEGACY` is a strict subset of `FOLDSEEK_COLS`, so
+falling back can only ever remove `qlen`, `tlen`, `qtmscore` and `ttmscore`.
+The other ten fields are in **both** lists — a build that rejects `lddt` or
+`theader` fails the retry identically, and the second error is then the one
+the operator has to explain. Those re-raise with a line saying why. Both
+halves of the phrase must appear on **one line** of the stderr tail:
+`<path> does not exist` is stock MMseqs2 wording for a missing database, and
+tested across a multi-line tail it would splice an unrelated line onto the
+words "format code" and read a path as a rejected column.
+
+**The scratch tree is now removed on every exit, not only success.** The
+cleanup sat after the loop body, so every re-raise — a full disk, an OOM
+kill, the undroppable-column path — left it behind. Against AFDB50 that is
+tens to hundreds of GB, and `CLAUDE.md` already records
+`results/foldseek/tmp*` as something that is never cleaned up. It is a
+`try/finally` now.
 
 **The warning was wrong about `qlen`.** Foldseek 5 and earlier accept `qlen`;
 only `qtmscore` and `ttmscore` are missing. The message said "no
