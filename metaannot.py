@@ -4582,15 +4582,48 @@ TIER_EVIDENCE = [
 ]
 
 
-def write_tier_coverage(df, path):
+def write_tier_coverage(df, path, cfg=None):
     """Coverage split by identifier prefix, for a merged search database.
 
     bin_summary.tsv answers "what did this proteome look like"; this answers
-    "and did its parts look alike", which for a database merged from two
-    metagenome-assembled catalogues plus this study's own assembly is the
-    question the headline number hides. Writes nothing and says why when the
-    ids are not tiered, so an absent file is never ambiguous.
+    "and did its parts look alike", which for a database merged from several
+    catalogues plus this study's own assembly is the question the headline
+    number hides. Writes nothing and says why when the ids are not tiered, so
+    an absent file is never ambiguous.
+
+    exclude_id_prefixes is applied FIRST. A run whose proteins_faa is the
+    whole search database rather than the identified subset carries the
+    decoys, the entrapment set and the contaminants, and on the database this
+    was written for those are the two LARGEST namespaces in the file --
+    18,318,713 rev_ and 2,280,823 ent_ against 11,379,230 uhgpL_. A tier table
+    whose top row is the decoy set is not a description of the biology, and it
+    would also spend the twelve-tier budget on namespaces that are there to be
+    ignored. They are dropped and counted out loud, never silently.
     """
+    if cfg is not None:
+        prefixes = tuple(cfg.get("exclude_id_prefixes") or ())
+        if prefixes:
+            drop = np.asarray([str(s).startswith(prefixes) for s in df.index],
+                              dtype=bool)
+            if drop.any():
+                hits = {}
+                for s in df.index[drop]:
+                    for pre in prefixes:
+                        if str(s).startswith(pre):
+                            hits[pre] = hits.get(pre, 0) + 1
+                            break
+                log(f"tier coverage: {int(drop.sum()):,} protein(s) excluded "
+                    f"by exclude_id_prefixes {hits} before the split. Decoy, "
+                    "entrapment and contaminant namespaces are in the search "
+                    "database to be ignored, and reporting their coverage "
+                    "beside a real catalogue's would invite reading them as "
+                    "one")
+                df = df[~drop]
+    if not len(df):
+        log("tier coverage: nothing is left after exclude_id_prefixes, so no "
+            f"per-tier table is written; {os.path.basename(path)} is absent "
+            "for that reason, not because a stage failed", "WARN")
+        return False
     tiers = id_tiers(df.index)
     if not tiers:
         log("protein ids are not split by a source prefix (or carry more "
@@ -4778,7 +4811,7 @@ def stage_integrate_final(cfg, p):
     with atomic_out(p.final) as tmp:
         df.to_csv(tmp, sep="\t")
     write_summary(df, p.summary)
-    write_tier_coverage(df, p.tier_coverage)
+    write_tier_coverage(df, p.tier_coverage, cfg)
     write_source_agreement(df, p.agreement)
     log(f"wrote {p.final}")
 

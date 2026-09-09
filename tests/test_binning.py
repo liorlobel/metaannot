@@ -814,3 +814,55 @@ def test_the_tier_table_is_written_beside_bin_summary(ma, tmp_path,
     cfg, p, df = _tiered(ma, tmp_path, paths_for, "tiers_beside")
     assert os.path.dirname(p.tier_coverage) == os.path.dirname(p.summary)
     assert os.path.basename(p.tier_coverage) == "tier_coverage.tsv"
+
+
+def test_decoys_and_entrapment_are_not_reported_as_tiers(ma, tmp_path,
+                                                         paths_for, capsys):
+    # symptom: proteins_faa is not always the identified subset. Run the whole
+    # search database through and its two LARGEST namespaces are rev_ and
+    # ent_ -- 18,318,713 and 2,280,823 against 11,379,230 uhgpL_ on the real
+    # one. A tier table whose top row is the decoy set is not a description of
+    # the biology, and those namespaces would also spend the twelve-tier
+    # budget on things that are there to be ignored.
+    real = [F.Protein(f"uhgpL_P{i:03d}", "M" + "A" * 99, ko="ko:K01234",
+                      pathway="ko00010,map00010", seed_taxid="820")
+            for i in range(4)]
+    junk = ([F.Protein(f"rev_uhgpL_P{i:03d}", "M" + "C" * 99) for i in range(6)]
+            + [F.Protein(f"ent_X{i:03d}", "M" + "D" * 99) for i in range(3)]
+            + [F.Protein("contam_TRYP", "M" + "E" * 99)])
+    other = [F.Protein(f"OIDECCNN_{i:05d}", "M" + "F" * 99) for i in range(2)]
+    cfg, p = paths_for("tier_decoy")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        real + junk + other)
+    F.write_emapper(p.emapper, real)
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage, cfg) is True
+    t = pd.read_csv(p.tier_coverage, sep="\t").set_index("tier")
+    assert set(t.index) == {"uhgpL_", "OIDECCNN_"}, list(t.index)
+    assert t["n"].sum() == 6, "the decoys were counted into a real tier"
+    # dropped, but never silently
+    err = capsys.readouterr().err
+    assert "excluded by exclude_id_prefixes" in err
+    assert "rev_" in err and "ent_" in err and "contam_" in err
+
+
+def test_a_proteome_of_nothing_but_decoys_writes_no_tier_table(
+        ma, tmp_path, paths_for, capsys):
+    ps = [F.Protein(f"rev_P{i:03d}", "M" + "A" * 99) for i in range(4)]
+    cfg, p = paths_for("tier_alldecoy")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, [])
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage, cfg) is False
+    assert not os.path.exists(p.tier_coverage)
+    assert "nothing is left after exclude_id_prefixes" in capsys.readouterr().err
+
+
+def test_the_tier_table_still_works_without_a_config(ma, tmp_path, paths_for):
+    # cfg is optional so the function stays callable from a notebook against a
+    # frame that has already been filtered.
+    cfg, p, df = _tiered(ma, tmp_path, paths_for, "tier_nocfg")
+    assert ma.write_tier_coverage(df, p.tier_coverage) is True
+    assert os.path.exists(p.tier_coverage)
