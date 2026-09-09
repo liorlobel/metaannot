@@ -537,6 +537,90 @@ def test_an_unknown_tmbed_gpu_setting_is_refused(ma, tmp_path, paths_for,
     assert "unknown tmbed_use_gpu" in str(e.value)
 
 
+# tmbed's real shape: a tqdm bar redrawn in place on stderr for hours, and the
+# predictions written only at the very end.
+_TMBED_STUB = """#!/usr/bin/env python3
+import sys, time
+a = sys.argv[1:]
+out = a[a.index("-p") + 1]
+for i in range(6):
+    bar = "\\r 61%|###### | " + str(i * 5000) + "/38204 [2:36:04<1:39:41]"
+    sys.stderr.write(bar)
+    sys.stderr.flush()
+    time.sleep(0.08)
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write(">P1\\nMKV\\nPPP\\n")
+"""
+
+
+def _stub_tmbed(tmp_path, monkeypatch):
+    """A tmbed on PATH that behaves like the real one's output does."""
+    d = tmp_path / "tmbedbin"
+    d.mkdir(exist_ok=True)
+    (d / "tmbed").write_text(_TMBED_STUB, encoding="utf-8")
+    os.chmod(d / "tmbed", 0o755)
+    if os.name == "nt":
+        # PATHEXT decides what is executable there, so an extension-less stub
+        # is never found — the same reason conftest's stub_bin writes a shim.
+        (d / "tmbed.cmd").write_text(
+            f'@echo off\r\n"{sys.executable}" "%~dp0tmbed" %*\r\n',
+            encoding="utf-8")
+    monkeypatch.setenv("PATH", str(d) + os.pathsep + os.environ["PATH"])
+    return d
+
+
+def test_tmbed_reports_progress_like_every_other_long_running_tool(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # symptom: tmbed is the tool the heartbeat was written for — the example
+    # in the release note is its own bar — but the stage called subprocess.run
+    # directly instead of run_cmd, so it got neither the stderr ring nor the
+    # heartbeat and said nothing for the 2 h 36 min it ran.
+    cfg, p = paths_for("tmbed_progress")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        F.protein_set()[:2])
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0.15)
+    ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    progress = [l for l in err.splitlines()
+                if " running " in l and "tmbed" in l]
+    assert progress, "the stage the heartbeat exists for emitted no progress"
+    assert any("61%|" in l for l in progress), \
+        "tmbed's own bar is what says how far along it is"
+    assert os.path.exists(p.tmbed), "the predictions are still adopted"
+
+
+def test_tmbed_is_launched_by_the_path_that_was_resolved_for_it(
+        ma, tmp_path, paths_for, monkeypatch):
+    # symptom: every tool is meant to be launched by the absolute path PATH
+    # resolves to, because CreateProcess ignores PATHEXT and a .cmd earlier on
+    # PATH loses to an .exe later on it — but the stage handed the OS the bare
+    # name, so the binary that ran need not be the one have() reported and the
+    # logged command line named.
+    cfg, p = paths_for("tmbed_argv")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        F.protein_set()[:2])
+    d = _stub_tmbed(tmp_path, monkeypatch)
+    launched = []
+
+    def _spy(real):
+        def go(argv, *a, **k):
+            launched.append([str(c) for c in argv])
+            return real(argv, *a, **k)
+        return go
+    # Both launchers, because the name handed to the OS is what is under test
+    # and not which of them the stage reaches for.
+    monkeypatch.setattr(ma.subprocess, "run", _spy(ma.subprocess.run))
+    monkeypatch.setattr(ma.subprocess, "Popen", _spy(ma.subprocess.Popen))
+    ma.stage_tmbed(cfg, p)
+    argv0 = [c[0] for c in launched
+             if os.path.basename(c[0]).startswith("tmbed")]
+    assert argv0, "no tmbed process was launched"
+    assert os.path.isabs(argv0[0]), \
+        f"tmbed was launched as {argv0[0]!r}, not the path PATH resolves to"
+    assert os.path.dirname(argv0[0]) == str(d)
+
+
 # --- run_cmd: progress out of a multi-hour tool ------------------------
 # symptom: tmbed ran 2 h 36 min and then died, twice, and InterProScan 2.9 h,
 # with nothing in the log between the command and the failure. Both write a

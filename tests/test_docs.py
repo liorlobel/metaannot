@@ -145,6 +145,23 @@ def test_documented_numeric_defaults_match_default_config(ma):
     assert "hard floor of 90 nt" in _text(README)
 
 
+def test_the_tmbed_length_cap_is_documented(ma):
+    # symptom: tmbed_max_len drops every protein over 3,000 residues from the
+    # topology stage — no n_tmh, no n_tmb, a changed stage output and a forced
+    # re-run of it — and appeared in no document, so the first anybody heard
+    # of the exclusion was a WARN in the middle of a multi-hour run.
+    txt = _norm(_text(README))
+    assert "tmbed_max_len" in txt, "tmbed_max_len is documented nowhere"
+    assert ma.DEFAULT_CONFIG["tmbed_max_len"] == 3000
+    assert f"tmbed_max_len: {ma.DEFAULT_CONFIG['tmbed_max_len']}" in txt, \
+        "the documented default has drifted from DEFAULT_CONFIG"
+    assert "tmbed_excluded.tsv" in txt, \
+        "a reader has to be told where the proteins that were cut are listed"
+    tmbed = next(s for s in ma.STAGES if s["name"] == "tmbed")
+    assert "tmbed_max_len" in tmbed["keys"], \
+        "the README says changing the cap re-runs the stage"
+
+
 def test_every_peptide_assignment_mode_is_documented_somewhere(ma):
     txt = _text(README) + _text(TUTORIAL) + _text(CHANGELOG) + _text(CLAUDE)
     for mode in ma.ASSIGNMENT_MODES:
@@ -188,6 +205,132 @@ def test_the_signature_version_is_documented_as_separate_from_the_tool_version(
 
 def test_the_changelog_names_the_released_version(ma):
     assert f"## v{ma.__version__}" in _text(CHANGELOG)
+
+
+# --- documentation that had drifted from the code ---------------------
+def test_the_changelog_and_the_readme_disagreed_on_the_uc_stage_count(ma):
+    # symptom: CHANGELOG's v0.3.0 entry said sixteen applicable stages ran on
+    # the UC dataset while README said fifteen and enumerated fifteen, so the
+    # answer to "how much of this tool has been run for real" depended on
+    # which file you opened.
+    readme = _norm(_text(README))
+    m = re.search(r"(\w+) of the twenty-one stages ran on that input: (.+?)\.",
+                  readme)
+    assert m, "the 'what has actually been run' stage list is gone from README"
+    named = set(re.findall(r"`([a-z_]+)`", m.group(2)))
+    unknown = named - set(ma.STAGE_NAMES)
+    assert not unknown, f"README names stages that do not exist: {unknown}"
+    # the enumeration is what settles it: the count in the prose, the count of
+    # the list, and the stages left over must all be the same arithmetic.
+    assert m.group(1) == "Fifteen" and len(named) == 15
+    assert len(set(ma.STAGE_NAMES) - named) == 6
+    assert "all fifteen applicable stages" in _norm(_text(CHANGELOG))
+
+
+def test_the_readme_eggnog_pfam_paragraph_was_truncated_mid_sentence(ma):
+    # symptom: the paragraph broke off at "with `run." in v0.3, taking with it
+    # the one thing it exists to say — that it is the pfam stage being OFF
+    # that used to hide a domain eggNOG had already assigned.
+    txt = _norm(_text(README))
+    m = re.search(r"\*\*eggNOG's own `PFAMs` column counts as domain "
+                  r"evidence\.\*\*(.+?)Bins 2 to 4", txt)
+    assert m, "the eggNOG PFAMs paragraph is gone from README.md"
+    para = m.group(1)
+    assert para.count("`") % 2 == 0, \
+        "an unclosed backtick: the paragraph is truncated again"
+    assert "`run.pfam: false`" in para, \
+        "the paragraph no longer names the condition it is about"
+    # the figure is the code comment's, so the two cannot drift apart
+    assert "6,271 of 17,377 dark proteins (36%)" in para
+    assert "6,271 of 17,377 dark proteins (36%)" in _norm(_text(METAANNOT_PY))
+
+
+def test_the_tutorial_free_form_list_named_a_removed_config_block(ma):
+    # symptom: TUTORIAL told the reader to proof-read `effector_predictions`
+    # by hand — a block v0.3.0 removed — and omitted two blocks that really
+    # are free-form, so a typo in one of those went on being invisible.
+    m = re.search(r"cannot see inside are the free-form blocks \((.+?)\),",
+                  _norm(_text(TUTORIAL)))
+    assert m, "the free-form block list is gone from TUTORIAL.md"
+    assert set(re.findall(r"`([\w.]+)`", m.group(1))) == ma.FREEFORM
+
+
+def test_the_tutorial_quoted_an_esmfold_message_v0_3_cannot_emit():
+    # symptom: the troubleshooting table quoted "were skipped (OOM) or never
+    # folded", the one hedged sentence v0.3 split into three separate causes.
+    # The row sent a reader hunting for a string the tool no longer prints,
+    # and blamed OOM for proteins that were never submitted to the card.
+    tut, code = _norm(_text(TUTORIAL)), _text(METAANNOT_PY)
+    assert "were skipped (OOM) or never folded" not in tut
+    for q in ("esmfold has not finished", "although esmfold has finished",
+              "were never submitted", "attempted and failed twice",
+              "absent from that list"):
+        assert _norm(q) in tut, f"the esmfold rows lost '{q}'"
+        assert q in code, f"TUTORIAL quotes '{q}', which the code cannot emit"
+
+
+def test_the_tutorial_still_said_reporter_ions_are_not_read():
+    # symptom: phase 3a told the reader "reporter-ion quantification is not
+    # supported at all" and pointed at a README section v0.3.0 deleted, and
+    # the troubleshooting table read the isobaric refusal as a dead end rather
+    # than as "the quant_format is wrong". Both predate the fragpipe_tmt
+    # reader, and between them they talk a TMT user out of a supported route.
+    tut, code = _norm(_text(TUTORIAL)), _text(METAANNOT_PY)
+    for gone in ("reporter-ion quantification is not supported at all",
+                 'See README, "FragPipe TMT output is not supported"',
+                 "Reporter-ion channels are not read"):
+        assert gone not in tut, f"TUTORIAL still says: {gone}"
+    assert "`quant_format: fragpipe_tmt`" in tut
+    # and the way out it offers is the one the refusal itself prints
+    assert "quant_format: fragpipe_tmt" in code
+
+
+def test_the_example_runbook_named_a_stage_that_no_longer_exists(ma):
+    # symptom: the run plan's "what is off, and why" still listed `effectors`,
+    # removed in v0.3.0 and absent from all eight configs, so the prose and
+    # the files it describes disagreed about what the runs turn off.
+    import glob
+    import yaml as _yaml
+    assert "effectors" not in ma.DEFAULT_CONFIG["run"]
+    m = re.search(r"## What is off, and why\n+(.+?)\n\n",
+                  _text(os.path.join(EXAMPLE, "README.md")), re.S)
+    assert m, "the 'what is off' section is gone from the example README"
+    named = set(re.findall(r"`([a-z_]+)`", m.group(1)))
+    off = None
+    for c in sorted(glob.glob(os.path.join(EXAMPLE, "*", "config.yaml"))):
+        run = _yaml.safe_load(open(c, encoding="utf-8"))["run"]
+        this = {k for k, v in run.items() if not v}
+        assert off is None or this == off, f"{c} turns off a different set"
+        off = this
+    assert off, "no example config was read"
+    assert named == off
+
+
+def test_claude_md_told_the_next_session_to_refuse_tmt(ma):
+    # symptom: CLAUDE.md is the standing instruction file an agent reads
+    # first, and after v0.3.0 shipped the fragpipe_tmt reader it still said
+    # "FragPipe TMT output is not supported ... do not read a number out of
+    # one". As written it instructed the next session to refuse exactly what
+    # the release was built to do.
+    assert "fragpipe_tmt" in ma.ALL_FORMATS
+    txt = _norm(_text(CLAUDE))
+    for gone in ("FragPipe TMT output is not supported",
+                 "Reporter-ion channels are not read",
+                 "do not read a number out of one",
+                 "Isobaric support is a separate piece of work",
+                 "Isobaric input is **refused, not read**",
+                 "Do not weaken it to get a TMT run through",
+                 "Only the pre-search half has been run on real data",
+                 "the report and R object have only ever run on synthetic "
+                 "data"):
+        assert gone not in txt, f"CLAUDE.md still says: {gone}"
+    assert "quant_format: fragpipe_tmt" in txt, \
+        "CLAUDE.md does not name the format that reads a TMT run"
+    # and what replaces rule 8 has to be the real division
+    assert "Fifteen of the twenty-one stages" in txt
+    for never in ("smorf", "context", "hhblits", "jackhmmer", "unipept",
+                  "taxonomy"):
+        assert f"`{never}`" in txt, f"CLAUDE.md no longer names {never}"
 
 
 # --- finding 60 -------------------------------------------------------

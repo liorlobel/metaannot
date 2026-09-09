@@ -101,7 +101,7 @@ re-runs on the next run and nothing else recomputes.
 Isobaric quantification, a cross-source agreement check, and the removal of a
 stage that asked the user to do the work somewhere else. Validated on two real
 datasets: the UC antibiotics label-free run end to end (38,204 proteins, all
-sixteen applicable stages, report and R object built from it), and Pittsburgh
+fifteen applicable stages, report and R object built from it), and Pittsburgh
 ICB-melanoma FragPipe TMT (8 plexes, 455,571 proteins).
 
 `SIGNATURE_VERSION` stays at **1**. Nothing here changes what a *search* stage's
@@ -502,6 +502,12 @@ that ran was not the tool `shutil.which` reported. `run_cmd` and the two
 direct `subprocess.run` callers now resolve the name first, so the
 availability check, the logged command line and the process that starts all
 agree. On POSIX this changes nothing.
+*(Corrected after v0.3.0. This paragraph said "the two direct
+`subprocess.run` callers", but `stage_tmbed` was a third and was not resolving
+its name — see the Unreleased entry, which routes it through `run_cmd`
+instead. `_run_rscript` remains outside this, deliberately: it needs the
+stderr `run_cmd` discards on success. Nothing else in the v0.3.0 entry has
+been changed.)*
 
 This surfaced as a test-suite failure, which is the more useful half: the
 `stub_bin` fixture writes extension-less Python scripts, so on Windows it was

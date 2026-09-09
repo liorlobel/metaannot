@@ -5,23 +5,30 @@ Project context and standing rules. Read `TUTORIAL.md` for the runbook.
 ## What this is
 
 `metaannot.py` is a single-file metaproteomics annotation pipeline. It takes
-FragPipe (or DIA-NN, or MSstats) **label-free** quantification plus a protein
-FASTA, annotates
-every protein with whatever evidence exists for it, and bins proteins by that
-evidence so the fraction KEGG-based analysis discards stops being invisible.
-It then writes an R Markdown report and a QFeatures object.
+FragPipe, DIA-NN or MSstats **label-free** quantification — or FragPipe **TMT**
+since v0.3.0 — plus a protein FASTA, annotates every protein with whatever
+evidence exists for it, and bins proteins by that evidence so the fraction
+KEGG-based analysis discards stops being invisible. It then writes an R
+Markdown report and a QFeatures object.
 
 One file. No package to install. `python metaannot.py --help`.
 
-**FragPipe TMT output is not supported.** Reporter-ion channels are not read.
-The per-plex `TMTn/*.tsv` tables are now **refused**: the loader spots the
-`Intensity <sample>` reporter columns and dies rather than collapsing to the
-single MS1 precursor column and reporting one "sample". The other TMT routes
-still fail on their own terms — the `tmt-report/` matrices are log2 and
-median-centred and would be log-transformed a second time, and the TMT
-`msstats.csv` breaks the parser outright — so neither is safe either. Do not
-point this tool at a TMT run and do not read a number out of one; say so
-instead. Isobaric support is a separate piece of work.
+**FragPipe TMT is read, from the per-plex folders and nowhere else.** v0.3.0
+added `quant_format: fragpipe_tmt`: `quant_table` becomes the FragPipe run
+directory holding the `TMTn/` folders, and the reader takes the reporter
+channels from each plex's `ion.tsv` or `peptide.tsv`, joins the plexes at
+feature level, and carries the plex into the design as a covariate. Those
+intensities are linear, so the log2 path, the roll-up and the
+median-of-ratios size factor apply unchanged, and the `tmt:` block configures
+the rest. Report the plex-exposure warning the join stage prints.
+
+Every **other** TMT file is still refused by name, and that is a result rather
+than a gap: the `tmt-report/` matrices are already log2, median-centred and
+protein level; a per-plex `protein.tsv` would report one plex as the whole
+experiment; and the TMT `msstats.csv` holds the channels in `Channel <mass>`
+columns that no format here maps to samples. Every one of those refusals names
+`quant_format: fragpipe_tmt` and the directory to point at instead. Apply what
+it names; do not force the file through another format.
 
 ## Standing rules
 
@@ -74,15 +81,20 @@ instead. Isobaric support is a separate piece of work.
    in `emapper_strip_id_prefix` instead. Apply what it names. Do not raise
    `emapper_min_coverage` to get past it.
 
-8. **Only the pre-search half has been run on real data.** One label-free
-   dataset has gone end to end (FragPipe `combined_peptide.tsv` + manifest +
-   precomputed eggNOG, 38,204 proteins): manifest parsing, the id join, the
-   shared-peptide rule, binning, roll-up and design recovery all work. Every
-   external search stage was off in that run, and the report and R object have
-   only ever run on synthetic data. So treat a run that enables search stages,
-   or that reaches the report, as validation rather than production:
-   sanity-check counts at every phase against the expectations in
-   `TUTORIAL.md` and say plainly when something looks wrong.
+8. **Fifteen of the twenty-one stages have been run on real data. Six have
+   not.** One label-free dataset went end to end — FragPipe
+   `combined_peptide.tsv` + manifest + precomputed eggNOG, 38,204 proteins —
+   through `emapper`, `pfam`, `dbcan`, `diamond`, `cluster`, `ncbifam`,
+   `kofam`, `interpro`, `signalp`, `tmbed`, `esmfold`, `foldseek`,
+   `integrate`, `finalise` and `join`, and both the report and the R object
+   were built from it. A 3-plex subset of an 8-plex FragPipe TMT run has also
+   completed end to end including the report. What has still never run on real
+   data is `smorf`, `context`, `hhblits`, `jackhmmer`, `unipept` and
+   `taxonomy` — all off by default — so a run that enables one of those is
+   validation rather than production: sanity-check its counts against the
+   expectations in `TUTORIAL.md` and say plainly when something looks wrong.
+   `3p_profile_only` is fed only by `hhblits` and `jackhmmer`, so no run has
+   ever put a protein in it.
 
 9. **A `parsed 0 ... from a non-empty file` warning is not noise.** It means a
    tool's output is truncated or in an unexpected format, so every protein
@@ -119,9 +131,12 @@ instead. Isobaric support is a separate piece of work.
   version-specific and must not be automated.
 - The taxon reference is a median of ratios, not a sum. A sum is biased by any
   strongly changing member of the taxon.
-- Isobaric input is **refused, not read**. Returning the pooled MS1 column as
-  the sole "sample" was silently wrong; a loud death is the intended
-  behaviour. Do not weaken it to get a TMT run through.
+- Isobaric input reached through the **wrong** `quant_format` is refused, not
+  read. Returning the pooled MS1 column as the sole "sample", or a
+  `tmt-report/` matrix as though its values were linear, was silently wrong; a
+  loud death that names `quant_format: fragpipe_tmt` is the intended
+  behaviour. Do not weaken a refusal to get a TMT run through — point the
+  supported reader at the run directory instead.
 - A FragPipe intensity of `0` means "not quantified", not "measured as zero",
   so it is read as missing (`zero_intensity_is_missing: true`, and the run
   logs how many cells that was). Summing zeros as real values turns

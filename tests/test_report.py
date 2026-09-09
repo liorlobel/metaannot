@@ -368,6 +368,33 @@ def test_a_hand_written_tmt_formula_is_left_alone(ma, tmp_path):
     assert re.search(r'design_formula: !r \'"~ group \+ plex"\'', _header(out))
 
 
+def test_a_formula_that_does_not_model_the_plex_keeps_it_out_of_factor_cols(
+        ma, tmp_path):
+    # symptom: the formula and factor_cols were replaced independently, so a
+    # user who wrote "~ group" kept their formula and still got factor_cols
+    # 'group,plex'; the knit then stopped on the report's own
+    # "factor_cols names a missing column" over a column their metadata had no
+    # reason to carry, naming a config key they never set.
+    cfg, p = _tmt_project(ma, tmp_path, TMT_CROSSED)
+    meta = tmp_path / "meta.tsv"          # the plex is not modelled, so it is
+    meta.write_text("sample\tgroup\ns1\ta\ns2\tb\ns3\ta\ns4\tb\n",  # not here
+                    encoding="utf-8")
+    cfg["analysis"]["metadata"] = str(meta)
+    cfg["analysis"]["design_formula"] = "~ group"
+    h = _header(ma.write_report_rmd(cfg, p))
+    assert re.search(r'design_formula: !r \'"~ group"\'', h)
+    assert re.search(r'factor_cols: !r \'"group"\'', h)
+    for cc in re.search(r'factor_cols: !r \'"(.*)"\'', h).group(1).split(","):
+        assert cc in list(pd.read_csv(meta, sep="\t", nrows=0).columns), \
+            "the Rmd stops the knit on a factor_cols column the metadata lacks"
+    # a formula that DOES model the plex still types it, interaction included
+    cfg["analysis"]["design_formula"] = "~ 0 + group * plex"
+    cfg["analysis"]["factor_cols"] = "group"
+    cfg["analysis"]["metadata"] = ""
+    assert re.search(r'factor_cols: !r \'"group,plex"\'',
+                     _header(ma.write_report_rmd(cfg, p)))
+
+
 def test_a_single_plex_run_does_not_get_a_plex_term(ma, tmp_path, capsys):
     # model.matrix() cannot make a contrast for a one-level factor, and one
     # plex is not a batch effect.
@@ -896,6 +923,38 @@ def test_an_rscript_that_writes_nothing_is_reported_as_a_failure(ma, tmp_path):
         ma._run_rscript(["Rscript", "-e", "stop('boom')"], "a test", "hint")
     assert "Rscript exited" in str(e.value)
     assert "boom" in str(e.value)
+
+
+def test_rscript_is_launched_by_the_path_that_was_resolved_for_it(
+        ma, tmp_path, monkeypatch):
+    # symptom: every tool is meant to be launched by the absolute path PATH
+    # resolves to, because CreateProcess ignores PATHEXT and an Rscript.bat
+    # earlier on PATH loses to an Rscript.exe later on it — but _run_rscript
+    # handed the OS the bare name, so the R that ran need not be the one
+    # have() reported and the logged command line named.
+    d = tmp_path / "rbin"
+    d.mkdir()
+    (d / "Rscript").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    os.chmod(d / "Rscript", 0o755)
+    if os.name == "nt":
+        # PATHEXT decides what is executable there, so an extension-less stub
+        # is never found — the same reason conftest's stub_bin writes a shim.
+        (d / "Rscript.cmd").write_text(
+            f'@echo off\r\n"{sys.executable}" "%~dp0Rscript" %*\r\n',
+            encoding="utf-8")
+    monkeypatch.setenv("PATH", str(d) + os.pathsep + os.environ["PATH"])
+    launched = []
+    real = ma.subprocess.run
+
+    def spy(argv, *a, **k):
+        launched.append([str(c) for c in argv])
+        return real(argv, *a, **k)
+    monkeypatch.setattr(ma.subprocess, "run", spy)
+    ma._run_rscript(["Rscript", "-e", "invisible(NULL)"], "a test")
+    assert launched, "no Rscript process was launched"
+    assert os.path.isabs(launched[0][0]), \
+        f"Rscript was launched as {launched[0][0]!r}, not the resolved path"
+    assert os.path.dirname(launched[0][0]) == str(d)
 
 
 @needs_r("SummarizedExperiment", "S4Vectors")

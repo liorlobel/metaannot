@@ -647,6 +647,121 @@ def test_doctor_names_unmatched_manifest_runs(tmp_path):
     assert "match no column" in proc.stdout
 
 
+# --- doctor's `== tmt ==` block ---------------------------------------
+# Every check below is really one question: does doctor's verdict match what
+# read_fragpipe_tmt will do with the same config? doctor is what a TMT user
+# reads before committing to a long run.
+def _tmt_doctor_project(tmp_path, plexes, no_annotation=(), **tmt):
+    """A fragpipe_tmt project whose only enabled stages are eggnog and join,
+    so doctor's verdict is about the TMT layout and nothing else.
+
+    `plexes` is {plex: [(channel, sample), ...]} in annotation order.
+    """
+    import fixtures as F
+    proj = _doctor_project(tmp_path, run={
+        k: (k in ("eggnog", "join")) for k in
+        ["eggnog", "pfam", "dbcan", "diamond", "cluster", "join", "topology",
+         "structure", "context", "unipept", "taxonomy", "ncbifam", "kofam",
+         "interpro", "hhblits", "jackhmmer", "smorf", "effectors"]})
+    root = str(tmp_path / "tmtrun")
+    for plex, channels in plexes.items():
+        F.write_tmt_plex(root, plex, list(channels),
+                         [{"peptide": "PEPTIDEK", "razor": "P_ko_path"}],
+                         write_annotation=plex not in no_annotation)
+    proj.write_config(quant_table=root, quant_format="fragpipe_tmt",
+                      manifest="", tmt=dict(tmt))
+    return proj
+
+
+def test_a_sample_name_in_two_plexes_is_a_doctor_failure_not_a_warning(
+        tmp_path):
+    # symptom: doctor WARNed that the plexes "will be treated as one sample
+    # measured in each" and exited 0, while read_fragpipe_tmt refuses the same
+    # config outright -- so the long run died on what doctor had blessed.
+    proj = _tmt_doctor_project(
+        tmp_path, {"TMT1": [("126", "A1"), ("127N", "A2")],
+                   "TMT2": [("126", "A1"), ("127N", "B2")]})
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=1,
+                         env=_no_r_env())
+    assert "MISS   1 sample name(s) appear in more than one plex" in proc.stdout
+    assert "'A1'" in proc.stdout
+    assert "treated as one sample" not in proc.stdout
+
+
+def test_a_bridge_named_in_every_plex_is_not_a_duplicate_sample_name(
+        tmp_path):
+    # the one case doctor must NOT flag: under both reference treatments the
+    # reader drops the reference before its own collision check, so a pool
+    # carrying one name in every plex is the design, not a name clash.
+    proj = _tmt_doctor_project(
+        tmp_path, {"TMT1": [("126", "A1"), ("131C", "Pool01")],
+                   "TMT2": [("126", "B1"), ("131N", "Pool01")]},
+        reference_name="Pool*")
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=0,
+                         env=_no_r_env())
+    assert "more than one plex" not in proc.stdout
+    assert "all checks passed" in proc.stdout
+
+
+def test_doctor_reads_tmt_reference_channel_as_a_glob(tmp_path):
+    # symptom: the reader and the README both glob the channel, doctor
+    # compared it as a literal, so '131*' -- a valid config -- was reported as
+    # matching nothing in any plex and doctor exited 1 on a run that works.
+    proj = _tmt_doctor_project(
+        tmp_path, {"TMT1": [("126", "A1"), ("131C", "Pool01")],
+                   "TMT2": [("126", "B1"), ("131N", "Pool02")]},
+        reference_channel="131*")
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=0,
+                         env=_no_r_env())
+    assert "tmt.reference_channel '131*' resolves in every plex" in proc.stdout
+
+
+def test_a_reference_pattern_matching_two_channels_of_a_plex_is_reported(
+        tmp_path):
+    # symptom: doctor said the pattern "resolves in every plex" and exited 0
+    # whenever it matched at least once, but the reader requires EXACTLY one
+    # reference per plex and dies on "matches 2 of its channels".
+    proj = _tmt_doctor_project(
+        tmp_path, {"TMT1": [("126", "A1"), ("131N", "Pool01"),
+                            ("131C", "Pool02")],
+                   "TMT2": [("126", "B1"), ("131N", "Pool03"),
+                            ("131C", "Pool04")]},
+        reference_name="Pool*")
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=1,
+                         env=_no_r_env())
+    assert "matches more than one channel in 2 plex(es)" in proc.stdout
+    assert "resolves in every plex" not in proc.stdout
+
+
+def test_doctor_does_not_say_a_reference_resolves_when_it_found_no_plexes(
+        tmp_path):
+    # symptom: with no plex directory at all the "matches nothing" set was
+    # empty, so doctor printed OK for a reference it had never looked for --
+    # an OK about a run it never opened.
+    proj = _tmt_doctor_project(
+        tmp_path, {"TMT1": [("126", "A1"), ("131C", "Pool01")]},
+        plex_glob="PLEX*", reference_name="Pool*")
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=1,
+                         env=_no_r_env())
+    assert "no plex directory matches" in proc.stdout
+    assert "resolves in every plex" not in proc.stdout
+
+
+def test_the_channel_count_is_not_claimed_for_plexes_doctor_could_not_read(
+        tmp_path):
+    # symptom: "N channels in every plex" was printed from the plexes whose
+    # annotation could be READ, so a run whose second plex had no annotation
+    # file was still described as uniform.
+    proj = _tmt_doctor_project(
+        tmp_path, {"TMT1": [("126", "A1"), ("127N", "A2")],
+                   "TMT2": [("126", "B1"), ("127N", "B2")]},
+        no_annotation=("TMT2",))
+    proc = run_metaannot("doctor", "--config", proj.config_path, expect=1,
+                         env=_no_r_env())
+    assert "channels in every plex" not in proc.stdout
+    assert "2 channels in each of the 1 plex(es) read" in proc.stdout
+
+
 # --- finding 13 -------------------------------------------------------
 def test_doctor_output_is_byte_stable_across_two_invocations(tmp_path):
     # symptom: an unstable report cannot be diffed between machines or across

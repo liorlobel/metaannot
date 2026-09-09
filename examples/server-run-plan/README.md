@@ -110,7 +110,7 @@ Each is a decision recorded in the configs rather than an oversight: `topology` 
 6.0 is licence-gated and not installed; tmbed needs a GPU), `structure` (ESMFold needs a
 GPU, Foldseek AFDB50 is ~123 GB down / ~200 GB on disk), `hhblits` and `jackhmmer` (they
 query `dark_all.faa`, which is 2–8% here, and UniRef50 is 8.8 GB down / 27 GB on disk),
-`context`, `smorf`, `effectors`, `unipept`, `taxonomy` (each needs an input that does not
+`context`, `smorf`, `unipept`, `taxonomy` (each needs an input that does not
 exist yet).
 
 `min_features_per_protein` is left at the documented default of **1**. The earlier UC run
