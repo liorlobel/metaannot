@@ -543,6 +543,10 @@ DEFAULT_CONFIG = {
     # VFDB's own category, by its stable numeric code. A hit whose category is
     # not listed falls back to diamond_weights.vfdb. Empty disables the split
     # and every VFDB hit scores the flat weight, which is the old behaviour.
+    # This map cannot resurrect a database the user switched off: with
+    # diamond_weights.vfdb at 0 or absent, VFDB contributes nothing and the
+    # categories are not applied, because the WARN, doctor and the README all
+    # promise that a zero weight means the database does not score.
     #   VFC0086 effector delivery system   VFC0235 exotoxin
     #   VFC0001 adherence                  VFC0204 motility
     #   VFC0258 immune modulation          VFC0272 nutritional/metabolic
@@ -2627,12 +2631,19 @@ def stage_tmbed(cfg, p):
         if bs:
             cmd += ["--batch-size", str(bs)]
         cmd += tool_args(cfg, "tmbed")
-        log("$ " + " ".join(cmd))
-        r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, text=True)
-        if r.returncode != 0:
-            tail = "\n".join((r.stderr or "").strip().splitlines()[-15:])
-            raise RuntimeError(f"tmbed exited {r.returncode}\n{tail}")
+        # run_cmd, not subprocess.run. This stage is the one the progress
+        # heartbeat was written for - tmbed ran 2 h 36 min and then died,
+        # twice, with nothing in the log between the command and the failure -
+        # and going straight to subprocess.run was what kept the only tool
+        # named in that example from ever emitting a progress line: no stderr
+        # ring, no heartbeat, and the tqdm bar buffered until the process
+        # ended. Nothing is lost by routing through it. run_cmd takes the env,
+        # so CUDA_VISIBLE_DEVICES still pins the device; tmbed's stdout was
+        # captured here and never read, and run_cmd sends it to /dev/null; the
+        # failure still raises RuntimeError quoting the last 15 lines of
+        # stderr. It also resolves the binary through resolve_tool, so tmbed
+        # is launched by the path `have` found rather than by a bare name.
+        run_cmd(cmd, env=env)
 
 
 def stage_cluster(cfg, p):
@@ -3976,7 +3987,24 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
         hit_ = df[f"{tag}_hit"].fillna("").ne("")
         pid_ = pd.to_numeric(df[f"{tag}_pident"], errors="coerce").fillna(0)
         wt = dia_weights.get(tag, 0)
-        if tag == "vfdb" and cat_w and f"{tag}_desc" in df.columns:
+        by_category = tag == "vfdb" and cat_w and f"{tag}_desc" in df.columns
+        if by_category and not wt:
+            # The category map SPLITS diamond_weights.vfdb; it is not a second
+            # way in. A database whose weight is 0 or missing contributes
+            # nothing - that is what the "no diamond_weights entry" WARN,
+            # doctor and the README all promise - and applying the map anyway
+            # handed 1-4 points per hit back to a user who had deliberately
+            # zeroed VFDB, so the only way to stop VFDB scoring was to empty
+            # the category map as well. Said out loud, because a map that is
+            # ignored is exactly the kind of thing that otherwise looks like
+            # the weighting simply not working.
+            log("vfdb: diamond_weights.vfdb is "
+                + ("0" if "vfdb" in dia_weights else "absent")
+                + ", so VFDB hits score 0 and vfdb_category_weights is not "
+                "applied; give vfdb a non-zero weight to weight its "
+                "categories", "WARN")
+            by_category = False
+        if by_category:
             code = df[f"{tag}_desc"].fillna("").astype(str).str.extract(
                 r"\((VFC\d+)\)", expand=False)
             n_code = int(code.notna().sum())
@@ -4163,6 +4191,33 @@ def post_integrate_evidence(p):
             or bool(glob.glob(f"{p.hhr_dir}/*.hhr")))
 
 
+# Every column build_annotation writes on every run, in the order it writes
+# them. The per-DIAMOND-database columns (<tag>_hit, <tag>_pident, <tag>_desc)
+# are deliberately absent: which of those exist depends on which databases the
+# config names, so their absence is a difference of configuration rather than
+# of version. ANN_CORE_COLS is what stage_integrate_final checks an
+# annotation_pass1.tsv against before adopting one it did not write itself;
+# keep it in step with build_annotation, which
+# test_ann_core_cols_lists_every_column_build_annotation_writes enforces.
+ANN_CORE_COLS = (
+    "protein_id", "length", "lpxtg", "ko", "cog_cat", "description",
+    "preferred_name", "ec", "pfams_emapper", "cazy", "og", "seed_taxid",
+    "n_pathway_specific", "has_ko", "in_specific_pathway", "pfam_hits",
+    "pfam_accs", "duf_only", "anchor_domain", "dbcan_hits", "ncbifam_hits",
+    "ncbifam_accs", "ncbifam_uninformative", "kofam_ko", "kofam_desc",
+    "ko_source", "ko_conflict", "interpro_sigs", "interpro_ipr",
+    "interpro_go", "interpro_informative", "hh_hit", "hh_prob", "hh_desc",
+    "jackhmmer_hit", "fold_cluster", "fold_cluster_size", "sp_class", "sp_cs",
+    "n_tmh", "n_tmb", "small_protein", "family_id", "foldseek_target",
+    "foldseek_desc", "foldseek_db", "foldseek_prob", "foldseek_tm",
+    "toxin_fold", "structure_requested", "structure_attempted",
+    "context_flags", "context_mge", "context_pul", "context_immunity",
+    "has_seq_annotation", "structure_evidence", "has_profile_hit", "bin",
+    "kegg_enrichment_visible", "rescued_by", "export_score", "effector_score",
+    "surface_or_secreted",
+)
+
+
 def stage_integrate_final(cfg, p):
     have_extra = post_integrate_evidence(p)
     if not have_extra and os.path.exists(p.pass1):
@@ -4170,11 +4225,35 @@ def stage_integrate_final(cfg, p):
         # column would burn the same seconds for the same answer. Only
         # structure_attempted can differ, because pass one writes dark.faa
         # after it reads it, and that column feeds nothing else.
+        _head = pd.read_csv(p.pass1, sep="\t", nrows=0, encoding="utf-8", encoding_errors="replace")
+        # The pass1 on disk was not necessarily written by THIS metaannot.
+        # `--only finalise` over a v0.2 results directory landed here with a
+        # pass1 carrying effector_score and no export_score, wrote it straight
+        # back out as annotation_final.tsv, and only then did write_summary
+        # ask for the median export_score and raise KeyError('export_score').
+        # What survived was a half-applied upgrade: a v0.2-shaped
+        # annotation_final.tsv with no export_score at all, a stale
+        # bin_summary.tsv, no source_agreement.tsv, and an R report whose
+        # col_or_na filled export_score with NA and ordered the shortlist by
+        # it. The check is over the whole column set rather than export_score
+        # alone because v0.2 also lacks ncbifam_accs, whose absence merely
+        # drops a comparison from source_agreement.tsv and says nothing.
+        # Refuse before a single byte is written.
+        _missing = [c for c in ANN_CORE_COLS if c not in _head.columns]
+        if _missing:
+            die(f"{p.pass1} is missing {_missing[:8]}"
+                + (f" and {len(_missing) - 8} more column(s)"
+                   if len(_missing) > 8 else "")
+                + ". It was written by an older metaannot whose "
+                "build_annotation produced a different set of columns, so "
+                "finalise cannot reuse it and nothing has been written. "
+                "Rebuild it with this version first: `--from integrate` does "
+                "integrate and finalise in one go, or `--force --only "
+                "integrate` then finalise.")
         log("no structure or profile evidence, reusing the first pass")
         # Every identifier-like column must be read as str. Pinning only
         # protein_id let a numeric seed_taxid round-trip through float64 and
         # be written back as "821.0", which matches nothing downstream.
-        _head = pd.read_csv(p.pass1, sep="\t", nrows=0, encoding="utf-8", encoding_errors="replace")
         _str_cols = {c: str for c in _head.columns
                      if c in set(ANN_STR_COLS) or c == "protein_id"}
         df = pd.read_csv(p.pass1, sep="\t", low_memory=False,
@@ -4865,50 +4944,81 @@ def stage_foldseek(cfg, p):
                      "--max-seqs", 300, "--threads", cfg["threads"], "-v", 1]
                     + fs_mem + tool_args(cfg, "foldseek"))
 
+        # try/finally so the scratch tree goes on EVERY exit, not only the
+        # successful one. Against AFDB50 it is tens to hundreds of GB, and
+        # CLAUDE.md already records `results/foldseek/tmp*` as a thing that is
+        # never cleaned up; each re-raise below used to add another way to
+        # leave one behind, and the one that matters is a genuine failure - a
+        # full disk or an OOM kill - where the tree is largest and a leak
+        # hurts most.
         try:
-            search(fs_fields)
-        except RuntimeError as e:
-            # RuntimeError, not StageError: run_cmd raises a plain
-            # RuntimeError on a non-zero exit, and StageError is a SUBCLASS of
-            # it, so `except StageError` could never catch the one failure
-            # this fallback exists for. It caught nothing and the branch was
-            # unreachable; the test that covered it injected a StageError no
-            # tool ever raises. StageError is still caught here, being a
-            # subclass.
-            #
-            # Only a rejected format code is retried. Foldseek validates
-            # --format-output inside convertalis and prints
-            # "Format code <field> does not exist." to stderr before exiting
-            # 1; run_cmd puts that stderr tail in the message. Any other
-            # failure - a bad database, a full disk, an OOM kill - is re-
-            # raised untouched, because retrying it would repeat the search
-            # to arrive at the same error.
-            msg = str(e).lower()
-            if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY) or not (
-                    "format code" in msg and "does not exist" in msg):
-                raise
-            log("foldseek rejected the full --format-output list, so this "
-                "build has no qtmscore/ttmscore (Foldseek 5 and earlier; "
-                "qlen is accepted there); falling back to the legacy "
-                "columns. The TM gate will use alntmscore, which is "
-                "normalised by the alignment rather than the query, and no "
-                "coverage filter can be applied — a short local match can "
-                "pass it. Upgrade Foldseek to restore the stricter gate.",
-                "WARN")
-            fs_fields = ",".join(FOLDSEEK_COLS_LEGACY)
-            # The scratch tree is deliberately NOT cleared before the retry.
-            # --format-output is consumed by convertalis, which easy-search
-            # runs AFTER the search, so this failure arrives with the whole
-            # multi-hour alignment already done and sitting in tmpd. The
-            # workflow guards its search with `notExists "${result}.dbtype"`,
-            # so leaving the tree in place means the retry re-runs the
-            # conversion rather than the search. Deleting it first, which is
-            # what this used to do, threw away the hours and paid for them
-            # again to change a formatting argument.
-            search(fs_fields)
-        # Against AFDB50 this scratch tree is tens to hundreds of GB, and it
-        # used to be left behind once per target.
-        shutil.rmtree(tmpd, ignore_errors=True)
+            try:
+                search(fs_fields)
+            except RuntimeError as e:
+                # RuntimeError, not StageError: run_cmd raises a plain
+                # RuntimeError on a non-zero exit, and StageError is a
+                # SUBCLASS of it, so `except StageError` could never catch the
+                # one failure this fallback exists for. It caught nothing and
+                # the branch was unreachable; the test that covered it
+                # injected a StageError no tool ever raises. StageError is
+                # still caught here, being a subclass.
+                #
+                # A rejected format code costs SECONDS, not the search.
+                # EasyStructureSearch.cpp validates --format-output in
+                # getOutputFormat (line 42) while the temporary directory is
+                # not created until line 59, so foldseek exits before it
+                # prefilters anything and leaves no tree behind. The retry is
+                # therefore cheap, which is why the test below is permissive:
+                # when the message says a format code was rejected but the
+                # field cannot be named, fall back anyway rather than lose the
+                # structural evidence to a wording change.
+                # Both halves of the phrase must be on ONE line.
+                # "<path> does not exist" is stock MMseqs2 wording for a
+                # missing database or temp dir, so tested across the whole
+                # multi-line stderr tail this would splice an unrelated line
+                # onto the words "format code" and read a path as a rejected
+                # column - falling back on a failure that has nothing to do
+                # with the format list.
+                hit = next((ln for ln in str(e).splitlines()
+                            if "format code" in ln.lower()
+                            and "does not exist" in ln.lower()), "")
+                if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY) or not hit:
+                    raise
+                m = re.search(r"format code\W*(\S+?)\s+does not exist",
+                              hit, re.I)
+                # Defensive, not a claim about upstream: both emitters print
+                # the name bare (foldseek LocalParameters.cpp, MMseqs2
+                # Parameters.cpp), so this only covers wording drift.
+                bad = m.group(1).strip("\"'`") if m else ""
+                # Matched case-insensitively above, so compare that way too -
+                # being half case-insensitive would classify QTMSCORE as
+                # undroppable and say something false about it.
+                droppable = set(FOLDSEEK_COLS) - set(FOLDSEEK_COLS_LEGACY)
+                lower = {c.lower() for c in droppable}
+                if bad and bad.lower() not in lower:
+                    # Falling back cannot remove this one: FOLDSEEK_COLS_LEGACY
+                    # is a strict SUBSET of FOLDSEEK_COLS, so the legacy list
+                    # asks for it too and the retry would fail identically.
+                    log(f"foldseek rejected the format code '{bad}', which the "
+                        "legacy column list asks for as well, so falling back "
+                        "cannot help: the only columns it drops are "
+                        + ", ".join(sorted(droppable)) + ". Not retrying; the "
+                        "error below is the real one.", "WARN")
+                    raise
+                named = f"the format code '{bad}'" if bad else \
+                    "a format code it could not name"
+                log(f"foldseek rejected {named}, so this build predates "
+                    "qtmscore/ttmscore (Foldseek 5 and earlier); falling back "
+                    "to the legacy columns, which drop "
+                    + ", ".join(sorted(droppable)) + ". The TM gate will use "
+                    "alntmscore, which is normalised by the alignment rather "
+                    "than the query, and no coverage filter can be applied - "
+                    "a short local match can pass it. Upgrade Foldseek to "
+                    "restore the stricter gate.", "WARN")
+                fs_fields = ",".join(FOLDSEEK_COLS_LEGACY)
+                search(fs_fields)
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
         parts.append((lab, outp))
     n_rows = 0
     with atomic_out(p.foldseek) as tmp, open(tmp, "w", encoding="utf-8") as out:
@@ -5878,19 +5988,30 @@ def tmt_annotation_path(plex, pdir, cfg):
                 f"(it lists {sorted(ann)}). Add one, or use the "
                 "'{plex}_annotation.txt' pattern form.")
         cand = str(ann[plex])
-        if not os.path.isabs(cand) and not os.path.exists(cand):
-            cand = os.path.join(pdir, cand)
     else:
         cand = str(ann).replace("{plex}", plex)
-        if not os.path.isabs(cand) and os.path.dirname(cand) == "":
-            cand = os.path.join(pdir, cand)
+    # Relative to the PLEX DIRECTORY, which is what the README documents, and
+    # not to the process's working directory. Resolving against the cwd made
+    # the file that was read depend on where the run was started from: a
+    # 'ann/{plex}.txt' pattern, or any map entry, picked up a same-named file
+    # beside the shell rather than the plex's own annotation, and mapping the
+    # reporter columns through the wrong plex's annotation is silent — the
+    # channels line up, the sample names do not. An absolute path is still
+    # taken exactly as written.
+    rel = cand
+    if not os.path.isabs(cand):
+        cand = os.path.join(pdir, cand)
     if not os.path.exists(cand):
         near = sorted(f for f in os.listdir(pdir) if "annotation" in f.lower())
         die(f"plex {plex} has no annotation file: {cand} does not exist. "
             f"{pdir} contains {near or 'no annotation-like file'}. FragPipe "
             "writes '<PLEX>_annotation.txt', not 'annotation.txt'; set "
             "tmt.annotation to the right pattern, or to a {plex: path} map. "
-            "Without it the reporter columns cannot be mapped to samples.")
+            + (f"'{rel}' does exist relative to the working directory "
+               f"{os.getcwd()}, but tmt.annotation is resolved against the "
+               "plex directory; give an absolute path if that is the file "
+               "you mean. " if rel != cand and os.path.exists(rel) else "")
+            + "Without it the reporter columns cannot be mapped to samples.")
     return cand
 
 
@@ -5910,11 +6031,18 @@ def quant_inputs(cfg):
         return [root]
     t = cfg.get("tmt") or {}
     fname = TMT_LEVEL_FILES.get(str(t.get("level") or "ion").lower(), "ion.tsv")
-    # psm.tsv is an input only when min_purity actually reads it; listing it
-    # unconditionally would invalidate every cached join the moment FragPipe
-    # rewrote a file the run never opened.
-    want_psm = float(t.get("min_purity") or 0) > 0
     try:
+        # Inside the try, and ValueError caught below: this float() ran before
+        # read_fragpipe_tmt could validate anything, so a min_purity written
+        # as '90%' came out of the signature as a bare traceback instead of
+        # the reader's own message naming the key and its range. The signature
+        # is not the place to judge the value; falling back to the directory
+        # leaves the reader to die properly.
+        #
+        # psm.tsv is an input only when min_purity actually reads it; listing
+        # it unconditionally would invalidate every cached join the moment
+        # FragPipe rewrote a file the run never opened.
+        want_psm = float(t.get("min_purity") or 0) > 0
         out = []
         for plex, pdir in tmt_plex_dirs(root, cfg):
             out.append(os.path.join(pdir, fname))
@@ -5923,7 +6051,7 @@ def quant_inputs(cfg):
             with contextlib.suppress(StageError):
                 out.append(tmt_annotation_path(plex, pdir, cfg))
         return sorted(out)
-    except (StageError, OSError):
+    except (StageError, OSError, TypeError, ValueError):
         return [root]
 
 
@@ -6322,7 +6450,19 @@ def read_fragpipe_tmt(root, cfg):
                     "tmt.use_reference_ratios: true to divide by it", "WARN")
 
         if use_ratios:
+            # A reference of 0 is not a reference. FragPipe writes 0 for "not
+            # quantified", and with zero_intensity_is_missing false it reaches
+            # here as a number: x/0 wrote +inf into every other channel of the
+            # plex and 0/0 wrote NaN, while notna() counts an inf as an
+            # observed value, so both the per-plex line below and the run's
+            # "use_reference_ratios cost ..." summary reported nothing lost
+            # over a poisoned matrix. The inf then survived sum(min_count=1)
+            # into the protein matrix, stayed inf through log2, and turned the
+            # taxon size factors of those samples into NaN. A feature whose
+            # reference is 0 (or non-finite) has no reference in this plex,
+            # which is the case already handled and counted.
             denom = vals[ref]
+            denom = denom.where(denom.ne(0) & np.isfinite(denom))
             n_bad = int(denom.isna().sum())
             others = [s for s in keep_samples if s != ref]
             # Counted before and after the divide, not from the feature count:
@@ -6338,9 +6478,9 @@ def read_fragpipe_tmt(root, cfg):
             keep_samples = others
             log(f"tmt {plex}: every channel divided by the reference "
                 f"'{ref}' ({chan_of[ref]}); the reference column itself is "
-                f"dropped, and {n_bad} feature(s) with no reference value "
-                f"became missing in this plex, costing {was - now} of {was} "
-                "value(s)")
+                f"dropped, and {n_bad} feature(s) with no usable reference "
+                "value (missing, 0 or non-finite) became missing in this "
+                f"plex, costing {was - now} of {was} value(s)")
         elif ref:
             # The covariate treatment. A pooled bridge is not a biological
             # sample: left in the sample columns it acquires a condition in
@@ -7449,9 +7589,12 @@ def tmt_size_factor_plex_exposure(tx, tax_col, int_cols, plex_of, min_proteins):
     reference and falls to the poscounts variant, whose median then mixes
     proteins whose reference was computed inside one plex with proteins whose
     reference spans them all. Measured on a fixture (see the tests): the
-    taxon-specific part of the factor is plex-free to 0.08 log2 for
-    well-observed taxa, and is pulled 0.77 log2 in one plex for a taxon with
-    half its proteins confined to it.
+    taxon-specific part of the factor stays within 0.03 log2 for well-observed
+    taxa, and is displaced 1.40 log2 for a taxon with 7 of its 10 proteins
+    confined to one plex — in that plex only, since it has no factor at all in
+    the other two. Those are the numbers README.md and the v0.3.0 CHANGELOG
+    entry quote; this docstring carried a different pair, which left three
+    places disagreeing about one fixture.
     """
     by_plex = {}
     for c in int_cols:
@@ -10989,7 +11132,17 @@ def _tmt_report_design(cfg, a, design_auto):
                 f"'{a['design_formula']}' — the condition is the hypothesis "
                 "and the plex is a batch term that absorbs it. Set "
                 "analysis.design_formula to override")
-        if a.get("factor_cols") == defaults["factor_cols"]:
+        # factor_cols follows the FORMULA, not the plex count. The two used to
+        # be decided independently, so a user who wrote their own formula
+        # without the plex ("~ 0 + group + sex") kept that formula and still
+        # got factor_cols 'group,plex' — and the report's own check on
+        # factor_cols then aborted the knit over a column their metadata had
+        # no reason to carry, naming a key they never set. The whole right-hand
+        # side is searched rather than the main-effect terms, because
+        # "group * plex" models the plex too and it still has to be typed.
+        rhs = str(a.get("design_formula", "")).split("~", 1)[-1]
+        if (a.get("factor_cols") == defaults["factor_cols"]
+                and re.search(r"(?<![\w.])plex(?![\w.])", rhs)):
             a["factor_cols"] = "group,plex"
             log(f"report: factor_cols is '{a['factor_cols']}', so the plex is "
                 "typed as a factor; an untyped plex code like '1' would be "
@@ -11131,7 +11284,17 @@ def _run_rscript(cmd, what, hint=""):
     is returned so the caller can quote it when the expected output is missing.
     """
     log("$ " + " ".join(str(c) for c in cmd))
-    proc = subprocess.run([str(c) for c in cmd], stdout=subprocess.DEVNULL,
+    # Launched by the path PATH resolves to, for the reason resolve_tool
+    # states: on Windows CreateProcess ignores PATHEXT, so an Rscript.exe
+    # later on PATH beat the Rscript.bat that have() and the logged line both
+    # named. This is the one launcher that cannot go through run_cmd - the
+    # stderr of a SUCCESSFUL run is what diagnoses "Rscript exited 0 and wrote
+    # nothing", and run_cmd discards it - so it has to resolve the name
+    # itself. The line above keeps the bare name, which is what a reader would
+    # type.
+    argv = [str(c) for c in cmd]
+    argv[0] = resolve_tool(argv[0])
+    proc = subprocess.run(argv, stdout=subprocess.DEVNULL,
                           stderr=subprocess.PIPE, text=True)
     tail = "\n".join((proc.stderr or "").strip().splitlines()[-20:])
     if proc.returncode != 0:
@@ -11751,7 +11914,13 @@ def cmd_doctor(args):
             if plexes:
                 print(f"  {'OK':6s} {len(plexes)} plex(es): "
                       f"{[n for n, _ in plexes]}")
-            sizes, seen_names, ref_hits = {}, {}, []
+            # Every rule below is read_fragpipe_tmt's own - which channels it
+            # keeps, how it resolves the reference, which names it refuses -
+            # because a verdict that disagrees with the reader is worse than
+            # no verdict: the run doctor blessed still dies, on the same
+            # config, hours later.
+            drop_empty = bool(t.get("drop_empty_channels", True))
+            sizes, seen_names, ref_hits = {}, {}, {}
             for plex, pdir in plexes:
                 lvl_path = os.path.join(pdir, fname)
                 if not os.path.exists(lvl_path):
@@ -11767,12 +11936,42 @@ def cmd_doctor(args):
                     print(f"  {'MISS':6s} {plex}: {e}")
                     continue
                 sizes[plex] = len(rows)
-                for chan, samp in rows:
-                    seen_names.setdefault(samp, []).append(plex)
-                    if ref_name and fnmatch.fnmatch(samp, ref_name):
-                        ref_hits.append((plex, chan, samp))
-                    elif ref_chan and chan == ref_chan:
-                        ref_hits.append((plex, chan, samp))
+                # The reader's keep_samples: an unassigned <PLEX>_<CHANNEL>
+                # placeholder is not a sample when drop_empty_channels is on.
+                keep = [(c, s) for c, s in rows
+                        if not (drop_empty and s == f"{plex}_{c}")]
+                if ref_name:
+                    hits = [s for _c, s in keep
+                            if fnmatch.fnmatchcase(s, ref_name)]
+                elif ref_chan:
+                    # fnmatchcase on the CHANNEL, because the reader and the
+                    # README both make reference_channel a glob ('131*'),
+                    # while this compared it to the channel as a literal and
+                    # so failed a config the run accepts. fnmatchcase, not
+                    # fnmatch, because it is what the reader uses: fnmatch
+                    # normalises through os.path.normcase, which lowercases on
+                    # Windows only, so fnmatch would make doctor's verdict
+                    # differ from the run's by platform. '131c' would pass
+                    # here and be refused by the reader.
+                    hits = [s for c, s in keep
+                            if fnmatch.fnmatchcase(c, ref_chan)]
+                else:
+                    hits = []
+                if ref_name or ref_chan:
+                    ref_hits[plex] = hits
+                    if len(hits) == 1:
+                        # Under both treatments the reference stops being a
+                        # sample column before the reader's collision check,
+                        # so a bridge carrying one name in every plex is the
+                        # design and must not be reported as a duplicate.
+                        keep = [(c, s) for c, s in keep if s != hits[0]]
+                for _c, s in keep:
+                    seen_names.setdefault(s, []).append(plex)
+            # "every plex" can only mean the ones doctor got as far as
+            # reading: a plex whose annotation failed above is in none of
+            # these counts and must not be summarised as though it had passed.
+            scope = ("every plex" if len(sizes) == len(plexes)
+                     else f"each of the {len(sizes)} plex(es) read")
             if sizes:
                 dist = sorted(set(sizes.values()))
                 if len(dist) > 1:
@@ -11783,28 +11982,48 @@ def cmd_doctor(args):
                           f"{dist}: "
                           f"{ {k: v for k, v in sorted(sizes.items())} }")
                 else:
-                    print(f"  {'OK':6s} {dist[0]} channels in every plex, "
+                    print(f"  {'OK':6s} {dist[0]} channels in {scope}, "
                           f"{sum(sizes.values())} in total")
             dupes = {n: pl for n, pl in seen_names.items() if len(pl) > 1}
             if dupes:
-                # One sample split across plexes is a fraction or a bridge and
-                # is fine; the reader keys on the name, so say which they are.
+                # This was a WARN promising the plexes would be "treated as
+                # one sample measured in each". They are not: the reader dies
+                # on the second plex to claim a name, so doctor was exiting 0
+                # on a config the run refuses outright.
+                ok = False
                 shown = dict(sorted(dupes.items())[:4])
-                print(f"  {'WARN':6s} {len(dupes)} sample name(s) appear in "
-                      f"more than one plex: {shown}. They will be treated as "
-                      "one sample measured in each")
+                print(f"  {'MISS':6s} {len(dupes)} sample name(s) appear in "
+                      f"more than one plex: {shown}. Sample names are the "
+                      "columns of the joined matrix, so the reader refuses "
+                      "two plexes that claim one; rename them per plex, or, "
+                      "if this is a bridge, name it with tmt.reference_name "
+                      "so it stops being a sample")
             if ref_name or ref_chan:
                 which = f"reference_name '{ref_name}'" if ref_name                     else f"reference_channel '{ref_chan}'"
-                missing = sorted({n for n, _ in plexes}
-                                 - {pl for pl, _, _ in ref_hits})
+                missing = sorted(p for p, h in ref_hits.items() if not h)
+                ambig = {p: h for p, h in sorted(ref_hits.items())
+                         if len(h) > 1}
                 if missing:
                     ok = False
                     print(f"  {'MISS':6s} tmt.{which} matches nothing in "
                           f"{len(missing)} plex(es): {missing[:6]}. A "
                           "reference absent from a plex leaves that plex "
                           "without a denominator")
-                else:
-                    print(f"  {'OK':6s} tmt.{which} resolves in every plex")
+                if ambig:
+                    # The reader takes exactly one reference per plex and
+                    # dies on anything else, so a pattern matching two
+                    # channels is a failure to report, not a resolution.
+                    ok = False
+                    print(f"  {'MISS':6s} tmt.{which} matches more than one "
+                          f"channel in {len(ambig)} plex(es): "
+                          f"{dict(list(ambig.items())[:4])}. The reference is "
+                          "one channel per plex; narrow the pattern until it "
+                          "names it")
+                if ref_hits and not missing and not ambig:
+                    # Guarded on ref_hits: with no plex read there is nothing
+                    # the pattern resolved in, and this line was printed
+                    # anyway - an OK about a run doctor never opened.
+                    print(f"  {'OK':6s} tmt.{which} resolves in {scope}")
             elif bool(t.get("use_reference_ratios", False)):
                 ok = False
                 print(f"  {'MISS':6s} tmt.use_reference_ratios is on but "

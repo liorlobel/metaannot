@@ -491,6 +491,39 @@ def test_the_tmt_annotation_file_is_named_after_its_plex(ma, tmp_path):
     assert "TMT1_annotation.txt" in str(e.value)   # what is actually there
 
 
+def test_a_relative_tmt_annotation_is_read_from_the_plex_not_the_cwd(
+        ma, tmp_path, monkeypatch):
+    # symptom: a relative tmt.annotation was resolved against the process's
+    # working directory, so a same-named file beside the shell won over the
+    # plex's own annotation and the reporter columns were mapped through it -
+    # silently, because the CHANNELS still line up and only the sample names
+    # are wrong.
+    root = str(tmp_path / "run")
+    F.write_tmt_plex(root, "TMT1", [("126", "A1"), ("127N", "A2")],
+                     [{"peptide": "PEPTIDEK", "razor": "P_ko_path"}],
+                     columns_named="channel")
+    pdir = os.path.join(root, "TMT1")
+    os.makedirs(os.path.join(pdir, "ann"))
+    shutil.move(os.path.join(pdir, "TMT1_annotation.txt"),
+                os.path.join(pdir, "ann", "TMT1.txt"))
+    cwd = tmp_path / "cwd"
+    (cwd / "ann").mkdir(parents=True)
+    for decoy in (cwd / "TMT1_annotation.txt", cwd / "ann" / "TMT1.txt"):
+        decoy.write_text("126 WRONG1\n127N WRONG2\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    # the pattern form, with a directory in it, and the {plex: path} map form
+    for ann in ("ann/{plex}.txt", {"TMT1": "ann/TMT1.txt"}):
+        _f, int_cols, _d = ma.read_feature_table(
+            root, "fragpipe_tmt", _tmt_cfg(ma, root, annotation=ann))
+        assert int_cols == ["A1", "A2"], ann
+    # and the decoy is named when the plex really has no such file
+    with pytest.raises(ma.StageError) as e:
+        ma.read_feature_table(root, "fragpipe_tmt",
+                              _tmt_cfg(ma, root,
+                                       annotation="TMT1_annotation.txt"))
+    assert "resolved against the plex directory" in str(e.value)
+
+
 def test_two_tmt_plexes_cannot_claim_the_same_sample_name(ma, tmp_path):
     # symptom: sample names become the columns of the joined matrix, so a
     # collision would silently merge two channels of two plexes.
@@ -642,6 +675,32 @@ def test_the_ratio_treatment_reports_the_values_it_deleted(ma, tmp_path,
     assert "substantially sparser" in err
     notes = "\n".join(design.attrs["design_notes"])
     assert "ratios" in notes and "2/4 value(s) lost" in notes
+
+
+def test_a_zero_reference_is_missing_not_a_divide_into_infinity(ma, tmp_path,
+                                                                capsys):
+    # symptom: with zero_intensity_is_missing false a reference FragPipe wrote
+    # as 0 stays a number, so x/0 put +inf into every other channel of the
+    # plex while notna() counted each inf as an observed value - the cost line
+    # reported nothing lost over a matrix whose infinities survive the roll-up
+    # and log2 and turn the taxon size factors into NaN.
+    root = str(tmp_path / "run")
+    F.write_tmt_plex(root, "TMT1",
+                     [("126", "A1"), ("127N", "A2"), ("131C", "Pool01")],
+                     [{"peptide": "HASREFK", "razor": "P_ko_path",
+                       "values": {"A1": 100, "A2": 200, "Pool01": 50}},
+                      {"peptide": "NOREFK", "razor": "P_dark1",
+                       "values": {"A1": 300, "A2": 400, "Pool01": 0}}])
+    cfg = _tmt_cfg(ma, root, reference_name="Pool*", use_reference_ratios=True)
+    cfg["zero_intensity_is_missing"] = False     # the 0 reaches the divide
+    feats, int_cols, design = ma.read_feature_table(root, "fragpipe_tmt", cfg)
+    assert not np.isinf(feats[int_cols].to_numpy(dtype=float)).any()
+    row = feats.set_index("feature_id").loc["NOREFK_n[230]NOREFK_2"]
+    assert pd.isna(row["A1"]) and pd.isna(row["A2"])
+    err = capsys.readouterr().err
+    assert "costing 2 of 4 value(s)" in err      # counted, not silently kept
+    assert "cost 2 of 4 non-reference value(s) (50.00%)" in err
+    assert "2/4 value(s) lost" in "\n".join(design.attrs["design_notes"])
 
 
 def test_the_condition_is_derived_from_unambiguous_sample_names(ma, tmp_path,
@@ -982,6 +1041,35 @@ def test_a_plex_confined_taxon_is_where_the_size_factor_is_exposed(ma,
     assert abs(resid.loc["T2"].dropna().mean()) > 0.4
 
 
+def test_the_plex_exposure_docstring_quoted_other_numbers_than_this_fixture(
+        ma, tmp_path):
+    # symptom: tmt_size_factor_plex_exposure's docstring said the taxon-
+    # specific part of the factor is "plex-free to 0.08 log2" and is "pulled
+    # 0.77 log2" for a taxon with "half" its proteins confined to one plex.
+    # This fixture confines 7 of 10 and measures 0.03 and 1.40 — which is what
+    # README.md and the v0.3.0 CHANGELOG entry quote. Three sources, two
+    # answers, one fixture, and no way for a reader to tell which was measured.
+    root, prots = _tmt_loaded_run(tmp_path, "docstr",
+                                  {"TMT1": 1.0, "TMT2": 3.0, "TMT3": 0.4},
+                                  missing=True)
+    _c, resid, plex, _prot, _sf = _size_factor_parts(ma, root, prots)
+    # per plex, because that is the comparison the prose makes: what the
+    # batch did to one taxon's factor inside the plex its members live in.
+    per_plex = {(t, p): float(resid.loc[t, [s for s in resid.columns
+                                            if plex[s] == p]].mean())
+                for t in resid.index for p in sorted(set(plex.values()))}
+    clean = max(abs(v) for (t, _p), v in per_plex.items()
+                if t != "T2" and not np.isnan(v))
+    confined = max(abs(v) for (t, _p), v in per_plex.items()
+                   if t == "T2" and not np.isnan(v))
+    doc = " ".join((ma.tmt_size_factor_plex_exposure.__doc__ or "").split())
+    assert f"{clean:.2f} log2" in doc, \
+        f"the docstring does not quote the measured {clean:.2f} log2"
+    assert f"{confined:.2f} log2" in doc, \
+        f"the docstring does not quote the measured {confined:.2f} log2"
+    assert "7 of its 10" in doc, "the docstring misstates how many are confined"
+
+
 def test_the_exposure_check_is_silent_when_there_is_one_plex(ma, tmp_path):
     root, prots = _tmt_loaded_run(tmp_path, "conf2",
                                   {"TMT1": 1.0, "TMT2": 2.0}, missing=True)
@@ -1125,6 +1213,21 @@ def test_psm_tables_are_stage_inputs_only_when_min_purity_reads_them(
     on = ma.quant_inputs(_tmt_cfg(ma, root, min_purity=0.5))
     assert not any(f.endswith("psm.tsv") for f in off)
     assert any(f.endswith("psm.tsv") for f in on)
+
+
+def test_a_non_numeric_min_purity_dies_in_the_reader_not_in_the_signature(
+        ma, tmp_path):
+    # symptom: the stage signature float()ed tmt.min_purity before the reader
+    # could validate anything, so a value like '90%' surfaced as a bare
+    # ValueError traceback instead of the message that names the key, the
+    # range and the value.
+    root = _tmt_run(tmp_path)
+    cfg = _tmt_cfg(ma, root, min_purity="90%")
+    assert ma.quant_inputs(cfg) == [root]        # tolerant, not a traceback
+    with pytest.raises(ma.StageError) as e:
+        ma.read_feature_table(root, "fragpipe_tmt", cfg)
+    assert "tmt.min_purity must be a number between 0 and 1" in str(e.value)
+    assert "'90%'" in str(e.value)
 
 
 def test_a_weak_and_empty_channel_is_named_as_under_corrected(ma, tmp_path,

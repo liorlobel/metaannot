@@ -163,12 +163,15 @@ Read that line and confirm the count is the number of samples you expect. It
 refuses only when rows of one sample disagree about the design (different
 `data_type`), or when two different samples resolve to the same quant column.
 
-**TMT is different and still needs a hand-written design**: there `experiment`
-is the plex, so the derived contrasts would be plex-versus-plex. Write
-`analysis.metadata` by hand (sample, condition, batch) — and note that
-reporter-ion quantification is not supported at all: a per-plex FragPipe table
-is now refused outright by the loader. See README, "FragPipe TMT output is not
-supported".
+**TMT does not come through this path at all.** In a `.fp-manifest`
+`experiment` is the plex, so a design derived from it would contrast plex
+against plex. Set `quant_format: fragpipe_tmt` and point `quant_table` at the
+FragPipe run directory holding the `TMTn/` folders: that reader builds the
+design itself with `plex` as a covariate, and derives the condition from the
+annotated sample names (`tmt.condition_from_name`, `auto` by default). It logs
+the derivation as a **guess** — check it, and set `tmt.condition_from_name` or
+write `analysis.metadata` by hand (sample, condition, batch) where the names
+cannot carry it. See README, "FragPipe TMT (isobaric)".
 
 Set in `config.yaml`:
 
@@ -243,7 +246,8 @@ that setting is silently not in effect — fix it before anything else. The
 so a misspelled `fdr` is reported rather than leaving the default quietly in
 force). What the check still cannot see inside are the free-form blocks
 (`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`,
-`effector_predictions`), whose keys you choose — proof-read those by hand.
+`vfdb_category_weights`, `diamond_evalues`), whose keys you choose — proof-read
+those by hand.
 
 For anything missing, `doctor` prints the exact commands. Three ways to act on
 them, in increasing order of trust:
@@ -679,7 +683,7 @@ evaluates a document with the working directory set to its own folder.
 | `manifest: N sample(s) are split across multiple fraction files` | a fractionated acquisition, one manifest row per fraction | not an error — the fractions are collapsed into one sample. Check N is the number of samples you expect |
 | `manifest: several samples map to the same quant column` | two different experiment/bioreplicate pairs resolve to one column | rename them so each run resolves to its own column; this is not fractionation and is not collapsed |
 | `have rows with different data_type` from the manifest | rows sharing a sample name are not fractions of one sample | fix the manifest, or write `analysis.metadata` by hand |
-| `this looks like isobaric (TMT/iTRAQ) output` | a per-plex FragPipe TMT table | correct, and deliberate. Reporter-ion channels are not read; use a label-free or DIA-NN input |
+| `this looks like isobaric (TMT/iTRAQ) output` | a per-plex FragPipe TMT table read under a label-free `quant_format` | the format is wrong, not the file. Set `quant_format: fragpipe_tmt` and point `quant_table` at the run directory holding the `TMTn/` folders, which the message names; that reader takes the reporter channels of every plex and joins them |
 | `is an HTML page, not the database` from an install command | the download URL now redirects to a landing page | fix that entry under `sources:` in `config.yaml` and rerun the install; do not retry the same URL |
 | `only N% of proteins matched` | identifier format differs | apply what metaannot names — an `emapper_id_transform`, or an `emapper_strip_id_prefix` when the search database prefixed its ids. Never raise `emapper_min_coverage` |
 | `emapper_strip_id_prefix 'X' matches no fasta id` | the prefix is wrong, or the FASTA never carried it | check the prefix against `head -1 input/proteins.faa`; the coverage diagnostic names one that would have matched |
@@ -704,7 +708,8 @@ evaluates a document with the working directory set to its own folder.
 | `deadlock: [...] can never become ready` | the scheduler has stages left but none whose dependencies are all satisfied, and nothing is still running | the message names the stuck stages and, per stage, which dependencies are unsatisfied. Normally that means those deps were excluded by `--only`/`--from`: add them to the selection, or drop the selection. If they *were* selected this is a bug in the stage graph, not a config error — keep the message |
 | a stage has said nothing for hours | it is working, or it is hung — you cannot tell from silence alone | every `progress_interval_s` seconds (60 by default) the newest line the tool wrote to stderr is echoed with its elapsed time; `no output yet on stderr` is the heartbeat from a tool that prints nothing. Set `progress_interval_s: 0` to switch it off |
 | `have been folded yet` after `integrate` | `esmfold` has not run | **not** a loss: nothing has been folded, so this pass simply carries no structural evidence. It is INFO, not WARN |
-| `requested structures exist` … `were skipped (OOM) or never folded` | `esmfold` finished and models are still missing | proteins over `max_len_structure` are counted separately in the same line; the remainder are OOM skips (`skipping <id>` in the esmfold log) or proteins added to `dark.faa` after the last fold |
+| `requested structures exist` … `esmfold has not finished` | the stage was interrupted, or has not been rerun since `dark.faa` grew | the missing models are **pending, not lost**. Every PDB already written is kept, so rerun the `esmfold` stage and it resumes from there |
+| `requested structures exist` … `although esmfold has finished` | `esmfold` finished and models are still missing | the line names each cause separately rather than guessing between them: proteins over `max_len_structure` `were never submitted`; proteins ESMFold `attempted and failed twice` are listed with the real error in `results/structures/esmfold_failed.tsv` (`skipping <id>` in the esmfold log is the same event); proteins `absent from that list` were added to `dark.faa` after the last fold and were never attempted at all |
 | a stage runs even though its `run.<stage>` flag is false | it was named with `--only` | intended — `--only` is a clearer statement of intent than a flag left off for another machine, and the run warns. This is how the GPU box runs `tmbed`/`esmfold` against the server's config |
 | `waiting for the GPU — tmbed is using it` | `esmfold` and `tmbed` both need the card | expected, not stuck. Each wants essentially a whole GPU (15.5 GB and 13.3 GB of a 16 GB device were observed), so they are leased one at a time; every CPU-only stage keeps running. `gpu_workers` raises the count, but they all still share the single `gpu_device` |
 | `refusing to search a DIAMOND database that cannot answer` | a `.dmnd` that is empty, truncated, or holds no sequences | a failed `diamond makedb` leaves one behind, and searching it reports 0 hits — the same output as a real absence. Rebuild it with the `diamond makedb` line the message prints, or drop the tag with `<tag>: ""` |
