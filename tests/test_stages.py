@@ -15,7 +15,7 @@ import sys
 import pytest
 
 import fixtures as F
-from conftest import build_project, run_metaannot
+from conftest import METAANNOT_PY, build_project, run_metaannot
 
 
 def _searchable(tmp_path, root, **over):
@@ -170,6 +170,80 @@ def test_every_dependency_output_is_in_the_dependents_signature_inputs(ma,
             if not (outs & inputs):
                 bad.append((st["name"], d))
     assert bad == [], f"dependencies absent from the signature: {bad}"
+
+
+def _build_annotation_config_keys():
+    """Config keys build_annotation reads on EVERY call, read off the source.
+
+    Derived rather than listed, so a key added to build_annotation later
+    cannot quietly skip the signature. Keys read only inside an `emit_dark`
+    branch are excluded: finalise calls build_annotation with emit_dark unset,
+    so those belong to integrate alone. `db` and `proteins_faa` name files,
+    which the signature already covers by content through stage["inp"].
+    """
+    import ast
+
+    tree = ast.parse(open(METAANNOT_PY, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "build_annotation")
+
+    def reads(node):
+        out = set()
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                    and n.value.id == "cfg"
+                    and isinstance(n.slice, ast.Constant)):
+                out.add(n.slice.value)
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "get"
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "cfg" and n.args
+                    and isinstance(n.args[0], ast.Constant)):
+                out.add(n.args[0].value)
+        return out
+
+    gated = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and "emit_dark" in ast.unparse(n.test):
+            gated |= reads(n)
+    return reads(fn) - gated - {"db", "proteins_faa"}
+
+
+def _bump(v):
+    """A value that differs from v, whatever shape v has."""
+    if isinstance(v, dict):
+        return dict(v, __probe__=1)
+    if isinstance(v, (list, tuple)):
+        return list(v) + ["__probe__"]
+    if isinstance(v, bool) or v is None:
+        return not v
+    if isinstance(v, (int, float)):
+        return v + 1
+    return f"{v}__probe__"
+
+
+@pytest.mark.parametrize("key", sorted(_build_annotation_config_keys()))
+@pytest.mark.parametrize("stage", ["integrate", "finalise"])
+def test_a_config_key_build_annotation_reads_invalidates_the_stage_that_runs_it(
+        ma, project, stage, key):
+    # symptom: vfdb_category_weights was in finalise's signature keys but not
+    # in integrate's. build_annotation applies it, and integrate is what runs
+    # build_annotation — so re-weighting VFDB left integrate cached, finalise
+    # re-ran, took its "no structure or profile evidence, reusing the first
+    # pass" branch, and re-published the stale scores. The run reported
+    # success and the setting had done nothing. foldseek_target_priority was
+    # missing from integrate the same way.
+    cfg = ma.load_config(project.config_path)
+    p = ma.Paths(cfg)
+    p.mkdirs()
+    st = [s for s in ma.STAGES if s["name"] == stage][0]
+    assert key in st["keys"], (
+        f"build_annotation reads cfg[{key!r}] on every call, but {stage!r} "
+        f"does not list it, so changing it leaves the stage cached")
+    before = ma.signature(st, cfg, p)
+    cfg[key] = _bump(cfg.get(key))
+    assert ma.signature(st, cfg, p) != before, (
+        f"changing {key!r} did not invalidate {stage!r}")
 
 
 def test_adding_a_diamond_database_invalidates_integrate(ma, tmp_path,
