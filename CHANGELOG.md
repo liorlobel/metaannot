@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+**`Ntox` could not fire, in the pattern list added to fix exactly that.**
+v0.3.0 added `CdiA`, `LXG`, `Ntox`, `nuclease toxin` and `zeta toxin` to
+`toxin_fold_patterns` because the shipped list had matched 0 of 38,204 real
+proteins — the whole-word rule meaning `Tc toxin` could not match inside
+`holotoxin`. `Ntox` was added with the same defect it was added to repair.
+Every family in that set is `Ntox` followed by a number — Ntox15, Ntox28,
+Ntox47 — and a digit is a word character, so the trailing `\b` meant a bare
+`Ntox` matched none of them. It matched only the string `Ntox` standing alone,
+which is not how the family is ever written. The pattern is now `Ntox\d*`.
+
+The test that was meant to prove it worked passed anyway, because its one case
+— `"Ntox47 nuclease toxin domain"` — is also matched by the neighbouring
+`nuclease toxin` pattern. Each case in that test now names the single pattern
+it exercises, and the test re-compiles the list **without** that pattern and
+asserts the description stops matching, so a case carried by a neighbour fails
+instead of reading as a pass.
+
+Patterns in `toxin_fold_patterns` are joined into one alternation and are
+therefore regexes rather than literals. That was always true and is now said
+in the config comment, since the default list contains a metacharacter for the
+first time.
+
+`toxin_fold_patterns` is in the `finalise` signature keys, so `finalise`
+re-runs on the next run and nothing else recomputes.
+
 ## v0.3.0 — 2026-09-08
 
 Isobaric quantification, a cross-source agreement check, and the removal of a

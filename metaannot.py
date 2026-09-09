@@ -647,6 +647,13 @@ DEFAULT_CONFIG = {
     # PDB 2vse - a genuine Tc-family holotoxin - was missed. The contact-
     # dependent and T6SS families matter most for gut commensals, which carry
     # CDI and LXG systems far more often than they carry classical exotoxins.
+    # `Ntox\d*` and not `Ntox`: every family in that set is Ntox followed by a
+    # number (Ntox15, Ntox28, Ntox47), and a digit is a word character, so the
+    # trailing \b of the whole-word rule means a bare "Ntox" cannot match any
+    # of them - the same failure that kept "Tc toxin" out of "holotoxin".
+    # These are joined into one alternation, so a pattern is a REGEX, not a
+    # literal; anything added here that contains a metacharacter must be
+    # written as one.
     "toxin_fold_patterns": [
         "aerolysin", "MACPF", "cholesterol-dependent cytolysin",
         "perfringolysin", "ADP-ribosyltransferase", "ADP-ribosylating",
@@ -654,7 +661,7 @@ DEFAULT_CONFIG = {
         "leukocidin", "Tc toxin", "holotoxin", "pore-forming", "colicin",
         "pyocin", "VgrG", "Rhs", "MARTX", "delta-endotoxin", "cytolysin",
         "insecticidal toxin", "nuclease toxin", "contact-dependent",
-        "CdiA", "LXG", "Ntox", "zeta toxin", "pierisin",
+        "CdiA", "LXG", r"Ntox\d*", "zeta toxin", "pierisin",
     ],
 
     "anchor_pfams": ["PF00395", "PF01473", "PF00746", "PF13715",
