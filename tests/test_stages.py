@@ -15,7 +15,7 @@ import sys
 import pytest
 
 import fixtures as F
-from conftest import build_project, run_metaannot
+from conftest import METAANNOT_PY, build_project, run_metaannot
 
 
 def _searchable(tmp_path, root, **over):
@@ -170,6 +170,80 @@ def test_every_dependency_output_is_in_the_dependents_signature_inputs(ma,
             if not (outs & inputs):
                 bad.append((st["name"], d))
     assert bad == [], f"dependencies absent from the signature: {bad}"
+
+
+def _build_annotation_config_keys():
+    """Config keys build_annotation reads on EVERY call, read off the source.
+
+    Derived rather than listed, so a key added to build_annotation later
+    cannot quietly skip the signature. Keys read only inside an `emit_dark`
+    branch are excluded: finalise calls build_annotation with emit_dark unset,
+    so those belong to integrate alone. `db` and `proteins_faa` name files,
+    which the signature already covers by content through stage["inp"].
+    """
+    import ast
+
+    tree = ast.parse(open(METAANNOT_PY, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "build_annotation")
+
+    def reads(node):
+        out = set()
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                    and n.value.id == "cfg"
+                    and isinstance(n.slice, ast.Constant)):
+                out.add(n.slice.value)
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "get"
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "cfg" and n.args
+                    and isinstance(n.args[0], ast.Constant)):
+                out.add(n.args[0].value)
+        return out
+
+    gated = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.If) and "emit_dark" in ast.unparse(n.test):
+            gated |= reads(n)
+    return reads(fn) - gated - {"db", "proteins_faa"}
+
+
+def _bump(v):
+    """A value that differs from v, whatever shape v has."""
+    if isinstance(v, dict):
+        return dict(v, __probe__=1)
+    if isinstance(v, (list, tuple)):
+        return list(v) + ["__probe__"]
+    if isinstance(v, bool) or v is None:
+        return not v
+    if isinstance(v, (int, float)):
+        return v + 1
+    return f"{v}__probe__"
+
+
+@pytest.mark.parametrize("key", sorted(_build_annotation_config_keys()))
+@pytest.mark.parametrize("stage", ["integrate", "finalise"])
+def test_a_config_key_build_annotation_reads_invalidates_the_stage_that_runs_it(
+        ma, project, stage, key):
+    # symptom: vfdb_category_weights was in finalise's signature keys but not
+    # in integrate's. build_annotation applies it, and integrate is what runs
+    # build_annotation — so re-weighting VFDB left integrate cached, finalise
+    # re-ran, took its "no structure or profile evidence, reusing the first
+    # pass" branch, and re-published the stale scores. The run reported
+    # success and the setting had done nothing. foldseek_target_priority was
+    # missing from integrate the same way.
+    cfg = ma.load_config(project.config_path)
+    p = ma.Paths(cfg)
+    p.mkdirs()
+    st = [s for s in ma.STAGES if s["name"] == stage][0]
+    assert key in st["keys"], (
+        f"build_annotation reads cfg[{key!r}] on every call, but {stage!r} "
+        f"does not list it, so changing it leaves the stage cached")
+    before = ma.signature(st, cfg, p)
+    cfg[key] = _bump(cfg.get(key))
+    assert ma.signature(st, cfg, p) != before, (
+        f"changing {key!r} did not invalidate {stage!r}")
 
 
 def test_adding_a_diamond_database_invalidates_integrate(ma, tmp_path,
@@ -922,20 +996,36 @@ def test_foldseek_requests_qtmscore_and_qlen_not_the_legacy_columns(
     assert fields == ma.FOLDSEEK_COLS
 
 
-def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
-        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
-    """Not every Foldseek release has qtmscore. Degrade, but never silently:
-    a run that quietly drops to the weaker gate is how this went unnoticed."""
-    calls = []
+# What run_cmd actually raises when a tool exits non-zero, and what Foldseek 5
+# actually prints for a format code it does not have. The old test invented
+# `ma.StageError("Invalid selection: qtmscore")`; run_cmd raises a plain
+# RuntimeError, and Foldseek's LocalParameters.cpp prints "Format code <field>
+# does not exist." So the string the fallback keys on has to be the real one.
+_FOLDSEEK_5_STDERR = (
+    "foldseek exited 1\n--- stderr tail ---\n"
+    "Format code qtmscore does not exist.\n")
 
+
+def _fake_foldseek(calls, fail_on_qtmscore=_FOLDSEEK_5_STDERR):
+    """A run_cmd that fails the full-column easy-search the way Foldseek does."""
     def fake_run(cmd, **kw):
         c = [str(x) for x in cmd]
         calls.append(c)
-        if c[1] == "easy-search" and "qtmscore" in c[c.index("--format-output") + 1]:
-            raise ma.StageError("Invalid selection: qtmscore")
+        if (len(c) > 1 and c[1] == "easy-search" and fail_on_qtmscore
+                and "qtmscore" in c[c.index("--format-output") + 1]):
+            raise RuntimeError(fail_on_qtmscore)
         return ""
+    return fake_run
 
-    monkeypatch.setattr(ma, "run_cmd", fake_run)
+
+def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
+    # symptom: run_cmd raises RuntimeError, StageError is a SUBCLASS of it,
+    # and the fallback was written `except StageError` — so it could never
+    # catch the failure it exists for. A Foldseek 5 build lost its structure
+    # evidence entirely instead of degrading to the legacy columns.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd", _fake_foldseek(calls))
     monkeypatch.setattr(ma, "have", lambda t: True)
     cfg, p = _fs_project(ma, tmp_path, paths_for)
     try:
@@ -947,9 +1037,74 @@ def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
     second = search[1][search[1].index("--format-output") + 1].split(",")
     assert second == ma.FOLDSEEK_COLS_LEGACY
     err = capsys.readouterr().err
-    assert "no qtmscore/qlen" in err
+    assert "no qtmscore/ttmscore" in err
     assert "normalised by the alignment" in err
 
+
+def test_the_foldseek_retry_keeps_the_scratch_tree_so_only_convertalis_reruns(
+        ma, tmp_path, paths_for, stub_bin, monkeypatch):
+    # symptom: --format-output is consumed by convertalis, which easy-search
+    # runs AFTER the search, so this failure arrives with the whole multi-hour
+    # alignment already done in tmpd. The retry did shutil.rmtree(tmpd) first,
+    # throwing that away and re-running the search to change a formatting
+    # argument. Foldseek skips its search when the tree still holds the
+    # result, so the tree must survive between the two attempts.
+    calls, tmp_alive = [], []
+    inner = _fake_foldseek(calls)
+
+    def fake_run(cmd, **kw):
+        c = [str(x) for x in cmd]
+        if len(c) > 1 and c[1] == "easy-search":
+            tmpd = c[5]
+            # Stand in for the completed alignment the real search leaves.
+            os.makedirs(tmpd, exist_ok=True)
+            marker = os.path.join(tmpd, "result.dbtype")
+            tmp_alive.append(os.path.exists(marker))
+            open(marker, "w").close()
+        return inner(cmd, **kw)
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run)
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    try:
+        ma.stage_foldseek(cfg, p)
+    except Exception:              # noqa: BLE001
+        pass
+    assert len(tmp_alive) == 2, "expected exactly two easy-search attempts"
+    assert tmp_alive[1], (
+        "the scratch tree was cleared between the attempts, so the retry "
+        "re-runs the search instead of just the conversion")
+
+
+def test_a_foldseek_failure_that_is_not_a_bad_format_code_is_not_retried(
+        ma, tmp_path, paths_for, stub_bin, monkeypatch):
+    # symptom: widening the handler to catch what run_cmd raises would, on its
+    # own, retry EVERY foldseek failure — and a search that died on a full
+    # disk or a bad database has no completed alignment to reuse, so the retry
+    # repeats the multi-hour search to arrive at the same error.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd", _fake_foldseek(
+        calls, fail_on_qtmscore="foldseek exited 1\n--- stderr tail ---\n"
+                                "Error: Could not open database\n"))
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    with pytest.raises(RuntimeError, match="Could not open database"):
+        ma.stage_foldseek(cfg, p)
+    search = [c for c in calls if len(c) > 1 and c[1] == "easy-search"]
+    assert len(search) == 1, "a real failure must not be retried"
+
+
+def test_the_fallback_catches_what_run_cmd_actually_raises(ma):
+    # symptom: the whole defect in one line. StageError is a subclass of
+    # RuntimeError, so `except StageError` cannot catch run_cmd's
+    # RuntimeError; the reverse containment is what makes the handler work.
+    assert issubclass(ma.StageError, RuntimeError)
+    assert not issubclass(RuntimeError, ma.StageError)
+    src = open(METAANNOT_PY, encoding="utf-8").read()
+    fold = src[src.index("def stage_foldseek"):]
+    fold = fold[:fold.index("\ndef ")]
+    assert "except RuntimeError" in fold, (
+        "stage_foldseek must catch what run_cmd raises, not only StageError")
 
 # ----------------------------------------------------------------------
 # a machine with no usable GPU should learn that from doctor, not from

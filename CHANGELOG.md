@@ -1,5 +1,101 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+**Foldseek's legacy-column fallback could never run, and would have paid for
+the search twice if it had.** `stage_foldseek` asks for `qtmscore` and `qlen`
+and falls back to the ten legacy columns when a build does not have them. It
+caught `StageError`. `run_cmd` raises a plain `RuntimeError` on a non-zero
+exit, and `StageError` is a **subclass** of `RuntimeError` — so the handler
+could not catch the one failure it exists for. A Foldseek 5 build lost its
+structure evidence outright instead of degrading. The test that covered it
+injected `ma.StageError("Invalid selection: qtmscore")`, a message no tool
+emits, so it passed over dead code.
+
+`stage_foldseek` is the only site with this shape: the other eight
+`except StageError` handlers are correct, because nothing on their paths
+reaches `run_cmd`.
+
+**The scratch tree now survives the retry.** `--format-output` is consumed by
+`convertalis`, which `easy-search` runs *after* the search — so this failure
+arrives with the entire multi-hour alignment already done and sitting in
+`tmpd`. The retry began with `shutil.rmtree(tmpd)`, throwing that away and
+re-running the search to change a formatting argument. Foldseek guards its
+search with `notExists "${result}.dbtype"`, so leaving the tree in place means
+the retry re-runs the conversion instead. The cleanup after a successful
+search is unchanged.
+
+**Only a rejected format code is retried.** Foldseek prints
+`Format code <field> does not exist.` to stderr and exits 1, and `run_cmd`
+carries that tail in its message. Any other failure — a bad database, a full
+disk, an OOM kill — is re-raised untouched: it has no completed alignment to
+reuse, so a retry would repeat the search to arrive at the same error.
+
+**The warning was wrong about `qlen`.** Foldseek 5 and earlier accept `qlen`;
+only `qtmscore` and `ttmscore` are missing. The message said "no
+qtmscore/qlen" and now names the right two columns and the version boundary.
+
+**Re-weighting VFDB was a silent no-op on a re-run.** `vfdb_category_weights`
+was in `finalise`'s signature keys but not in `integrate`'s. `build_annotation`
+is what applies the weighting, and `integrate` is what runs `build_annotation`
+— so editing the map invalidated only the stage that could not act on it.
+`integrate` stayed cached with the old scores; `finalise` re-ran, found no
+structure or profile evidence, took its `reusing the first pass` branch, and
+copied the stale `annotation_pass1.tsv` through verbatim. `annotation_final.tsv`
+and `bin_summary.tsv` came out byte-identical and the run reported success.
+
+That branch is the common case, not an edge: it is taken whenever
+`run.structure`, `run.hhblits` and `run.jackhmmer` are all off, which is the
+default and is what all eight configs under `examples/server-run-plan/` set.
+The v0.3.0 upgrade itself was unaffected only by luck — `integrate`'s signature
+changed anyway that release, because its input list lost `p.effectors`.
+
+`foldseek_target_priority` was missing from `integrate` for the same reason and
+is added with it. It reaches `build_annotation` on any re-run where a previous
+Foldseek result is already on disk.
+
+The rule is now stated where it can be checked: **every config key
+`build_annotation` reads unconditionally must appear in the signature keys of
+both stages that run it.** The three keys read only inside its `emit_dark`
+branch — `exclude_id_prefixes`, `max_dark_structures`, `max_len_structure` —
+belong to `integrate` alone, because `finalise` never writes `dark.faa`. A new
+test derives that set from the source rather than listing it, so a key added to
+`build_annotation` later cannot quietly skip the signature.
+
+**Cost on an existing results directory.** Adding keys changes the signature
+payload, so `integrate` re-runs once for everybody, and `finalise` with it.
+Both work in process. No search stage is upstream-invalidated, and `esmfold`
+takes `dark.faa` as its only input and hashes it by content — so an unchanged
+work list keeps every fold. No InterProScan, KOfam, ESMFold or Foldseek compute
+is discarded.
+
+**`Ntox` could not fire, in the pattern list added to fix exactly that.**
+v0.3.0 added `CdiA`, `LXG`, `Ntox`, `nuclease toxin` and `zeta toxin` to
+`toxin_fold_patterns` because the shipped list had matched 0 of 38,204 real
+proteins — the whole-word rule meaning `Tc toxin` could not match inside
+`holotoxin`. `Ntox` was added with the same defect it was added to repair.
+Every family in that set is `Ntox` followed by a number — Ntox15, Ntox28,
+Ntox47 — and a digit is a word character, so the trailing `\b` meant a bare
+`Ntox` matched none of them. It matched only the string `Ntox` standing alone,
+which is not how the family is ever written. The pattern is now `Ntox\d*`.
+
+The test that was meant to prove it worked passed anyway, because its one case
+— `"Ntox47 nuclease toxin domain"` — is also matched by the neighbouring
+`nuclease toxin` pattern. Each case in that test now names the single pattern
+it exercises, and the test re-compiles the list **without** that pattern and
+asserts the description stops matching, so a case carried by a neighbour fails
+instead of reading as a pass.
+
+Patterns in `toxin_fold_patterns` are joined into one alternation and are
+therefore regexes rather than literals. That was always true and is now said
+in the config comment, since the default list contains a metacharacter for the
+first time.
+
+`toxin_fold_patterns` is in the `finalise` signature keys, so `finalise`
+re-runs on the next run and nothing else recomputes.
+
 ## v0.3.0 — 2026-09-08
 
 Isobaric quantification, a cross-source agreement check, and the removal of a

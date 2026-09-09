@@ -648,6 +648,13 @@ DEFAULT_CONFIG = {
     # PDB 2vse - a genuine Tc-family holotoxin - was missed. The contact-
     # dependent and T6SS families matter most for gut commensals, which carry
     # CDI and LXG systems far more often than they carry classical exotoxins.
+    # `Ntox\d*` and not `Ntox`: every family in that set is Ntox followed by a
+    # number (Ntox15, Ntox28, Ntox47), and a digit is a word character, so the
+    # trailing \b of the whole-word rule means a bare "Ntox" cannot match any
+    # of them - the same failure that kept "Tc toxin" out of "holotoxin".
+    # These are joined into one alternation, so a pattern is a REGEX, not a
+    # literal; anything added here that contains a metacharacter must be
+    # written as one.
     "toxin_fold_patterns": [
         "aerolysin", "MACPF", "cholesterol-dependent cytolysin",
         "perfringolysin", "ADP-ribosyltransferase", "ADP-ribosylating",
@@ -655,7 +662,7 @@ DEFAULT_CONFIG = {
         "leukocidin", "Tc toxin", "holotoxin", "pore-forming", "colicin",
         "pyocin", "VgrG", "Rhs", "MARTX", "delta-endotoxin", "cytolysin",
         "insecticidal toxin", "nuclease toxin", "contact-dependent",
-        "CdiA", "LXG", "Ntox", "zeta toxin", "pierisin",
+        "CdiA", "LXG", r"Ntox\d*", "zeta toxin", "pierisin",
     ],
 
     "anchor_pfams": ["PF00395", "PF01473", "PF00746", "PF13715",
@@ -4860,22 +4867,44 @@ def stage_foldseek(cfg, p):
 
         try:
             search(fs_fields)
-        except StageError:
-            # qtmscore, ttmscore and the length columns are not in every
-            # Foldseek release. Fall back rather than fail, but say what was
-            # lost - a run that quietly drops to the weaker gate and never
-            # mentions it is how the old behaviour went unnoticed.
-            if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY):
+        except RuntimeError as e:
+            # RuntimeError, not StageError: run_cmd raises a plain
+            # RuntimeError on a non-zero exit, and StageError is a SUBCLASS of
+            # it, so `except StageError` could never catch the one failure
+            # this fallback exists for. It caught nothing and the branch was
+            # unreachable; the test that covered it injected a StageError no
+            # tool ever raises. StageError is still caught here, being a
+            # subclass.
+            #
+            # Only a rejected format code is retried. Foldseek validates
+            # --format-output inside convertalis and prints
+            # "Format code <field> does not exist." to stderr before exiting
+            # 1; run_cmd puts that stderr tail in the message. Any other
+            # failure - a bad database, a full disk, an OOM kill - is re-
+            # raised untouched, because retrying it would repeat the search
+            # to arrive at the same error.
+            msg = str(e).lower()
+            if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY) or not (
+                    "format code" in msg and "does not exist" in msg):
                 raise
             log("foldseek rejected the full --format-output list, so this "
-                "build has no qtmscore/qlen; falling back to the legacy "
+                "build has no qtmscore/ttmscore (Foldseek 5 and earlier; "
+                "qlen is accepted there); falling back to the legacy "
                 "columns. The TM gate will use alntmscore, which is "
                 "normalised by the alignment rather than the query, and no "
                 "coverage filter can be applied — a short local match can "
                 "pass it. Upgrade Foldseek to restore the stricter gate.",
                 "WARN")
             fs_fields = ",".join(FOLDSEEK_COLS_LEGACY)
-            shutil.rmtree(tmpd, ignore_errors=True)
+            # The scratch tree is deliberately NOT cleared before the retry.
+            # --format-output is consumed by convertalis, which easy-search
+            # runs AFTER the search, so this failure arrives with the whole
+            # multi-hour alignment already done and sitting in tmpd. The
+            # workflow guards its search with `notExists "${result}.dbtype"`,
+            # so leaving the tree in place means the retry re-runs the
+            # conversion rather than the search. Deleting it first, which is
+            # what this used to do, threw away the hours and paid for them
+            # again to change a formatting argument.
             search(fs_fields)
         # Against AFDB50 this scratch tree is tens to hundreds of GB, and it
         # used to be left behind once per target.
@@ -8107,7 +8136,17 @@ STAGES = [
                            p.ncbifam, p.kofam, p.interpro,
                            p.diamond_done] + sorted(
                                glob.glob(f"{p.diamond_dir}/*.tsv")),
+         # Every config key build_annotation reads UNCONDITIONALLY has to be
+         # here, because this stage is what runs it. vfdb_category_weights and
+         # foldseek_target_priority were missing: finalise listed both, but on
+         # a run with no structure or profile evidence finalise takes the
+         # "reusing the first pass" branch and copies annotation_pass1.tsv
+         # verbatim, so the only stage that could act on the change was the
+         # one the change did not invalidate. Re-weighting VFDB was a silent
+         # no-op on every such re-run. The three emit_dark keys below belong
+         # to this stage alone, since finalise never writes dark.faa.
          keys=["thresholds", "weights", "diamond_weights",
+               "vfdb_category_weights", "foldseek_target_priority",
                "diamond_evalues", "anchor_pfams",
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",
