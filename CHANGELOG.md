@@ -2,7 +2,49 @@
 
 ## Unreleased
 
+### Added
+
+**`doctor` reports the GPU.** It had no GPU check at all, so a machine with no
+usable CUDA device turned on `run.structure`, was told "all checks passed",
+waited hours, and learned the truth when `esmfold` finally ran and exited. With
+`run.structure` or `run.topology` on, a `== gpu ==` block now says what the
+stages will find.
+
+`cuda_probe()` separates the two cases that look identical and are not: no card
+at all, and a perfectly good card with a CPU-only `torch` wheel. The second is
+the more confusing failure because the hardware is right there, so it is named
+with its fix. It does not import torch when torch is absent — `doctor` has to
+stay fast and has to run on machines that have none.
+
+`structure` without CUDA is a MISS, because `stage_esmfold` exits rather than
+fold on CPU; the message names the way out, which is to fold on a GPU host and
+copy `results/structures/` back, since `foldseek` is CPU-only and searches
+whatever models are there. `topology` is a WARN and not a MISS: SignalP 6 is
+CPU-only and unaffected, and tmbed does run without a GPU — just one to two
+orders of magnitude slower.
+
+`stage_tmbed` now names the protein count before starting a CPU fallback.
+"Fell back to CPU" is a footnote at 5,000 proteins and a two-day decision at
+455,000, and tmbed writes nothing until it finishes, so that path cannot be
+told apart from a hang while it is running.
+
 ### Fixed
+
+**RAM detection answered 0 on everything without `/proc`.** `detect_ram_gb()`
+tried `os.sysconf("SC_PHYS_PAGES")`, then `/proc/meminfo`, then gave up. macOS
+*defines* `_SC_PHYS_PAGES` but `sysconf` returns EINVAL for it, and Darwin has
+no `/proc`, so both probes fell through — and the caller reads 0 as "could not
+detect", so the memory budget silently became zero and every stage ran with no
+allocation: no DIAMOND `-b`, no `-Xmx` for InterProScan, no
+`--split-memory-limit` for MMseqs2 or Foldseek. Nothing errored; the run was
+just quietly unbudgeted. Windows had neither probe and returned 0 too, which
+matters because `doctor`, `report` and `object` run there directly.
+
+Added `hw.memsize` for Darwin and `GlobalMemoryStatusEx` for Windows, after the
+existing probes rather than instead of them. Verified: 127 GB on Windows, 94 GB
+in WSL2. The first probe also now checks `sysconf` returned a positive number
+before trusting it. Invisible until now because CI is `ubuntu-latest` only.
+
 
 **Foldseek's legacy-column fallback could never run.**
 `stage_foldseek` asks for `qtmscore` and `qlen`
