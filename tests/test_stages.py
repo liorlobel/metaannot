@@ -1806,3 +1806,38 @@ def test_no_such_warning_when_every_sharing_tier_is_listed(ma, tmp_path,
                        "exact", 0.0, 0.0, 100,
                        strip_prefixes=["uhgpL_", "uhgpSM_"])
     assert "reports as unannotated" not in capsys.readouterr().err
+
+
+def test_a_tier_that_matches_nothing_is_called_out_as_a_zero_not_a_low_number(
+        ma, tmp_path, capsys):
+    # symptom: the AMPSphere tier of the real run matched 0 of its 2,168
+    # proteins -- no eggNOG table on that machine is keyed on AMP/SPHERE ids
+    # -- and it is 30% of the whole dark fraction. The headline coverage was
+    # 98.4%, so nothing said so.
+    have = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(8)]
+    none = [F.Protein(f"ampS_AMP10.000_{i:03d}", "MKV" * 40) for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), have + none)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), have)
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100)
+    err = capsys.readouterr().err
+    assert "tier ampS_ matched NONE of its 3 protein(s)" in err
+    assert "not for want of biology" in err
+    # the tier that DID match must not be accused of it
+    assert "tier uhgpL_ matched NONE" not in err
+
+
+def test_a_merely_low_tier_is_not_called_a_zero(ma, tmp_path, capsys):
+    have = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(8)]
+    thin = [F.Protein(f"ampS_AMP10.000_{i:03d}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), have + thin)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), have + thin[:1])
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100)
+    assert "matched NONE" not in capsys.readouterr().err

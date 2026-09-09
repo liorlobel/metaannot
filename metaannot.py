@@ -2193,6 +2193,25 @@ def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
             shape_of.setdefault(id_key_shape(ex), []).append(pref)
             log(f"emapper reuse:   {pref or '(no prefix)':20s} "
                 f"{hit[pref]:>8,}/{n:<8,} {100.0 * hit[pref] / n:5.1f}%")
+            if not hit[pref]:
+                # Zero is not a small number, it is a different kind of
+                # answer. A tier at 5% has a table that mostly misses; a tier
+                # at 0% has no table keyed on its identifiers at all, and
+                # every one of its proteins will be reported 4_dark by
+                # construction rather than by biology. On the run this was
+                # written for that is the AMPSphere tier -- 2,168 identified
+                # proteins, 30% of the whole dark fraction, and no eggNOG
+                # table anywhere on the machine is keyed on AMP/SPHERE ids.
+                # The headline coverage was 98.4%, so nothing else said it.
+                log(f"emapper reuse: tier {pref or '(no prefix)'} matched "
+                    f"NONE of its {n:,} protein(s). Not a low number -- a "
+                    "zero, which is what a tier whose identifiers no "
+                    "configured table is keyed on looks like. Every one of "
+                    "them will bin as 4_dark for want of a join, not for "
+                    "want of biology. Either add a table for it to "
+                    "emapper_precomputed, or record that this tier is "
+                    "unannotated by construction so the dark fraction is "
+                    "read with that in mind", "WARN")
         # A tier tag left out of emapper_strip_id_prefix while a tier sharing
         # its key space is in it loses the whole table for that tier, and the
         # symptom is a plausible-looking coverage number rather than an error.
