@@ -439,10 +439,63 @@ representative, which is worth knowing.
 
 ---
 
-## Phase 6 — GPU stages, on the RTX laptop
+## Phase 6 — GPU stages
 
-`tmbed` and `esmfold` need CUDA. Run them there and bring the results back;
-metaannot **adopts** outputs it finds rather than recomputing.
+`tmbed` and `esmfold` want CUDA. Run them on a GPU host and bring the results
+back; metaannot **adopts** outputs it finds rather than recomputing.
+
+### No CUDA GPU? Read this first
+
+`doctor` now tells you before a run starts, rather than letting you find out
+when `esmfold` finally runs. With `run.structure` or `run.topology` on it
+prints a `== gpu ==` block:
+
+```
+== gpu ==
+  WARN   a card is present (NVIDIA GeForce RTX 5080) but torch reports CUDA
+         unavailable - usually a CPU-only torch build
+  MISS   run.structure needs CUDA: stage_esmfold exits rather than fold on CPU
+  WARN   run.topology: SignalP 6 is CPU-only and unaffected. tmbed will fall
+         back to CPU, where it is one to two orders of magnitude slower
+```
+
+It separates the two cases that look identical and are not: **no card**, and
+**a perfectly good card with a CPU-only `torch` wheel**. The second is the more
+confusing failure, because the hardware is right there. Fix it by reinstalling
+torch from the CUDA index matching your driver.
+
+What to do, by stage:
+
+| stage | without CUDA |
+|---|---|
+| `signalp` | **unaffected** — SignalP 6 is CPU-only anyway |
+| `tmbed` | runs, but 1–2 orders of magnitude slower. Fine for a few thousand proteins; not for a few hundred thousand |
+| `esmfold` | **refuses.** Folding on CPU is impractical at any real scale, so the stage exits rather than pretend |
+| `foldseek` | **unaffected** — CPU-only, and it searches whatever models are present |
+
+So a machine with no GPU can still run 19 of the 21 stages, and can still get
+structural evidence: fold elsewhere, copy `results/structures/` across, and
+`foldseek` will search what it finds. That split is deliberate — the expensive
+GPU step is separable from the search that uses it.
+
+Three settings decide what happens:
+
+```yaml
+tmbed_use_gpu: auto     # GPU if present, CPU if not (default)
+tmbed_use_gpu: true     # a missing GPU is FATAL - use this when slow is worse than absent
+tmbed_use_gpu: false    # CPU deliberately, no warning
+run.structure: false    # skip esmfold and foldseek entirely
+```
+
+`auto` is the default because losing topology evidence to a missing card is
+worse than being slow — but at a few hundred thousand proteins that judgement
+inverts, which is why the run says the protein count out loud before starting
+the CPU path.
+
+**On Apple Silicon**, `torch.cuda.is_available()` is False regardless of how
+good the chip is: neither `tmbed` nor `esmfold` has an MPS path today. Treat a
+Mac as a no-GPU host for these two stages. See `docs/gui-design.md` for the
+full per-platform picture.
 
 On the laptop:
 
@@ -659,48 +712,127 @@ evaluates a document with the working directory set to its own folder.
 
 ---
 
-## Resource guide
+## Resource guide — and how to size a run
 
-| stage | cost | memory | notes |
-|---|---|---|---|
-| emapper (reuse) | minutes | low | streams; a 50 M-row table is fine |
-| pfam / ncbifam | hours | moderate | scales with `--cpu` |
-| diamond | hours | `-b` × 6 GB per job | databases run concurrently |
-| interpro | **longest** | large JVM heap | disable on the first pass |
-| cluster | minutes–hours | `--split-memory-limit` | |
-| tmbed / esmfold | GPU-bound | 16 GB VRAM | laptop only; one at a time (`gpu_workers`) |
-| foldseek | hours | large | serial across targets on purpose |
-| integrate / finalise / join | minutes | ~1 GB per 100k proteins | |
+These are **measured**, not estimated. Every stage that runs records its own
+duration as `seconds` in `results/.metaannot_state.json`, so your run reports
+its own numbers; quote those rather than these.
 
-No benchmark ships with the tool, so the non-tool costs above are estimates,
-not measurements. Reading a large quant table is the one expensive non-tool
-step (order of a gigabyte and tens of seconds per read, and a full run reads
-three times). The wall time of a real run is essentially the search tools.
+Two real runs on one workstation (22 cores, 94 GB to WSL2, one 16 GB card),
+three stages at a time:
+
+| stage | 38,204 proteins | 455,571 proteins |
+|---|---|---|
+| `emapper` (reuse) | 0.02 h | 0.02 h |
+| `diamond` (5 databases) | under a minute | 0.08 h |
+| `dbcan` | 0.01 h | 0.17 h |
+| `cluster` (MMseqs2) | under a minute | **0.03 h** |
+| `pfam` | 0.45 h | **7.2 h** |
+| `ncbifam` | 0.40 h | **5.6 h** |
+| `kofam` | 0.49 h | 10 h+ |
+| `signalp` | 0.93 h | 50 h+ |
+| `tmbed` | 0.87 h | 23 h+ |
+| `interpro` | 2.84 h | ~34 h |
+| `foldseek` | 0.02 h | — |
+| `esmfold` | 1.6 h for 1,805 models under 478 aa | — |
+
+### The thing that surprises people: it is not linear
+
+The protein count went up 11.9×. Most stages went up **15–50×**.
+
+The reason is contention, not size. At 38k every stage finishes quickly, so
+three-at-a-time rarely means three long stages overlapping. At 455k every long
+stage runs concurrently with every other long stage for its entire life, and
+they share 22 cores. SignalP measured **11.4 sequences/s** with the machine
+mostly to itself and **2.0–3.2 sequences/s** with tmbed and KOfam alongside —
+the same work, three to five times slower.
+
+So: **scale by observed contention, not by protein count.** A useful rule is to
+take the linear estimate and double it once you are past about 100k proteins.
+
+MMseqs2 is the exception worth noting — 455,571 proteins clustered into 49,347
+families in 108 seconds, because clustering scales with redundancy rather than
+with count.
+
+### Sizing your run
+
+**Measure the database first.** `grep -c '^>' proteins.faa` decides everything
+below.
+
+| database | what to do |
+|---|---|
+| **under ~50k** | run everything; a full pass is hours |
+| **50k–150k** | run everything, but expect a day; keep `stage_workers: 3` |
+| **over ~150k** | read the rest of this section before starting |
+
+Past roughly 150k proteins, three decisions matter more than any tuning:
+
+1. **Start InterProScan first, not last.** It is the longest stage by a wide
+   margin, and the scheduler picks stages in table order with only
+   `stage_workers` running at once — so it can start *hours* after everything
+   else and then define the finish. Run it as its own pass first:
+   ```bash
+   python metaannot.py run --config config.yaml --only interpro
+   python metaannot.py run --config config.yaml          # everything else
+   ```
+   On a 455k run, letting it start last cost most of a day.
+
+2. **Ask whether the whole database needs annotating.** The expensive stages
+   run over `proteins_faa`, but only the proteins that survive to the quant
+   table can reach the report. On one real TMT run that was **8,668 razor
+   proteins out of 455,571 — 1.9%**. The other 98% were searched only to
+   populate a database-wide bin table.
+
+   `subset` reduces the FASTA to what a quant table references, and is worth
+   trying — but check what it gives you before relying on it. On a smORF
+   database it saved nothing (455,571 of 457,611), because short peptides map
+   almost everywhere. And restricting the set is **not free**:
+   `peptide_assignment: taxon_unique` needs a taxid for every shared-peptide
+   *candidate*, so a smaller universe turns features into
+   `shared_unknown_taxon` and drops them. eggNOG is the cheap stage that has to
+   stay broad; the search stages are the expensive ones that need not.
+
+3. **Consider fewer concurrent stages, not more.** `stage_workers: 3` on 22
+   cores means three tools each taking 7. If one of them takes 10 anyway (tmbed
+   does), everything else is squeezed. Lowering to 2 does not reduce total CPU
+   work, but it does make each stage finish sooner, which matters because
+   several stages write nothing until they are done.
+
+### Stages that write nothing until they finish
+
+`tmbed` and the `hmmsearch` stages buffer their output and write once at the
+end. On a large database that means many hours with an empty output file, which
+cannot be told from a hang — check CPU time (`ps -o time -C tmbed`) rather than
+file size. It also means a crash loses the whole stage.
+
+`esmfold` is the exception: it checkpoints every model as it is written, so a
+machine that dies at protein 1,800 of 1,900 costs the tail and nothing else.
 
 ---
 
-## First-run caveat
+## What has actually been run
 
-Phases 0–5 with the search stages **off** are the part that has been run on real
-data: one label-free FragPipe dataset, 38,204 proteins and 122,278 features,
-through `emapper` (reuse), `integrate`, `finalise` and `join`. Manifest parsing,
-the id join, the shared-peptide rule, binning, the roll-up and the recovered
-design all worked there.
+**Two real datasets, end to end.**
 
-What has still never run on real data is the search tools themselves —
-hmmsearch, DIAMOND, InterProScan, KOfamScan, HHblits, jackhmmer, ESMFold,
-Foldseek, SignalP/TMbed — and the Unipept API. Only their output parsers are
-tested, and `3s_structure_only` / `3p_profile_only` have never been populated
-from a real search.
+A label-free FragPipe run — 38,204 proteins, 122,278 features, 36 samples in six
+groups — went through fifteen of the twenty-one stages: `emapper` (reuse),
+`pfam`, `dbcan`, `diamond` over five databases, `cluster`, `ncbifam`, `kofam`,
+`interpro`, `signalp`, `tmbed`, `esmfold`, `foldseek`, `integrate`, `finalise`
+and `join`. The report knitted and the QFeatures object built from that run on
+R 4.6.1, not from synthetic data. Final bins were 47.6 / 28.2 / 19.0 / 1.0 /
+0.4 / 3.8%, and the dark bin fell from 9,731 proteins on eggNOG alone to 1,462.
 
-The **report knits and the R object builds** on synthetic data under R 4.3 with
-pandoc 3.1, rmarkdown, limma, SummarizedExperiment and the tidyverse — synthetic
-only, never on a real result. None of that is reproducible from what you have:
-no test file, benchmark or synthetic generator ships with `metaannot.py`. The
-QFeatures assay-link branch of the object script has not been exercised; when it
-fails it prints a generic "QFeatures version differs" and falls back to a
-SummarizedExperiment, so check the class of what you get back.
+A FragPipe **TMT** run followed on a second dataset — 8 plexes, 88 channels, 75
+biological samples, 455,571 proteins — so `quant_format: fragpipe_tmt` is not a
+paper path either.
 
-So anything past phase 5, and any run that enables a search stage, is still
-validation. Check counts at every phase, and when something looks wrong, say so
-and stop rather than pressing on.
+**What still has not run on real data:** `smorf`, `context`, `hhblits`,
+`jackhmmer`, `unipept` and `taxonomy`, all off by default. So the remote-profile
+searches and the peptide-LCA taxonomy comparison remain unexercised outside
+their output parsers, and `3p_profile_only` has never been populated by any run
+— it is fed only by `hh_hit` and `jackhmmer_hit`.
+
+A test suite ships in `tests/`, so the plumbing described in this tutorial is
+reproducible offline. What does not ship is a benchmark script, and the datasets
+themselves are not redistributable, so the timings above cannot be re-derived
+from what you have.
