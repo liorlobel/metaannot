@@ -118,14 +118,41 @@ def test_a_holotoxin_is_matched(ma):
     assert _tox_re(ma).search(desc)
 
 
-@pytest.mark.parametrize("desc", [
-    "contact-dependent growth inhibition toxin CdiA",
-    "LXG domain-containing toxin",
-    "Ntox47 nuclease toxin domain",
-    "zeta toxin family protein",
+# Each case names the ONE pattern it exists to exercise, and the test below
+# removes that pattern to prove the match came from it. The first version of
+# this test asserted only "something matched" on
+# "Ntox47 nuclease toxin domain" — which matches on `nuclease toxin`, so it
+# passed while `Ntox` matched nothing at all. A description that a neighbouring
+# pattern also covers cannot tell you whether the pattern you meant to add
+# works.
+@pytest.mark.parametrize("pattern,desc", [
+    ("CdiA", "CdiA-CT toxin domain"),
+    ("LXG", "LXG domain-containing protein"),
+    (r"Ntox\d*", "Ntox47 domain-containing protein"),
+    (r"Ntox\d*", "Bacterial toxin 28 domain (Ntox28)"),
+    ("zeta toxin", "zeta toxin family protein"),
+    ("nuclease toxin", "HNH nuclease toxin"),
+    ("contact-dependent", "contact-dependent growth inhibition system"),
 ])
-def test_the_families_gut_commensals_actually_carry_are_matched(ma, desc):
-    assert _tox_re(ma).search(desc)
+def test_the_families_gut_commensals_actually_carry_are_matched(ma, pattern,
+                                                                desc):
+    """Every real Ntox family is Ntox followed by a number, and a digit is a
+    word character — so the trailing \\b of the whole-word rule meant a bare
+    `Ntox` matched none of Ntox15/Ntox28/Ntox47. Same failure as 'Tc toxin'
+    inside 'holotoxin', in a pattern added to fix that one."""
+    import re
+    pats = ma.DEFAULT_CONFIG["toxin_fold_patterns"]
+    assert pattern in pats, f"{pattern!r} is no longer in toxin_fold_patterns"
+    assert _tox_re(ma).search(desc), f"{desc!r} scores no toxin fold"
+
+    # The whole point: without THIS pattern the description must stop matching.
+    # Otherwise the case is being carried by one of its neighbours and says
+    # nothing about the pattern it was written for.
+    without = re.compile(
+        r"\b(?:" + "|".join(p for p in pats if p != pattern) + r")\b", re.I)
+    assert not without.search(desc), (
+        f"{desc!r} still matches with {pattern!r} removed, so this case does "
+        f"not actually exercise {pattern!r}")
 
 
 @pytest.mark.parametrize("desc", [
