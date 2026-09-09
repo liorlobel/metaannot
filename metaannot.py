@@ -4809,22 +4809,44 @@ def stage_foldseek(cfg, p):
 
         try:
             search(fs_fields)
-        except StageError:
-            # qtmscore, ttmscore and the length columns are not in every
-            # Foldseek release. Fall back rather than fail, but say what was
-            # lost - a run that quietly drops to the weaker gate and never
-            # mentions it is how the old behaviour went unnoticed.
-            if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY):
+        except RuntimeError as e:
+            # RuntimeError, not StageError: run_cmd raises a plain
+            # RuntimeError on a non-zero exit, and StageError is a SUBCLASS of
+            # it, so `except StageError` could never catch the one failure
+            # this fallback exists for. It caught nothing and the branch was
+            # unreachable; the test that covered it injected a StageError no
+            # tool ever raises. StageError is still caught here, being a
+            # subclass.
+            #
+            # Only a rejected format code is retried. Foldseek validates
+            # --format-output inside convertalis and prints
+            # "Format code <field> does not exist." to stderr before exiting
+            # 1; run_cmd puts that stderr tail in the message. Any other
+            # failure - a bad database, a full disk, an OOM kill - is re-
+            # raised untouched, because retrying it would repeat the search
+            # to arrive at the same error.
+            msg = str(e).lower()
+            if fs_fields == ",".join(FOLDSEEK_COLS_LEGACY) or not (
+                    "format code" in msg and "does not exist" in msg):
                 raise
             log("foldseek rejected the full --format-output list, so this "
-                "build has no qtmscore/qlen; falling back to the legacy "
+                "build has no qtmscore/ttmscore (Foldseek 5 and earlier; "
+                "qlen is accepted there); falling back to the legacy "
                 "columns. The TM gate will use alntmscore, which is "
                 "normalised by the alignment rather than the query, and no "
                 "coverage filter can be applied — a short local match can "
                 "pass it. Upgrade Foldseek to restore the stricter gate.",
                 "WARN")
             fs_fields = ",".join(FOLDSEEK_COLS_LEGACY)
-            shutil.rmtree(tmpd, ignore_errors=True)
+            # The scratch tree is deliberately NOT cleared before the retry.
+            # --format-output is consumed by convertalis, which easy-search
+            # runs AFTER the search, so this failure arrives with the whole
+            # multi-hour alignment already done and sitting in tmpd. The
+            # workflow guards its search with `notExists "${result}.dbtype"`,
+            # so leaving the tree in place means the retry re-runs the
+            # conversion rather than the search. Deleting it first, which is
+            # what this used to do, threw away the hours and paid for them
+            # again to change a formatting argument.
             search(fs_fields)
         # Against AFDB50 this scratch tree is tens to hundreds of GB, and it
         # used to be left behind once per target.
