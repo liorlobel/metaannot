@@ -678,3 +678,71 @@ def test_the_scheduler_sorts_the_ready_set_before_it_caps_at_stage_workers(
     lease = src.index("run_now, waiting = gpu_lease(", decide)
     cap = src.index("if len(futures) >= workers:", decide)
     assert decide < srt < lease < cap
+
+
+# --- the lock and a killed run ----------------------------------------
+# symptom: atexit does not run on SIGTERM or SIGHUP, so a run stopped by
+# `kill`, by a scheduler's time limit, or by a closing ssh session left a lock
+# file behind naming a pid that no longer exists. On the same host the next
+# run can prove it is dead; from another node of a cluster it cannot, and the
+# resume became a stale-lock refusal needing --force-unlock.
+@pytest.mark.skipif(os.name == "nt",
+                    reason="TerminateProcess runs no handler on Windows; "
+                           "SIGTERM cannot be delivered to a child there")
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGHUP"])
+def test_a_killed_run_releases_the_results_lock(tmp_path, stub_bin, signame):
+    sig = getattr(signal, signame, None)
+    if sig is None:
+        pytest.skip(f"{signame} does not exist here")
+    proj = _searchable(tmp_path, tmp_path / f"k{signame}")
+    env = dict(os.environ, STUB_SLEEP="10", PYTHONHASHSEED="0")
+    proc = subprocess.Popen(
+        [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        cwd=proj.root)
+    lock = proj.rpath(".metaannot.lock")
+    assert _wait_for(lambda: os.path.exists(lock)), "the lock was never taken"
+    proc.send_signal(sig)
+    out, err = proc.communicate(timeout=60)
+    assert not os.path.exists(lock), \
+        f"the lock survived {signame}:\n{err[-2000:]}"
+    assert f"stopping on {signame}" in err
+    assert "releasing the results lock" in err
+    assert proc.returncode == -sig or proc.returncode == 128 + int(sig), \
+        f"exit status {proc.returncode} is neither 128+N nor a signal death"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="see above")
+def test_a_run_killed_that_way_resumes_without_force_unlock(tmp_path,
+                                                            stub_bin):
+    # the whole point: the next invocation must not need --force-unlock.
+    ref = _searchable(tmp_path, tmp_path / "kref")
+    ref.run()
+    want = _outputs(ref, skip=(PASS1,))
+    proj = _searchable(tmp_path, tmp_path / "kres")
+    env = dict(os.environ, STUB_SLEEP="10", PYTHONHASHSEED="0")
+    proc = subprocess.Popen(
+        [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        cwd=proj.root)
+    assert _wait_for(lambda: os.path.exists(proj.rpath(".metaannot.lock")))
+    proc.send_signal(signal.SIGTERM)
+    proc.communicate(timeout=60)
+    again = proj.run(env={"STUB_SLEEP": "0"})
+    assert "--force-unlock" not in again.stderr
+    assert "already running here" not in again.stderr
+    assert _outputs(proj, skip=(PASS1,)) == want
+
+
+def test_the_signals_that_can_strand_a_lock_are_all_handled(ma):
+    # SIGINT is deliberately absent: Python raises KeyboardInterrupt for it,
+    # which unwinds through the lock's `with` and runs atexit, so a handler
+    # here would replace an orderly stop with an abrupt one.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("_release_lock_on_signal(sig, _frame)")
+    tail = src[i:i + 4000]
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        assert f'"{name}"' in tail, f"{name} is not registered"
+    assert "SIGINT" not in tail
+    assert "os._exit" in tail, \
+        "sys.exit would wait for the stage pool's workers"

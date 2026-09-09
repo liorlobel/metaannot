@@ -65,6 +65,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -12987,7 +12988,62 @@ def cmd_run(args):
         log(f"metaannot {__version__} starting")
         lock = ResultsLock(p.lock, force=getattr(args, "force_unlock", False))
         lock.__enter__()
-        atexit.register(lock.__exit__)
+        # The BOUND METHOD, not a closure over `lock`. Both of these used to
+        # be reachable from a name that this function reassigns further down,
+        # and the signal handler duly called threading.Lock.__exit__ and died
+        # with "release unlocked lock" - which took the run out with an
+        # uncaught RuntimeError and exit 1 rather than releasing anything.
+        release_results_lock = lock.__exit__
+        atexit.register(release_results_lock)
+
+        def _release_lock_on_signal(sig, _frame):
+            """Release the results lock when the run is killed, not only when
+            it exits.
+
+            atexit does not run on SIGTERM or SIGHUP - Python's default
+            handler terminates the process outright - so a run stopped by
+            `kill`, by a scheduler hitting its time limit, or by a closing ssh
+            session left a lock file behind naming a pid that no longer
+            exists. On the same host the next run can prove that and reclaim
+            it; from another node of a cluster it cannot, and the resume
+            became a stale-lock refusal needing --force-unlock.
+
+            What this does NOT do: stop the tools already running. TMbed,
+            InterProScan and DIAMOND are separate processes that outlive us,
+            and the state file is what records which stages were mid-flight.
+            It releases the lock, flushes the log, and exits 128+N so a
+            wrapper script still sees a killed process rather than a clean
+            one.
+
+            Windows delivers almost none of this: subprocess.terminate() is
+            TerminateProcess, which runs no handler at all. SIGBREAK
+            (Ctrl-Break) is the one that does arrive, so it is registered too.
+            """
+            name = getattr(sig, "name", None) or \
+                getattr(signal.Signals(sig), "name", str(sig))
+            log(f"stopping on {name}: releasing the results lock {p.lock}. "
+                "Any tool already running is a separate process and is not "
+                "stopped by this, so its output may be incomplete; "
+                f"{p.state} records which stages were running.", "WARN")
+            release_results_lock()
+            with contextlib.suppress(Exception):
+                sys.stderr.flush()
+            if _LOGFH:
+                with contextlib.suppress(Exception):
+                    _LOGFH.flush()
+            # os._exit, not sys.exit: SystemExit here would unwind through the
+            # stage pool's `with`, which WAITS for its workers, and a tmbed
+            # chunk can be an hour. A kill has to mean now.
+            os._exit(128 + int(sig))
+
+        for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+            _sig = getattr(signal, _name, None)
+            if _sig is not None:
+                # ValueError when this is not the main thread, OSError when
+                # the platform refuses the signal. Neither is worth failing a
+                # run over: the lock still comes off on a normal exit.
+                with contextlib.suppress(ValueError, OSError, AttributeError):
+                    signal.signal(_sig, _release_lock_on_signal)
 
     for name in (args.only or []) + ([args.from_stage] if args.from_stage else []):
         if name not in STAGE_NAMES:
@@ -13169,11 +13225,14 @@ def cmd_run(args):
     done = set()
     ran = adopted = skipped = 0
     failure = []
-    lock = threading.Lock()
+    # state_lock, not `lock`: the results lock taken at the top of this
+    # function is also called lock, and a closure over the name (the signal
+    # handler was one) got whichever had been assigned most recently.
+    state_lock = threading.Lock()
 
     def finish(name, action, sig=None, err=None, secs=None):
         nonlocal ran, adopted, skipped
-        with lock:
+        with state_lock:
             if err is not None:
                 state[name] = {"signature": None, "status": "failed",
                                "error": str(err)[:500],
@@ -13201,7 +13260,7 @@ def cmd_run(args):
         """Recorded before the stage starts, so that a run killed mid-write
         leaves a trace. Without it the half-written file was the only evidence
         left, and the next run adopted it as a finished one."""
-        with lock:
+        with state_lock:
             state[name] = {"signature": None, "status": "running",
                            "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
             save_state(p.state, state)
