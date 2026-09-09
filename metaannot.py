@@ -8056,7 +8056,17 @@ STAGES = [
                            p.ncbifam, p.kofam, p.interpro,
                            p.diamond_done] + sorted(
                                glob.glob(f"{p.diamond_dir}/*.tsv")),
+         # Every config key build_annotation reads UNCONDITIONALLY has to be
+         # here, because this stage is what runs it. vfdb_category_weights and
+         # foldseek_target_priority were missing: finalise listed both, but on
+         # a run with no structure or profile evidence finalise takes the
+         # "reusing the first pass" branch and copies annotation_pass1.tsv
+         # verbatim, so the only stage that could act on the change was the
+         # one the change did not invalidate. Re-weighting VFDB was a silent
+         # no-op on every such re-run. The three emit_dark keys below belong
+         # to this stage alone, since finalise never writes dark.faa.
          keys=["thresholds", "weights", "diamond_weights",
+               "vfdb_category_weights", "foldseek_target_priority",
                "diamond_evalues", "anchor_pfams",
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",

@@ -4,6 +4,40 @@
 
 ### Fixed
 
+**Re-weighting VFDB was a silent no-op on a re-run.** `vfdb_category_weights`
+was in `finalise`'s signature keys but not in `integrate`'s. `build_annotation`
+is what applies the weighting, and `integrate` is what runs `build_annotation`
+— so editing the map invalidated only the stage that could not act on it.
+`integrate` stayed cached with the old scores; `finalise` re-ran, found no
+structure or profile evidence, took its `reusing the first pass` branch, and
+copied the stale `annotation_pass1.tsv` through verbatim. `annotation_final.tsv`
+and `bin_summary.tsv` came out byte-identical and the run reported success.
+
+That branch is the common case, not an edge: it is taken whenever
+`run.structure`, `run.hhblits` and `run.jackhmmer` are all off, which is the
+default and is what all eight configs under `examples/server-run-plan/` set.
+The v0.3.0 upgrade itself was unaffected only by luck — `integrate`'s signature
+changed anyway that release, because its input list lost `p.effectors`.
+
+`foldseek_target_priority` was missing from `integrate` for the same reason and
+is added with it. It reaches `build_annotation` on any re-run where a previous
+Foldseek result is already on disk.
+
+The rule is now stated where it can be checked: **every config key
+`build_annotation` reads unconditionally must appear in the signature keys of
+both stages that run it.** The three keys read only inside its `emit_dark`
+branch — `exclude_id_prefixes`, `max_dark_structures`, `max_len_structure` —
+belong to `integrate` alone, because `finalise` never writes `dark.faa`. A new
+test derives that set from the source rather than listing it, so a key added to
+`build_annotation` later cannot quietly skip the signature.
+
+**Cost on an existing results directory.** Adding keys changes the signature
+payload, so `integrate` re-runs once for everybody, and `finalise` with it.
+Both work in process. No search stage is upstream-invalidated, and `esmfold`
+takes `dark.faa` as its only input and hashes it by content — so an unchanged
+work list keeps every fold. No InterProScan, KOfam, ESMFold or Foldseek compute
+is discarded.
+
 **`Ntox` could not fire, in the pattern list added to fix exactly that.**
 v0.3.0 added `CdiA`, `LXG`, `Ntox`, `nuclease toxin` and `zeta toxin` to
 `toxin_fold_patterns` because the shipped list had matched 0 of 38,204 real
