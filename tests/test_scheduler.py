@@ -305,6 +305,11 @@ def test_resuming_from_every_stage_reproduces_the_clean_result(tmp_path,
     assert _outputs(proj, skip=(PASS1,)) == want
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="send_signal(SIGINT) is unsupported on Windows, and CTRL_C_EVENT "
+           "goes to the whole console group including the test runner. The "
+           "path is covered on Linux, where this passes.")
 def test_an_interrupted_run_leaves_parseable_state_and_resumes(tmp_path,
                                                                stub_bin):
     # symptom: a run killed mid-write left the half-written file as the only

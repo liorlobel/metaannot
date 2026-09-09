@@ -9126,6 +9126,45 @@ def signature(stage, cfg, p):
         json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _windows_pid_alive(pid):
+    """Whether a pid names a live process on Windows, without signalling it.
+
+    Unprovable means alive, as everywhere else in the lock: a missing API, a
+    refused handle or an ambiguous exit code all answer True, and
+    --force-unlock is the escape. Only ERROR_INVALID_PARAMETER -- the answer
+    Windows gives for a pid that does not exist at all -- is taken as proof of
+    death.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:                                   # pragma: no cover
+        return True
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.DWORD]
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                            int(pid))
+        if not h:
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True
+            # STILL_ACTIVE is ambiguous with a process that exited WITH code
+            # 259, which is why it errs towards alive rather than away.
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:                                   # pragma: no cover
+        return True
+
+
 class ResultsLock:
     """One writer per results directory.
 
@@ -9154,8 +9193,12 @@ class ResultsLock:
             return True
         if os.name == "nt":
             # os.kill(pid, 0) on Windows calls TerminateProcess: asking
-            # whether a process is alive would kill it.
-            return True
+            # whether a process is alive that way would KILL it. OpenProcess
+            # asks without touching it. Answering "alive" unconditionally, as
+            # this did, meant a lock left by a crashed run on Windows could
+            # never be reclaimed and every resume needed --force-unlock -- and
+            # a crash is exactly when reclaiming has to work.
+            return _windows_pid_alive(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -12840,6 +12883,24 @@ def cmd_doctor(args):
                   f"({len(missing)} item(s), ~{_gb(total)} GB)")
             print("review it, then run it, or rerun doctor with --fix"
                   if missing else "nothing to install")
+
+    if args.fix and os.name == "nt":
+        # The commands come out of `requirements()` as POSIX shell -- mkdir
+        # -p, curl, tar, gunzip, hmmpress -- and are run through
+        # subprocess(shell=True), which on Windows is cmd.exe. `mkdir -p
+        # 'C:\\db'` there creates a directory called -p; curl and tar may or
+        # may not exist; and every one of them can exit 0 having done nothing,
+        # which is precisely the failure the post-install verification was
+        # written to catch. Refuse rather than half-work.
+        die("doctor --fix cannot run on Windows: the install commands it "
+            "generates are POSIX shell, and cmd.exe silently mis-executes "
+            "them (`mkdir -p C:\\db` makes a directory called -p).\n"
+            "  Write the plan and run it where the tools live:\n"
+            "    python metaannot.py doctor --config <cfg> "
+            "--install-plan install.sh\n"
+            "    wsl bash install.sh          # or Git Bash, or the Linux "
+            "host that will do the run\n"
+            "  Every other doctor check works here; only --fix is refused.")
 
     if args.fix:
         if not missing:
