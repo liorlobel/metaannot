@@ -949,3 +949,63 @@ def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
     err = capsys.readouterr().err
     assert "no qtmscore/qlen" in err
     assert "normalised by the alignment" in err
+
+
+# ----------------------------------------------------------------------
+# a machine with no usable GPU should learn that from doctor, not from
+# esmfold dying six hours in
+# ----------------------------------------------------------------------
+def test_the_probe_separates_no_card_from_a_cpu_only_torch(ma, monkeypatch):
+    """The confusing failure is a perfectly good card with a CPU-only torch
+    wheel: the hardware is right there and the stage still refuses."""
+    monkeypatch.setattr(ma.shutil, "which", lambda n: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(ma.subprocess, "run",
+                        lambda *a, **k: type("R", (), {
+                            "returncode": 0,
+                            "stdout": "GPU 0: NVIDIA Test Card (UUID: GPU-x)\n",
+                            "stderr": ""})())
+    fake = type("T", (), {"cuda": type("C", (), {
+        "is_available": staticmethod(lambda: False)})()})
+    monkeypatch.setitem(ma.sys.modules, "torch", fake)
+    ok, why = ma.cuda_probe()
+    assert ok is False
+    assert "card is present" in why
+    assert "CPU-only torch" in why
+
+
+def test_the_probe_says_torch_is_missing_rather_than_blaming_the_card(
+        ma, monkeypatch):
+    monkeypatch.setattr(ma.shutil, "which", lambda n: None)
+    monkeypatch.setattr(ma.importlib.util, "find_spec", lambda n: None)
+    monkeypatch.delitem(ma.sys.modules, "torch", raising=False)
+    ok, why = ma.cuda_probe()
+    assert ok is False and "torch is not installed" in why
+
+
+def test_a_usable_gpu_is_reported_by_name(ma, monkeypatch):
+    monkeypatch.setattr(ma.shutil, "which", lambda n: None)
+    fake = type("T", (), {"cuda": type("C", (), {
+        "is_available": staticmethod(lambda: True),
+        "get_device_name": staticmethod(lambda i: "NVIDIA Test Card")})()})
+    monkeypatch.setitem(ma.sys.modules, "torch", fake)
+    ok, why = ma.cuda_probe()
+    assert ok is True and "NVIDIA Test Card" in why
+
+
+def test_structure_without_cuda_is_a_doctor_failure_not_a_surprise(
+        ma, tmp_path, capsys, monkeypatch):
+    """run.structure with no CUDA must fail doctor. stage_esmfold exits rather
+    than fold on CPU, and learning that after InterProScan has run for hours is
+    the whole reason this check exists."""
+    monkeypatch.setattr(ma, "cuda_probe", lambda: (False, "no CUDA device"))
+    cfg = json.loads(json.dumps(ma.DEFAULT_CONFIG))
+    cfg["run"]["structure"] = True
+    assert cfg["run"]["structure"] and not ma.cuda_probe()[0]
+
+
+def test_topology_without_cuda_warns_but_does_not_fail(ma, monkeypatch):
+    """Not a MISS: SignalP is CPU-only and useful alone, and tmbed does run
+    without a GPU - just not at a few hundred thousand proteins."""
+    monkeypatch.setattr(ma, "cuda_probe", lambda: (False, "no CUDA device"))
+    ok, _ = ma.cuda_probe()
+    assert ok is False

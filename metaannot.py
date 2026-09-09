@@ -57,6 +57,7 @@ import fnmatch
 import glob
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -2508,6 +2509,48 @@ def stage_signalp(cfg, p):
             _atomic_rm(work)
 
 
+def cuda_probe():
+    """-> (usable, detail): what the GPU stages will actually find.
+
+    Two questions that are easy to conflate. `nvidia-smi` says a card is
+    physically present and its driver is loaded. `torch.cuda.is_available()` is
+    what esmfold and tmbed actually test, and a CPU-only torch wheel answers
+    "no" on a machine with a perfectly good card - which is the single most
+    confusing way for a GPU stage to fail, because the hardware is right there.
+    Report both, and say plainly when they disagree.
+
+    Deliberately does not import torch when it is absent: `doctor` must stay
+    fast and must run on a machine that has no torch at all.
+    """
+    smi = shutil.which("nvidia-smi") is not None
+    card = ""
+    if smi:
+        try:
+            r = subprocess.run([resolve_tool("nvidia-smi"), "-L"],
+                               capture_output=True, text=True, timeout=20)
+            card = (r.stdout or "").strip().splitlines()[0] if r.returncode == 0                 and r.stdout.strip() else ""
+        except (OSError, subprocess.SubprocessError):
+            card = ""
+    if "torch" not in sys.modules and not importlib.util.find_spec("torch"):
+        return (False, "torch is not installed, so no stage can use a GPU"
+                + (f" (a card is present: {card})" if card else ""))
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                name = torch.cuda.get_device_name(0)
+            except Exception:                               # noqa: BLE001
+                name = card or "device 0"
+            return True, f"torch reports CUDA available: {name}"
+        if card:
+            return (False, f"a card is present ({card}) but torch reports CUDA "
+                    "unavailable - usually a CPU-only torch build; reinstall "
+                    "torch with the CUDA index for your driver")
+        return False, "no CUDA device and no nvidia-smi"
+    except Exception as e:                                  # noqa: BLE001
+        return False, f"torch could not be queried ({type(e).__name__}: {e})"
+
+
 def stage_tmbed(cfg, p):
     if not have("tmbed"):
         die("tmbed not found (pip install tmbed && tmbed download)")
@@ -2525,6 +2568,21 @@ def stage_tmbed(cfg, p):
     if want == "auto":
         log("tmbed: GPU preferred, CPU fallback allowed "
             "(set tmbed_use_gpu: true to make a missing GPU fatal)")
+    if want != "false":
+        # "Fell back to CPU" is not a detail at this scale. TMbed embeds with
+        # ProtT5 and writes nothing until the very end, so a CPU fallback on a
+        # large proteome is hours of work with no output and no way to tell it
+        # from a hang. Say the number out loud before it starts, not after.
+        usable, why = cuda_probe()
+        if not usable:
+            n = sum(1 for _ in read_fasta(cfg["proteins_faa"]))
+            log(f"tmbed: {why}. This stage will run on CPU over {n:,} "
+                "protein(s), where it is one to two orders of magnitude "
+                "slower than on a GPU and writes nothing until it finishes, "
+                "so it cannot be told apart from a hang. Set "
+                "tmbed_use_gpu: false to accept that deliberately, true to "
+                "make it fatal, or run.topology: false to skip both topology "
+                "stages", "WARN")
     # One over-long protein kills the whole stage, and no device setting saves
     # it. TMbed embeds with ProtT5, whose attention score matrix is
     # length-squared x heads: titin, at 34,350 residues, asks for 141 GB in a
@@ -11586,6 +11644,36 @@ def cmd_doctor(args):
                 print(f"  {'MISS':6s} {bad}")
             elif warn:
                 print(f"  {'WARN':6s} {warn}")
+
+    if cfg["run"].get("structure") or cfg["run"].get("topology"):
+        # Without this, a machine with no usable GPU passed every check and the
+        # user learned the truth hours later, when esmfold finally ran and
+        # died. The GPU is the one requirement doctor could not see.
+        print("== gpu ==")
+        usable, why = cuda_probe()
+        print(f"  {'OK' if usable else 'WARN':6s} {why}")
+        if not usable:
+            if cfg["run"].get("structure"):
+                print(f"  {'MISS':6s} run.structure needs CUDA: stage_esmfold "
+                      "exits rather than fold on CPU, which is impractical at "
+                      "any real scale. Set run.structure: false, or fold on a "
+                      "GPU host and copy results/structures/ back - foldseek "
+                      "itself is CPU-only and will search whatever models are "
+                      "there.")
+                ok = False
+            if cfg["run"].get("topology"):
+                # Not a MISS: signalp is CPU-only and useful on its own, and
+                # tmbed does run without a GPU - just not at this size.
+                print(f"  {'WARN':6s} run.topology: SignalP 6 is CPU-only and "
+                      "unaffected. tmbed will fall back to CPU, where it is "
+                      "one to two orders of magnitude slower - fine for a few "
+                      "thousand proteins, not for a few hundred thousand. Set "
+                      "tmbed_use_gpu: false to say so deliberately, or true to "
+                      "make a missing GPU fatal instead of slow.")
+        elif cfg["run"].get("structure") and cfg["run"].get("topology"):
+            print(f"  {'OK':6s} esmfold and tmbed share gpu_device "
+                  f"{cfg['gpu_device']}, so at most "
+                  f"{cfg.get('gpu_workers', 1)} of them runs at a time")
 
     if cfg["quant_format"] == "fragpipe_tmt":
         # Without this block doctor says nothing at all about a TMT run: the
