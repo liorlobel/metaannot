@@ -8220,7 +8220,7 @@ UNIPEPT_KEYS = ["unipept.result", "unipept.allow_http", "unipept.api_url",
                 "unipept.consensus_min_peptides"]
 
 STAGES = [
-    dict(name="emapper", enabled="eggnog",
+    dict(name="emapper", cost=3, enabled="eggnog",
          out=lambda p: [p.emapper],
          inp=lambda c, p: [c["proteins_faa"]] + (
              [c["emapper_precomputed"]] if isinstance(c["emapper_precomputed"], str)
@@ -8229,50 +8229,50 @@ STAGES = [
                "emapper_strip_id_prefix",
                "emapper_min_coverage", "db.eggnog_data"],
          deps=[], fn=stage_emapper),
-    dict(name="pfam", enabled="pfam", out=lambda p: [p.pfam],
+    dict(name="pfam", cost=3, enabled="pfam", out=lambda p: [p.pfam],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["pfam_hmm"]],
          keys=["db.pfam_hmm"], deps=[], fn=stage_pfam),
-    dict(name="dbcan", enabled="dbcan", out=lambda p: [p.dbcan],
+    dict(name="dbcan", cost=2, enabled="dbcan", out=lambda p: [p.dbcan],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["dbcan_hmm"]],
          keys=["db.dbcan_hmm", "thresholds.dbcan_evalue"], deps=[], fn=stage_dbcan),
-    dict(name="diamond", empty_ok=True, enabled="diamond",
+    dict(name="diamond", cost=2, empty_ok=True, enabled="diamond",
          out=lambda p: [p.diamond_done],
          inp=lambda c, p: [c["proteins_faa"]] + list((c["db"].get("diamond") or {}).values()),
          keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues"],
          deps=[], fn=stage_diamond),
-    dict(name="signalp", enabled="topology", out=lambda p: [p.signalp],
+    dict(name="signalp", cost=3, enabled="topology", out=lambda p: [p.signalp],
          inp=lambda c, p: [c["proteins_faa"]], keys=["signalp_mode"],
          deps=[], fn=stage_signalp),
     # gpu=True: this stage takes an exclusive lease on gpu_device. tmbed held
     # 15.5 GB of a 16 GB card; see gpu_workers.
-    dict(name="tmbed", enabled="topology", gpu=True, out=lambda p: [p.tmbed],
+    dict(name="tmbed", cost=3, enabled="topology", gpu=True, out=lambda p: [p.tmbed],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["gpu_device", "tmbed_use_gpu", "tmbed_max_len",
                "tmbed_batch_size"], deps=[], fn=stage_tmbed),
-    dict(name="cluster", enabled="cluster", out=lambda p: [p.cluster],
+    dict(name="cluster", cost=1, enabled="cluster", out=lambda p: [p.cluster],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["thresholds.cluster_min_seq_id", "thresholds.cluster_coverage"],
          deps=[], fn=stage_cluster),
-    dict(name="ncbifam", enabled="ncbifam", out=lambda p: [p.ncbifam],
+    dict(name="ncbifam", cost=3, enabled="ncbifam", out=lambda p: [p.ncbifam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("ncbifam_hmm", "")],
          keys=["db.ncbifam_hmm", "thresholds.ncbifam_cutoff"], deps=[], fn=stage_ncbifam),
-    dict(name="kofam", enabled="kofam", out=lambda p: [p.kofam],
+    dict(name="kofam", cost=3, enabled="kofam", out=lambda p: [p.kofam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("kofam_ko_list", "")],
          keys=["db.kofam_profiles", "db.kofam_ko_list"], deps=[], fn=stage_kofam),
-    dict(name="interpro", enabled="interpro", out=lambda p: [p.interpro],
+    dict(name="interpro", cost=3, enabled="interpro", out=lambda p: [p.interpro],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["interpro_applications", "db.interproscan_sh"], deps=[], fn=stage_interpro),
-    dict(name="smorf", empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
+    dict(name="smorf", cost=1, empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
          inp=lambda c, p: [c.get("contigs_fna", "")],
          keys=["smorf_mode", "thresholds.smorf_max_len"], deps=[], fn=stage_smorf),
-    dict(name="context", enabled="context", out=lambda p: [p.context],
+    dict(name="context", cost=1, enabled="context", out=lambda p: [p.context],
          inp=lambda c, p: [c.get("gff") or "", p.emapper, p.pfam, p.signalp,
                            p.dbcan],
          keys=["gff", "context_window", "immunity_max_len", "immunity_max_gap",
                "pul_min_cazymes", "thresholds.dbcan_min_cov",
                "thresholds.dbcan_evalue"],
          deps=['emapper', 'pfam', 'signalp', 'dbcan'], fn=stage_context),
-    dict(name="integrate", enabled=None,
+    dict(name="integrate", cost=2, enabled=None,
          out=lambda p: [p.pass1, p.dark, p.dark_all],
          inp=lambda c, p: [c["proteins_faa"], p.emapper, p.pfam, p.dbcan,
                            p.signalp, p.tmbed, p.cluster, p.context,
@@ -8297,16 +8297,16 @@ STAGES = [
          deps=['emapper', 'pfam', 'dbcan', 'diamond', 'signalp', 'tmbed', 'cluster', 'ncbifam', 'kofam', 'interpro', 'context'], fn=stage_integrate_pass1),
     # dark_all.faa, not dark.faa: the profile searches query the whole
     # unannotated set, the structure work-list is a GPU budget.
-    dict(name="jackhmmer", empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
+    dict(name="jackhmmer", cost=3, empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
          inp=lambda c, p: [p.dark_all, c["db"].get("jackhmmer_db", "")],
          keys=["db.jackhmmer_db", "jackhmmer_iterations",
                "thresholds.jackhmmer_evalue"], deps=['integrate'], fn=stage_jackhmmer),
-    dict(name="hhblits", empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
+    dict(name="hhblits", cost=3, empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
          inp=lambda c, p: [p.dark_all, c["db"].get("hhblits_db", "")],
          keys=["db.hhblits_db", "hhblits_iterations"], deps=['integrate'], fn=stage_hhblits),
     # gpu=True: ESMFold peaked at 13.3 GB on a single short sequence, so it
     # cannot share a 16 GB card with tmbed; see gpu_workers.
-    dict(name="esmfold", empty_ok=True, enabled="structure", gpu=True,
+    dict(name="esmfold", cost=3, empty_ok=True, enabled="structure", gpu=True,
          out=lambda p: [p.struct_done],
          inp=lambda c, p: [p.dark],
          keys=["max_len_structure", "esmfold_chunk_size",
@@ -8314,7 +8314,7 @@ STAGES = [
                "esmfold_vram_cap", "esmfold_bytes_per_residue_pair",
                "esmfold_vram_reserve_gb"],
          deps=['integrate'], fn=stage_esmfold),
-    dict(name="foldseek", empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
+    dict(name="foldseek", cost=2, empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
          inp=lambda c, p: [p.struct_done],
          keys=["db.foldseek_target", "db.foldseek_extra_targets",
                "thresholds.foldseek_evalue", "foldseek_self_cluster",
@@ -8323,7 +8323,7 @@ STAGES = [
                "thresholds.foldseek_cluster_tmscore",
                "thresholds.foldseek_cluster_coverage"],
          deps=['esmfold'], fn=stage_foldseek),
-    dict(name="finalise", enabled=None,
+    dict(name="finalise", cost=2, enabled=None,
          out=lambda p: [p.final, p.summary, p.agreement],
          inp=lambda c, p: [p.pass1, p.foldseek, p.context, p.fold_clusters,
                            p.ncbifam, p.kofam, p.interpro,
@@ -8334,17 +8334,17 @@ STAGES = [
                "toxin_fold_patterns", "ncbifam_uninformative_test",
                "foldseek_target_priority"],
          deps=['integrate', 'jackhmmer', 'hhblits', 'foldseek', 'context'], fn=stage_integrate_final),
-    dict(name="unipept", enabled="unipept", out=lambda p: [p.unipept_lca],
+    dict(name="unipept", cost=3, enabled="unipept", out=lambda p: [p.unipept_lca],
          inp=lambda c, p: quant_inputs(c) + [(c.get("unipept") or {}).get("result", "")],
          keys=UNIPEPT_KEYS + ["quant_table", "quant_format", "tmt",
                "peptide_only_reader", "exclude_id_prefixes"],
          deps=[], fn=stage_unipept),
-    dict(name="taxonomy", enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
+    dict(name="taxonomy", cost=1, enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
          inp=lambda c, p: [p.unipept_lca, p.final] + quant_inputs(c),
          keys=UNIPEPT_KEYS + ["db.ncbi_taxonomy", "peptide_only_reader",
                "exclude_id_prefixes", "quant_format", "tmt"],
          deps=['unipept', 'finalise'], fn=stage_taxonomy),
-    dict(name="join", enabled="join",
+    dict(name="join", cost=2, enabled="join",
          out=lambda p: [f"{p.quant_dir}/annotated_quant.tsv"],
          # taxonomy_comparison is a real input: join merges its columns and
          # resolves effective_taxid from it. Omitting it left annotated_quant
@@ -8362,6 +8362,37 @@ STAGES = [
          deps=['finalise', 'taxonomy'], fn=stage_join),
 ]
 STAGE_NAMES = [s["name"] for s in STAGES]
+
+
+# How long a stage runs, coarsely. 3 = hours, 2 = minutes, 1 = seconds, and
+# the numbers come off two real runs rather than intuition: on 38k proteins
+# interproscan took 2.8 h, signalp 56 min, tmbed 52 min, kofam 29 min, pfam
+# 27 min, ncbifam 24 min, dbcan 41 s, cluster 14 s; on 1.3M proteins kofam
+# took 14.3 h, pfam 7.2 h, ncbifam 5.6 h, dbcan 10 min, diamond 5 min,
+# cluster 109 s, and interproscan was still running after two days. Three
+# ranks is all the resolution the scheduler can use: it decides which ready
+# stage claims a worker first, not when anything finishes.
+STAGE_COSTS = {st["name"]: st["cost"] for st in STAGES}
+
+
+def stage_priority(name):
+    """Sort key for one round's ready stages: the longest one goes first.
+
+    Every stage with no dependencies is ready in the first round, and
+    stage_workers is 4, so the first four IN TABLE ORDER started and the rest
+    waited. That put cluster (109 s) and dbcan (10 min) on the box while
+    interproscan — the longest stage in the pipeline by an order of magnitude
+    — sat in the queue behind them. Longest-processing-time-first is the
+    standard greedy answer to that, and here it costs one sort of a list that
+    is never longer than 21.
+
+    Two things this must NOT do. It must not reach the cache: scheduling
+    order cannot change a stage's output, so no signature and no keys list
+    mentions cost. And it must not default: indexing STAGE_COSTS raises
+    KeyError on an unknown name, where a .get(name, 1) would quietly rank a
+    stage added without a cost as trivial and reintroduce the exact problem.
+    """
+    return STAGE_COSTS[name]
 
 
 def gpu_lease(ready, running, slots, needs_gpu):
@@ -12691,6 +12722,11 @@ def cmd_run(args):
                         f"{' '.join(unmet)} to the selection."))
                     continue
                 run_now.append(name)
+            # Longest first, so a long stage late in the table does not wait
+            # behind a short one ahead of it for a worker. Python's sort is
+            # stable, so stages of equal rank keep table order and the run
+            # log reads the way it always did.
+            run_now.sort(key=stage_priority, reverse=True)
             # The GPU is not divisible the way the CPU and RAM budgets are, so
             # it is leased rather than shared. A deferred stage stays in
             # `remaining` and is reconsidered next round; it never occupies a

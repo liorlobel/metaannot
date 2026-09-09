@@ -996,9 +996,17 @@ and `esmfold` then run after `integrate`, because their input is the dark set
 it writes.
 
 Concurrency is capped by `stage_workers`, so the first wave is a queue rather
-than a stampede: with the default 3, the longest stage in the table order
-starts only when a slot frees. On a large proteome that matters — InterProScan
-paces everything, and it begins last if the table puts it last.
+than a stampede: with the default 4, twelve ready stages compete for four
+slots. The scheduler orders that queue longest-first. Every stage carries a
+coarse cost rank — hours, minutes, or seconds, measured on real runs — and the
+hours-class stages claim the workers while the seconds-class ones fill in
+behind them as slots free. Dispatching in table order instead, as it did
+before v0.4.0, gave the first wave to `dbcan` (10 min) and `diamond` (5 min)
+while `signalp` and `tmbed` (about an hour each) queued.
+
+The order is a starting order, not a schedule: it makes nothing faster, and
+InterProScan still paces a large run. See
+[Sizing your run](TUTORIAL.md#sizing-your-run) for what to do about that.
 
 ```yaml
 threads: 32

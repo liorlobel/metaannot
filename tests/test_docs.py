@@ -534,3 +534,19 @@ def test_the_example_configs_enable_the_stages_the_readme_claims(ma):
         # every stage that exists must be stated one way or the other
         missing = set(ma.DEFAULT_CONFIG["run"]) - set(run)
         assert missing == set(), f"{os.path.relpath(c, ROOT)} is silent about {missing}"
+
+
+def test_the_documented_stage_workers_default_matches_the_config(ma):
+    """The README said "with the default 3" six lines above its own example
+    writing 4, in the paragraph explaining the scheduling behaviour a reader
+    goes there to understand. test_documented_numeric_defaults_match_default_config
+    pins the config VALUE and never looked at the prose."""
+    import re
+    # the raw text, not _norm's: paragraph breaks are the boundary here.
+    txt = _text(README)
+    i = txt.find("Concurrency is capped by `stage_workers`")
+    assert i != -1, "the stage_workers paragraph moved; find it again"
+    para = _norm(txt[i:txt.index(chr(10) * 2, i)])
+    m = re.search(r"with the default (\d+)", para)
+    assert m, f"no stated default in the stage_workers paragraph: {para!r}"
+    assert int(m.group(1)) == ma.DEFAULT_CONFIG["stage_workers"]

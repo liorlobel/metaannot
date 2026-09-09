@@ -578,3 +578,103 @@ def test_the_run_says_which_gpu_stages_share_one_device(tmp_path, stub_bin):
     proc = proj2.run(expect=1)           # signalp6/tmbed are not installed
     assert "at most 1 of them runs at a time" in proc.stderr
     assert "SAME card" in proc.stderr
+
+
+# --- longest-processing-time-first ------------------------------------
+# symptom: every stage with no dependencies is ready in the first round and
+# stage_workers is 4, so the first four IN TABLE ORDER started. On the
+# 1.3M-protein run that handed workers to cluster (109 s) and dbcan (10 min)
+# while signalp and tmbed — nearly an hour each on a set an order of
+# magnitude smaller — queued behind them.
+def _wave_one(ma):
+    """The stages a fresh run finds ready in its first round."""
+    return [st["name"] for st in ma.STAGES if not st["deps"]]
+
+
+def test_the_first_wave_no_longer_goes_to_the_shortest_stages_in_table_order(
+        ma):
+    ready = _wave_one(ma)
+    before = ready[:4]
+    after = sorted(ready, key=ma.stage_priority, reverse=True)[:4]
+    # what it used to pick, and why that was wrong
+    assert before == ["emapper", "pfam", "dbcan", "diamond"]
+    assert {"dbcan", "diamond"} & set(after) == set()
+    # every stage that now claims a first-round worker is an hours-class one
+    assert all(ma.stage_priority(n) == 3 for n in after), after
+    assert after == ["emapper", "pfam", "signalp", "tmbed"]
+
+
+def test_a_short_stage_never_outranks_a_long_one_wherever_the_table_puts_it(
+        ma):
+    order = sorted(_wave_one(ma), key=ma.stage_priority, reverse=True)
+    # interpro is tenth in the table and the longest stage in the pipeline;
+    # cluster and smorf are seconds and sit on either side of it.
+    for short in ("cluster", "smorf", "dbcan", "diamond"):
+        assert order.index("interpro") < order.index(short), (
+            f"{short} is dispatched before interpro: {order}")
+
+
+def test_equal_cost_stages_keep_table_order(ma):
+    # the sort has to be stable, or the run log reorders itself between
+    # releases for no reason a reader could explain.
+    names = [st["name"] for st in ma.STAGES]
+    order = sorted(names, key=ma.stage_priority, reverse=True)
+    for rank in (3, 2, 1):
+        same = [n for n in order if ma.stage_priority(n) == rank]
+        assert same == [n for n in names if ma.stage_priority(n) == rank], rank
+
+
+def test_every_stage_declares_a_cost_and_it_is_a_known_rank(ma):
+    for st in ma.STAGES:
+        assert "cost" in st, f"{st['name']} declares no cost"
+        assert st["cost"] in (1, 2, 3), (st["name"], st["cost"])
+    assert set(ma.STAGE_COSTS) == {st["name"] for st in ma.STAGES}
+
+
+def test_an_unknown_stage_name_raises_rather_than_ranking_as_trivial(ma):
+    # a .get(name, 1) default would silently rank a stage added without a
+    # cost as seconds-class, which is the bug this ordering exists to fix.
+    with pytest.raises(KeyError):
+        ma.stage_priority("no_such_stage")
+
+
+def test_a_stage_nothing_waits_on_never_outranks_one_integrate_needs(ma):
+    by_name = {st["name"]: st for st in ma.STAGES}
+    depended_on = {d for st in ma.STAGES for d in st["deps"]}
+    orphans = [st["name"] for st in ma.STAGES
+               if st["name"] not in depended_on and st["deps"]] + \
+              [st["name"] for st in ma.STAGES
+               if st["name"] not in depended_on and not st["deps"]]
+    assert "smorf" in orphans, orphans
+    floor = min(ma.stage_priority(d) for d in by_name["integrate"]["deps"])
+    for name in orphans:
+        if name == "join":                 # the terminal stage, waits on all
+            continue
+        assert ma.stage_priority(name) <= floor, (
+            f"{name} blocks nothing yet outranks a stage integrate is "
+            f"waiting for")
+
+
+def test_the_cost_rank_never_enters_a_cache_signature(ma):
+    # scheduling order cannot change a stage's output, so changing it must
+    # not recompute anything.
+    for st in ma.STAGES:
+        assert not any("cost" in k for k in st["keys"]), st["name"]
+    cfg = {"full_content_digest": False, "tool_args": {}}
+    cheap = dict(name="x", cost=1, inp=lambda c, p: [], keys=[],
+                 out=lambda p: [])
+    dear = dict(cheap, cost=3)
+    assert ma.signature(cheap, cfg, None) == ma.signature(dear, cfg, None)
+
+
+def test_the_scheduler_sorts_the_ready_set_before_it_caps_at_stage_workers(
+        ma):
+    # the sort is worthless below the `len(futures) >= workers` break, and
+    # wrong after gpu_lease, which hands the card to whichever gpu stage it
+    # sees first.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    decide = src.index("                run_now.append(name)")
+    srt = src.index("run_now.sort(key=stage_priority, reverse=True)", decide)
+    lease = src.index("run_now, waiting = gpu_lease(", decide)
+    cap = src.index("if len(futures) >= workers:", decide)
+    assert decide < srt < lease < cap

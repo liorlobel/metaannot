@@ -767,15 +767,17 @@ below.
 | database | what to do |
 |---|---|
 | **under ~50k** | run everything; a full pass is hours |
-| **50k–150k** | run everything, but expect a day; keep `stage_workers: 3` |
+| **50k–150k** | run everything, but expect a day; the default `stage_workers: 4` is fine |
 | **over ~150k** | read the rest of this section before starting |
 
 Past roughly 150k proteins, three decisions matter more than any tuning:
 
-1. **Start InterProScan first, not last.** It is the longest stage by a wide
-   margin, and the scheduler picks stages in table order with only
-   `stage_workers` running at once — so it can start *hours* after everything
-   else and then define the finish. Run it as its own pass first:
+1. **Give InterProScan its own pass.** It is the longest stage by a wide
+   margin. Since v0.4.0 the scheduler dispatches the hours-class stages before
+   the short ones, so it no longer starts *behind* `dbcan` and `diamond` — but
+   with only `stage_workers` running at once it still may not get a slot in
+   the first round, and when it shares it gets `threads / stage_workers` CPU.
+   Running it alone gives it the whole machine:
    ```bash
    python metaannot.py run --config config.yaml --only interpro
    python metaannot.py run --config config.yaml          # everything else
@@ -797,9 +799,10 @@ Past roughly 150k proteins, three decisions matter more than any tuning:
    `shared_unknown_taxon` and drops them. eggNOG is the cheap stage that has to
    stay broad; the search stages are the expensive ones that need not.
 
-3. **Consider fewer concurrent stages, not more.** `stage_workers: 3` on 22
-   cores means three tools each taking 7. If one of them takes 10 anyway (tmbed
-   does), everything else is squeezed. Lowering to 2 does not reduce total CPU
+3. **Consider fewer concurrent stages, not more.** The runs measured above used
+   `stage_workers: 3` — not the default of 4 — on 22 cores, so three tools took
+   7 each. If one of them takes 10 anyway (tmbed does), everything else is
+   squeezed. Lowering to 2 does not reduce total CPU
    work, but it does make each stage finish sooner, which matters because
    several stages write nothing until they are done.
 
