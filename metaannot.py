@@ -531,6 +531,23 @@ DEFAULT_CONFIG = {
     # aborts the stage on any device, hours in, with nothing written. 0
     # disables the cap and restores the old behaviour.
     "tmbed_max_len": 3000,
+    # TMbed writes nothing until it finishes, so one invocation over a large
+    # proteome risks days of work on a single process. The input is split into
+    # chunks of about this many residues and each is committed as it lands, so
+    # an interrupted run resumes instead of starting over. It costs one ProtT5
+    # load per chunk, which is why the default is millions of residues and not
+    # thousands: under 5M (roughly 17k average proteins) there is exactly one
+    # chunk and the behaviour is what it always was. 0 disables the split.
+    "tmbed_chunk_residues": 5000000,
+    # A chunk that fails leaves its finished predictions behind and its
+    # proteins in results/topology/tmbed_failed.tsv. False stops the run there
+    # so nothing downstream reads a partial topology set by accident; True
+    # accepts the shortfall deliberately.
+    "tmbed_allow_partial": False,
+    # A device that has stopped responding fails every remaining chunk the
+    # same way, slowly. Stop after this many in a row rather than working
+    # through all of them. 0 = never stop early.
+    "tmbed_max_consecutive_failures": 2,
     "interpro_applications": "Pfam,NCBIfam,Gene3D,SUPERFAMILY,PANTHER,SMART,CDD,PIRSF",
     "hhblits_iterations": 2,
     "hhblits_workers": 4,
@@ -1675,20 +1692,13 @@ def _count_segments(labels, chars):
 def parse_tmbed(path):
     """tmbed --out-format 0 (3-line): header, sequence, per-residue labels.
     H/h transmembrane helix, B/b transmembrane beta strand, S signal."""
-    # Streamed: the 3-line format carries every sequence, so reading the whole
-    # file into a list cost as much memory as the FASTA itself.
-    out, pid, pending = {}, None, 0
-    with opener(path) as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                pid, pending = line[1:].split()[0], 2
-            elif pid is not None and pending == 2:
-                pending = 1                      # the sequence line
-            elif pid is not None and pending == 1:
-                out[pid] = (_count_segments(line, "Hh"),
-                            _count_segments(line, "Bb"))
-                pid, pending = None, 0
+    # Streamed through iter_tmbed_records, which is also what stage_tmbed
+    # counts chunks with: one definition of a complete record, so a file
+    # truncated mid-write cannot be read as short here and full there.
+    out = {}
+    for hdr, _seq, lab in iter_tmbed_records(path):
+        out[hdr[1:].split()[0]] = (_count_segments(lab, "Hh"),
+                                   _count_segments(lab, "Bb"))
     warn_if_no_records(path, len(out), "topologies")
     return out
 
@@ -2562,6 +2572,80 @@ def cuda_probe():
         return False, f"torch could not be queried ({type(e).__name__}: {e})"
 
 
+# TMbed writes nothing until it finishes. A single invocation over a whole
+# proteome is therefore an all-or-nothing bet measured in days: the run on
+# 1.3M proteins was still going after two days with an empty output file, and
+# the two before it died at 2 h 36 min with nothing recoverable. Splitting the
+# input into chunks turns that into a series of checkpoints. The price is one
+# ProtT5 load per chunk, which is why the chunk count is bounded from both
+# ends: tmbed_chunk_residues sets the floor, TMBED_MAX_PARTS the ceiling.
+TMBED_MAX_PARTS = 256
+
+
+def tmbed_chunk_plan(lengths, budget, max_parts=TMBED_MAX_PARTS):
+    """Group (id, length) pairs into length-sorted, residue-budgeted chunks.
+
+    Longest first, for two reasons. ProtT5 pads every sequence in a batch out
+    to the longest one in it, so a chunk of similar lengths wastes less work
+    than one mixing 30-residue peptides with 3000-residue proteins. And
+    whatever is going to exhaust the device is in the first chunk, where it
+    costs one chunk to discover instead of the whole stage.
+
+    Returns (chunks, budget). The budget returned can be larger than the one
+    asked for: a sequence longer than the budget still needs a chunk, and a
+    budget small enough to ask for more than max_parts chunks would spend more
+    time loading weights than predicting.
+    """
+    if not lengths:
+        return [], 0
+    total = sum(n for _, n in lengths)
+    budget = int(budget or 0)
+    if budget <= 0:                      # 0 = one invocation, as before
+        return [[pid for pid, _ in lengths]], total
+    # Greedy packing closes a chunk when the NEXT sequence would overflow it,
+    # so every chunk but the last can fall short of the budget by as much as
+    # the longest sequence. A floor of total/max_parts alone therefore still
+    # overshoots the ceiling: 5000 x 100 residues against 256 parts planned
+    # 264 of them. Adding the longest sequence to the floor guarantees every
+    # non-final chunk holds more than total/max_parts, and so bounds the
+    # count. It is also what gives an over-long sequence a chunk of its own
+    # rather than dropping it.
+    budget = max(budget, -(-total // max_parts) + max(n for _, n in lengths))
+    chunks, cur, cur_n = [], [], 0
+    for pid, n in sorted(lengths, key=lambda x: (-x[1], x[0])):
+        if cur and cur_n + n > budget:
+            chunks.append(cur)
+            cur, cur_n = [], 0
+        cur.append(pid)
+        cur_n += n
+    if cur:
+        chunks.append(cur)
+    return chunks, budget
+
+
+def iter_tmbed_records(path):
+    """(header, sequence, labels) for every COMPLETE record of a 3-line file.
+
+    One definition of "complete", used by both the parser and the chunk
+    bookkeeping. The format has no trailer, so a TMbed killed mid-write leaves
+    a header and a sequence with no label line; that is not a prediction and
+    must never be counted, copied or adopted as one.
+    """
+    if not os.path.exists(path):
+        return
+    buf = []
+    with opener(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                buf = [line]
+            elif len(buf) in (1, 2):
+                buf.append(line)
+                if len(buf) == 3:
+                    yield tuple(buf)
+                    buf = []
+
+
 def stage_tmbed(cfg, p):
     if not have("tmbed"):
         die("tmbed not found (pip install tmbed && tmbed download)")
@@ -2581,51 +2665,144 @@ def stage_tmbed(cfg, p):
             "(set tmbed_use_gpu: true to make a missing GPU fatal)")
     if want != "false":
         # "Fell back to CPU" is not a detail at this scale. TMbed embeds with
-        # ProtT5 and writes nothing until the very end, so a CPU fallback on a
-        # large proteome is hours of work with no output and no way to tell it
-        # from a hang. Say the number out loud before it starts, not after.
+        # ProtT5, so a CPU fallback on a large proteome is hours of work per
+        # chunk. Say the number out loud before it starts, not after.
         usable, why = cuda_probe()
         if not usable:
             n = sum(1 for _ in read_fasta(cfg["proteins_faa"]))
             log(f"tmbed: {why}. This stage will run on CPU over {n:,} "
                 "protein(s), where it is one to two orders of magnitude "
-                "slower than on a GPU and writes nothing until it finishes, "
-                "so it cannot be told apart from a hang. Set "
-                "tmbed_use_gpu: false to accept that deliberately, true to "
-                "make it fatal, or run.topology: false to skip both topology "
-                "stages", "WARN")
-    # One over-long protein kills the whole stage, and no device setting saves
-    # it. TMbed embeds with ProtT5, whose attention score matrix is
-    # length-squared x heads: titin, at 34,350 residues, asks for 141 GB in a
-    # single allocation. Observed twice on real data — 8.79 GiB refused on a
-    # 16 GB card, then 151 GB refused on a 94 GB host under --cpu-fallback —
-    # each time after hours of work that TMbed writes only at the end, so
-    # nothing was recoverable. Cap the input instead, and record what was cut
-    # rather than letting the exclusion pass unnoticed.
+                "slower than on a GPU. Set tmbed_use_gpu: false to accept "
+                "that deliberately, true to make it fatal, or "
+                "run.topology: false to skip both topology stages", "WARN")
+
     faa = cfg["proteins_faa"]
+    out_dir = os.path.dirname(p.tmbed) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    # One over-long protein kills the whole stage, and no device setting saves
+    # it. ProtT5's attention score matrix is length-squared x heads: titin, at
+    # 34,350 residues, asks for 141 GB in a single allocation. Observed twice
+    # on real data - 8.79 GiB refused on a 16 GB card, then 151 GB refused on
+    # a 94 GB host under --cpu-fallback. Cap the input instead, and record
+    # what was cut rather than letting the exclusion pass unnoticed.
+    #
+    # Lengths only: a 1.3M-protein FASTA does not fit in a list of sequences,
+    # so each chunk re-reads the file rather than holding it.
     cap = int(cfg.get("tmbed_max_len", 0) or 0)
-    if cap:
-        long_ones = [(pid, len(seq)) for pid, seq in read_fasta(faa)
-                     if len(seq) > cap]
-        if long_ones:
-            os.makedirs(os.path.dirname(p.tmbed) or ".", exist_ok=True)
-            faa = f"{p.tmbed}.capped.faa"
-            with open(faa, "w", encoding="utf-8") as fh:
-                for pid, seq in read_fasta(cfg["proteins_faa"]):
-                    if len(seq) <= cap:
+    work, excluded = [], []
+    for pid, seq in read_fasta(faa):
+        (excluded if cap and len(seq) > cap else work).append((pid, len(seq)))
+    if excluded:
+        excl = f"{out_dir}/tmbed_excluded.tsv"
+        with open(excl, "w", encoding="utf-8") as fh:
+            fh.write("protein_id\tlength\n")
+            for pid, n in sorted(excluded, key=lambda x: -x[1]):
+                fh.write(f"{pid}\t{n}\n")
+        log(f"tmbed: {len(excluded)} protein(s) longer than "
+            f"tmbed_max_len={cap} are excluded; ProtT5 attention is "
+            f"length-squared and the longest here "
+            f"({max(n for _, n in excluded)} aa) would need more memory than "
+            f"any device present. They get no topology evidence and are "
+            f"listed in {excl}", "WARN")
+
+    if not work:
+        # Nothing to predict is not a failure: a proteome of nothing but
+        # over-cap sequences, or an empty FASTA, should leave an empty
+        # prediction file rather than handing TMbed an empty input and
+        # reporting whatever it does with it. The stage is empty_ok, so the
+        # file is adoptable on a rerun.
+        with atomic_out(p.tmbed) as tmp:
+            open(tmp, "w", encoding="utf-8").close()
+        log(f"tmbed: no sequence is left to predict "
+            f"({len(excluded)} excluded by tmbed_max_len={cap}), so "
+            f"{p.tmbed} is empty and nothing is run", "WARN")
+        return
+
+    chunks, budget = tmbed_chunk_plan(work, cfg.get("tmbed_chunk_residues"))
+    total_res = sum(n for _, n in work)
+    asked = int(cfg.get("tmbed_chunk_residues") or 0)
+    log(f"tmbed: {len(work):,} protein(s), {total_res / 1e6:.1f}M residues -> "
+        f"{len(chunks)} chunk(s) of at most {budget / 1e6:.1f}M residues, "
+        f"longest sequence {max(n for _, n in work):,} aa. TMbed writes "
+        "nothing until it finishes, so each chunk is a checkpoint: an "
+        "interrupted run resumes from the last one instead of starting over."
+        + (f" The budget asked for ({asked / 1e6:.1f}M) was raised to keep "
+           f"the plan under {TMBED_MAX_PARTS} chunks, because ProtT5 is "
+           "loaded once per chunk." if asked and budget > asked else "")
+        + (" Set tmbed_chunk_residues: 0 for a single invocation."
+           if len(chunks) > 1 else ""))
+
+    # Every work protein, mapped to its chunk. Entries are removed as
+    # predictions are written, so whatever is left at the end is exactly the
+    # set that got none - taken from the files, not from the loop's own
+    # bookkeeping, because a chunk that exits 0 can still be short.
+    where = {}
+    for i, ids in enumerate(chunks):
+        for pid in ids:
+            where[pid] = i
+    lengths = dict(work)
+    parts = f"{out_dir}/tmbed_parts"
+    width = len(str(len(chunks)))
+
+    def part_paths(i):
+        tag = f"{i:0{width}d}"
+        return (f"{parts}/{tag}.faa", f"{parts}/{tag}.pred",
+                f"{parts}/{tag}.pred.part")
+
+    def already(i):
+        """A chunk counts as done when its committed output holds a record
+        for every sequence that went into it."""
+        pred = part_paths(i)[1]
+        if not os.path.exists(pred):
+            return False
+        return sum(1 for _ in iter_tmbed_records(pred)) >= len(chunks[i])
+
+    single = len(chunks) == 1 and not excluded
+    os.makedirs(parts, exist_ok=True)
+    if single:
+        # Nothing was filtered and nothing is split, so TMbed reads the
+        # original FASTA. This is the whole of the old behaviour, and it keeps
+        # a second copy of the proteome off the disk for ordinary runs.
+        inputs = {0: faa}
+    else:
+        pending = [i for i in range(len(chunks)) if not already(i)]
+        inputs = {i: part_paths(i)[0] for i in range(len(chunks))}
+        if pending:
+            # Rewritten every run rather than reused: a chunk FASTA is written
+            # before anything reads it, so a killed writer leaves a short one,
+            # and a short input would quietly shrink the chunk.
+            fhs = {i: open(inputs[i], "w", encoding="utf-8") for i in pending}
+            try:
+                for pid, seq in read_fasta(faa):
+                    fh = fhs.get(where.get(pid, -1))
+                    if fh is not None:
                         fh.write(f">{pid}\n{seq}\n")
-            excl = f"{os.path.dirname(p.tmbed)}/tmbed_excluded.tsv"
-            with open(excl, "w", encoding="utf-8") as fh:
-                fh.write("protein_id\tlength\n")
-                for pid, n in sorted(long_ones, key=lambda x: -x[1]):
-                    fh.write(f"{pid}\t{n}\n")
-            log(f"tmbed: {len(long_ones)} protein(s) longer than "
-                f"tmbed_max_len={cap} are excluded; ProtT5 attention is "
-                f"length-squared and the longest here ({long_ones and max(n for _, n in long_ones)} aa) "
-                f"would need more memory than any device present. They get no "
-                f"topology evidence and are listed in {excl}", "WARN")
-    with atomic_out(p.tmbed) as tmp:
-        cmd = ["tmbed", "predict", "-f", faa, "-p", tmp,
+            finally:
+                for fh in fhs.values():
+                    fh.close()
+
+    errors = {}                       # chunk index -> why it failed
+    consecutive = 0
+    max_consecutive = int(cfg.get("tmbed_max_consecutive_failures", 2) or 0)
+    t0, res_done = time.time(), 0
+    for i, ids in enumerate(chunks):
+        pred, part = part_paths(i)[1], part_paths(i)[2]
+        res = sum(lengths[pid] for pid in ids)
+        if already(i):
+            log(f"tmbed: chunk {i + 1}/{len(chunks)} is already predicted; "
+                "skipping")
+            res_done += res
+            continue
+        if len(chunks) > 1:
+            eta = ""
+            if res_done:
+                rate = (time.time() - t0) / res_done
+                eta = (f", ~{(total_res - res_done) * rate / 3600:.1f}h left")
+            log(f"tmbed: chunk {i + 1}/{len(chunks)}, {len(ids):,} "
+                f"sequence(s), {res / 1e6:.1f}M residues{eta}")
+        _atomic_rm(part)
+        cmd = ["tmbed", "predict", "-f", inputs[i], "-p", part,
                "--out-format", "0"] + gpu
         bs = int(cfg.get("tmbed_batch_size", 0) or 0)
         if bs:
@@ -2633,17 +2810,87 @@ def stage_tmbed(cfg, p):
         cmd += tool_args(cfg, "tmbed")
         # run_cmd, not subprocess.run. This stage is the one the progress
         # heartbeat was written for - tmbed ran 2 h 36 min and then died,
-        # twice, with nothing in the log between the command and the failure -
-        # and going straight to subprocess.run was what kept the only tool
-        # named in that example from ever emitting a progress line: no stderr
-        # ring, no heartbeat, and the tqdm bar buffered until the process
-        # ended. Nothing is lost by routing through it. run_cmd takes the env,
-        # so CUDA_VISIBLE_DEVICES still pins the device; tmbed's stdout was
-        # captured here and never read, and run_cmd sends it to /dev/null; the
-        # failure still raises RuntimeError quoting the last 15 lines of
-        # stderr. It also resolves the binary through resolve_tool, so tmbed
-        # is launched by the path `have` found rather than by a bare name.
-        run_cmd(cmd, env=env)
+        # twice, with nothing in the log between the command and the failure.
+        # run_cmd takes the env, so CUDA_VISIBLE_DEVICES still pins the
+        # device, and it resolves the binary through resolve_tool so tmbed is
+        # launched by the path `have` found rather than by a bare name.
+        try:
+            run_cmd(cmd, env=env)
+        except StageError:
+            # die() raises StageError, which IS a RuntimeError. A bare
+            # `except RuntimeError` below would swallow "tmbed not found" or a
+            # record with an empty identifier and report it as a chunk that
+            # failed, which is neither true nor retryable.
+            raise
+        except RuntimeError as e:
+            # Whatever TMbed managed to write before it died stays where it
+            # is: .pred.part is read by the concatenation below, which copies
+            # complete records only. The chunk is NOT committed, so a rerun
+            # retries it.
+            kept = sum(1 for _ in iter_tmbed_records(part))
+            msg = str(e).strip().splitlines()
+            errors[i] = msg[-1] if msg else "no message"
+            consecutive += 1
+            log(f"tmbed: chunk {i + 1}/{len(chunks)} failed after writing "
+                f"{kept}/{len(ids)} prediction(s), which are kept: "
+                f"{errors[i]}", "WARN")
+            if max_consecutive and consecutive >= max_consecutive:
+                log(f"tmbed: {consecutive} chunk(s) in a row failed, so the "
+                    f"remaining {len(chunks) - i - 1} are not attempted - a "
+                    "device that has stopped responding fails all of them the "
+                    "same way, slowly", "WARN")
+                break
+            continue
+        consecutive = 0
+        os.replace(part, pred)
+        res_done += res
+
+    # Concatenated through the record iterator rather than copied byte for
+    # byte, so a truncated tail in a salvaged .pred.part cannot reach the
+    # committed file. The record ORDER here is by length, not the order of
+    # proteins_faa; nothing reads it positionally (parse_tmbed builds a dict).
+    with atomic_out(p.tmbed) as tmp:
+        written = 0
+        with open(tmp, "w", encoding="utf-8") as out:
+            for i in range(len(chunks)):
+                pred, part = part_paths(i)[1], part_paths(i)[2]
+                src = pred if os.path.exists(pred) else part
+                for hdr, seq, lab in iter_tmbed_records(src):
+                    out.write(f"{hdr}\n{seq}\n{lab}\n")
+                    where.pop(hdr[1:].split()[0], None)
+                    written += 1
+        if where:
+            # Name the casualties in a file rather than only in the log, so
+            # the shortfall survives into the results directory and can be
+            # read back by whoever asks why a protein has no topology.
+            miss = f"{out_dir}/tmbed_failed.tsv"
+            with open(miss, "w", encoding="utf-8") as fh:
+                fh.write("protein_id\tlength\tchunk\terror\n")
+                for pid in sorted(where, key=lambda q: -lengths.get(q, 0)):
+                    i = where[pid]
+                    fh.write(f"{pid}\t{lengths.get(pid, '')}\t{i}\t"
+                             f"{errors.get(i, 'not attempted')}\n")
+            log(f"tmbed: {len(where):,} of {len(work):,} protein(s) got no "
+                f"prediction; listed in {miss}", "WARN")
+            if not cfg.get("tmbed_allow_partial"):
+                die(f"tmbed finished {written:,} of {len(work):,} "
+                    f"prediction(s) across {len(chunks)} chunk(s).\n"
+                    f"  Every completed chunk is kept in {parts}, so "
+                    "rerunning resumes from there rather than starting "
+                    "over.\n"
+                    "  A card that has stopped responding usually needs the "
+                    "machine or the WSL session restarted, not another "
+                    "attempt.\n"
+                    f"  The proteins that got nothing are listed in {miss}. "
+                    "To go on without them, set tmbed_allow_partial: true.")
+            log("tmbed: continuing with a partial topology set because "
+                "tmbed_allow_partial is on; an absent helix or strand count "
+                "here means not attempted, not absent", "WARN")
+        log(f"tmbed: {written:,} prediction(s) -> {p.tmbed}")
+
+    # Only once the committed file exists. Until then the parts ARE the
+    # result, and a run that dies between the two must be able to resume.
+    shutil.rmtree(parts, ignore_errors=True)
 
 
 def stage_cluster(cfg, p):
@@ -8245,10 +8492,21 @@ STAGES = [
          deps=[], fn=stage_signalp),
     # gpu=True: this stage takes an exclusive lease on gpu_device. tmbed held
     # 15.5 GB of a 16 GB card; see gpu_workers.
-    dict(name="tmbed", cost=3, enabled="topology", gpu=True, out=lambda p: [p.tmbed],
+    # empty_ok: a proteome whose every sequence is over tmbed_max_len leaves
+    # an empty prediction file on purpose, and a rerun must be able to adopt
+    # it rather than re-deciding that there is nothing to do.
+    #
+    # tmbed_chunk_residues is deliberately NOT a key. It changes how the work
+    # is divided and therefore the ORDER of the records, but not one
+    # prediction in them, and listing it would throw away a 30-hour stage
+    # because someone tuned a checkpoint size. The two keys that DO change
+    # what is in the file - how much of a failure is tolerated - are listed.
+    dict(name="tmbed", cost=3, enabled="topology", gpu=True, empty_ok=True,
+         out=lambda p: [p.tmbed],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["gpu_device", "tmbed_use_gpu", "tmbed_max_len",
-               "tmbed_batch_size"], deps=[], fn=stage_tmbed),
+               "tmbed_batch_size", "tmbed_allow_partial",
+               "tmbed_max_consecutive_failures"], deps=[], fn=stage_tmbed),
     dict(name="cluster", cost=1, enabled="cluster", out=lambda p: [p.cluster],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["thresholds.cluster_min_seq_id", "thresholds.cluster_coverage"],

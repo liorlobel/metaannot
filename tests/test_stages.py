@@ -96,11 +96,13 @@ def test_an_empty_output_is_not_adopted(tmp_path, stub_bin):
 
 
 def test_a_stage_that_declares_emptiness_meaningful_is_adopted_empty(ma):
-    # diamond, smorf, jackhmmer, hhblits, esmfold and foldseek can legitimately
-    # produce nothing; every other stage cannot.
+    # diamond, smorf, jackhmmer, hhblits, esmfold, foldseek and tmbed can
+    # legitimately produce nothing; every other stage cannot. tmbed joined the
+    # list when tmbed_max_len grew teeth: a proteome whose every sequence is
+    # over the cap leaves an empty prediction file on purpose.
     empty_ok = {s["name"] for s in ma.STAGES if s.get("empty_ok")}
     assert empty_ok == {"diamond", "smorf", "jackhmmer", "hhblits", "esmfold",
-                        "foldseek"}
+                        "foldseek", "tmbed"}
 
 
 def test_a_non_empty_output_produced_elsewhere_is_adopted(tmp_path, stub_bin):
@@ -540,16 +542,47 @@ def test_an_unknown_tmbed_gpu_setting_is_refused(ma, tmp_path, paths_for,
 # tmbed's real shape: a tqdm bar redrawn in place on stderr for hours, and the
 # predictions written only at the very end.
 _TMBED_STUB = """#!/usr/bin/env python3
-import sys, time
+import os, sys, time
 a = sys.argv[1:]
 out = a[a.index("-p") + 1]
+faa = a[a.index("-f") + 1]
 for i in range(6):
     bar = "\\r 61%|###### | " + str(i * 5000) + "/38204 [2:36:04<1:39:41]"
     sys.stderr.write(bar)
     sys.stderr.flush()
     time.sleep(0.08)
+# One 3-line record per INPUT sequence, which is the part of the real tool's
+# behaviour the stage now depends on: it reconciles what it handed over
+# against what came back, so a stub that always wrote the same fixed record
+# would pass every id-handling bug straight through.
+recs, pid, seq = [], None, []
+for line in open(faa, encoding="utf-8"):
+    line = line.strip()
+    if line.startswith(">"):
+        if pid:
+            recs.append((pid, "".join(seq)))
+        pid, seq = line[1:].split()[0], []
+    elif line:
+        seq.append(line)
+if pid:
+    recs.append((pid, "".join(seq)))
+# The three ways a real run goes wrong, addressed by PROTEIN ID rather than by
+# chunk file name so a test does not have to predict how the plan was
+# numbered. FAIL: this chunk dies (after PARTIAL records, if set). DROP: it
+# exits 0 having written fewer records than it was given, which is the failure
+# no exit code reports.
+fail = set(x for x in os.environ.get("TMBED_STUB_FAIL", "").split(",") if x)
+dying = fail & set(q for q, _ in recs)
+if dying:
+    recs = recs[:int(os.environ.get("TMBED_STUB_PARTIAL", "0"))]
+elif os.environ.get("TMBED_STUB_DROP"):
+    recs = recs[:int(os.environ["TMBED_STUB_DROP"])]
 with open(out, "w", encoding="utf-8") as fh:
-    fh.write(">P1\\nMKV\\nPPP\\n")
+    for pid, seq in recs:
+        fh.write(">" + pid + "\\n" + seq + "\\n" + "i" * len(seq) + "\\n")
+if dying:
+    sys.stderr.write("\\nRuntimeError: CUDA out of memory\\n")
+    sys.exit(1)
 """
 
 
@@ -1364,3 +1397,256 @@ def test_topology_without_cuda_warns_but_does_not_fail(ma, monkeypatch):
     monkeypatch.setattr(ma, "cuda_probe", lambda: (False, "no CUDA device"))
     ok, _ = ma.cuda_probe()
     assert ok is False
+
+
+# --- tmbed chunking ---------------------------------------------------
+# symptom: TMbed writes nothing until it finishes, so one invocation over a
+# whole proteome is an all-or-nothing bet measured in days. The run on 1.3M
+# proteins was still going after two days with an empty output file, and the
+# two before it died at 2 h 36 min with nothing recoverable.
+def test_the_chunk_plan_is_longest_first(ma):
+    # ProtT5 pads a batch out to its longest member, and whatever is going to
+    # exhaust the device should be in the FIRST chunk, not the last.
+    chunks, _ = ma.tmbed_chunk_plan([("s", 10), ("l", 500), ("m", 100)], 600)
+    assert chunks[0][0] == "l"
+    assert [q for c in chunks for q in c] == ["l", "m", "s"]
+
+
+def test_no_chunk_exceeds_the_residue_budget(ma):
+    lengths = [(f"p{i}", 50 + (i % 7) * 30) for i in range(200)]
+    chunks, budget = ma.tmbed_chunk_plan(lengths, 400)
+    by_id = dict(lengths)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert sum(by_id[q] for q in c) <= budget, c
+
+
+def test_a_sequence_longer_than_the_budget_still_gets_a_chunk(ma):
+    # the budget is a target, not a filter: dropping the sequence here would
+    # lose a protein that tmbed_max_len had already decided to keep.
+    chunks, budget = ma.tmbed_chunk_plan(
+        [("big", 9000), ("a", 10), ("b", 10)], 100)
+    assert sorted(q for c in chunks for q in c) == ["a", "b", "big"]
+    assert budget >= 9000
+
+
+def test_a_tiny_budget_cannot_ask_for_more_chunks_than_the_ceiling(ma):
+    # one ProtT5 load per chunk, so a 1-residue budget over a real proteome
+    # would spend all its time loading weights.
+    chunks, budget = ma.tmbed_chunk_plan(
+        [(f"p{i}", 100) for i in range(5000)], 1)
+    assert len(chunks) <= ma.TMBED_MAX_PARTS
+    assert budget > 1
+
+
+def test_a_zero_budget_is_one_invocation(ma):
+    chunks, budget = ma.tmbed_chunk_plan(
+        [(f"p{i}", 100) for i in range(50)], 0)
+    assert len(chunks) == 1 and len(chunks[0]) == 50
+    assert budget == 5000
+
+
+def test_every_protein_lands_in_exactly_one_chunk(ma):
+    lengths = [(f"p{i}", 1 + (i * 37) % 500) for i in range(1000)]
+    chunks, _ = ma.tmbed_chunk_plan(lengths, 2000)
+    flat = [q for c in chunks for q in c]
+    assert len(flat) == len(set(flat)) == 1000
+
+
+def test_the_chunk_plan_is_deterministic_when_lengths_tie(ma):
+    # equal lengths are ordered by id, so two runs of the same config produce
+    # the same parts and a resume matches them up.
+    lengths = [("b", 100), ("a", 100), ("c", 100)]
+    one, _ = ma.tmbed_chunk_plan(lengths, 150)
+    two, _ = ma.tmbed_chunk_plan(list(reversed(lengths)), 150)
+    assert one == two == [["a"], ["b"], ["c"]]
+
+
+def test_a_record_with_no_label_line_is_not_a_prediction(ma, tmp_path):
+    # the 3-line format has no trailer, so a killed writer leaves a header and
+    # a sequence. Counting that as done would commit a protein with no
+    # topology as though it had one.
+    f = tmp_path / "t.pred"
+    f.write_text(">P1\nMKV\niii\n>P2\nMKVA\n", encoding="utf-8")
+    assert [r[0] for r in ma.iter_tmbed_records(str(f))] == [">P1"]
+    assert set(ma.parse_tmbed(str(f))) == {"P1"}
+
+
+def test_a_missing_prediction_file_reads_as_no_records(ma, tmp_path):
+    assert list(ma.iter_tmbed_records(str(tmp_path / "nope.pred"))) == []
+
+
+def _many(n, length=200):
+    """n equal-length proteins, so the chunk plan falls out by id."""
+    return [F.Protein(f"P{i:03d}", "M" + "A" * (length - 1)) for i in range(n)]
+
+
+def _parts_dir(p):
+    return f"{os.path.dirname(p.tmbed)}/tmbed_parts"
+
+
+def test_a_split_run_predicts_every_protein_and_leaves_no_parts(
+        ma, tmp_path, paths_for, monkeypatch):
+    cfg, p = paths_for("tmbed_split")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 4 proteins per chunk
+    _stub_tmbed(tmp_path, monkeypatch)
+    ma.stage_tmbed(cfg, p)
+    assert len(ma.parse_tmbed(p.tmbed)) == 20
+    assert not os.path.exists(_parts_dir(p)), \
+        "the parts are the result until the file is committed, and rubbish " \
+        "afterwards"
+
+
+def test_a_finished_chunk_is_not_predicted_a_second_time(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # the whole point of splitting: an interrupted run resumes.
+    cfg, p = paths_for("tmbed_resume")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 5 chunks of 4
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P008,P012,P016")   # chunks 2-4
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    kept = sorted(f for f in os.listdir(_parts_dir(p)) if f.endswith(".pred"))
+    assert kept == ["0.pred", "1.pred"], kept
+    monkeypatch.delenv("TMBED_STUB_FAIL")
+    capsys.readouterr()
+    ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    assert err.count("is already predicted; skipping") == 2, err
+    assert len(ma.parse_tmbed(p.tmbed)) == 20
+
+
+def test_a_failed_chunk_keeps_what_tmbed_wrote_and_names_the_rest(
+        ma, tmp_path, paths_for, monkeypatch):
+    cfg, p = paths_for("tmbed_partial")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(8))
+    cfg["tmbed_chunk_residues"] = 800          # 2 chunks of 4
+    cfg["tmbed_allow_partial"] = True
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P004")             # chunk 1
+    monkeypatch.setenv("TMBED_STUB_PARTIAL", "1")             # 1 record, die
+    ma.stage_tmbed(cfg, p)
+    got = ma.parse_tmbed(p.tmbed)
+    assert len(got) == 5, "4 from the good chunk plus the 1 salvaged"
+    miss = f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv"
+    rows = [l.split("\t") for l in
+            io.open(miss, encoding="utf-8").read().splitlines()[1:]]
+    assert len(rows) == 3
+    assert not ({r[0] for r in rows} & set(got)), \
+        "a protein cannot be both predicted and a casualty"
+    assert all("out of memory" in r[3] for r in rows), rows
+
+
+def test_a_failed_chunk_stops_the_run_unless_partial_is_allowed(
+        ma, tmp_path, paths_for, monkeypatch):
+    # a silently short topology set shifts every bin, and nothing downstream
+    # can tell "no helix" from "never asked".
+    cfg, p = paths_for("tmbed_strict")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(8))
+    cfg["tmbed_chunk_residues"] = 800
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P004")
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_tmbed(cfg, p)
+    assert "tmbed_allow_partial: true" in str(e.value)
+    assert not os.path.exists(p.tmbed), \
+        "a partial prediction set must not be committed"
+    assert os.path.exists(_parts_dir(p)), \
+        "the finished chunks have to survive for the rerun to resume"
+
+
+def test_a_wedged_device_stops_the_run_rather_than_failing_every_chunk(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    cfg, p = paths_for("tmbed_wedged")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 5 chunks
+    cfg["tmbed_max_consecutive_failures"] = 2
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P000,P004,P008,P012,P016")
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    assert "chunk(s) in a row failed" in err
+    assert err.count("failed after writing") == 2, \
+        "the remaining chunks must not be attempted one by one"
+
+
+def test_a_chunk_that_exits_zero_but_comes_back_short_is_not_accepted(
+        ma, tmp_path, paths_for, monkeypatch):
+    # exit 0 is the tool's opinion; the reconciliation is ours.
+    cfg, p = paths_for("tmbed_short")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(4))
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_DROP", "2")       # writes 2 of 4, exit 0
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_tmbed(cfg, p)
+    assert "2 of 4" in str(e.value)
+    rows = io.open(f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv",
+                   encoding="utf-8").read().splitlines()[1:]
+    assert len(rows) == 2
+
+
+def test_a_proteome_of_nothing_but_over_cap_sequences_runs_nothing(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    cfg, p = paths_for("tmbed_allcapped")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(3, 400))
+    cfg["tmbed_max_len"] = 100
+    _stub_tmbed(tmp_path, monkeypatch)
+    ma.stage_tmbed(cfg, p)
+    assert not os.path.exists(_parts_dir(p)), "tmbed was given an empty input"
+    assert os.path.exists(p.tmbed) and os.path.getsize(p.tmbed) == 0
+    err = capsys.readouterr().err
+    assert "no sequence is left to predict" in err
+    excl = io.open(f"{os.path.dirname(p.tmbed)}/tmbed_excluded.tsv",
+                   encoding="utf-8").read().splitlines()[1:]
+    assert len(excl) == 3
+
+
+def test_the_stage_may_write_an_empty_prediction_file(ma):
+    # ...so decide() has to be willing to adopt one on a rerun.
+    assert {s["name"]: s for s in ma.STAGES}["tmbed"].get("empty_ok") is True
+
+
+def test_the_chunk_size_is_not_allowed_to_invalidate_the_cache(ma):
+    # it changes the order of the records and nothing else; listing it would
+    # throw away a 30-hour stage because someone tuned a checkpoint size.
+    st = {s["name"]: s for s in ma.STAGES}["tmbed"]
+    assert "tmbed_chunk_residues" not in st["keys"]
+    # what DOES change the contents is listed
+    assert "tmbed_allow_partial" in st["keys"]
+    assert "tmbed_max_consecutive_failures" in st["keys"]
+
+
+def test_the_chunk_plan_is_logged_before_any_prediction_starts(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    cfg, p = paths_for("tmbed_plan")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(12))
+    cfg["tmbed_chunk_residues"] = 800
+    _stub_tmbed(tmp_path, monkeypatch)
+    ma.stage_tmbed(cfg, p)
+    lines = capsys.readouterr().err.splitlines()
+    plan = [i for i, l in enumerate(lines) if "chunk(s) of at most" in l]
+    ran = [i for i, l in enumerate(lines) if "$ " in l and "tmbed predict" in l]
+    assert plan and ran and plan[0] < ran[0]
+    assert "3 chunk(s)" in lines[plan[0]]
+
+
+def test_a_die_from_inside_run_cmd_is_not_reported_as_a_chunk_failure(
+        ma, tmp_path, paths_for, monkeypatch):
+    # StageError IS a RuntimeError, so the `except RuntimeError` that turns a
+    # dead chunk into a casualty list would also swallow an abort. run_cmd
+    # raises only plain RuntimeError today, so this pins the intent rather
+    # than a live path: the monkeypatch is what a future die() in run_cmd
+    # would look like, and the stage must let it through untouched.
+    cfg, p = paths_for("tmbed_die")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(4))
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setattr(ma, "run_cmd",
+                        lambda *a, **k: ma.die("tmbed not found"))
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_tmbed(cfg, p)
+    assert "tmbed not found" in str(e.value)
+    assert "failed after writing" not in str(e.value)
+    assert not os.path.exists(f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv")
