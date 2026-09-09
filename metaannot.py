@@ -585,6 +585,23 @@ DEFAULT_CONFIG = {
     #   diamond_evalues: {bagel: 1e-3}
     "diamond_evalues": {},
 
+    # Per-database minimum percent identity, overriding
+    # thresholds.diamond_min_pident. Applied twice on purpose: as DIAMOND's
+    # own --id during the search, so the table stays small, and again when the
+    # table is read, so a file adopted from elsewhere or produced before the
+    # floor existed keeps the same promise.
+    #
+    # 50 for these three because their hits are read as claims about a
+    # PARTICULAR protein, not as a family assignment. On the 1.3M-protein run
+    # CARD returned 39,138 hits and VFDB 107,219 at the 30% default; above 50%
+    # they are 4,661 and 21,623. The rest are the usual metagenome background
+    # -- a 32%-identity match to a beta-lactamase over half a query is a hit
+    # against the fold, not evidence that this protein confers resistance, and
+    # reporting it as "carries an AMR gene" is the error a reviewer would find
+    # first. BAGEL's sequences are short enough that a low-identity alignment
+    # is close to meaningless.
+    "diamond_min_pidents": {"card": 50, "vfdb": 50, "bagel": 50},
+
     "thresholds": {
         "diamond_evalue": 1e-10,
         "diamond_min_qcov": 50,
@@ -2259,6 +2276,24 @@ def diamond_evalue_for(cfg, tag):
         die(f"{where} must be a number, not {raw!r}")
 
 
+def diamond_min_pident_for(cfg, tag):
+    """The identity floor this DIAMOND database is filtered at.
+
+    Per-database for the same reason the e-value is: one number cannot fit a
+    reference database whose hits are read as "this protein IS that one"
+    (CARD, VFDB, BAGEL, floored at 50) and one read as "this protein is in
+    that family" (where 30 is the useful setting).
+    """
+    over = (cfg.get("diamond_min_pidents") or {})
+    raw = over[tag] if tag in over else cfg["thresholds"]["diamond_min_pident"]
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        where = (f"diamond_min_pidents.{tag}" if tag in over
+                 else "thresholds.diamond_min_pident")
+        die(f"{where} must be a number, not {raw!r}")
+
+
 def best_possible_evalue(letters, typical_len):
     """The smallest e-value a hit against this database could ever reach.
 
@@ -2439,12 +2474,19 @@ def stage_diamond(cfg, p):
     # thread scaling is sublinear, so 4 jobs at N/4 threads finish sooner than
     # 4 jobs at N threads in sequence.
     base_ev = float(cfg["thresholds"]["diamond_evalue"])
+    base_id = float(cfg["thresholds"]["diamond_min_pident"])
     for tag, _path in jobs:
         ev = diamond_evalue_for(cfg, tag)
         if ev != base_ev:
             log(f"{tag}: searching at --evalue {ev:g} from diamond_evalues, "
                 f"not the thresholds.diamond_evalue {base_ev:g} the other "
                 "databases use")
+        pid = diamond_min_pident_for(cfg, tag)
+        if pid != base_id:
+            log(f"{tag}: searching at --id {pid:g} from diamond_min_pidents, "
+                f"not the thresholds.diamond_min_pident {base_id:g} the other "
+                "databases use, so nothing below that identity is reported "
+                "at all")
 
     workers = min(len(jobs), max(1, int(cfg.get("diamond_workers", 4))))
     per = max(1, int(cfg["threads"]) // workers)
@@ -2464,9 +2506,14 @@ def stage_diamond(cfg, p):
         # tables it stands for were not: a killed DIAMOND left a half-written
         # <tag>.tsv that integrate read as that database's complete answer.
         with atomic_out(f"{p.diamond_dir}/{tag}.tsv") as tmp:
+            # --id as well as the reader's filter. DIAMOND applies it during
+            # the search, so a floored database writes thousands of rows
+            # instead of hundreds of thousands and the parse is not the place
+            # the promise first takes effect.
             run_cmd(["diamond", "blastp", "-q", cfg["proteins_faa"],
                      "-d", dbpath, "-o", tmp, "--very-sensitive",
                      "-e", f"{diamond_evalue_for(cfg, tag):g}",
+                     "--id", f"{diamond_min_pident_for(cfg, tag):g}",
                      "--max-target-seqs", 5, "--threads", per, "--quiet"]
                     + mem + tool_args(cfg, "diamond")
                     + ["--outfmt", "6", "qseqid", "sseqid", "pident",
@@ -3957,8 +4004,15 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
         # The same per-database e-value the search used: filtering the table
         # back down to thresholds.diamond_evalue here would quietly undo a
         # diamond_evalues entry and leave the user's setting doing nothing.
+        # The same per-database identity floor the search used, for the same
+        # reason as the e-value above: reading the table back at the global
+        # thresholds.diamond_min_pident would quietly undo a
+        # diamond_min_pidents entry. It also has to be applied HERE and not
+        # only on the command line, because a <tag>.tsv adopted from another
+        # machine, or written before the floor existed, never saw --id.
+        min_pid = diamond_min_pident_for(cfg, tag)
         hits = parse_diamond(path, diamond_evalue_for(cfg, tag),
-                             th["diamond_min_qcov"], th["diamond_min_pident"])
+                             th["diamond_min_qcov"], min_pid)
         df[f"{tag}_hit"] = from_dict({k: v[0] for k, v in hits.items()}, idx)
         df[f"{tag}_pident"] = from_dict(
             {k: v[1] for k, v in hits.items()}, idx, float("nan"))
@@ -4220,6 +4274,18 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # used to score the full weight. Below diamond_strong_pident the weight is
     # halved rather than dropped, so a weak hit still ranks above no hit.
     strong_pid = th.get("diamond_strong_pident", 50)
+    # A database floored at or above diamond_strong_pident cannot produce a
+    # weak hit: everything that survived the filter scores full weight and the
+    # halving below is dead for it. Said once, because the alternative is a
+    # reader concluding from the config that VFDB hits are being graded by
+    # identity when in fact they cannot be.
+    floored = [t for t in dia_tags
+               if diamond_min_pident_for(cfg, t) >= strong_pid]
+    if floored:
+        log(f"{', '.join(sorted(floored))}: filtered at or above "
+            f"diamond_strong_pident={strong_pid:g}, so every surviving hit "
+            "scores the full diamond_weights value and the half-weight rule "
+            "for weak hits never applies to them")
     # VFDB is not one kind of evidence. Its own VFC category code says which,
     # and a flat weight throws that away: on a real gut metaproteome, of 3,308
     # VFDB hits the two largest categories were "Immune modulation" (965) and
@@ -8525,7 +8591,8 @@ STAGES = [
     dict(name="diamond", cost=2, empty_ok=True, enabled="diamond",
          out=lambda p: [p.diamond_done],
          inp=lambda c, p: [c["proteins_faa"]] + list((c["db"].get("diamond") or {}).values()),
-         keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues"],
+         keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues",
+               "thresholds.diamond_min_pident", "diamond_min_pidents"],
          deps=[], fn=stage_diamond),
     dict(name="signalp", cost=3, enabled="topology", out=lambda p: [p.signalp],
          inp=lambda c, p: [c["proteins_faa"]], keys=["signalp_mode"],
@@ -8588,7 +8655,8 @@ STAGES = [
          # to this stage alone, since finalise never writes dark.faa.
          keys=["thresholds", "weights", "diamond_weights",
                "vfdb_category_weights", "foldseek_target_priority",
-               "diamond_evalues", "anchor_pfams",
+               "diamond_evalues",
+               "diamond_min_pidents", "anchor_pfams",
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",
                "ncbifam_uninformative_test"],
@@ -8628,7 +8696,8 @@ STAGES = [
                            p.hhr_done, p.jackhmmer],
          keys=["thresholds", "weights", "diamond_weights",
                "vfdb_category_weights",
-               "diamond_evalues", "anchor_pfams",
+               "diamond_evalues",
+               "diamond_min_pidents", "anchor_pfams",
                "toxin_fold_patterns", "ncbifam_uninformative_test",
                "foldseek_target_priority"],
          deps=['integrate', 'jackhmmer', 'hhblits', 'foldseek', 'context'], fn=stage_integrate_final),

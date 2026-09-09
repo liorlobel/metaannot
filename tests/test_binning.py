@@ -1,6 +1,7 @@
 """The evidence bins: the one thing this tool exists to compute."""
 from __future__ import annotations
 
+import copy
 import itertools
 import os
 
@@ -490,20 +491,88 @@ def test_a_protein_over_the_length_cap_is_not_blamed_on_oom(ma, tmp_path,
 
 
 # --- the effector score ----------------------------------------------
-def test_a_weak_diamond_hit_scores_half_the_weight_of_a_strong_one(
-        ma, tmp_path, paths_for):
-    # symptom: a 31%-identity VFDB hit scored the same as a 90% one.
+def _two_vfdb_hits(ma, tmp_path, paths_for, name, **over):
+    """P_dark1 at 95% identity and P_dark2 at 31%, both against VFDB."""
     ps = F.protein_set()
-    cfg, p = paths_for("dia")
+    cfg, p = paths_for(name)
     cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    cfg.update(over)
     F.write_emapper(p.emapper, ps)
     F.write_diamond(os.path.join(p.diamond_dir, "vfdb.tsv"), [
         ("P_dark1", "VFG1", 95.0, 1e-40, 300.0, 90, "hemolysin"),
         ("P_dark2", "VFG2", 31.0, 1e-40, 300.0, 90, "hemolysin")])
-    df = ma.build_annotation(cfg, p)
+    return cfg, ma.build_annotation(cfg, p)
+
+
+def test_a_weak_diamond_hit_scores_half_the_weight_of_a_strong_one(
+        ma, tmp_path, paths_for):
+    # symptom: a 31%-identity VFDB hit scored the same as a 90% one.
+    # diamond_min_pidents emptied, because the shipped floor of 50 for VFDB
+    # now removes the weak hit before the weighting ever sees it — this is
+    # the rule as it applies to a database that is NOT floored.
+    cfg, df = _two_vfdb_hits(ma, tmp_path, paths_for, "dia",
+                             diamond_min_pidents={})
     w = cfg["diamond_weights"]["vfdb"]
     assert df.loc["P_dark1", "effector_score"] - \
         df.loc["P_dark2", "effector_score"] == w - w // 2
+
+
+def test_a_hit_below_the_databases_identity_floor_is_not_reported_at_all(
+        ma, tmp_path, paths_for):
+    # CARD, VFDB and BAGEL hits are read as claims about a PARTICULAR protein,
+    # so a 31%-identity match is not weak evidence of virulence, it is a match
+    # against the fold. On the 1.3M-protein run this is the difference between
+    # 107,219 VFDB hits and 21,623.
+    cfg, df = _two_vfdb_hits(ma, tmp_path, paths_for, "dia_floor")
+    assert cfg["diamond_min_pidents"]["vfdb"] == 50
+    assert df.loc["P_dark1", "vfdb_hit"] == "VFG1"
+    assert not df.loc["P_dark2", "vfdb_hit"], \
+        "a 31% hit survived a 50% floor"
+
+
+def test_the_floor_applies_when_the_table_was_written_without_it(
+        ma, tmp_path, paths_for):
+    # a <tag>.tsv adopted from another machine, or written before the floor
+    # existed, never saw DIAMOND's --id. The reader is what keeps the promise
+    # for those, which is why the filter lives in both places.
+    _, df = _two_vfdb_hits(ma, tmp_path, paths_for, "dia_adopted")
+    assert not df.loc["P_dark2", "vfdb_hit"]
+
+
+def test_a_floored_database_says_its_half_weight_rule_is_dead(
+        ma, tmp_path, paths_for, capsys):
+    # otherwise a reader concludes from diamond_strong_pident that VFDB hits
+    # are being graded by identity, when nothing below 50 can reach the grader.
+    _two_vfdb_hits(ma, tmp_path, paths_for, "dia_said")
+    err = capsys.readouterr().err
+    said = [l for l in err.splitlines()
+            if "half-weight rule for weak hits never applies" in l]
+    assert len(said) == 1, err
+    assert "vfdb: filtered at or above diamond_strong_pident=50" in said[0]
+
+
+def test_an_unfloored_database_says_nothing_about_the_half_weight_rule(
+        ma, tmp_path, paths_for, capsys):
+    _two_vfdb_hits(ma, tmp_path, paths_for, "dia_quiet", diamond_min_pidents={})
+    assert "half-weight rule" not in capsys.readouterr().err
+
+
+def test_the_identity_floor_is_per_database_like_the_evalue(ma):
+    cfg = copy.deepcopy(ma.DEFAULT_CONFIG)
+    assert ma.diamond_min_pident_for(cfg, "card") == 50
+    assert ma.diamond_min_pident_for(cfg, "vfdb") == 50
+    assert ma.diamond_min_pident_for(cfg, "bagel") == 50
+    # anything not named falls back to the global setting
+    assert ma.diamond_min_pident_for(cfg, "merops") == \
+        cfg["thresholds"]["diamond_min_pident"] == 30
+
+
+def test_a_non_numeric_identity_floor_is_a_message_not_a_traceback(ma):
+    cfg = copy.deepcopy(ma.DEFAULT_CONFIG)
+    cfg["diamond_min_pidents"] = {"card": "half"}
+    with pytest.raises(ma.StageError) as e:
+        ma.diamond_min_pident_for(cfg, "card")
+    assert "diamond_min_pidents.card must be a number" in str(e.value)
 
 
 def _vfdb_scored(ma, tmp_path, paths_for, name, **over):
