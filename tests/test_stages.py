@@ -1477,9 +1477,9 @@ def test_topology_without_cuda_warns_but_does_not_fail(ma, monkeypatch):
 
 # --- tmbed chunking ---------------------------------------------------
 # symptom: TMbed writes nothing until it finishes, so one invocation over a
-# whole proteome is an all-or-nothing bet measured in days. The run on 1.3M
-# proteins was still going after two days with an empty output file, and the
-# two before it died at 2 h 36 min with nothing recoverable.
+# whole proteome is an all-or-nothing bet measured in days. The run on
+# 455,571 proteins was still going after two days with an empty output file,
+# and the two before it died at 2 h 36 min with nothing recoverable.
 def test_the_chunk_plan_is_longest_first(ma):
     # ProtT5 pads a batch out to its longest member, and whatever is going to
     # exhaust the device should be in the FIRST chunk, not the last.
@@ -1726,3 +1726,43 @@ def test_a_die_from_inside_run_cmd_is_not_reported_as_a_chunk_failure(
     assert "tmbed not found" in str(e.value)
     assert "failed after writing" not in str(e.value)
     assert not os.path.exists(f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv")
+
+
+def test_emapper_coverage_is_reported_per_identifier_tier(ma, tmp_path,
+                                                          capsys):
+    # symptom: a merged search database was reported by one headline number.
+    # The real one is a public catalogue tier that arrives with precomputed
+    # annotations and a tier assembled from this study's own reads that does
+    # not; 60% overall here is 100% and 0%, and only the split says so.
+    have = [F.Protein(f"uhgpL_MGYG{i:05d}", "MKV" * 40, ko="ko:K01234",
+                      pathway="ko00010,map00010", seed_taxid="820")
+            for i in range(6)]
+    missing = [F.Protein(f"OIDECCNN_{i:05d}", "MKV" * 40) for i in range(4)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), have + missing)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), have)
+    report = str(tmp_path / "report.tsv")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), report,
+                       "exact", 0.5, 0.9, 100)
+    err = capsys.readouterr().err
+    tier_lines = [l for l in err.splitlines() if "emapper reuse:   " in l]
+    assert len(tier_lines) == 2, err
+    assert "uhgpL_" in tier_lines[0] and "100.0%" in tier_lines[0]
+    assert "OIDECCNN_" in tier_lines[1] and "0.0%" in tier_lines[1]
+    rep = dict(l.split("\t") for l in
+               io.open(report, encoding="utf-8").read().splitlines()[1:])
+    assert rep["tier_uhgpL__proteins"] == "6"
+    assert rep["tier_uhgpL__annotated"] == "6"
+    assert rep["tier_OIDECCNN__proteins"] == "4"
+    assert rep["tier_OIDECCNN__annotated"] == "0"
+
+
+def test_an_untiered_protein_set_gets_no_tier_rows(ma, tmp_path):
+    ps = [F.Protein(f"P{i:05d}", "MKV" * 40, ko="ko:K01234",
+                    pathway="ko00010,map00010", seed_taxid="820")
+          for i in range(5)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), ps)
+    report = str(tmp_path / "report.tsv")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), report,
+                       "exact", 0.5, 0.9, 100)
+    assert "tier_" not in io.open(report, encoding="utf-8").read()

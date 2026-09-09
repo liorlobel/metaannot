@@ -583,9 +583,9 @@ def test_the_run_says_which_gpu_stages_share_one_device(tmp_path, stub_bin):
 # --- longest-processing-time-first ------------------------------------
 # symptom: every stage with no dependencies is ready in the first round and
 # stage_workers is 4, so the first four IN TABLE ORDER started. On the
-# 1.3M-protein run that handed workers to cluster (109 s) and dbcan (10 min)
-# while signalp and tmbed — nearly an hour each on a set an order of
-# magnitude smaller — queued behind them.
+# 455,571-protein run that handed workers to cluster (109 s) and dbcan
+# (10 min) while signalp and tmbed — nearly an hour each on a set an order
+# of magnitude smaller — queued behind them.
 def _wave_one(ma):
     """The stages a fresh run finds ready in its first round."""
     return [st["name"] for st in ma.STAGES if not st["deps"]]

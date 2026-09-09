@@ -598,9 +598,9 @@ DEFAULT_CONFIG = {
     # floor existed keeps the same promise.
     #
     # 50 for these three because their hits are read as claims about a
-    # PARTICULAR protein, not as a family assignment. On the 1.3M-protein run
-    # CARD returned 39,138 hits and VFDB 107,219 at the 30% default; above 50%
-    # they are 4,661 and 21,623. The rest are the usual metagenome background
+    # PARTICULAR protein, not as a family assignment. On a 455,571-protein
+    # run CARD returned 39,138 hits and VFDB 107,219 at the 30% default; above
+    # 50% they are 4,661 and 21,623. The rest are the usual metagenome background
     # -- a 32%-identity match to a beta-lactamase over half a query is a hit
     # against the fold, not evidence that this protein confers resistance, and
     # reporting it as "carries an AMR gene" is the error a reviewer would find
@@ -1359,6 +1359,7 @@ class Paths:
         self.fold_clusters = f"{R}/foldseek/fold_clusters.tsv"
         self.final = f"{R}/annotation_final.tsv"
         self.summary = f"{R}/bin_summary.tsv"
+        self.tier_coverage = f"{R}/tier_coverage.tsv"
         # Whether the evidence sources that reach the same protein agree
         # about it, which coverage numbers alone cannot say.
         self.agreement = f"{R}/source_agreement.tsv"
@@ -1990,6 +1991,38 @@ def id_prefix_candidates(pid, limit=3):
     return out
 
 
+# A merged search database is the normal case for a metaproteomics run, and
+# its tiers do not annotate alike. The Pittsburgh one is four: uhgpL_ (395,467
+# UHGP proteins), OIDECCNN_ (43,139 Prokka calls off the matched metagenome),
+# uhgpSM_ (14,797) and ampS_ (2,168). A single "94% have an eggNOG hit" hides
+# that one of those tiers arrives with precomputed annotations while another
+# is ORFs nobody has ever seen, and the difference is the whole reason the
+# proteome was merged in the first place.
+#
+# 12 is where a prefix stops being a source label and starts being part of
+# the id: one Prokka locus tag per MAG would give hundreds, and a table with
+# a row each answers no question anyone asked.
+MAX_ID_TIERS = 12
+
+
+def id_tiers(ids, max_tiers=MAX_ID_TIERS):
+    """{prefix: count} when the ids look like a merged database, else {}.
+
+    The prefix is everything up to and including the first _ | : or . - the
+    same delimiter set id_prefix_candidates uses. Returns {} when there is
+    only one prefix (nothing to split) or more than max_tiers (the prefix is
+    part of the id, not a label). Ids with no delimiter at all group under "".
+    """
+    counts = {}
+    for pid in ids:
+        m = PREFIX_DELIM_RE.search(pid)
+        key = pid[:m.end()] if m else ""
+        counts[key] = counts.get(key, 0) + 1
+        if len(counts) > max_tiers:
+            return {}
+    return {} if len(counts) < 2 else counts
+
+
 def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
                     diagnose_rows, strip_prefixes=()):
     want = {pid for pid, _ in read_fasta(faa)}
@@ -2111,6 +2144,23 @@ def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
     cov = len(seen) / len(want)
     log(f"emapper reuse: scanned {n_scanned} rows, matched {len(seen)} "
         f"({100*cov:.1f}% of the protein set)")
+    # Per tier, because one headline coverage over a merged database is an
+    # average of things that are not alike: a public catalogue tier arrives
+    # with precomputed annotations and a tier assembled from this study's own
+    # reads does not, and 94% overall can be 99% and 30%.
+    tiers = id_tiers(want)
+    tier_cov = {}
+    if tiers:
+        hit = {k: 0 for k in tiers}
+        for i in seen:
+            m = PREFIX_DELIM_RE.search(i)
+            k = i[:m.end()] if m else ""
+            if k in hit:
+                hit[k] += 1
+        for pref, n in sorted(tiers.items(), key=lambda kv: -kv[1]):
+            tier_cov[pref] = (n, hit[pref])
+            log(f"emapper reuse:   {pref or '(no prefix)':20s} "
+                f"{hit[pref]:>8,}/{n:<8,} {100.0 * hit[pref] / n:5.1f}%")
     if bridged:
         log(f"emapper reuse: {len(bridged)} of those proteins matched only "
             "after emapper_strip_id_prefix was removed from the fasta id")
@@ -2163,6 +2213,9 @@ def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
             fh.write(f"id_transform\t{transform}\n")
             fh.write(f"recommended_transform\t{recommend}\n")
             fh.write(f"recommended_strip_id_prefix\t{best_pref}\n")
+            for pref, (n, hit) in tier_cov.items():
+                fh.write(f"tier_{pref or 'none'}_proteins\t{n}\n")
+                fh.write(f"tier_{pref or 'none'}_annotated\t{hit}\n")
 
     if cov < min_cov:
         die(f"only {100*cov:.1f}% of proteins matched (emapper_min_coverage "
@@ -2710,8 +2763,9 @@ def cuda_probe():
 
 # TMbed writes nothing until it finishes. A single invocation over a whole
 # proteome is therefore an all-or-nothing bet measured in days: the run on
-# 1.3M proteins was still going after two days with an empty output file, and
-# the two before it died at 2 h 36 min with nothing recoverable. Splitting the
+# 455,571 proteins (214.9M residues) was still going after two days with an
+# empty output file, and the two before it died at 2 h 36 min with nothing
+# recoverable. Splitting the
 # input into chunks turns that into a series of checkpoints. The price is one
 # ProtT5 load per chunk, which is why the chunk count is bounded from both
 # ends: tmbed_chunk_residues sets the floor, TMBED_MAX_PARTS the ceiling.
@@ -2823,8 +2877,8 @@ def stage_tmbed(cfg, p):
     # a 94 GB host under --cpu-fallback. Cap the input instead, and record
     # what was cut rather than letting the exclusion pass unnoticed.
     #
-    # Lengths only: a 1.3M-protein FASTA does not fit in a list of sequences,
-    # so each chunk re-reads the file rather than holding it.
+    # Lengths only: a 455,571-protein FASTA does not fit in a list of
+    # sequences, so each chunk re-reads the file rather than holding it.
     cap = int(cfg.get("tmbed_max_len", 0) or 0)
     work, excluded = [], []
     for pid, seq in read_fasta(faa):
@@ -4516,6 +4570,57 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     return df
 
 
+# Evidence a protein can carry, as (label, column). A column absent from the
+# frame is skipped rather than reported as 0%: "this stage did not run" and
+# "this stage found nothing" are different answers and must not share a cell.
+TIER_EVIDENCE = [
+    ("eggnog", "og"), ("ko", "ko"), ("pfam", "pfam_hits"),
+    ("ncbifam", "ncbifam_hits"), ("kofam", "kofam_ko"),
+    ("interpro", "interpro_sigs"), ("dbcan", "dbcan_hits"),
+    ("cazy", "cazy"),
+]
+
+
+def write_tier_coverage(df, path):
+    """Coverage split by identifier prefix, for a merged search database.
+
+    bin_summary.tsv answers "what did this proteome look like"; this answers
+    "and did its parts look alike", which for a database merged from two
+    metagenome-assembled catalogues plus this study's own assembly is the
+    question the headline number hides. Writes nothing and says why when the
+    ids are not tiered, so an absent file is never ambiguous.
+    """
+    tiers = id_tiers(df.index)
+    if not tiers:
+        log("protein ids are not split by a source prefix (or carry more "
+            f"than {MAX_ID_TIERS} distinct ones), so no per-tier coverage "
+            f"table is written; {os.path.basename(path)} is absent for that "
+            "reason, not because a stage failed")
+        return False
+    m = pd.Series(list(df.index), index=df.index).str.extract(
+        r"^([^_|:.]*[_|:.])", expand=False).fillna("")
+    rows = []
+    for pref, _n in sorted(tiers.items(), key=lambda kv: -kv[1]):
+        sub = df[m == pref]
+        row = {"tier": pref or "(no prefix)", "n": len(sub),
+               "pct_of_proteome": round(100.0 * len(sub) / len(df), 1)}
+        for label, col in TIER_EVIDENCE:
+            if col in sub.columns:
+                row[f"pct_{label}"] = round(
+                    100.0 * sub[col].fillna("").astype(str).ne("").mean(), 1)
+        row["pct_dark"] = round(100.0 * sub["bin"].eq("4_dark").mean(), 1)
+        row["median_export_score"] = sub["export_score"].median()
+        rows.append(row)
+    t = pd.DataFrame(rows).set_index("tier")
+    with atomic_out(path) as tmp:
+        t.to_csv(tmp, sep="\t")
+    log(f"{len(t)} identifier tier(s) in the protein set; coverage per tier "
+        f"-> {path}")
+    for line in t.to_string().splitlines():
+        log(line)
+    return True
+
+
 def write_summary(df, path):
     g = df.groupby("bin")
     s = pd.DataFrame({
@@ -4672,6 +4777,7 @@ def stage_integrate_final(cfg, p):
     with atomic_out(p.final) as tmp:
         df.to_csv(tmp, sep="\t")
     write_summary(df, p.summary)
+    write_tier_coverage(df, p.tier_coverage)
     write_source_agreement(df, p.agreement)
     log(f"wrote {p.final}")
 
@@ -8823,8 +8929,8 @@ STAGE_NAMES = [s["name"] for s in STAGES]
 # How long a stage runs, coarsely. 3 = hours, 2 = minutes, 1 = seconds, and
 # the numbers come off two real runs rather than intuition: on 38k proteins
 # interproscan took 2.8 h, signalp 56 min, tmbed 52 min, kofam 29 min, pfam
-# 27 min, ncbifam 24 min, dbcan 41 s, cluster 14 s; on 1.3M proteins kofam
-# took 14.3 h, pfam 7.2 h, ncbifam 5.6 h, dbcan 10 min, diamond 5 min,
+# 27 min, ncbifam 24 min, dbcan 41 s, cluster 14 s; on 455,571 proteins
+# kofam took 14.3 h, pfam 7.2 h, ncbifam 5.6 h, dbcan 10 min, diamond 5 min,
 # cluster 109 s, and interproscan was still running after two days. Three
 # ranks is all the resolution the scheduler can use: it decides which ready
 # stage claims a worker first, not when anything finishes.
