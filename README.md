@@ -210,16 +210,18 @@ DUF-only protein stays in `3d_duf_only` however good its fold or profile hit is
 held back so the 3s/3p rescue numbers are read with that in mind.
 
 **eggNOG's own `PFAMs` column counts as domain evidence.** Binning on the
-`pfam` stage's `hmmsearch` hits alone meant that with `run. On an early eggNOG-only pass of the UC
-metaproteome — before the search stages were run, so not the completed UC run
-quoted later in this file — 6,271 of 17,377 dark proteins (36%) carried an
-eggNOG Pfam: the dark bin was inflated by a missing join rather than by
-biology. The fix is in, so that figure is a record of the defect rather than
-something a current run reproduces; in the completed UC run `4_dark` is 3.8%. An eggNOG Pfam
-whose only accession is a DUF/UPF lands the protein in `3d_duf_only` rather than
-`3_annotated_no_ko`, on the same rule as an `hmmsearch` DUF. So expect a smaller
-`4_dark` than earlier versions of this tool produced, for a join reason rather
-than a biological one.
+`pfam` stage's `hmmsearch` hits alone meant that with `run.pfam: false` a
+protein eggNOG had already assigned a domain to was reported as having no
+evidence. On an early eggNOG-only pass of the UC metaproteome — before the
+search stages were run, so not the completed UC run quoted later in this file —
+6,271 of 17,377 dark proteins (36%) carried an eggNOG Pfam: the dark bin was
+inflated by a missing join rather than by biology. The fix is in, so that
+figure is a record of the defect rather than something a current run
+reproduces; in the completed UC run `4_dark` is 3.8%. An eggNOG Pfam whose only
+accession is a DUF/UPF lands the protein in `3d_duf_only` rather than
+`3_annotated_no_ko`, on the same rule as an `hmmsearch` DUF. So expect a
+smaller `4_dark` than earlier versions of this tool produced, for a join reason
+rather than a biological one.
 
 Bins 2 to 4 are what KEGG enrichment silently discards. Global KEGG maps
 (01100, 01110, …) are excluded from the pathway test: a protein whose only
@@ -432,7 +434,7 @@ Two keys outside that block behave differently for `fragpipe_tmt`:
 | key | default | for `fragpipe_tmt` |
 |---|---|---|
 | `analysis.min_plexes` | `1` | the **protein**-level companion to `tmt.min_plexes`, applied in the report beside `min_valid_per_group`. Inert without a per-sample plex, so label-free is untouched. |
-| `analysis.design_formula` / `analysis.factor_cols` | `"~ 0 + group"` / `"group"` | with two or more plexes the **defaults** become `"~ 0 + group + plex"` and `"group,plex"`. Only the literal defaults are replaced; a formula you wrote is left exactly as written. |
+| `analysis.design_formula` / `analysis.factor_cols` | `"~ 0 + group"` / `"group"` | with two or more plexes the **defaults** become `"~ 0 + group + plex"` and `"group,plex"`. Only the literal defaults are replaced; a formula you wrote is left exactly as written — and `plex` is then added to `factor_cols` only if your formula actually models it, since naming a factor the model never uses stops the knit. |
 
 Each plex is read on its own and the plexes are joined on the feature id — the
 peptide sequence, the modified sequence and the charge at `level: ion`, the
@@ -536,7 +538,9 @@ written into `design_record.txt` beside the numbers they produced:
   classic bridge design and it removes the plex effect directly, but it assumes
   the same pool went into every plex, it discards the reference's own variance,
   and it **propagates the reference's missingness**: a feature with no
-  reference value in a plex becomes `NA` for every channel of that plex. The
+  reference value in a plex becomes `NA` for every channel of that plex — and
+  a reference FragPipe wrote as `0` counts as no reference whatever
+  `zero_intensity_is_missing` says, since dividing by it is not a ratio. The
   run reports what that cost, per plex and in total — on the real 8-plex run,
   6,576 of 1,237,468 values, 0.53% — and warns when it is large.
 
@@ -1194,6 +1198,34 @@ hmmsearch is the superset in **every** case and InterProScan in none: the two
 never contradict each other, one is simply more sensitive. A pair like that is
 called out in the report, because "they disagree 27% of the time" and "one
 finds more than the other" are very different claims.
+
+### The length TMbed can actually embed
+
+TMbed embeds with ProtT5, whose attention score matrix is length-squared ×
+heads, so one sequence costs roughly `len² × 32 × 4` bytes: 1.1 GB at 3,000
+residues and 141 GB at titin's 34,350. That is a **single** allocation, so no
+device setting saves it — observed twice on real data, 8.79 GiB refused on a
+16 GB card and then 151 GB refused on a 94 GB host under `--cpu-fallback`, each
+time hours in and with nothing written, because TMbed writes its predictions
+only at the end. So the input is capped rather than the failure retried:
+
+```yaml
+tmbed_max_len: 3000     # residues; 0 disables the cap
+```
+
+Proteins longer than this are excluded from the search and listed with their
+lengths in `results/topology/tmbed_excluded.tsv`, and the run says how many
+were cut and how long the longest was. They get **no topology evidence** — no
+`n_tmh`, no `n_tmb` — so for those proteins the export score's beta-barrel term
+and the TMbed half of the `surface_or_secreted` gate are missing evidence
+rather than evidence against, exactly as they are on a run with `topology` off.
+It cuts both ways: `n_tmh` also drives `multi_tm_helix_penalty`, so an excluded
+protein escapes that penalty as well as forgoing `tm_beta_barrel`. Its
+`export_score` is not simply lower than it should be — it is uninformed, and
+can land either side of the score it would have had.
+The key is part of the `tmbed` stage's signature, so changing it re-runs that
+stage, and the predictions it writes are an input to `integrate`, so that and
+`finalise` follow. No other stage recomputes.
 
 ### The length a card can actually fold
 

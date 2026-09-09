@@ -172,17 +172,58 @@ def _project_for(root, fmt, **over):
     elif fmt == "msstats_protein":
         q = F.write_msstats_protein(os.path.join(inp, "protein.tsv"), ps,
                                     samples, groups)
+    elif fmt == "fragpipe_tmt":
+        q = _tmt_run(os.path.join(inp, "tmt"), ps, samples)
     else:
         raise AssertionError(fmt)
     cfg = {"quant_table": q, "quant_format": fmt}
     if fmt.startswith("msstats"):
         cfg["manifest"] = ""          # the design comes from the long table
+    elif fmt == "fragpipe_tmt":
+        cfg["manifest"] = ""          # the design comes from the annotations
+        cfg["tmt"] = {"reference_name": "Pool*"}
     proj.write_config(**cfg)
     return proj
 
 
+def _tmt_run(root, proteins, samples):
+    """A two-plex FragPipe TMT run the sweep above can drive.
+
+    fragpipe_tmt is the one format whose quant_table is a DIRECTORY rather
+    than a file, so it cannot be produced by one of the writers beside it:
+    every plex needs its own ion.tsv and its own annotation, and the design
+    comes from those annotations instead of the manifest. Two plexes, one
+    condition of each in both, is the smallest shape that still makes the
+    reader join across plexes, drop a pooled reference and derive a design.
+
+    Every protein carries three peptides and every fourth of them is also
+    mapped to its neighbour, so the peptide_assignment axis of the sweep is
+    a real axis here rather than three names for one answer: of 30 features
+    razor assigns 30, taxon_unique 26 and protein_unique 23.
+    """
+    rows = []
+    for i, r in enumerate(F.peptides_for(proteins)):
+        row = {"peptide": r["peptide"], "razor": r["razor"]}
+        if i % 4 == 3:
+            row["mapped"] = [proteins[(i // 3 + 1) % len(proteins)].pid]
+        rows.append(row)
+    chans = ("126", "127N", "128N", "129N")
+    # The samples alternate between the plexes, so both conditions are in
+    # both: a plex holding one condition only is confounded and the reader
+    # refuses it. The pool sits at a DIFFERENT channel in each plex, as it
+    # does in the real data, so reference_name and not reference_channel is
+    # what can resolve it.
+    for i, (plex, ref_chan, pool) in enumerate((("TMT1", "131C", "Pool01"),
+                                                ("TMT2", "131N", "Pool02"))):
+        ann = [(chans[j], s) for j, s in enumerate(samples[i::2])]
+        F.write_tmt_plex(root, plex, ann + [(ref_chan, pool)], rows,
+                         seed=40 + i)
+    return root
+
+
 ALL_FORMATS = ["diann", "fragpipe", "fragpipe_peptide", "fragpipe_ion",
-               "msstats_csv", "msstats_feature", "msstats_protein"]
+               "fragpipe_tmt", "msstats_csv", "msstats_feature",
+               "msstats_protein"]
 
 
 @pytest.mark.parametrize("fmt", ALL_FORMATS)
@@ -305,6 +346,29 @@ def test_repeated_runs_agree_across_hash_seeds(tmp_path):
     a = build_project(tmp_path / "h0")
     a.run(env={"PYTHONHASHSEED": "0"})
     b = build_project(tmp_path / "h1")
+    b.run(env={"PYTHONHASHSEED": "12345"})
+    assert _digest(a) == _digest(b)
+
+
+# The two above run the label-free peptide table, which is one file read in
+# row order. fragpipe_tmt is the reader with somewhere to hide: it walks a
+# DIRECTORY of plexes, keys each plex's channels through its own annotation
+# and joins the plexes on a feature key it builds itself, so its result can
+# depend on readdir order or on the iteration order of a dict in a way no
+# other format's can.
+def test_five_repeated_tmt_runs_give_one_hash(tmp_path):
+    seen = set()
+    for i in range(5):
+        proj = _project_for(tmp_path / f"tmt{i}", "fragpipe_tmt")
+        proj.run()
+        seen.add(_digest(proj))
+    assert len(seen) == 1, f"{len(seen)} distinct results from 5 TMT runs"
+
+
+def test_repeated_tmt_runs_agree_across_hash_seeds(tmp_path):
+    a = _project_for(tmp_path / "th0", "fragpipe_tmt")
+    a.run(env={"PYTHONHASHSEED": "0"})
+    b = _project_for(tmp_path / "th1", "fragpipe_tmt")
     b.run(env={"PYTHONHASHSEED": "12345"})
     assert _digest(a) == _digest(b)
 

@@ -506,6 +506,52 @@ def test_a_weak_diamond_hit_scores_half_the_weight_of_a_strong_one(
         df.loc["P_dark2", "effector_score"] == w - w // 2
 
 
+def _vfdb_scored(ma, tmp_path, paths_for, name, **over):
+    """P_dark1's export score with one categorised VFDB hit against it."""
+    ps = F.protein_set()
+    cfg, p = paths_for(name)
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    cfg.update(over)
+    F.write_emapper(p.emapper, ps)
+    F.write_diamond(os.path.join(p.diamond_dir, "vfdb.tsv"), [
+        ("P_dark1", "VFG1", 95.0, 1e-40, 300.0, 90,
+         "Type III secretion effector SopB (VFC0086)")])
+    return ma.build_annotation(cfg, p).loc["P_dark1", "export_score"]
+
+
+def test_a_zeroed_vfdb_cannot_be_resurrected_by_its_category_map(
+        ma, tmp_path, paths_for, capsys):
+    # symptom: the missing-weight WARN, doctor and the README all say a
+    # database whose diamond_weights entry is 0 or absent contributes nothing,
+    # but vfdb_category_weights was applied regardless — so a user who zeroed
+    # vfdb still collected 4 points per effector-delivery hit, and the only
+    # way to stop VFDB scoring was to empty the category map as well.
+    ps = F.protein_set()
+    cfg, p = paths_for("vfdb_none")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, ps)
+    no_hit = ma.build_annotation(cfg, p).loc["P_dark1", "export_score"]
+
+    weights = dict(ma.DEFAULT_CONFIG["diamond_weights"])
+    cat = ma.DEFAULT_CONFIG["vfdb_category_weights"]["VFC0086"]
+    weighted = _vfdb_scored(ma, tmp_path, paths_for, "vfdb_on")
+    assert weighted == no_hit + cat, \
+        "with a weight, the category map is what scores the hit"
+
+    zeroed = _vfdb_scored(ma, tmp_path, paths_for, "vfdb_zero",
+                          diamond_weights=dict(weights, vfdb=0))
+    assert zeroed == no_hit, "weight 0 must mean the database does not score"
+    absent = _vfdb_scored(ma, tmp_path, paths_for, "vfdb_absent",
+                          diamond_weights={k: v for k, v in weights.items()
+                                           if k != "vfdb"})
+    assert absent == no_hit, "an absent weight is weight 0, not weight 4"
+    # Silently dropping the map would read as the weighting not working.
+    err = capsys.readouterr().err
+    assert err.count("vfdb_category_weights is not applied") == 2
+    assert "diamond_weights.vfdb is 0" in err
+    assert "diamond_weights.vfdb is absent" in err
+
+
 def test_a_bare_lpxtg_motif_alone_is_not_a_sortase_substrate(ma, tmp_path,
                                                              paths_for):
     # symptom: a bare LP.TG 4-mer occurs by chance in ~0.03% of proteins and
