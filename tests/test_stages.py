@@ -996,20 +996,36 @@ def test_foldseek_requests_qtmscore_and_qlen_not_the_legacy_columns(
     assert fields == ma.FOLDSEEK_COLS
 
 
-def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
-        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
-    """Not every Foldseek release has qtmscore. Degrade, but never silently:
-    a run that quietly drops to the weaker gate is how this went unnoticed."""
-    calls = []
+# What run_cmd actually raises when a tool exits non-zero, and what Foldseek 5
+# actually prints for a format code it does not have. The old test invented
+# `ma.StageError("Invalid selection: qtmscore")`; run_cmd raises a plain
+# RuntimeError, and Foldseek's LocalParameters.cpp prints "Format code <field>
+# does not exist." So the string the fallback keys on has to be the real one.
+_FOLDSEEK_5_STDERR = (
+    "foldseek exited 1\n--- stderr tail ---\n"
+    "Format code qtmscore does not exist.\n")
 
+
+def _fake_foldseek(calls, fail_on_qtmscore=_FOLDSEEK_5_STDERR):
+    """A run_cmd that fails the full-column easy-search the way Foldseek does."""
     def fake_run(cmd, **kw):
         c = [str(x) for x in cmd]
         calls.append(c)
-        if c[1] == "easy-search" and "qtmscore" in c[c.index("--format-output") + 1]:
-            raise ma.StageError("Invalid selection: qtmscore")
+        if (len(c) > 1 and c[1] == "easy-search" and fail_on_qtmscore
+                and "qtmscore" in c[c.index("--format-output") + 1]):
+            raise RuntimeError(fail_on_qtmscore)
         return ""
+    return fake_run
 
-    monkeypatch.setattr(ma, "run_cmd", fake_run)
+
+def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
+        ma, tmp_path, paths_for, stub_bin, capsys, monkeypatch):
+    # symptom: run_cmd raises RuntimeError, StageError is a SUBCLASS of it,
+    # and the fallback was written `except StageError` — so it could never
+    # catch the failure it exists for. A Foldseek 5 build lost its structure
+    # evidence entirely instead of degrading to the legacy columns.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd", _fake_foldseek(calls))
     monkeypatch.setattr(ma, "have", lambda t: True)
     cfg, p = _fs_project(ma, tmp_path, paths_for)
     try:
@@ -1021,5 +1037,71 @@ def test_a_foldseek_that_rejects_the_new_columns_falls_back_and_says_so(
     second = search[1][search[1].index("--format-output") + 1].split(",")
     assert second == ma.FOLDSEEK_COLS_LEGACY
     err = capsys.readouterr().err
-    assert "no qtmscore/qlen" in err
+    assert "no qtmscore/ttmscore" in err
     assert "normalised by the alignment" in err
+
+
+def test_the_foldseek_retry_keeps_the_scratch_tree_so_only_convertalis_reruns(
+        ma, tmp_path, paths_for, stub_bin, monkeypatch):
+    # symptom: --format-output is consumed by convertalis, which easy-search
+    # runs AFTER the search, so this failure arrives with the whole multi-hour
+    # alignment already done in tmpd. The retry did shutil.rmtree(tmpd) first,
+    # throwing that away and re-running the search to change a formatting
+    # argument. Foldseek skips its search when the tree still holds the
+    # result, so the tree must survive between the two attempts.
+    calls, tmp_alive = [], []
+    inner = _fake_foldseek(calls)
+
+    def fake_run(cmd, **kw):
+        c = [str(x) for x in cmd]
+        if len(c) > 1 and c[1] == "easy-search":
+            tmpd = c[5]
+            # Stand in for the completed alignment the real search leaves.
+            os.makedirs(tmpd, exist_ok=True)
+            marker = os.path.join(tmpd, "result.dbtype")
+            tmp_alive.append(os.path.exists(marker))
+            open(marker, "w").close()
+        return inner(cmd, **kw)
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run)
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    try:
+        ma.stage_foldseek(cfg, p)
+    except Exception:              # noqa: BLE001
+        pass
+    assert len(tmp_alive) == 2, "expected exactly two easy-search attempts"
+    assert tmp_alive[1], (
+        "the scratch tree was cleared between the attempts, so the retry "
+        "re-runs the search instead of just the conversion")
+
+
+def test_a_foldseek_failure_that_is_not_a_bad_format_code_is_not_retried(
+        ma, tmp_path, paths_for, stub_bin, monkeypatch):
+    # symptom: widening the handler to catch what run_cmd raises would, on its
+    # own, retry EVERY foldseek failure — and a search that died on a full
+    # disk or a bad database has no completed alignment to reuse, so the retry
+    # repeats the multi-hour search to arrive at the same error.
+    calls = []
+    monkeypatch.setattr(ma, "run_cmd", _fake_foldseek(
+        calls, fail_on_qtmscore="foldseek exited 1\n--- stderr tail ---\n"
+                                "Error: Could not open database\n"))
+    monkeypatch.setattr(ma, "have", lambda t: True)
+    cfg, p = _fs_project(ma, tmp_path, paths_for)
+    with pytest.raises(RuntimeError, match="Could not open database"):
+        ma.stage_foldseek(cfg, p)
+    search = [c for c in calls if len(c) > 1 and c[1] == "easy-search"]
+    assert len(search) == 1, "a real failure must not be retried"
+
+
+def test_the_fallback_catches_what_run_cmd_actually_raises(ma):
+    # symptom: the whole defect in one line. StageError is a subclass of
+    # RuntimeError, so `except StageError` cannot catch run_cmd's
+    # RuntimeError; the reverse containment is what makes the handler work.
+    assert issubclass(ma.StageError, RuntimeError)
+    assert not issubclass(RuntimeError, ma.StageError)
+    src = open(METAANNOT_PY, encoding="utf-8").read()
+    fold = src[src.index("def stage_foldseek"):]
+    fold = fold[:fold.index("\ndef ")]
+    assert "except RuntimeError" in fold, (
+        "stage_foldseek must catch what run_cmd raises, not only StageError")

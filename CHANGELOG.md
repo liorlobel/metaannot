@@ -4,6 +4,39 @@
 
 ### Fixed
 
+**Foldseek's legacy-column fallback could never run, and would have paid for
+the search twice if it had.** `stage_foldseek` asks for `qtmscore` and `qlen`
+and falls back to the ten legacy columns when a build does not have them. It
+caught `StageError`. `run_cmd` raises a plain `RuntimeError` on a non-zero
+exit, and `StageError` is a **subclass** of `RuntimeError` — so the handler
+could not catch the one failure it exists for. A Foldseek 5 build lost its
+structure evidence outright instead of degrading. The test that covered it
+injected `ma.StageError("Invalid selection: qtmscore")`, a message no tool
+emits, so it passed over dead code.
+
+`stage_foldseek` is the only site with this shape: the other eight
+`except StageError` handlers are correct, because nothing on their paths
+reaches `run_cmd`.
+
+**The scratch tree now survives the retry.** `--format-output` is consumed by
+`convertalis`, which `easy-search` runs *after* the search — so this failure
+arrives with the entire multi-hour alignment already done and sitting in
+`tmpd`. The retry began with `shutil.rmtree(tmpd)`, throwing that away and
+re-running the search to change a formatting argument. Foldseek guards its
+search with `notExists "${result}.dbtype"`, so leaving the tree in place means
+the retry re-runs the conversion instead. The cleanup after a successful
+search is unchanged.
+
+**Only a rejected format code is retried.** Foldseek prints
+`Format code <field> does not exist.` to stderr and exits 1, and `run_cmd`
+carries that tail in its message. Any other failure — a bad database, a full
+disk, an OOM kill — is re-raised untouched: it has no completed alignment to
+reuse, so a retry would repeat the search to arrive at the same error.
+
+**The warning was wrong about `qlen`.** Foldseek 5 and earlier accept `qlen`;
+only `qtmscore` and `ttmscore` are missing. The message said "no
+qtmscore/qlen" and now names the right two columns and the version boundary.
+
 **Re-weighting VFDB was a silent no-op on a re-run.** `vfdb_category_weights`
 was in `finalise`'s signature keys but not in `integrate`'s. `build_annotation`
 is what applies the weighting, and `integrate` is what runs `build_annotation`
