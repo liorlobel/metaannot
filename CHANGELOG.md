@@ -4,6 +4,188 @@
 
 ### Added
 
+**The scheduler dispatches longest-first, not in table order.** Every stage
+with no dependencies is ready in the first round, so the first `stage_workers`
+of them IN TABLE ORDER started and the rest queued. The 455,571-protein run
+shows what that costs: with `stage_workers: 3` the first wave was emapper,
+pfam and dbcan, and InterProScan — the longest stage in the pipeline — did not
+start until **27.1 hours in**, when kofam finally freed a worker. dbcan, which
+takes ten minutes, held one of the three from the first second.
+
+Each stage now carries a coarse cost rank (3 = hours, 2 = minutes, 1 =
+seconds) taken off two real runs rather than intuition, and each round's ready
+set is sorted by it. Longest-processing-time-first is the standard greedy
+answer and it costs one sort of a list that is never longer than 21. The rank
+reaches no cache signature and no `keys` list — scheduling order cannot change
+a stage's output — and `stage_priority` indexes rather than defaults, so a
+stage added without a cost raises instead of silently ranking as trivial.
+
+**TMbed runs in resumable, length-sorted chunks.** TMbed writes nothing until
+it finishes — not "buffers a bit", nothing — so a single invocation over a
+whole proteome was an all-or-nothing bet measured in days. On the
+455,571-protein run it produced no progress bar and no partial file for 31
+hours; the two attempts before it died at 2 h 36 min with nothing recoverable.
+
+The input is now grouped into chunks of about `tmbed_chunk_residues`
+(5,000,000 by default, roughly 17k average proteins) and each is committed as
+it lands, so an interrupted run resumes from the last finished chunk. Under 5M
+residues there is exactly one chunk and the behaviour is unchanged; `0`
+disables the split.
+
+Chunks are length-sorted longest-first for two reasons: ProtT5 pads every
+sequence in a batch out to the longest one in it, so a chunk of similar
+lengths wastes less work; and whatever is going to exhaust the device is then
+in the FIRST chunk, where it costs one chunk to discover instead of the whole
+stage. The count is bounded at both ends — the budget is a floor, 256 parts a
+ceiling — since ProtT5 is loaded once per chunk. The floor adds the longest
+sequence to `total / max_parts`, because greedy packing closes a chunk when
+the next sequence would overflow it and can fall short by that much; without
+the term, 5,000 × 100 residues planned 264 parts against a ceiling of 256.
+
+A chunk that dies keeps whatever TMbed wrote. What reaches the committed file
+is reconciled against what was handed over — from the files, because a chunk
+can exit 0 and still come back short — and anything missing is named in
+`results/topology/tmbed_failed.tsv`. `tmbed_allow_partial` (default false)
+decides whether that is fatal, and `tmbed_max_consecutive_failures` (2) stops
+a wedged card from failing every remaining chunk the same way, slowly. The
+stage is now `empty_ok`: a proteome whose every sequence is over
+`tmbed_max_len` leaves an empty prediction file on purpose and runs nothing.
+
+`tmbed_chunk_residues` is deliberately not part of the signature — it changes
+the order of the records and not one prediction in them, and listing it would
+discard a 30-hour stage because someone tuned a checkpoint size. The two keys
+that change what is in the file are listed.
+
+**A per-database identity floor for DIAMOND: 50% for CARD, VFDB and BAGEL.**
+Hits from those three are read as claims about a particular protein, not as a
+family assignment, and the pipeline reported them down to the 30% global
+default. On the 455,571-protein run that was 39,138 CARD hits and 107,219 VFDB
+hits; above 50% they are 4,661 and 21,623. A 32%-identity match to a
+beta-lactamase over half a query is a hit against the fold, not evidence that
+the protein confers resistance.
+
+`diamond_min_pidents` mirrors `diamond_evalues` and is applied twice on
+purpose: as DIAMOND's `--id` during the search, so a floored database writes
+thousands of rows rather than hundreds of thousands, and again in the reader,
+because a `<tag>.tsv` adopted from elsewhere never saw `--id`. It also kills
+the half-weight rule for a floored database — nothing below
+`diamond_strong_pident` survives the filter — which the run now says once,
+rather than leaving the config implying a grading that cannot happen.
+
+**Coverage per identifier tier.** A merged search database is the normal case
+and its tiers do not annotate alike: the run this was built on is `uhgpL_`
+(395,467), `OIDECCNN_` (43,139), `uhgpSM_` (14,797) and `ampS_` (2,168), one
+of which arrives with precomputed annotations and one of which is ORFs nobody
+has ever seen. `finalise` writes `results/tier_coverage.tsv` — count, share,
+percentage carrying each kind of evidence, percentage dark, median export
+score — and `emapper` logs and records the same split for its own coverage.
+
+Tiers are detected from the identifier prefix, and declined in the two cases
+where a prefix is not a source label: one prefix over everything, and more
+than twelve. When declined, no file is written **and the run says why**, so an
+absent table is never ambiguous. A column absent from the frame is skipped
+rather than reported as 0%, because "the stage did not run" and "the stage
+found nothing" must not share a cell.
+
+**`doctor` recognises a motif seed set.** The BAGEL database this pipeline
+built and searched — 262 entries, mean 15 residues, exactly 0 hits against
+38,204 proteins — was not a bacteriocin sequence database. BAGEL4 ships two
+things that look alike on disk, and what got built was the motif SEED set its
+HMM step uses. The existing check answered that with "lower your `--evalue`",
+which is wrong twice over: it sends the reader to tune a threshold on the
+wrong kind of file, and the tuned search then produces meaningless hits
+instead of meaningless silence.
+
+Two signals, either sufficient: a typical sequence under 25 residues, and
+seed-set markers in the headers of a source FASTA beside the `.dmnd`. 25 and
+not 40, because mature nisin is 34 residues and a genuinely short bacteriocin
+database must not be accused of this. The message replaces the e-value advice
+rather than joining it; that check is not gone, only narrower.
+
+### Fixed
+
+**A structure interrupted mid-write counted as folded, for ever.** The resume
+rule for `esmfold` is "the `.pdb` is there, so it is folded", and each
+structure was written in place. `open()` truncates immediately, so a run
+interrupted between the open and the flush — a wedged card, a bugcheck, a
+Ctrl-C, all of which this stage has seen — left a 0-byte file that every later
+run counted. The protein was then permanently absent from Foldseek with
+nothing anywhere to say why.
+
+Structures go through `atomic_out` now, whose temp is dot-prefixed and keeps
+its extension, so `glob("*.pdb")` never sees a file something is still
+writing. For the files already on disk, `folded_already()` checks for a
+coordinate line — and not only in the fold loop: the early exit that decides
+whether the GPU is touched at all asks the same question first, so a guard in
+the loop alone would have been unreachable.
+
+**The results lock survived SIGTERM and SIGHUP.** `atexit` does not run on
+either — Python's default handler terminates the process outright — so a run
+stopped by `kill`, by a scheduler hitting its time limit, or by a closing ssh
+session left a lock naming a pid that no longer exists. On the same host the
+next run can prove it is dead; from another node it cannot, and the resume
+became a stale-lock refusal needing `--force-unlock`.
+
+The handler releases the lock, flushes the log and exits 128+N. It does not
+stop the tools already running — they are separate processes that outlive us —
+and it uses `os._exit`, because `SystemExit` would unwind through the stage
+pool's `with`, which waits for its workers, and a tmbed chunk can be an hour.
+SIGINT stays unhandled on purpose: Python raises `KeyboardInterrupt` for it,
+which unwinds the lock's `with` and runs `atexit`.
+
+Writing the test found a live bug in the handler itself. `cmd_run` bound
+`lock` twice — the `ResultsLock` at the top and a `threading.Lock` 230 lines
+below — and a closure captures the name, so the handler called
+`threading.Lock.__exit__`, died with "release unlocked lock", and took the run
+out with an uncaught `RuntimeError` and exit 1 instead of releasing anything.
+The mutex is `state_lock` now, and both the handler and `atexit` hold the
+bound method rather than the name.
+
+**`doctor --fix` ran POSIX shell through cmd.exe.** Every command it generates
+is `mkdir -p` / `curl` / `tar` / `gunzip` / `hmmpress`, and
+`subprocess(shell=True)` on Windows hands those to cmd.exe, where
+`mkdir -p C:\db` creates a directory called `-p` and each step can exit 0
+having done nothing — precisely the failure the post-install verification
+exists to catch, happening for every item at once. It refuses there now and
+names the alternative: `--install-plan` here, `wsl bash install.sh` where the
+tools live. `--install-plan` itself still works on Windows.
+
+**The results lock could never be reclaimed on Windows.** `_holder_is_alive`
+returned True unconditionally there, because `os.kill(pid, 0)` calls
+`TerminateProcess` and asking whether a process is alive that way would kill
+it — but that made a crashed run permanently unresumable without
+`--force-unlock`, and a crash is exactly when reclaiming has to work.
+`OpenProcess` asks without touching the process. Unprovable still means alive:
+only `ERROR_INVALID_PARAMETER`, the answer for a pid that does not exist at
+all, is taken as proof of death.
+
+### Documentation
+
+The resource guide now carries the second run's measured numbers and says
+plainly which three stages had not finished when it was written, rather than
+rounding an unfinished stage into the table. The linear-scaling claim is
+replaced with the measured spread: 11.9× the proteins gave 14–30× the time on
+the stages that finished, with MMseqs2 the exception at 7.6×. A new table
+gives the start time of every stage on that run, which is where the 27-hour
+InterProScan delay is visible.
+
+Corrected throughout: the Pittsburgh proteome is **455,571 proteins /
+214.9M residues**, counted off the FASTA. Several comments written during this
+work said 1.3M, which was a recollection rather than a measurement. Also
+corrected in three places: BAGEL's 262 entries of median length 15 are its
+motif seed set, not "262 bacteriocin sequences", and the documented
+`stage_workers` default is 4.
+
+### Tests
+
+The suite is green on Windows for the first time: 723 passed, 0 failed. Three
+failures there were platform assumptions rather than defects — a path test
+comparing POSIX strings, and two tests using signals Windows cannot deliver to
+a child — and two were the real Windows defects fixed above. The signal tests
+are skipped on Windows and verified under Linux, where they pass.
+
+### Added
+
 **`doctor` reports the GPU.** It had no GPU check at all, so a machine with no
 usable CUDA device turned on `run.structure`, was told "all checks passed",
 waited hours, and learned the truth when `esmfold` finally ran and exited. With

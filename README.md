@@ -202,8 +202,9 @@ keeps its evidence, so a bare AlphaFold accession is not demoted — on the
 default AFDB50 target the demotion therefore fires rarely, for want of any text
 to test.
 
-That is the complete set; `annotation_final.tsv`, `bin_summary.tsv` and the
-report's factor levels use exactly these seven strings. The tests are applied in
+That is the complete set; `annotation_final.tsv`, `bin_summary.tsv`,
+`tier_coverage.tsv` and the report's factor levels use exactly these seven
+strings. The tests are applied in
 the order KO-with-pathway, KO, sequence annotation, DUF, structure, profile, so a
 DUF-only protein stays in `3d_duf_only` however good its fold or profile hit is
 — deliberate, since a DUF still names a family, and the run counts how many were
@@ -846,6 +847,41 @@ is **not** reported as `MANUAL: no path configured`.
 Give each database you do keep an entry in `diamond_weights` or it scores 0 and
 the run warns.
 
+### The identity a hit has to reach
+
+Not every DIAMOND database is read the same way. A MEROPS or TADB hit is a
+family assignment — "this looks like a protease" — and 30% identity over good
+coverage supports that. A CARD, VFDB or BAGEL hit is read as a claim about a
+**particular** protein: this confers resistance, this is a virulence factor.
+A 32%-identity match to a beta-lactamase over half a query is a hit against
+the fold, and reporting it as "carries an AMR gene" is the claim a reviewer
+would check first.
+
+```yaml
+thresholds:
+  diamond_min_pident: 30     # merops, tadb, and anything else
+diamond_min_pidents:
+  card: 50                   # defaults; override or empty to change them
+  vfdb: 50
+  bagel: 50
+```
+
+On the 455,571-protein run this is the difference between 39,138 CARD hits and
+4,661, and between 107,219 VFDB hits and 21,623.
+
+`diamond_min_pidents` mirrors `diamond_evalues` and is applied **twice on
+purpose**: as DIAMOND's own `--id` during the search, so a floored database
+writes thousands of rows instead of hundreds of thousands, and again when the
+table is read, because a `<tag>.tsv` adopted from another machine or written
+before the floor existed never saw `--id`. It is part of the `diamond`,
+`integrate` and `finalise` signatures.
+
+One consequence worth knowing: `thresholds.diamond_strong_pident` (50) halves
+the weight of a hit below it, and a database floored at or above that number
+can no longer produce one. Every VFDB hit that reaches the scoring takes the
+full weight, and the run says so once rather than leaving the config implying
+a grading that cannot happen.
+
 ### A database that cannot hit
 
 Three things a DIAMOND database can do that look exactly like "no virulence
@@ -1180,6 +1216,35 @@ earlier, larger `dark.faa` cannot mask a shortfall — but when `finalise` takes
 its "no structure or profile evidence, reusing the first pass" path, no
 shortfall message is printed at all.
 
+### Did the parts of a merged database annotate alike?
+
+The search database for a metaproteomics run is normally a merge, and one
+headline coverage over it is an average of things that are not alike. The run
+this tool was built on is four tiers by identifier prefix: `uhgpL_` (395,467
+UHGP proteins), `OIDECCNN_` (43,139 Prokka calls off the matched metagenome),
+`uhgpSM_` (14,797) and `ampS_` (2,168). One of those arrives with precomputed
+eggNOG annotations and another is ORFs nobody has ever seen — which is the
+reason the proteome was merged in the first place, and exactly what "94% have
+an eggNOG hit" hides.
+
+`finalise` writes `results/tier_coverage.tsv`: one row per prefix with the
+count, the share of the proteome, the percentage carrying each kind of
+evidence, the percentage dark, and the median export score. `emapper` logs and
+records the same split for its own coverage, which is where the difference is
+starkest.
+
+Tiers are detected, not configured: the prefix is the text up to the first
+`_`, `|`, `:` or `.`. Two cases are declined rather than guessed at — one
+prefix over everything (contig ids all share `k141_`, so splitting says
+nothing) and more than twelve (one Prokka locus tag per MAG is not a source
+label). When that happens no file is written **and the run says why**, so an
+absent `tier_coverage.tsv` is never ambiguous between "not applicable" and "a
+stage failed". A UniProt-style merge splits into `sp|` and `tr|` for free.
+
+A column absent from the annotation frame is skipped rather than reported as
+0%: "the stage did not run" and "the stage found nothing" are different
+answers and must not share a cell.
+
 ### Do the sources agree, or merely overlap?
 
 Two sources reaching the same protein is not the same as the two of them
@@ -1251,6 +1316,47 @@ can land either side of the score it would have had.
 The key is part of the `tmbed` stage's signature, so changing it re-runs that
 stage, and the predictions it writes are an input to `integrate`, so that and
 `finalise` follow. No other stage recomputes.
+
+### TMbed writes nothing until it finishes
+
+Not "buffers a bit" — nothing. On the 455,571-protein run it produced no
+progress bar and no partial file for 31 hours, and the two attempts before it
+died at 2 h 36 min with nothing recoverable. A single invocation over a whole
+proteome is therefore an all-or-nothing bet measured in days.
+
+```yaml
+tmbed_chunk_residues: 5000000   # 0 = one invocation, the old behaviour
+tmbed_allow_partial: false      # true: finish without the failed chunks
+tmbed_max_consecutive_failures: 2
+```
+
+The input is grouped into chunks of about that many residues and each is
+committed as it lands, so an interrupted run resumes from the last finished
+chunk. Under 5M residues — roughly 17k average proteins — there is exactly one
+chunk and the behaviour is what it always was.
+
+Chunks are **length-sorted, longest first**, for two reasons: ProtT5 pads every
+sequence in a batch out to the longest one in it, so a chunk of similar lengths
+wastes less work than one mixing 30-residue peptides with 3,000-residue
+proteins; and whatever is going to exhaust the device is then in the *first*
+chunk, where it costs one chunk to discover instead of the whole stage. The
+count is bounded at both ends — the budget is a floor, 256 parts a ceiling —
+because ProtT5 is loaded once per chunk.
+
+A chunk that dies keeps whatever TMbed wrote. What ends up in the committed
+file is reconciled against what was handed over, from the files rather than
+from the loop's bookkeeping, because a chunk can exit 0 and still come back
+short; anything missing is named in `results/topology/tmbed_failed.tsv`. By
+default that shortfall is fatal, so nothing downstream reads a partial
+topology set by accident, and `tmbed_max_consecutive_failures` stops a wedged
+card from failing every remaining chunk the same way, slowly.
+
+`tmbed_chunk_residues` is deliberately **not** part of the stage signature. It
+changes how the work is divided, and therefore the order of the records, but
+not one prediction in them; listing it would discard a 30-hour stage because
+someone tuned a checkpoint size. `tmbed_allow_partial` and
+`tmbed_max_consecutive_failures` *are* listed, because they change what is in
+the file.
 
 ### The length a card can actually fold
 
@@ -1473,9 +1579,24 @@ protein count: 1,805 folds at or under 478 aa took 1.6 h in total, while the 91
 sequences above that machine's VRAM cliff were projected at 7.4 h on their own.
 See **The length a card can actually fold**.
 
-Those figures scale roughly with protein count. On a 455,571-protein run —
-twelve times the size — expect InterProScan alone to pace the whole thing at
-well over a day.
+**They do not scale linearly.** On a 455,571-protein run — 11.9× the size —
+the stages that finished came in at 14–30×, not 12×: kofam 14.3 h (29×), pfam
+7.2 h (16×), ncbifam 5.6 h (14×), dbcan 617 s (15×), diamond 291 s (30×). The
+cause is contention rather than size: at 38k a long stage rarely overlaps
+another long stage, and at 455k every one of them overlaps every other for its
+whole life. SignalP measured 11.4 sequences/s with the machine mostly to
+itself and 2.0–3.2 sequences/s alongside tmbed and kofam — the same work,
+three to five times slower. Doubling the linear estimate past ~100k proteins
+is a fair planning rule and an optimistic one for the worst stage.
+
+MMseqs2 is the exception: 455,571 proteins clustered into 49,347 families in
+109 seconds, 7.6× for 11.9× the proteins, because clustering scales with
+redundancy rather than with count.
+
+Three of that run's stages had not finished when this was written, and are
+deliberately not quoted rather than rounded: SignalP was 58% through after
+30.7 h, InterProScan had been going 3.7 h, and TMbed had written nothing at
+all in 30.7 h. See [TUTORIAL.md](TUTORIAL.md#resource-guide--and-how-to-size-a-run).
 
 The hot paths are vectorised: protein-group explosion, bin assignment and
 export scoring are array operations, not row-wise `apply`, and sequences are

@@ -713,7 +713,10 @@ evaluates a document with the working directory set to its own folder.
 | a stage runs even though its `run.<stage>` flag is false | it was named with `--only` | intended — `--only` is a clearer statement of intent than a flag left off for another machine, and the run warns. This is how the GPU box runs `tmbed`/`esmfold` against the server's config |
 | `waiting for the GPU — tmbed is using it` | `esmfold` and `tmbed` both need the card | expected, not stuck. Each wants essentially a whole GPU (15.5 GB and 13.3 GB of a 16 GB device were observed), so they are leased one at a time; every CPU-only stage keeps running. `gpu_workers` raises the count, but they all still share the single `gpu_device` |
 | `refusing to search a DIAMOND database that cannot answer` | a `.dmnd` that is empty, truncated, or holds no sequences | a failed `diamond makedb` leaves one behind, and searching it reports 0 hits — the same output as a real absence. Rebuild it with the `diamond makedb` line the message prints, or drop the tag with `<tag>: ""` |
-| `incapable of a hit before it starts` | the database's sequences are too short for the configured e-value | a 15-residue peptide cannot reach `1e-10`, so that search's 0 hits say nothing about the biology. Give the tag its own threshold under `diamond_evalues:`, or record that this database needs different settings. The warning also names the `diamond_weights` entry that claims the database can score |
+| `incapable of a hit before it starts` | the database's sequences are too short for the configured e-value | that search's 0 hits say nothing about the biology. Give the tag its own threshold under `diamond_evalues:`, or record that this database needs different settings. The warning also names the `diamond_weights` entry that claims the database can score |
+| `looks like a motif or seed set rather than a protein sequence database` | the `.dmnd` was built from motifs, not sequences | check **what** you built before touching any threshold. BAGEL4 ships bacteriocin sequence files *and* the motif seed set its HMM step uses (`LE-`, `MA-`, `ggmotif`, `lasso`, median 15 residues); building the seed set gives 0 hits and no e-value fixes that, because a `blastp` against 15-residue seeds searches for those residues and not for the molecules they mark. Rebuild from the sequence files |
+| `doctor --fix cannot run on Windows` | `--fix` on a Windows host | its install commands are POSIX shell and cmd.exe mis-executes them (`mkdir -p C:\db` makes a directory called `-p`). Use `--install-plan install.sh` here and `wsl bash install.sh` where the tools live |
+| `got no prediction; listed in tmbed_failed.tsv` | one or more tmbed chunks failed | the finished chunks are kept and a rerun resumes from them. If the card is wedged, restart the machine or the WSL session rather than rerunning. `tmbed_allow_partial: true` accepts the shortfall deliberately |
 
 ---
 
@@ -726,24 +729,34 @@ its own numbers; quote those rather than these.
 Two real runs on one workstation (22 cores, 94 GB to WSL2, one 16 GB card),
 three stages at a time:
 
-| stage | 38,204 proteins | 455,571 proteins |
-|---|---|---|
-| `emapper` (reuse) | 0.02 h | 0.02 h |
-| `diamond` (5 databases) | under a minute | 0.08 h |
-| `dbcan` | 0.01 h | 0.17 h |
-| `cluster` (MMseqs2) | under a minute | **0.03 h** |
-| `pfam` | 0.45 h | **7.2 h** |
-| `ncbifam` | 0.40 h | **5.6 h** |
-| `kofam` | 0.49 h | 10 h+ |
-| `signalp` | 0.93 h | 50 h+ |
-| `tmbed` | 0.87 h | 23 h+ |
-| `interpro` | 2.84 h | ~34 h |
-| `foldseek` | 0.02 h | — |
-| `esmfold` | 1.6 h for 1,805 models under 478 aa | — |
+| stage | 38,204 proteins | 455,571 proteins | ratio |
+|---|---|---|---|
+| `emapper` (reuse) | 3.0 s | 76 s | 25× |
+| `diamond` (5 databases) | 9.7 s | 291 s | 30× |
+| `cluster` (MMseqs2) | 14 s | **109 s** | **7.6×** |
+| `dbcan` | 41 s | 617 s | 15× |
+| `ncbifam` | 0.40 h | **5.6 h** | 14× |
+| `pfam` | 0.45 h | **7.2 h** | 16× |
+| `kofam` | 0.49 h | **14.3 h** | 29× |
+| `signalp` | 0.93 h | *still running* | — |
+| `tmbed` | 0.87 h | *still running* | — |
+| `interpro` | 2.84 h | *still running* | — |
+| `foldseek` | 57 s | — | — |
+| `esmfold` | 1.6 h for 1,805 models under 478 aa | — | — |
+
+The three *still running* cells are not estimates withheld for tidiness —
+that run was in its 31st hour when this table was written and those stages had
+not finished. What was known at that moment: SignalP was 58% through
+(262,200 of 455,571 sequences after 30.7 h, so on the order of 53 h);
+InterProScan had been going 3.7 h; TMbed had written **nothing at all** in
+30.7 h, which is what that tool does — see `tmbed_chunk_residues` below.
+Rather than round those into the table, read your own: every stage records
+its `seconds` in `results/.metaannot_state.json`.
 
 ### The thing that surprises people: it is not linear
 
-The protein count went up 11.9×. Most stages went up **15–50×**.
+The protein count went up **11.9×**. The stages that finished went up
+**14–30×**, and the spread between them is as informative as the numbers.
 
 The reason is contention, not size. At 38k every stage finishes quickly, so
 three-at-a-time rarely means three long stages overlapping. At 455k every long
@@ -752,12 +765,35 @@ they share 22 cores. SignalP measured **11.4 sequences/s** with the machine
 mostly to itself and **2.0–3.2 sequences/s** with tmbed and KOfam alongside —
 the same work, three to five times slower.
 
-So: **scale by observed contention, not by protein count.** A useful rule is to
-take the linear estimate and double it once you are past about 100k proteins.
+So: **scale by observed contention, not by protein count.** The measured
+overshoot against a linear estimate ran from 1.2× (ncbifam) to 2.5× (kofam),
+so doubling the linear estimate past about 100k proteins is a fair planning
+rule and an optimistic one for the worst stage.
 
 MMseqs2 is the exception worth noting — 455,571 proteins clustered into 49,347
-families in 108 seconds, because clustering scales with redundancy rather than
-with count.
+families in 109 seconds, **7.6×** for 11.9× the proteins, because clustering
+scales with redundancy rather than with count.
+
+### The other thing: when a stage starts is not when it is reached
+
+On that same run, with `stage_workers: 3`, the stages started here:
+
+| start | stage | why then |
+|---|---|---|
+| 0 s | `emapper`, `pfam`, `dbcan` | first three **in table order** |
+| 76 s | `diamond` | emapper finished |
+| 291 s | `signalp` | diamond finished |
+| 617 s | `tmbed` | dbcan finished |
+| 7.2 h | `cluster`, `ncbifam` | pfam finished |
+| 12.8 h | `kofam` | ncbifam finished |
+| **27.1 h** | **`interpro`** | kofam finished |
+
+InterProScan is the longest stage in the pipeline and it started **27 hours
+in**, because it is tenth in a table whose first three entries include one
+that takes ten minutes. Since v0.4.0 the scheduler sorts each round's ready
+stages longest-first, so the hours-class stages claim the workers and dbcan
+waits instead. It is still worth giving InterProScan its own pass at this
+scale — see below — but it no longer queues behind a ten-minute stage.
 
 ### Sizing your run
 
@@ -808,13 +844,44 @@ Past roughly 150k proteins, three decisions matter more than any tuning:
 
 ### Stages that write nothing until they finish
 
-`tmbed` and the `hmmsearch` stages buffer their output and write once at the
-end. On a large database that means many hours with an empty output file, which
-cannot be told from a hang — check CPU time (`ps -o time -C tmbed`) rather than
-file size. It also means a crash loses the whole stage.
+The `hmmsearch` stages buffer their output and write once at the end. On a
+large database that means hours with an empty output file, which cannot be
+told from a hang — check CPU time (`ps -o time -C hmmsearch`) rather than file
+size. A crash loses the whole stage.
 
-`esmfold` is the exception: it checkpoints every model as it is written, so a
-machine that dies at protein 1,800 of 1,900 costs the tail and nothing else.
+**TMbed is the extreme case**, and since v0.4.0 the tool works around it. On
+the 455,571-protein run it wrote nothing at all for the first 31 hours: not a
+progress bar, not a partial file. Two earlier attempts died at 2 h 36 min with
+nothing recoverable. So the input is now split into chunks of about
+`tmbed_chunk_residues` (5,000,000 by default, roughly 17k average proteins),
+each committed as it lands:
+
+```yaml
+tmbed_chunk_residues: 5000000   # 0 = one invocation, the old behaviour
+tmbed_allow_partial: false      # true: finish without the failed chunks
+tmbed_max_consecutive_failures: 2
+```
+
+An interrupted run resumes from the last finished chunk instead of starting
+over, and the log says which chunk it is on and roughly how long is left. The
+chunks are length-sorted longest-first, so the sequences most likely to
+exhaust the card are in the *first* chunk, where that costs minutes to
+discover rather than the whole stage. The price is one ProtT5 load per chunk,
+which is why the budget is millions of residues and not thousands — under 5M
+there is exactly one chunk and nothing changes.
+
+A chunk that dies keeps whatever TMbed managed to write, and what came back is
+reconciled against what was handed over — from the files, because a chunk can
+exit 0 and still be short. Anything missing is named in
+`results/topology/tmbed_failed.tsv`, and by default that is fatal, so nothing
+downstream reads a short topology set by accident.
+
+`esmfold` checkpoints every model as it is written, so a machine that dies at
+protein 1,800 of 1,900 costs the tail and nothing else. Each structure is
+**renamed** into place rather than written in place — a run killed between the
+open and the flush used to leave a 0-byte `.pdb` that every later run counted
+as folded, and a file with no coordinate line in it is now refolded rather
+than trusted.
 
 ---
 
