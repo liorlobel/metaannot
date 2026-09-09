@@ -5,6 +5,7 @@ and 3 GB of weights - but the part that has actually cost time is not the
 folding, it is what happens when a fold fails partway through a long run. That
 part is pure control flow, so it is faked here rather than skipped.
 """
+import io
 import os
 import sys
 import types
@@ -415,3 +416,83 @@ def test_a_work_list_entirely_over_max_len_structure_skips_the_gpu(folding,
     err = capsys.readouterr().err
     assert "the GPU is not touched at all" in err
     assert "backend on" not in err
+
+
+# --- interrupted writers ----------------------------------------------
+# symptom: the resume rule is "the .pdb is there, so it is folded", and the
+# file was written in place. A run killed between open() and the flush — a
+# wedged card, a bugcheck, a Ctrl-C, all of which this stage has seen — left a
+# 0-byte structure that every later run counted as done. The protein was then
+# permanently absent from Foldseek with nothing anywhere to say why.
+def test_a_structure_is_renamed_into_place_never_written_in_place(
+        folding, ma, monkeypatch):
+    seen = []
+    real = ma.atomic_out
+    import contextlib
+
+    @contextlib.contextmanager
+    def spy(path):
+        with real(path) as tmp:
+            seen.append((path, tmp))
+            yield tmp
+    monkeypatch.setattr(ma, "atomic_out", spy)
+    cfg, p, _ = folding(_seqs(3))
+    pdbs = [(dst, tmp) for dst, tmp in seen if dst.endswith(".pdb")]
+    assert len(pdbs) == 3, seen
+    for dst, tmp in pdbs:
+        assert tmp != dst, "the structure was written straight to its name"
+        assert os.path.basename(tmp).startswith("."), \
+            f"{tmp} is not hidden from glob('*.pdb')"
+        assert tmp.endswith(".pdb")
+    assert _folded(p) == ["P000", "P001", "P002"]
+    assert not [f for f in os.listdir(p.structures)
+                if ma.ATOMIC_SUFFIX in f], "a temp was left behind"
+
+
+def test_an_empty_structure_left_by_a_killed_writer_is_refolded(
+        folding, ma, capsys):
+    cfg, p, model = folding(_seqs(2))
+    open(f"{p.structures}/P001.pdb", "w", encoding="utf-8").close()
+    capsys.readouterr()
+    folding(_seqs(2), reuse=(cfg, p))
+    err = capsys.readouterr().err
+    assert "holds no atom" in err
+    assert os.path.getsize(f"{p.structures}/P001.pdb") > 0
+    assert "ATOM" in io.open(f"{p.structures}/P001.pdb",
+                             encoding="utf-8").read()
+
+
+def test_a_structure_with_no_atom_records_is_refolded(folding, ma, capsys):
+    cfg, p, model = folding(_seqs(2))
+    io.open(f"{p.structures}/P000.pdb", "w", encoding="utf-8").write(
+        "HEADER    truncated before the coordinates\n")
+    capsys.readouterr()
+    folding(_seqs(2), reuse=(cfg, p))
+    assert "ATOM" in io.open(f"{p.structures}/P000.pdb",
+                             encoding="utf-8").read()
+
+
+def test_a_complete_structure_is_still_skipped(folding, ma, capsys):
+    # the guard must not turn a resume into a refold: that is the whole point
+    # of the stage keeping its output.
+    cfg, p, model = folding(_seqs(3))
+    before = dict(model.attempts)
+    capsys.readouterr()
+    _, _, model2 = folding(_seqs(3), reuse=(cfg, p))
+    assert model2.attempts == {}, "a finished structure was folded again"
+    assert before and "holds no atom" not in capsys.readouterr().err
+
+
+def test_a_torn_structure_does_not_make_the_stage_decide_it_is_finished(
+        folding, ma, capsys):
+    # the early exit runs BEFORE the loop and before the GPU is touched, so a
+    # guard in the loop alone is unreachable: the stage would announce that
+    # everything was already folded and return, leaving the damaged file for
+    # Foldseek.
+    cfg, p, _ = folding(_seqs(2))
+    open(f"{p.structures}/P000.pdb", "w", encoding="utf-8").close()
+    capsys.readouterr()
+    _, _, model = folding(_seqs(2), reuse=(cfg, p))
+    err = capsys.readouterr().err
+    assert "the GPU is not touched at all" not in err
+    assert list(model.attempts) == ["P000"], model.attempts

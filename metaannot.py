@@ -4770,6 +4770,33 @@ def vram_fit_length(cfg, torch):
     return n
 
 
+def folded_already(path):
+    """A committed structure, as opposed to what a killed writer left behind.
+
+    The resume rule for this stage is "the .pdb is there, so it is folded",
+    and open() truncates the moment it is called, so a run interrupted between
+    the open and the flush leaves a 0-byte or header-only file that
+    os.path.exists cannot tell from a finished one. Every later run then
+    counted it, and the protein was permanently absent from Foldseek with
+    nothing anywhere to say why. Structures are renamed into place now, so
+    this cannot happen again, but the files already on disk from before it
+    still can.
+
+    Stops at the first coordinate line, so checking a whole directory costs
+    one short read per file rather than a full pass over gigabytes.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return False
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("ATOM"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def stage_esmfold(cfg, p):
     os.makedirs(p.structures, exist_ok=True)
     if not nonempty(p.dark):
@@ -4789,7 +4816,7 @@ def stage_esmfold(cfg, p):
     static_cap = int(cfg["max_len_structure"])
     pending = [q for q, t in read_fasta(p.dark)
                if len(t) <= static_cap
-               and not os.path.exists(f"{p.structures}/{q}.pdb")]
+               and not folded_already(f"{p.structures}/{q}.pdb")]
     if not pending:
         n_have = len(glob.glob(f"{p.structures}/*.pdb"))
         log(f"esmfold: every sequence at or under max_len_structure="
@@ -4955,15 +4982,21 @@ def stage_esmfold(cfg, p):
         for pid, seq in seqs:
             out_pdb = f"{p.structures}/{pid}.pdb"
             if os.path.exists(out_pdb):
-                skipped += 1
-                if pid not in seen:
-                    with open(out_pdb, encoding="utf-8") as fh:
-                        mp = mean_plddt(fh.read())
-                    ph.write(f"{pid}\t{len(seq)}\t"
-                             + (f"{mp:.1f}\n" if mp is not None else "NA\n"))
-                    ph.flush()
-                    seen.add(pid)
-                continue
+                if not folded_already(out_pdb):
+                    log(f"esmfold: {out_pdb} holds no atom, which is what an "
+                        "interrupted writer leaves behind; refolding it "
+                        "rather than counting it", "WARN")
+                else:
+                    skipped += 1
+                    if pid not in seen:
+                        with open(out_pdb, encoding="utf-8") as fh:
+                            mp = mean_plddt(fh.read())
+                        ph.write(f"{pid}\t{len(seq)}\t"
+                                 + (f"{mp:.1f}\n" if mp is not None
+                                    else "NA\n"))
+                        ph.flush()
+                        seen.add(pid)
+                    continue
             pdb, chunk = None, base_chunk
             why = ""
             for attempt in (0, 1):
@@ -5024,8 +5057,15 @@ def stage_esmfold(cfg, p):
                     break
                 continue
             consecutive = 0
-            with open(out_pdb, "w", encoding="utf-8") as fh:
-                fh.write(pdb)
+            # Renamed into place, never written in place. This loop runs for
+            # hours and is interrupted often — a wedged card, a bugcheck, a
+            # Ctrl-C — and the resume rule is "the file is there, so it is
+            # folded". atomic_out's temp is dot-prefixed and keeps the
+            # extension, so glob("*.pdb") never sees it and a leftover cannot
+            # come back as a structure named ".P0001.9134.7.part".
+            with atomic_out(out_pdb) as tmp_pdb:
+                with open(tmp_pdb, "w", encoding="utf-8") as fh:
+                    fh.write(pdb)
             mp = mean_plddt(pdb)
             ph.write(f"{pid}\t{len(seq)}\t"
                      + (f"{mp:.1f}\n" if mp is not None else "NA\n"))
