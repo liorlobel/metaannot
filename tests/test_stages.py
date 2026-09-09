@@ -917,17 +917,35 @@ def test_a_healthy_database_is_searched_without_comment(ma, tmp_path,
     assert os.path.exists(f"{p.diamond_dir}/vfdb.tsv")
 
 
-def test_a_short_peptide_database_warns_that_the_evalue_is_unreachable(
+def test_a_seed_set_is_named_as_one_and_not_blamed_on_the_evalue(
         ma, tmp_path, paths_for, stub_bin, capsys):
-    # BAGEL's real shape: 262 sequences, median 15 residues.
+    # 262 sequences / 4009 letters is the shape of the database this pipeline
+    # actually built and searched: BAGEL4's motif SEED set, mean 15 residues,
+    # 0 hits against 38,204 proteins. The e-value was never the problem.
     db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
     cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
     ma.stage_diamond(cfg, p)
     err = capsys.readouterr().err
-    assert "incapable of a hit before it starts" in err
+    assert "motif or seed set rather than a protein sequence database" in err
     assert "15 residues" in err
-    assert "diamond_evalues" in err
-    # it still runs: this is a warning about the threshold, not a broken file
+    assert "NO e-value makes that a real search" in err
+    assert "diamond_evalues" not in err
+    # it still runs: this is a warning about what was built, not a broken file
+    assert os.path.exists(f"{p.diamond_dir}/bagel.tsv")
+
+
+def test_a_short_peptide_database_warns_that_the_evalue_is_unreachable(
+        ma, tmp_path, paths_for, stub_bin, capsys):
+    # 40-residue peptides are long enough not to be a seed set, and still
+    # cannot reach an --evalue somebody set to 1e-30.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=10480)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
+    cfg["diamond_evalues"] = {"bagel": 1e-30}
+    ma.stage_diamond(cfg, p)
+    err = capsys.readouterr().err
+    assert "incapable of a hit before it starts" in err
+    assert "40 residues" in err
+    assert "motif or seed set" not in err
     assert os.path.exists(f"{p.diamond_dir}/bagel.tsv")
 
 
@@ -949,6 +967,9 @@ def test_a_per_database_evalue_silences_the_warning_and_is_used(
     ma.stage_diamond(cfg, p)
     err = capsys.readouterr().err
     assert "incapable of a hit" not in err
+    # the seed-set warning is about WHAT was built and is not silenced by a
+    # threshold; only the e-value advice is.
+    assert "motif or seed set" in err
     assert "searching at --evalue 0.001 from diamond_evalues" in err
     assert ma.diamond_evalue_for(cfg, "bagel") == 1e-3
     assert ma.diamond_evalue_for(cfg, "vfdb") == \
@@ -1021,8 +1042,13 @@ def test_doctor_refuses_a_zero_byte_diamond_database(tmp_path):
     assert "diamond makedb" in proc.stdout
 
 
-def test_doctor_warns_about_a_database_too_short_for_the_evalue(tmp_path,
-                                                                stub_bin):
+def test_doctor_recognises_a_motif_seed_set_rather_than_blaming_the_evalue(
+        tmp_path, stub_bin):
+    # 262 sequences / 4009 letters is the real BAGEL database that prompted
+    # both of these checks: a mean of 15 residues, which is not a short
+    # protein database but BAGEL4's motif SEED set. Advising a lower --evalue
+    # sends the reader off to tune a threshold on the wrong kind of file, and
+    # the tuned search still answers a question nobody asked.
     db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
     proj = build_project(tmp_path / "p", threads=1,
                          db={"diamond": {"bagel": db}},
@@ -1035,8 +1061,58 @@ def test_doctor_warns_about_a_database_too_short_for_the_evalue(tmp_path,
                               "hhblits": False, "jackhmmer": False,
                               "smorf": False, "effectors": False})
     proc = run_metaannot("doctor", "--config", proj.config_path)
+    assert "motif or seed set rather than a protein sequence database" in \
+        proc.stdout
+    assert "15 residues" in proc.stdout
+    assert "NO e-value makes that a real search" in proc.stdout
+    assert "diamond_evalues" not in proc.stdout, \
+        "the e-value advice is meant to be replaced here, not added to"
+
+
+def test_doctor_reads_the_headers_when_the_source_fasta_is_beside_the_db(
+        tmp_path, stub_bin):
+    # length is not the only signal, and it is the weaker one: a database of
+    # 60-residue entries whose headers say ggmotif is still a seed set.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=100, letters=6000)
+    io.open(str(tmp_path / "bagel.fas"), "w", encoding="utf-8").write(
+        "".join(f">LE-entry{i} ggmotif\n{'A' * 60}\n" for i in range(100)))
+    proj = build_project(tmp_path / "p", threads=1,
+                         db={"diamond": {"bagel": db}},
+                         run={"eggnog": True, "pfam": False, "dbcan": False,
+                              "diamond": True, "cluster": False, "join": False,
+                              "topology": False, "structure": False,
+                              "context": False, "unipept": False,
+                              "taxonomy": False, "ncbifam": False,
+                              "kofam": False, "interpro": False,
+                              "hhblits": False, "jackhmmer": False,
+                              "smorf": False, "effectors": False})
+    proc = run_metaannot("doctor", "--config", proj.config_path)
+    assert "motif or seed set" in proc.stdout
+    assert "ggmotif" in proc.stdout
+    assert "LE-/MA- accession prefixes" in proc.stdout
+
+
+def test_doctor_still_warns_about_a_database_too_short_for_the_evalue(
+        tmp_path, stub_bin):
+    # the e-value check is narrower now, not gone: 40-residue peptides are
+    # long enough not to be a seed set, and still cannot reach an --evalue
+    # that someone set to 1e-30.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=10480)
+    proj = build_project(tmp_path / "p", threads=1,
+                         db={"diamond": {"bagel": db}},
+                         diamond_evalues={"bagel": 1e-30},
+                         run={"eggnog": True, "pfam": False, "dbcan": False,
+                              "diamond": True, "cluster": False, "join": False,
+                              "topology": False, "structure": False,
+                              "context": False, "unipept": False,
+                              "taxonomy": False, "ncbifam": False,
+                              "kofam": False, "interpro": False,
+                              "hhblits": False, "jackhmmer": False,
+                              "smorf": False, "effectors": False})
+    proc = run_metaannot("doctor", "--config", proj.config_path)
     assert "incapable of a hit before it starts" in proc.stdout
     assert "diamond_evalues" in proc.stdout
+    assert "motif or seed set" not in proc.stdout
 
 
 def test_the_per_database_evalue_also_filters_the_hit_table(ma, tmp_path,

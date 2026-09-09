@@ -577,12 +577,18 @@ DEFAULT_CONFIG = {
         "VFC0272": 1,                        # housekeeping in a virulence coat
     },
     # Per-database e-value, overriding thresholds.diamond_evalue for that tag
-    # alone. One threshold cannot fit every database: BAGEL is 262 bacteriocin
-    # sequences with a median length of 15 residues, and no 15-residue
-    # alignment can reach 1e-10, so at the pipeline default that search was
-    # incapable of a hit before it started and its 0 hits against 38,204
-    # proteins said nothing about the biology. Empty = one threshold for all.
+    # alone. One threshold cannot fit every database: a bacteriocin database
+    # is built from peptides an order of magnitude shorter than VFDB's
+    # 350-residue proteins, and no short alignment can reach 1e-10, so at the
+    # pipeline default that search is close to incapable of a hit before it
+    # starts. Empty = one threshold for all.
     #   diamond_evalues: {bagel: 1e-3}
+    #
+    # A caution the 0-hit BAGEL run on this pipeline earned: check WHAT was
+    # built before tuning the threshold. Those 262 "sequences" of median
+    # length 15 were BAGEL4's motif SEED set, not its bacteriocins, and no
+    # e-value turns a blastp against 15-residue seeds into a bacteriocin
+    # search. diamond_db_check now says so instead of offering this knob.
     "diamond_evalues": {},
 
     # Per-database minimum percent identity, overriding
@@ -598,8 +604,8 @@ DEFAULT_CONFIG = {
     # -- a 32%-identity match to a beta-lactamase over half a query is a hit
     # against the fold, not evidence that this protein confers resistance, and
     # reporting it as "carries an AMR gene" is the error a reviewer would find
-    # first. BAGEL's sequences are short enough that a low-identity alignment
-    # is close to meaningless.
+    # first. BAGEL's peptides are short enough that a low-identity alignment
+    # over them is close to meaningless.
     "diamond_min_pidents": {"card": 50, "vfdb": 50, "bagel": 50},
 
     "thresholds": {
@@ -2333,6 +2339,75 @@ def _fasta_lengths(path, cap=200000):
     return out
 
 
+# BAGEL4 ships two different things and they look alike on disk: the
+# bacteriocin SEQUENCE files, and the motif seed set its HMM/regex step is
+# built from - headers like LE-nisin, MA-lantibiotic, ggmotif, lasso, with a
+# median length of 15 residues. The seed set is what got built into a DIAMOND
+# database on a real run, and it returned exactly 0 hits against 38,204
+# proteins. The e-value advice below was the wrong answer to that: blastp
+# against 15-residue seeds is a search for those fifteen residues, not for the
+# molecules they mark, and no threshold makes it into a bacteriocin search.
+#
+# 25 residues, not 40: mature nisin is 34, so a real bacteriocin database can
+# be genuinely short and must not be accused of being a seed set.
+MOTIF_SEED_MAX_LEN = 25
+MOTIF_SEED_MARKERS = ("ggmotif", "lasso", "motif", "seed")
+
+
+def diamond_source_fasta(cfg, tag, path):
+    """A FASTA on disk this .dmnd was built from, or "".
+
+    .fas is the name `doctor --fix` stages beside the database; a
+    sources.diamond entry that is a local path rather than a URL is the other
+    way a config records where the sequences came from.
+    """
+    stem = os.path.splitext(path)[0]
+    named = ((cfg.get("sources") or {}).get("diamond") or {}).get(tag, "")
+    cands = ([named] if named and os.path.isfile(named) else []) + \
+        [stem + ext for ext in (".fas", ".faa", ".fasta")]
+    for cand in cands:
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def motif_seed_evidence(cfg, tag, path, typical):
+    """Why this database looks like a motif seed set rather than sequences.
+
+    Returns a list of human-readable reasons, empty when it looks like a
+    normal protein database. Two signals, either sufficient: a typical
+    sequence too short to be a protein at all, and headers carrying the words
+    a seed set uses. The headers are only readable when a source FASTA is
+    beside the .dmnd, since `diamond dbinfo` reports counts and nothing else.
+    """
+    why = []
+    if typical is not None and typical < MOTIF_SEED_MAX_LEN:
+        why.append(f"its typical sequence is {typical:.0f} residues, shorter "
+                   "than any whole protein")
+    fasta = diamond_source_fasta(cfg, tag, path)
+    if fasta:
+        found, prefixed, n = set(), False, 0
+        with opener(fasta) as fh:
+            for line in fh:
+                if not line.startswith(">"):
+                    continue
+                n += 1
+                tok = (line[1:].split() or [""])[0].lower()
+                # LE- and MA- are checked as a PREFIX of the accession, not as
+                # a substring: "gamma-haemolysin" contains "ma-".
+                prefixed = prefixed or tok.startswith(("le-", "ma-"))
+                low = line.lower()
+                found |= {m for m in MOTIF_SEED_MARKERS if m in low}
+                if n >= 200:
+                    break
+        if prefixed:
+            found.add("LE-/MA- accession prefixes")
+        if found:
+            why.append(f"{os.path.basename(fasta)} carries "
+                       + ", ".join(sorted(found)) + " in its headers")
+    return why
+
+
 def diamond_db_profile(cfg, tag, path):
     """(typical_len, letters, provenance) for a DIAMOND database.
 
@@ -2368,15 +2443,8 @@ def diamond_db_profile(cfg, tag, path):
     else:
         why = "diamond is not installed, so the .dmnd cannot be read"
 
-    stem = os.path.splitext(path)[0]
-    src = ((cfg.get("sources") or {}).get("diamond") or {}).get(tag, "")
-    # .fas is the name doctor --fix stages beside the database; a sources entry
-    # that is a local path rather than a URL is the other way a config records
-    # where the sequences came from.
-    cands = ([src] if src and os.path.isfile(src) else []) +         [stem + ext for ext in (".fas", ".faa", ".fasta")]
-    for cand in cands:
-        if not os.path.isfile(cand):
-            continue
+    cand = diamond_source_fasta(cfg, tag, path)
+    if cand:
         lens = sorted(_fasta_lengths(cand))
         if lens:
             return (lens[len(lens) // 2], sum(lens),
@@ -2390,12 +2458,15 @@ def diamond_db_check(cfg, tag, path):
     """(refusal, warning) for one configured DIAMOND database; either may be
     None. A missing file is the caller's business, not this function's.
 
-    Both of these were real. A `diamond makedb` that had failed left a
+    All three of these were real. A `diamond makedb` that had failed left a
     zero-byte .dmnd, which the stage would have searched, reporting no hits -
-    the same output as a real absence of virulence factors. And BAGEL built
-    correctly, 262 sequences of median length 15, then returned exactly 0 hits
-    against 38,204 proteins at --evalue 1e-10, because a 15-residue peptide
-    cannot reach 1e-10: the search was incapable of a hit before it started.
+    the same output as a real absence of virulence factors. A database whose
+    sequences are too short for the configured e-value cannot produce a hit
+    however good the alignment. And the BAGEL database that prompted both
+    checks turned out to be neither: it was built from BAGEL4's motif SEED
+    set, 262 entries of median length 15, so its 0 hits against 38,204
+    proteins were not a threshold problem at all and lowering --evalue would
+    have produced meaningless hits instead of meaningless silence.
     """
     try:
         size = os.path.getsize(path)
@@ -2415,6 +2486,28 @@ def diamond_db_check(cfg, tag, path):
                 "would report 0 hits, which is indistinguishable from a real "
                 f"absence. Rebuild it: diamond makedb --in <fasta> -d {stem}"), None
     ev = diamond_evalue_for(cfg, tag)
+    weight = (cfg.get("diamond_weights") or {}).get(tag)
+    # A database that cannot answer is also holding a scoring weight that says
+    # it can contribute to the export ranking.
+    note = (f" It also carries diamond_weights {tag}: {weight}, which claims "
+            "it can contribute to the score.") if weight else ""
+    seed = motif_seed_evidence(cfg, tag, path, typical)
+    if seed:
+        # Deliberately INSTEAD of the e-value advice below, not alongside it.
+        # Telling someone to lower --evalue here sends them to tune a
+        # threshold on a database that is the wrong kind of thing, and the
+        # tuned search still answers a question nobody asked.
+        return None, (
+            f"{tag}: this looks like a motif or seed set rather than a "
+            f"protein sequence database - {'; and '.join(seed)}. A blastp "
+            "against it searches for those residues, not for the molecules "
+            "they mark, so its hits and its 0 hits both say nothing about the "
+            "biology, and NO e-value makes that a real search. BAGEL in "
+            "particular ships both: build the database from its bacteriocin "
+            "sequence files, not from the seed set its HMM step uses. If this "
+            f"really is a database of very short peptides, set "
+            f"sources.diamond.{tag} to the FASTA so this check can see what "
+            f"it is.{note}")
     if typical is None:
         return None, (f"{tag}: {prov}, so nothing here can tell whether "
                       f"--evalue {ev:g} is reachable for this database. If it "
@@ -2423,11 +2516,6 @@ def diamond_db_check(cfg, tag, path):
     best = best_possible_evalue(letters, typical)
     if best is None or best <= ev:
         return None, None
-    weight = (cfg.get("diamond_weights") or {}).get(tag)
-    # A database that cannot hit is also holding a scoring weight that says it
-    # can contribute to the effector ranking.
-    note = (f" It also carries diamond_weights {tag}: {weight}, which claims "
-            "it can contribute to the score.") if weight else ""
     return None, (
         f"{tag}: sequences here are about {typical:.0f} residues ({prov}), and "
         f"the best e-value even a perfect alignment that long could reach is "
@@ -2458,7 +2546,8 @@ def stage_diamond(cfg, p):
     # missing one is reported above, the broken one returns 0 hits, and 0 hits
     # is what a real absence of virulence factors looks like too. Both halves
     # of this were observed on one run - a zero-byte .dmnd left by a failed
-    # makedb, and BAGEL searched at an e-value no 15-residue peptide can reach.
+    # makedb, and a BAGEL database built from a motif seed set rather than
+    # from bacteriocin sequences.
     refusals = []
     for tag, path in jobs:
         bad, warn = diamond_db_check(cfg, tag, path)

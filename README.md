@@ -848,7 +848,7 @@ the run warns.
 
 ### A database that cannot hit
 
-Two things a DIAMOND database can do that look exactly like "no virulence
+Three things a DIAMOND database can do that look exactly like "no virulence
 factors here", and that both `doctor` and the `diamond` stage now refuse or
 warn about before the search starts:
 
@@ -859,22 +859,39 @@ warn about before the search starts:
   `diamond dbinfo` reports as holding no sequences is now a refusal, naming the
   `diamond makedb` line that rebuilds it. `doctor` reports it as `MISS`.
 
-* **A database whose sequences are too short for the e-value.** BAGEL is 262
-  bacteriocin sequences with a median length of 15 residues. At the pipeline
-  default of `thresholds.diamond_evalue: 1e-10` it returned exactly 0 hits
-  against 38,204 proteins — not a finding about the biology, because the best
-  e-value a perfect 15-residue alignment can reach is about 1e-5. The run now
-  says so, with the number, and names the weight the database is holding while
-  it cannot hit.
+* **A motif seed set built as though it were a sequence database.** BAGEL4
+  ships two different things: its bacteriocin sequence files, and the motif
+  seed set its HMM/regex step is built from — headers like `LE-nisin`,
+  `ggmotif`, `lasso`, median length 15 residues. The seed set is what got
+  built here, and it returned exactly 0 hits against 38,204 proteins. A
+  `blastp` against 15-residue seeds searches for those fifteen residues, not
+  for the molecules they mark, so **no e-value makes it a bacteriocin
+  search** — lowering the threshold would have produced meaningless hits
+  instead of meaningless silence. A database whose typical sequence is under
+  25 residues, or whose source FASTA headers carry those markers, is now
+  called out as a seed set, and the e-value advice below is deliberately
+  *replaced* rather than added to. (25, not 40: mature nisin is 34 residues,
+  so a genuinely short bacteriocin database must not be accused of this.)
 
-The fix for the second one is a per-database e-value:
+* **A database whose sequences are too short for the e-value.** Distinct from
+  the above, and now the narrower case: real short peptides that still cannot
+  reach the threshold set for them. The estimate is a perfect self-match of
+  the database's typical sequence, so it fires only when a hit is essentially
+  impossible rather than merely unlikely. The run says so with the number, and
+  names the weight the database is holding while it cannot hit.
+
+The fix for the third one is a per-database e-value:
 
 ```yaml
 thresholds:
   diamond_evalue: 1e-10     # vfdb, merops, card, tadb
 diamond_evalues:
-  bagel: 1e-3               # 15-residue peptides cannot reach 1e-10
+  bagel: 1e-3               # short peptides cannot reach 1e-10
 ```
+
+Check *what* you built before reaching for this knob. On this pipeline's own
+run the 0 hits were the seed-set mistake above, not the threshold, and the
+per-database e-value would have papered over it.
 
 `diamond_evalues` overrides `thresholds.diamond_evalue` for that tag alone, in
 the search *and* in the filter `integrate` applies to the hit table, and the
