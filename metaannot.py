@@ -41,6 +41,12 @@ __version__ = "0.4.0"
 # discards days of InterProScan and Foldseek compute.
 SIGNATURE_VERSION = 1
 
+# The schema of `describe --json`. Anything reading that JSON is not in this
+# file and cannot be fixed in the same commit as the engine, so it needs to be
+# able to say "I do not understand this shape" instead of guessing. Bumped when
+# a key is removed or its meaning changes; adding a key is not a bump.
+DESCRIBE_VERSION = 1
+
 # The evidence bins, in the order build_annotation() tests them. This is the
 # single source of the bin vocabulary: the module docstring above, the report's
 # BIN_LEVELS/BIN_COLS and bin_summary.tsv all take their order from it, because
@@ -53,6 +59,7 @@ import argparse
 import atexit
 import concurrent.futures
 import contextlib
+import copy
 import fnmatch
 import glob
 import gzip
@@ -297,6 +304,21 @@ DEFAULT_CONFIG = {
     # difference between a silent process and a progress bar. Nothing is
     # hoarded - see run_cmd.
     "progress_interval_s": 60,
+    # How often the run stamps `_run.last_seen` into the state file, in
+    # seconds. 0 turns it off. It exists so that a console can say "last seen
+    # 4h ago" about a run whose process table this machine cannot read - a job
+    # on another node of the array, or any job at all on Windows.
+    #
+    # ADVISORY ONLY. Nothing in this file reads it back, and in particular it
+    # never authorises reclaiming a lock. A heartbeat that stopped is not
+    # evidence the process died: it is equally the signature of one failed
+    # write, a thread that died, or a filesystem that went away, and from
+    # another host those are indistinguishable from a corpse. Reclaiming a
+    # lock on that reading puts two runs in one results directory, which is
+    # silent corruption; a stale lock is --force-unlock, which is a human
+    # deciding. This number is what that human decides on. Cheap: one small
+    # file rewrite twice a minute.
+    "heartbeat_s": 30,
     # How many independent stages may run at once. Each gets threads //
     # stage_workers CPUs. Parallel stages multiply peak memory.
     "stage_workers": 4,
@@ -1383,6 +1405,9 @@ class Paths:
         self.state = f"{R}/.metaannot_state.json"
         self.lock = f"{R}/.metaannot.lock"
         self.logfile = f"{R}/metaannot.log"
+        # Not a dotfile: its whole purpose is to be found by whoever opens the
+        # directory in six months. See write_effective_config().
+        self.effective_config = f"{R}/config.effective.yaml"
 
     def mkdirs(self):
         if os.path.exists(self.R) and not os.path.isdir(self.R):
@@ -9292,6 +9317,11 @@ class ResultsLock:
         self.force = force
         self.empty_grace = float(empty_grace)
         self.held = False
+        # What __enter__ wrote into the file, and whether it got as far as
+        # writing it. __exit__ reads both back: it may only remove a lock that
+        # is still the one this object took. See is_still_ours().
+        self.token = None
+        self.wrote = False
 
     def _holder_is_alive(self, info):
         """Whether the process named in a lock file may still be running.
@@ -9302,6 +9332,13 @@ class ResultsLock:
         of the shared array (we cannot see its process table), a pid owned by
         another user (os.kill raises PermissionError, which is an OSError and
         used to read as 'dead'), and a garbled lock file.
+
+        `_run.last_seen` in the state file beside this one is deliberately NOT
+        consulted. A heartbeat that stopped is not proof the process stopped -
+        one failed write ends the thread, not the run - and reclaiming on that
+        reading is how two runs end up writing one results directory. The
+        heartbeat is there for a person to read; the decision it informs is
+        --force-unlock, and it is theirs.
         """
         pid, host = info.get("pid"), info.get("host", "")
         if not isinstance(pid, int) or host != socket.gethostname():
@@ -9339,8 +9376,9 @@ class ResultsLock:
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
-                              "started": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        self.token = {"pid": os.getpid(), "host": socket.gethostname(),
+                      "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        payload = json.dumps(self.token)
         # O_EXCL, not exists()-then-write: two runs launched in the same second
         # both used to see no lock and both proceed.
         for _ in range(3):
@@ -9389,15 +9427,130 @@ class ResultsLock:
                 except OSError:
                     pass
                 continue
+            # Held from the instant the file exists, not from the instant it
+            # is written. Between those two statements the lock already blocks
+            # every other run, and a signal landing there used to strand it for
+            # good: __exit__ was a no-op because self.held was still False, and
+            # the file is fully written within microseconds so the zero-byte
+            # grace never applies either. Racing SIGTERM against a starting run
+            # left a lock behind in 8 of 30 attempts. cmd_run registers the
+            # release BEFORE calling __enter__ for the same reason, so the hook
+            # is already armed by the time we get here.
+            self.held = True
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(payload)
-            self.held = True
+            self.wrote = True
             return self
         die(f"could not take the results lock {self.path}: it keeps being "
             "recreated, so another metaannot is starting at the same moment.")
 
+    def is_still_ours(self):
+        """Whether this run still owns the results directory.
+
+        THE ownership gate, and the only one: every write a superseded run can
+        still make asks this one question. It exists because a killed run now
+        UNWINDS - SIGTERM raises KeyboardInterrupt instead of terminating the
+        process where it stands - and unwinding WRITES. The sequence those
+        writes have to survive is an operator's: run A is killed, A unwinds
+        slowly, the operator sees it hang and --force-unlocks the directory,
+        run B starts, and A's tail then lands on top of B. Both callers are
+        here to keep out of B's way - __exit__ must not remove B's lock, and
+        RunRecord must not write over B's `_run`.
+
+        Three answers, not two, because the callers agree on "ours" and on
+        "B's" and genuinely differ on "no lock at all": there is nothing for
+        __exit__ to remove, while for RunRecord a vacant path means nobody was
+        superseded and its own verdict is still worth writing. True is ours
+        (or unreadable, see below), False is somebody else's, None is vacant.
+
+        Keyed on the CONTENT of the lock file, because the way a lock changes
+        hands is remove-then-create: pid, host and the second it started
+        identify the writer even on a filesystem that hands the same inode
+        straight back, and a file another process has since written reads as
+        "not ours", which is the answer we want.
+
+        What it does NOT cover is a stage's own output file. A worker still
+        inside st["fn"] when the interrupt lands runs to completion - the
+        executor's __exit__ waits for it - and atomic_out renames its result
+        into place at the end. That rename is not gated here on purpose: a
+        transient read error on the lock would abort a stage that is
+        legitimately finishing, which is a worse failure than the one being
+        prevented.
+
+        That leaves a real hole, and it is not bounded the way it looks. This
+        run's own record is indeed never written - finish() is past by then -
+        but the record in the file by then is the REPLACEMENT's, and if the
+        replacement has already finished that stage and marked it "ok", our
+        rename drops our output under its valid signature and the run after
+        that reports "cached" and reads it. Nothing detects that. It is the
+        reason --force-unlock on a run that is still alive is unsupported
+        (CLAUDE.md rule 4), rather than something this gate can fix: closing
+        it needs the stage write itself to be ownership-checked, which is the
+        abort-a-finishing-stage trade above.
+        """
+        if self.token is None:
+            # Never entered, so there is nothing of ours anywhere: not a lock
+            # to release, and not a directory to write into.
+            return False
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            # No lock at all, which is NOT the same answer as somebody else's
+            # and must not be collapsed into it: the two callers want opposite
+            # things here. There is nothing to release, so __exit__ treats
+            # this as "not ours"; but nothing has taken the directory either,
+            # so refusing the state write costs a run nobody superseded its
+            # own final verdict - _run stranded at "running" with a WARN
+            # announcing a handover that never happened. None says "vacant",
+            # and each caller reads it for itself.
+            return None
+        except OSError:
+            # Unreadable is NOT the same answer as somebody else's, and
+            # collapsing the two strands the very lock this whole path exists
+            # to remove: one NFS EACCES, EIO or ESTALE on our OWN lock read as
+            # "not ours", so __exit__ left it behind for a human to
+            # --force-unlock - a regression against every version before the
+            # ownership check, all of which removed it unconditionally. A lock
+            # we cannot read is one we have no evidence has changed hands, so
+            # we go on behaving as its owner: release it on the way out, and
+            # go on stamping until something says otherwise.
+            return True
+        if not raw:
+            # Zero bytes is our own abandoned create - __enter__ marks the
+            # lock held before it writes - unless we did get the payload out,
+            # in which case somebody else is between their O_EXCL and their
+            # write, and this is emphatically not ours.
+            return not self.wrote
+        try:
+            info = json.loads(raw)
+        except ValueError:
+            return False              # garbled: not something we wrote
+        return all(info.get(k) == self.token.get(k)
+                   for k in ("pid", "host", "started"))
+
     def __exit__(self, *exc):
-        if self.held:
+        """Release the lock - but only if it is still the lock we took.
+
+        This process can outlive its own lock. SIGTERM now unwinds instead of
+        terminating, so a run being killed can still be deep in a stage's
+        cleanup when an operator, seeing it hang, --force-unlocks the
+        directory and starts a replacement; the file at this path is then the
+        REPLACEMENT's lock by the time our atexit hook runs. Removing it let a
+        third run join the second one in the same results directory - two live
+        writers, which is the exact corruption this class exists to prevent,
+        and it was reproduced end to end. Unconditional removal was safe only
+        while SIGTERM killed the process outright.
+        """
+        if not self.held:
+            return False
+        # Cleared first: the signal path and the atexit hook both fire, and a
+        # second call must not be able to remove a lock somebody else took in
+        # between the two.
+        self.held = False
+        # `is True`, not truthiness: a vacant path (None) means there is no
+        # file to remove, and os.remove would only raise.
+        if self.is_still_ours() is True:
             try:
                 os.remove(self.path)
             except OSError:
@@ -9489,6 +9642,311 @@ def save_state(path, state):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(dict(state), fh, indent=1, sort_keys=True)
         os.replace(tmp, path)
+
+
+# The key the run record lives under. A leading underscore because the rest of
+# the state file is keyed by stage name and this is not a stage: nothing may
+# look it up as one. STAGE_NAMES never contains it, so --force skips it and
+# decide() never asks it for a signature; save_state sorts keys, so it also
+# lands first in the file, where someone opening it cold will see it.
+RUN_KEY = "_run"
+
+# Consecutive failed heartbeat writes after which the timer stops trying and
+# says so. Not 1: a single ENOSPC, an NFS blip or an ESTALE is transient and
+# the next tick usually succeeds. Not unbounded: a thread retrying a write that
+# can never succeed would repeat itself for the length of the run.
+HEARTBEAT_GIVE_UP = 5
+
+
+class RunRecord:
+    """The `_run` block at the head of the state file: what made this
+    directory, and whether it is still making it.
+
+    The per-stage records say what was computed. Nothing said what did the
+    computing, so a results directory opened cold - one of eight on a shared
+    box - could not name the config, the host, the version or the command
+    behind it. And nothing outside the process could tell "InterProScan, hour
+    19" from "the box died", because ResultsLock can only ask the process table
+    about a pid on this host. `last_seen` is the answer to the second question
+    and is stamped on a timer.
+
+    It is ADVISORY, and deliberately so: it is written for a person, or a
+    console showing one, to read. _holder_is_alive() does not consult it and
+    must not be made to, because a heartbeat that stopped is not proof that a
+    process stopped - one failed write, or a thread that died, looks exactly
+    the same from another host - and a lock reclaimed on that reading trades a
+    stale lock for two runs writing one directory. The number is here so that
+    the human deciding whether to --force-unlock has something to decide on.
+    """
+
+    def __init__(self, path, state, argv, config_path, interval=30,
+                 owner=None):
+        self.path = path
+        self.state = state
+        # The ResultsLock this run holds, and through it the single ownership
+        # gate every write below consults - see ResultsLock.is_still_ours().
+        # None where there is no lock to consult: a dry run takes none, and a
+        # RunRecord built directly (a test, a caller using describe()) has
+        # none either. There the old unconditional behaviour is correct,
+        # because without a lock there is no replacement run to collide with.
+        self.owner = owner
+        # Said once and then never again. A run whose directory has been given
+        # away has nothing further to contribute to it, and repeating that at
+        # every tick would fill the log of the run that now owns the place.
+        self.superseded = False
+        # Kept exactly as the config wrote it - an integer stays an integer, so
+        # a reader parsing `_run.heartbeat_s` finds the type the documented
+        # example shows. cmd_run has already refused anything that is not a
+        # non-negative number of seconds; see the die() beside the one for
+        # progress_interval_s.
+        self.interval = interval
+        self.lock = None                  # the scheduler's, once there is one
+        self._stop = threading.Event()
+        # Around `rec` alone, and always taken OUTSIDE the scheduler's lock.
+        # It is what keeps a tick that is already past its wait() from writing
+        # last_seen after stamp() has written `finished`, which showed a
+        # console a run whose last sign of life postdated its own end.
+        self._rec_lock = threading.Lock()
+        now, stamp = time.strftime("%Y-%m-%dT%H:%M:%S"), time.time()
+        self.rec = {
+            # host + pid + the second it started. Unique without reaching for
+            # uuid, and legible in a log line or a directory listing.
+            "run_id": f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
+            "version": __version__,
+            "config_path": config_path,
+            "argv": list(argv),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "started": now,
+            "last_seen": now,
+            # The same instant as a number, because the string above is local
+            # time with no zone: two hosts sharing one filesystem across two
+            # timezones cannot subtract each other's stamps, and this is read
+            # precisely in the cross-host case.
+            "last_seen_epoch": stamp,
+            # Written down so a reader knows how long silence has to last
+            # before it means anything, without having to know this file's
+            # defaults.
+            "heartbeat_s": self.interval,
+            "finished": None,
+            # "running" until something says otherwise. A run that is SIGKILLed
+            # or loses power never gets to say otherwise, and that is correct:
+            # last_seen is what then tells a reader it is looking at a corpse.
+            "final_status": "running",
+        }
+        state[RUN_KEY] = self.rec
+        # The last stamp that actually reached the FILE, which is not the same
+        # thing as rec["last_seen"]: a tick advances that in memory and only
+        # then attempts the write that carries it. Quoting the in-memory value
+        # after a failed write named a moment no reader could ever find in the
+        # state file - see the give-up warning in _beat(). cmd_run writes the
+        # record immediately after building it, so this one is true from here.
+        self._written = now
+
+    def _save(self, required=False):
+        """One state write: a tick may skip it, the final verdict may not, and
+        neither may write into a directory this run no longer owns.
+
+        The ownership gate comes first and binds `required` too. A final
+        verdict is the one record of how this run ended, but it is written
+        into a file that belongs to whoever holds the lock now, and stamping
+        "interrupted" over a live run's `_run` corrupts a running directory to
+        preserve a dead run's last word. Losing the word is the cheaper of the
+        two, so a superseded run says so once, in the log, and stops.
+
+        Returns whether the state file was actually written.
+
+        save_state needs no help to be safe - it serialises on _STATELOCK and
+        renames a complete file into place - so the scheduler's lock is not
+        what keeps this write from tearing anything. It is taken to stay out of
+        the scheduler's way: a tick landing while finish() holds that lock is a
+        second write of the same file for the sake of one changed timestamp,
+        and the tick is the one that can wait. It has to be taken OUTSIDE
+        _STATELOCK, the order finish() and mark_running() take it in, or the
+        two orders deadlock.
+
+        Which is why a tick that cannot get it inside five seconds writes
+        nothing at all: a skipped stamp costs a display one stale interval and
+        the next tick repairs it, while writing anyway is precisely the
+        unsynchronised write the lock was being taken to avoid. The final stamp
+        is not skippable - it is the only record of how the run ended - so it
+        writes whether the lock comes or not.
+        """
+        # `is False`, not falsiness: only a lock somebody else now holds
+        # stops the write. A vacant path (None) means no replacement exists to
+        # be corrupted, and this run's own verdict is worth more than the
+        # theoretical race with a run that has not created its lock yet - and
+        # would overwrite us anyway when it did.
+        if self.owner is not None and self.owner.is_still_ours() is False:
+            # Stop the heartbeat too: there is no directory left for it to
+            # stamp, and a timer waking every interval to be turned away is
+            # the same decision taken over and over.
+            self._stop.set()
+            if not self.superseded:
+                self.superseded = True
+                log(f"this run no longer holds {self.owner.path}: the results "
+                    "directory has been handed to another run, so nothing "
+                    "further is written to .metaannot_state.json from here. "
+                    "That happens when a run is killed, takes a while to "
+                    "unwind, and is --force-unlocked meanwhile; the `_run` "
+                    "record in that file belongs to the run that holds the "
+                    "directory now, and this run's own verdict is not worth "
+                    "overwriting a live one's state with.", "WARN")
+            return False
+        lock = self.lock
+        if lock is None:
+            save_state(self.path, self.state)
+            return True
+        # Timed, not blocking: this also runs on the way out of an interrupted
+        # run, and a final stamp that hangs the process is worse than one
+        # written a moment out of order. save_state is atomic either way.
+        got = lock.acquire(timeout=5.0)
+        try:
+            if got or required:
+                save_state(self.path, self.state)
+                return True
+            return False
+        finally:
+            if got:
+                lock.release()
+
+    def watch(self, lock):
+        """Start stamping last_seen, sharing the scheduler's lock."""
+        self.lock = lock
+        if not self.interval:
+            return
+        # Daemon: a state-file timer must never be the reason a finished run
+        # fails to exit. Nothing here needs flushing at shutdown either - every
+        # tick has already been written.
+        threading.Thread(target=self._beat, name="metaannot-heartbeat",
+                         daemon=True).start()
+
+    def _tick(self):
+        """Stamp last_seen. False once stamp() has had the last word, or once
+        this run no longer owns the directory."""
+        with self._rec_lock:
+            if self._stop.is_set():
+                # This thread can already be past its wait() when stamp() runs,
+                # and a last_seen a few milliseconds LATER than `finished` is a
+                # finished run whose last sign of life postdates its own end.
+                return False
+            self.rec["last_seen"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            self.rec["last_seen_epoch"] = time.time()
+            if self._save():
+                self._written = self.rec["last_seen"]
+        return not self.superseded
+
+    def _beat(self):
+        # Event.wait, not sleep: the stamp on the way out must not have to wait
+        # up to a whole interval for this thread to notice it should stop.
+        misses = 0
+        while not self._stop.wait(self.interval):
+            try:
+                if not self._tick():
+                    return
+                misses = 0
+            except Exception as e:                        # noqa: BLE001
+                # One bad write must not end the signal. Before this guard a
+                # single transient OSError killed the thread, and last_seen
+                # stopped advancing for the rest of a thirty-four-hour run with
+                # nothing to show for it but one traceback buried in the log -
+                # while the run itself carried on perfectly well. Everything is
+                # caught, not just OSError, because nothing this thread does is
+                # load-bearing: the worst a skipped tick costs is one stale
+                # line on a display. run_cmd's pump thread swallows its own
+                # errors for the same reason.
+                misses += 1
+                if misses == 1:
+                    log(f"could not stamp the run heartbeat ({e}); "
+                        "`_run.last_seen` will be stale until a write "
+                        "succeeds. The run itself is not affected.", "WARN")
+                if misses >= HEARTBEAT_GIVE_UP:
+                    # Said out loud, once, rather than going quiet: a display
+                    # that simply stops updating reads as a dead run, which is
+                    # the one conclusion this must not invite.
+                    # `_written`, not rec["last_seen"]: _tick advances the
+                    # record in memory and only then attempts the write that
+                    # would carry it, so after HEARTBEAT_GIVE_UP failures the
+                    # in-memory value is up to HEARTBEAT_GIVE_UP x heartbeat_s
+                    # AHEAD of anything in the file. Quoting it told an
+                    # operator the run had last been seen at a timestamp that
+                    # appears nowhere in the state file they were about to
+                    # open - and the whole point of this line is to send them
+                    # to that file.
+                    log(f"the run heartbeat failed {misses} times running and "
+                        f"is giving up; `_run.last_seen` is frozen in the "
+                        f"state file at {self._written} and from here on says "
+                        "NOTHING about whether this run is alive. The run "
+                        "itself continues.", "WARN")
+                    return
+
+    def stamp(self, status):
+        """Record how the run ended, and stop the heartbeat.
+
+        The first verdict wins. cmd_run says "ok" or "failed" as it returns;
+        main() says "failed" for a die() and "interrupted" for Ctrl-C or
+        SIGTERM. `all` reaches both - the run succeeds and the report may then
+        die - and there the run really did succeed.
+        """
+        with self._rec_lock:
+            self._stop.set()
+            if self.rec["final_status"] != "running":
+                return
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            self.rec["final_status"] = status
+            self.rec["finished"] = now
+            self.rec["last_seen"] = now
+            self.rec["last_seen_epoch"] = time.time()
+            # required: a tick may skip a lock it cannot get, but the one
+            # record of how this run ended may not. It does not override the
+            # ownership gate in _save() - see the docstring there.
+            if self._save(required=True):
+                self._written = now
+
+
+# The run in this process, for main()'s handlers: they are the only place that
+# can tell an interrupt from a failure, and they are a long way from cmd_run's
+# locals.
+_RUN = None
+
+
+def stamp_run(status):
+    if _RUN is not None:
+        _RUN.stamp(status)
+
+
+def write_effective_config(path, cfg):
+    """The merged config this run actually used, defaults and all.
+
+    The results keep the stage records but not the settings behind them, and
+    the config file beside them is whatever it says today, not what it said in
+    March - nor does it carry the defaults that were never written down, or the
+    --threads/--ram/--faa the command line added.
+
+    It is deliberately NOT a stage output and appears in no stage's inputs.
+    signature() hashes each stage's declared inputs and its named config keys;
+    a file in the results root that is rewritten on every run would, the moment
+    any stage listed it, invalidate that stage on every run - which for
+    InterProScan is thirty-four hours spent recording what the run already
+    knew. Nothing in metaannot ever reads this file back.
+    """
+    if yaml is None:
+        return                    # pyyaml is optional until a config is read
+    # Written whole and renamed, because a console reads this file while the
+    # run that wrote it is still going - and through atomic_out rather than a
+    # temp of its own, because the naming is the point: the leading dot and the
+    # fixed .part suffix are what make `find results -name '.*.part.*'` find
+    # every leftover in the tree. A bespoke `config.effective.yaml.<pid>.tmp`
+    # was the one leftover that sweep could not see, in the results ROOT, which
+    # is the directory an operator opens cold. atomic_out also removes the temp
+    # if yaml.safe_dump raises half way through.
+    with atomic_out(path) as tmp:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("# The merged configuration this run used: the built-in "
+                     "defaults, then the\n# config file, then the command "
+                     "line. A record, not an input - metaannot\n# never reads "
+                     "this file back, and no stage's signature includes it.\n")
+            yaml.safe_dump(cfg, fh, sort_keys=False, default_flow_style=False)
 
 
 # ======================================================================
@@ -12495,6 +12953,115 @@ def cmd_init(args):
     print(f"wrote {args.out}")
 
 
+def describe(cfg, p, config_path=None):
+    """Everything a program outside this file needs in order to drive it.
+
+    A front end that hard-codes what a config key means, or which stage writes
+    which file, drifts from the engine and starts lying - and the lie is
+    expensive, because most stages hash their database path by VALUE, so a
+    front end that rewrites one cosmetically restarts InterProScan. This is the
+    contract that makes that unnecessary: the shape of the config, the stage
+    graph and requirements() as data, so nothing has to import a private
+    function or scrape --help.
+
+    Two halves, and the difference matters. `default_config`, `stages` and the
+    versions are STATIC - the same on any machine running this file. `config`,
+    `paths` and `requirements` are what this machine says about this config
+    RIGHT NOW: requirements() probes PATH and the filesystem, so `ok` is a fact
+    about `host` at `generated`, not a property of metaannot.
+    """
+    return {
+        "describe_version": DESCRIBE_VERSION,
+        "metaannot_version": __version__,
+        "signature_version": SIGNATURE_VERSION,
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "host": socket.gethostname(),
+        "config_path": config_path,
+        # Copied, like every other field in this dict. cmd_describe
+        # serialises immediately and could not tell the difference, but
+        # describe() is also the in-process entry point a front end is meant to
+        # use, and returning the live objects meant a caller that normalised
+        # the document it got back was editing this process's own defaults.
+        "config": copy.deepcopy(cfg),
+        "default_config": copy.deepcopy(DEFAULT_CONFIG),
+        # The config vocabulary, so a form generator does not have to infer any
+        # of it: which keys are paths (and so want a file picker ON THIS HOST),
+        # which blocks are replaced wholesale rather than merged, which are
+        # free-form and so cannot be validated against the defaults, and which
+        # are gone.
+        "path_keys": list(PATH_KEYS),
+        "db_path_keys": list(DB_PATH_KEYS),
+        "replace_blocks": sorted(REPLACE_BLOCKS),
+        "freeform_keys": sorted(FREEFORM),
+        "retired_keys": dict(RETIRED_KEYS),
+        "stage_names": list(STAGE_NAMES),
+        "stages": [{
+            "name": st["name"],
+            # The run: flag that turns it on, or null for the two stages that
+            # have none and always run.
+            "enabled": st["enabled"],
+            "deps": list(st["deps"]),
+            # The config keys hashed into this stage's signature: change one of
+            # these and the stage recomputes. This is the list a front end has
+            # to know before it "helpfully" normalises a path.
+            "keys": list(st["keys"]),
+            "gpu": bool(st.get("gpu")),
+            "empty_ok": bool(st.get("empty_ok")),
+            "outputs": list(st["out"](p)),
+            # Longest-first scheduling: 1 seconds, 2 minutes, 3 hours. What
+            # the scheduler sorts each round's ready set by, so a front end
+            # can order or annotate the table the same way.
+            "cost": st.get("cost"),
+        } for st in STAGES],
+        "bins": list(BIN_ORDER),
+        "quant_formats": sorted(ALL_FORMATS),
+        # Where a watcher polls. Named rather than reconstructed, so the day
+        # one of them moves the watcher moves with it.
+        "paths": {"results_dir": p.R, "state": p.state, "lock": p.lock,
+                  "log": p.logfile, "effective_config": p.effective_config},
+        "run_key": RUN_KEY,
+        "requirements": requirements(cfg, p),
+    }
+
+
+def cmd_describe(args):
+    cfg = load_config(args.config)
+    if not args.config:
+        # load_config resolves paths against the config FILE's directory, so
+        # with no --config `results_dir` is still the bare default and every
+        # path under it - what the README calls the files a watcher polls -
+        # would be relative to whatever cwd this process happened to have. A
+        # watcher that stored those strings would poll the wrong directory.
+        # Absolute here, exactly as --config already makes them.
+        cfg["results_dir"] = os.path.abspath(cfg["results_dir"])
+    # No mkdirs(): asking what metaannot is must not create fifteen
+    # directories, and requirements() never touches the results directory.
+    p = Paths(cfg)
+    doc = describe(cfg, p,
+                   os.path.abspath(args.config) if args.config else None)
+    if args.json:
+        json.dump(doc, sys.stdout, indent=1, sort_keys=True, default=str)
+        print()
+        return 0
+    reqs = doc["requirements"]
+    print(f"metaannot {doc['metaannot_version']} on {doc['host']} "
+          f"(describe schema {doc['describe_version']}, "
+          f"signatures v{doc['signature_version']})")
+    print(f"config:  {doc['config_path'] or 'built-in defaults only'}")
+    print(f"results: {doc['paths']['results_dir']}")
+    on = [st["name"] for st in doc["stages"]
+          if st["enabled"] is None or cfg["run"].get(st["enabled"])]
+    print(f"stages:  {len(doc['stages'])} defined, {len(on)} on "
+          f"({' '.join(on)})")
+    miss = [r for r in reqs if not r["ok"]]
+    print(f"needs:   {len(reqs)} items, {len(reqs) - len(miss)} present"
+          + (f", missing: {' '.join(r['id'] for r in miss)}" if miss else ""))
+    print("\nThis is the human summary. Pass --json for the full machine-"
+          "readable\ncontract: the config shape, the stage graph and every "
+          "requirement.")
+    return 0
+
+
 def cmd_doctor(args):
     cfg = load_config(args.config)
     p = Paths(cfg)
@@ -13135,7 +13702,11 @@ def cmd_subset(args):
 
 
 def cmd_run(args):
-    global _LOGFH
+    global _LOGFH, _RUN
+    # Cleared first: main()'s handlers stamp whatever _RUN points at, and a
+    # record left over from an earlier cmd_run in this process would send that
+    # stamp to another results directory's state file.
+    _RUN = None
     cfg = load_config(args.config)
     if args.threads is not None:
         if int(args.threads) < 1:
@@ -13148,6 +13719,20 @@ def cmd_run(args):
     except (TypeError, ValueError):
         die(f"progress_interval_s must be a number of seconds (0 disables), "
             f"not {cfg['progress_interval_s']!r}")
+    heartbeat_s = cfg.get("heartbeat_s", DEFAULT_CONFIG["heartbeat_s"])
+    # Fatal, exactly like its sibling above. A mistyped interval is the same
+    # config error in either key, and warning about one while dying on the
+    # other teaches people that the warning is optional. `heartbeat_s: true` is
+    # the case that made it worth saying: bool is an int in Python, so it went
+    # through float() and became a ONE-SECOND heartbeat, rewriting the state
+    # file every second for the length of the run; a negative was clamped to
+    # "off" without a word. A number, not a string of one, so that what a
+    # reader finds in `_run.heartbeat_s` is what the config says.
+    if (isinstance(heartbeat_s, bool)
+            or not isinstance(heartbeat_s, (int, float))
+            or not math.isfinite(heartbeat_s) or heartbeat_s < 0):
+        die("heartbeat_s must be a number of seconds, 0 or more (0 disables), "
+            f"not {heartbeat_s!r}")
     # Absolute, as load_config already makes the config's own paths: the cache
     # must not see 'results' and './results' as two different projects.
     if args.faa:
@@ -13156,6 +13741,7 @@ def cmd_run(args):
         cfg["results_dir"] = os.path.abspath(args.results_dir)
 
     p = Paths(cfg)
+    state = None
     if not args.dry_run:
         # Not before the dry-run branch: a plan check should not leave fifteen
         # new directories behind for the next person to wonder about.
@@ -13163,7 +13749,6 @@ def cmd_run(args):
         _LOGFH = open(p.logfile, "a", encoding="utf-8")
         log(f"metaannot {__version__} starting")
         lock = ResultsLock(p.lock, force=getattr(args, "force_unlock", False))
-        lock.__enter__()
         # The BOUND METHOD, not a closure over `lock`. Both of these used to
         # be reachable from a name that this function reassigns further down,
         # and the signal handler duly called threading.Lock.__exit__ and died
@@ -13171,6 +13756,13 @@ def cmd_run(args):
         # uncaught RuntimeError and exit 1 rather than releasing anything.
         release_results_lock = lock.__exit__
         atexit.register(release_results_lock)
+        # Registered BEFORE the lock is taken. os.open(O_EXCL) and this call
+        # used to have the whole of __enter__ between them, and a signal
+        # landing in that window left a fully written lock behind with no hook
+        # to remove it - 8 of 30 tries, each of them printing `interrupted.`
+        # and exiting cleanly. __exit__ on a lock that was never taken is a
+        # no-op, so arming the hook first costs nothing.
+        lock.__enter__()
 
         def _release_lock_on_signal(sig, _frame):
             """Release the results lock when the run is killed, not only when
@@ -13241,6 +13833,26 @@ def cmd_run(args):
             # over: the lock still comes off on a normal exit.
             with contextlib.suppress(ValueError, OSError, AttributeError):
                 signal.signal(_sig, _release_lock_on_signal)
+        # Both artefacts, under the lock and next to each other, because a run
+        # must not be able to die BETWEEN them. Written apart - the config
+        # here, the record a hundred lines and three die()s later - an early
+        # fatal error left a config.effective.yaml describing a run the state
+        # file had never heard of, and on a resume one that flatly contradicted
+        # the previous run's `_run`: "finished ok, threads 7, against a FASTA
+        # that does not exist", none of which had happened.
+        #
+        # `state` is read here rather than earlier so that it is read while
+        # this run holds the lock, and the record goes into it before the
+        # --force loop below, which pops stage names only - `_run` is not one.
+        state = load_state(p.state)
+        # The lock goes in as the record's owner: every `_run` write this run
+        # makes from here - the heartbeat, and the final verdict on the way
+        # out of an interrupt - is gated on still holding it.
+        _RUN = RunRecord(p.state, state, sys.argv,
+                         os.path.abspath(args.config) if args.config else None,
+                         heartbeat_s, owner=lock)
+        save_state(p.state, state)
+        write_effective_config(p.effective_config, cfg)
 
     for name in (args.only or []) + ([args.from_stage] if args.from_stage else []):
         if name not in STAGE_NAMES:
@@ -13265,7 +13877,10 @@ def cmd_run(args):
     # recorded here, so the next run adopted its stale output without ever
     # comparing signatures — and the config change that prompted the redo was
     # then ignored for good.
-    state = load_state(p.state)
+    if state is None:
+        # A dry run takes no lock and writes nothing, so it reads the state
+        # only now, and only to plan against.
+        state = load_state(p.state)
     if args.force:
         for n in selected:
             state.pop(n, None)
@@ -13426,6 +14041,11 @@ def cmd_run(args):
     # function is also called lock, and a closure over the name (the signal
     # handler was one) got whichever had been assigned most recently.
     state_lock = threading.Lock()
+    if _RUN is not None:
+        # Started here and not earlier because it shares this lock with
+        # finish() and mark_running(), and there is nothing to serialise
+        # against before they exist.
+        _RUN.watch(state_lock)
 
     def finish(name, action, sig=None, err=None, secs=None):
         nonlocal ran, adopted, skipped
@@ -13624,17 +14244,77 @@ def cmd_run(args):
             log("more than one failed because they were running concurrently; "
                 "fix them together, or use --serial to fail on the first",
                 "FATAL")
+        stamp_run("failed")
         return 1
 
+    stamp_run("ok")
     log(f"done: {ran} run, {adopted} adopted, {skipped} skipped. "
         f"Results in {p.R}/")
     return 0
+
+
+# Which signal raised the KeyboardInterrupt that is currently unwinding, so
+# main() can exit 128 + it. None means no handler of ours ran, which is a real
+# Ctrl-C.
+_STOP_SIGNUM = None
+
+
+def handle_sigterm_like_sigint():
+    """Make SIGTERM unwind, the way SIGINT already does.
+
+    The results lock is released by an atexit hook, and atexit runs only if the
+    interpreter unwinds. Python's default SIGINT raises KeyboardInterrupt, so
+    Ctrl-C unwinds and the lock goes; SIGTERM's default terminates the process
+    where it stands, so `kill`, `systemctl stop` and `wsl --terminate` all left
+    .metaannot.lock behind - and a lock that cannot be disproved (written on
+    another node, or any lock at all on Windows) reads as a live run, so the
+    next run refuses to start until someone passes --force-unlock.
+
+    The handler raises KeyboardInterrupt rather than exiting, and that is the
+    whole point: a SIGTERMed run then takes exactly the path Ctrl-C already
+    takes - the same unwinding, the same `except KeyboardInterrupt` in main(),
+    the same `_run` stamp, the same WARN line word for word, the same
+    recomputation of the stage that was writing, and the same atexit lock
+    release. Leaving the same trace as an interrupt is the behaviour being
+    asked for; a second, differently-worded shutdown path is not.
+
+    The ONE thing the two do not share is the exit status, which is why the
+    signal number is recorded here: main() reports 128 + it, so Ctrl-C is 130
+    and SIGTERM is 143. That is the shell's convention and systemd's - units
+    carry SuccessExitStatus=143 precisely so that `systemctl stop` is not
+    logged as a failed unit - and 130 for a SIGTERM would tell a supervisor
+    that a user pressed Ctrl-C when none did. The exit status is the only
+    channel left in which a supervisor can tell an operator's stop from a
+    person at a keyboard, so it is the one place the two differ.
+
+    It inherits SIGINT's latency too: the interrupt reaches the main thread
+    only and ThreadPoolExecutor's __exit__ waits for the stage that is running,
+    so under systemd a long stage can still reach TimeoutStopSec and be
+    SIGKILLed. Releasing the lock is what this fixes; killing a running tool
+    promptly is a different change. It also inherits SIGINT's behaviour under a
+    storm of signals: one arriving inside threading's own shutdown abandons the
+    executor join and the process dies of the signal instead. That is Python's
+    default SIGINT semantics, which is what was asked for.
+    """
+    def raise_keyboard_interrupt(signum, frame):
+        global _STOP_SIGNUM
+        _STOP_SIGNUM = signum
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
+    except (ValueError, OSError, AttributeError):
+        # Only the main thread of the main interpreter may install a handler,
+        # and SIGTERM does not exist on every platform metaannot imports on.
+        # Losing the handler costs a stale lock; refusing to run costs the run.
+        pass
 
 
 def main():
     # Before anything can log: a description carrying one U+FFFD used to be
     # able to kill a multi-hour run on a cp1252 console.
     configure_console_streams()
+    handle_sigterm_like_sigint()
     ap = argparse.ArgumentParser(
         prog="metaannot",
         description="Single-file metaproteome functional annotation pipeline.",
@@ -13657,6 +14337,15 @@ def main():
     s.add_argument("--yes", "-y", action="store_true",
                    help="skip the confirmation prompt for --fix")
     s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("describe",
+                       help="print what this build is: config shape, stages "
+                            "and requirements")
+    s.add_argument("--config", default=None)
+    s.add_argument("--json", action="store_true",
+                   help="emit the machine-readable contract instead of a "
+                        "summary")
+    s.set_defaults(func=cmd_describe)
 
     s = sub.add_parser("subset", help="build the identified-protein fasta")
     s.add_argument("--db", required=True, help="full protein database fasta")
@@ -13728,6 +14417,10 @@ def main():
     try:
         rc = args.func(args) or 0
     except StageError as e:
+        # Stamped here rather than in cmd_run: die() unwinds past every return
+        # it has, and this is the only place that sees the difference between
+        # a run that failed and a run that was interrupted.
+        stamp_run("failed")
         log(str(e), "FATAL")
         sys.exit(1)
     except BrokenPipeError:
@@ -13740,12 +14433,26 @@ def main():
             pass
         sys.exit(0)
     except KeyboardInterrupt:
+        # Ctrl-C, or SIGTERM via handle_sigterm_like_sigint(). Stamped before
+        # sys.exit so it is written while the results lock is still held: the
+        # atexit hook that releases the lock runs after this.
+        stamp_run("interrupted")
+        # One message, character for character, whichever signal brought us
+        # here. A " (SIGTERM)" suffix was tried and taken out again: it
+        # contradicts the claim this whole path is built on - that the exit
+        # status is the ONLY channel in which the two differ - which
+        # handle_sigterm_like_sigint(), the README and the TUTORIAL all make
+        # in those words. A supervisor reads the status, not the log, and a
+        # person reading the log wants the same sentence they already know.
         log("interrupted. Stages that FINISHED are cached and skipped next "
             "time, but the stage that was running was never recorded, so its "
             "half-written output would be adopted as if it were complete: "
             "rerun that one with --only <stage> --force before trusting it.",
             "WARN")
-        sys.exit(130)
+        # 128 + the signal: 130 for Ctrl-C, 143 for SIGTERM. See
+        # handle_sigterm_like_sigint() for why these two differ here and
+        # nowhere else.
+        sys.exit(128 + int(_STOP_SIGNUM or signal.SIGINT))
     try:
         sys.stdout.flush()
     except BrokenPipeError:

@@ -6,6 +6,7 @@ code is a defect, not a typo.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -550,3 +551,183 @@ def test_the_documented_stage_workers_default_matches_the_config(ma):
     m = re.search(r"with the default (\d+)", para)
     assert m, f"no stated default in the stage_workers paragraph: {para!r}"
     assert int(m.group(1)) == ma.DEFAULT_CONFIG["stage_workers"]
+
+
+# ----------------------------------------------------------------------
+# what a results directory says about itself
+# ----------------------------------------------------------------------
+def test_the_documented_run_record_matches_the_one_a_run_writes(ma, tmp_path):
+    # this JSON block is what a console author reads to build a parser, so a
+    # key it does not have - or a number of a different type - is a parser
+    # written against a file that does not exist. `heartbeat_s: 30.0` in the
+    # real record against `30` in the example was exactly that.
+    m = re.search(r'```json\n(\s*"_run":.*?)\n```', _text(README), re.S)
+    assert m, "the README no longer shows a _run example"
+    example = json.loads("{" + m.group(1) + "}")["_run"]
+    rec = ma.RunRecord(str(tmp_path / "state.json"), {}, ["metaannot", "run"],
+                       None, ma.DEFAULT_CONFIG["heartbeat_s"]).rec
+    assert set(example) == set(rec), "the documented record has drifted"
+    assert example["heartbeat_s"] == ma.DEFAULT_CONFIG["heartbeat_s"]
+    assert type(example["heartbeat_s"]) is type(rec["heartbeat_s"]), \
+        "a reader parses this example and then meets the real file"
+    assert example["final_status"] == "running"
+
+
+def test_the_documented_heartbeat_default_is_the_real_one(ma):
+    # the same pinning tmbed_max_len gets: a documented default that nothing
+    # compares to DEFAULT_CONFIG drifts silently.
+    txt = _norm(_text(README))
+    assert f"heartbeat_s: {ma.DEFAULT_CONFIG['heartbeat_s']} " in txt, \
+        "the documented heartbeat_s default has drifted from DEFAULT_CONFIG"
+
+
+def test_the_docs_never_promise_that_a_heartbeat_reclaims_a_lock(ma):
+    """The heartbeat is advisory, and the docs have to say so, because the
+    opposite promise is what a shared-filesystem user would act on. A stopped
+    heartbeat is not a stopped process - one failed write ends the timer - so
+    nothing may reclaim on it, and _holder_is_alive is where that is enforced.
+    """
+    src = open(os.path.join(ROOT, "metaannot.py"), encoding="utf-8").read()
+    assert "_heartbeat_says_dead" not in src, \
+        "the reclaim-on-a-stale-heartbeat path is back"
+    for doc in (README, TUTORIAL):
+        txt = _norm(_text(doc))
+        assert "advisory" in txt or "does not decide for you" in txt, \
+            f"{os.path.basename(doc)} does not say the heartbeat is advisory"
+        assert "is treated as a corpse and removed" not in txt
+        assert "proof of death" not in txt
+    assert "nothing in metaannot reclaims a lock because a" in \
+        _norm(_text(README))
+
+
+def test_the_documented_signal_exit_codes_are_the_conventional_ones(ma):
+    # 128 + the signal, which is what the shell and systemd both expect: a
+    # supervisor reading 130 for a `systemctl stop` is told a user pressed
+    # Ctrl-C, and SuccessExitStatus=143 never matches.
+    import signal
+    txt = _norm(_text(README))
+    assert f"`{128 + int(signal.SIGINT)}` for Ctrl-C" in txt
+    assert f"`{128 + int(signal.SIGTERM)}` for `SIGTERM`" in txt
+    assert "SuccessExitStatus=143" in txt
+    assert f"exit status {128 + int(signal.SIGTERM)}" in _norm(_text(TUTORIAL))
+
+
+def test_the_readme_does_not_sell_requirements_as_all_of_doctor(ma):
+    # measured: on one project `describe --json` reported 3 not-ok
+    # requirements while `doctor` additionally reported the missing input, the
+    # emapper_precomputed files, a retired config key, the DIAMOND content
+    # checks and the CUDA probe. A preflight built on `requirements` alone is
+    # green for a config doctor fails, and the README said "exactly what
+    # doctor checks, as data".
+    txt = _norm(_text(README))
+    assert "exactly what `doctor` checks" not in txt
+    assert "the tool-and-database half of `doctor`" in txt
+    cfg = ma.load_config(None)
+    ids = {r["id"] for r in ma.requirements(cfg, ma.Paths(cfg))}
+    for missing in ("proteins_faa", "quant_table"):
+        assert missing not in ids, \
+            f"requirements now covers {missing}; the README paragraph is stale"
+        assert missing in txt, f"the README does not name {missing} as a gap"
+    assert "CUDA probe" in txt
+
+
+def test_the_readme_says_what_the_new_files_disclose(ma):
+    # both artefacts widen what a shared results directory tells a reader, and
+    # .metaannot_state.json travels inside the .rds people publish as
+    # supplementary data.
+    txt = _norm(_text(README))
+    assert "`sources.*` and `tool_args` are free-form" in txt
+    assert "presigned URL" in txt
+    for freeform in ("sources", "tool_args"):
+        assert freeform in ma.FREEFORM or freeform in ma.DEFAULT_CONFIG, \
+            f"{freeform} is not a config block any more"
+
+
+# `doctor`'s own section headings, minus the two that requirements() feeds
+# (`== tools ==` and `== databases ==`, printed from a variable). The README
+# paragraph that tells a console author what doctor checks BEYOND
+# `requirements` has to name every one of them, because it reads as a closed
+# list and a preflight screen gets built from it.
+DOCTOR_SECTIONS = ("config", "inputs", "precomputed emapper", "gpu", "tmt",
+                   "manifest", "taxonomy", "resources", "R")
+
+
+def test_the_readme_names_every_section_doctor_prints(ma):
+    # symptom: the list omitted `== manifest ==`, `== resources ==` and
+    # `== R ==` outright, so a preflight built from it is green for a config
+    # doctor fails on the manifest-to-column mapping, on a memory split that
+    # cannot give eggNOG --dbmem, or on a missing required R package.
+    src = _text(os.path.join(ROOT, "metaannot.py"))
+    printed = set(re.findall(r"== ([A-Za-z][A-Za-z ]*) ==", src))
+    assert printed, "doctor no longer prints section headings"
+    assert printed == set(DOCTOR_SECTIONS), \
+        f"doctor's sections have changed: {printed ^ set(DOCTOR_SECTIONS)}"
+    txt = _norm(_text(README))
+    for name in sorted(printed) + ["tools", "databases"]:
+        assert f"`== {name} ==`" in txt, \
+            f"the README's list of what doctor checks omits == {name} =="
+
+
+def test_the_readme_says_the_run_records_config_path_can_be_null(ma, tmp_path):
+    # symptom: `run` with no --config writes `"config_path": null`, but the
+    # README's JSON example shows a string and the prose never said otherwise,
+    # so a console author writing a strict parser fails on the real file the
+    # first time somebody runs metaannot without a config.
+    txt = _norm(_text(README))
+    assert "`config_path` is the absolute path" in txt and "`null`" in txt, \
+        "the README does not say config_path is nullable"
+    # ...and the file really does say null, so the prose is not the drifting
+    # half. The run dies on the missing FASTA, but the record is written well
+    # before that check.
+    proc = subprocess.run([sys.executable, METAANNOT_PY, "run"],
+                          capture_output=True, text=True, cwd=str(tmp_path),
+                          timeout=300)
+    assert proc.returncode == 1 and "proteins_faa not found" in proc.stderr
+    raw = _text(os.path.join(str(tmp_path), "results",
+                             ".metaannot_state.json"))
+    assert '"config_path": null' in raw
+    assert json.loads(raw)["_run"]["config_path"] is None
+
+
+def test_the_docs_say_what_a_superseded_run_stops_doing(ma):
+    """`--force-unlock` is used on a directory whose holder may still be
+    unwinding - SIGTERM makes a killed run unwind, and unwinding writes - so
+    what the old run does next is operator-facing and has to be written down.
+
+    Pinned as BEHAVIOUR, not as call syntax: an earlier version of this test
+    asserted the literal `if self.is_still_ours():`, which broke the moment the
+    gate grew its third answer and said nothing about whether the two callers
+    still asked it. What matters is that both writes consult the one gate and
+    that the three answers stay distinguishable, because collapsing "vacant"
+    into "somebody else's" cost an unsuperseded run its own final verdict."""
+    src = _text(os.path.join(ROOT, "metaannot.py"))
+    assert "def is_still_ours(self):" in src, "the ownership gate is gone"
+    assert "self.is_still_ours() is True" in src, \
+        "the lock release must remove only on a definite yes"
+    assert "self.owner.is_still_ours() is False" in src, \
+        "the state write must refuse only on a definite no, not on a vacancy"
+    assert "this run no longer holds" in src
+
+    # The three answers, exercised rather than grepped.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        lk = ma.ResultsLock(os.path.join(d, "x.lock"))
+        lk.__enter__()
+        assert lk.is_still_ours() is True, "our own lock must read as ours"
+        with open(lk.path, "w", encoding="utf-8") as fh:
+            fh.write('{"pid": 1, "host": "somewhere-else", "started": "z"}')
+        assert lk.is_still_ours() is False, "another run's lock must read False"
+        os.remove(lk.path)
+        assert lk.is_still_ours() is None, "a vacant path must be its own answer"
+
+    txt = _norm(_text(README))
+    assert "A run that is unwinding stops writing when it is superseded" in txt
+    assert "this run no longer holds" in txt, \
+        "the README does not quote the line the operator will actually see"
+    # The honest version: the stage output is NOT protected, and saying it is
+    # was wrong - the record in the file by then belongs to the replacement.
+    assert "under the new run's valid signature" in txt, \
+        "the README does not say the stage output can land under a live record"
+    assert "remains unsupported" in txt, \
+        "the README does not say --force-unlock on a live run is unsupported"
+    assert "this run no longer holds" in _norm(_text(TUTORIAL))

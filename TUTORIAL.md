@@ -405,9 +405,22 @@ A results directory takes a lock for the duration. A second run against the
 same directory refuses rather than interleaving its writes. A lock is reclaimed
 automatically only when it names a pid on this host that is provably gone —
 which on Windows is never, because asking there would kill the process. A
-crashed run may therefore need `--force-unlock`. The exception is a zero-byte
-lock, which is what a power loss or a hard crash leaves behind: those are
-removed on sight once they are more than a minute old.
+crashed run may therefore need `--force-unlock`. The `_run.last_seen` heartbeat
+tells you how long the holder has been silent, which is what you want before
+deciding that; it does not decide for you. The exception is a zero-byte lock,
+which is what a power loss or a hard crash leaves behind: those are removed on
+sight once they are more than a minute old.
+
+`SIGTERM` no longer strands a lock. `kill` and `systemctl stop` now unwind the
+run exactly as Ctrl-C does — same message, lock released, exit status 143 where
+Ctrl-C gives 130 — though, also exactly as Ctrl-C does, the stage already
+running has to finish first, so the process does not exit immediately.
+
+Which is why `--force-unlock` on a directory whose holder is still unwinding is
+safe: from the moment the lock is no longer the one that run took, it stops
+writing to `.metaannot_state.json` and stops trying to remove the lock. It says
+`this run no longer holds ...` once and exits, and the `_run` record you then
+watch is the replacement's.
 
 Monitor from another shell:
 
@@ -417,7 +430,11 @@ python -c "import json;print(json.dumps(json.load(open('results/.metaannot_state
 ```
 
 The state file shows which stages finished, how long each took, and any that
-failed with the reason.
+failed with the reason. Its `_run` block, first in the file, says what produced
+the directory — version, host, pid, config path, command line — and whether the
+run is still alive: `final_status` plus a `last_seen` stamped every
+`heartbeat_s` seconds. `results/config.effective.yaml` beside it is the merged
+configuration the run actually used, defaults included.
 
 **If it dies:** rerun the same command. Completed stages are cached and skipped;
 only the failed one and its dependents rerun. Do **not** add a bare `--force` —

@@ -103,6 +103,13 @@ STUBS = {
     "hmmsearch": r"""
 import sys, os, time
 a = sys.argv[1:]
+# STUB_WAIT_FOR blocks the stage until the test creates that path, which is
+# what turns "a run that unwinds slowly" from a sleep race into something a
+# test can time exactly: the run stays inside the stage, and so inside the
+# executor's shutdown wait, until the test says otherwise.
+gate = os.environ.get("STUB_WAIT_FOR")
+while gate and not os.path.exists(gate):
+    time.sleep(0.02)
 time.sleep(float(os.environ.get("STUB_SLEEP", "0")))
 def val(flag):
     return a[a.index(flag) + 1] if flag in a else None
