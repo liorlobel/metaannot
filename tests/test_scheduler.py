@@ -305,6 +305,11 @@ def test_resuming_from_every_stage_reproduces_the_clean_result(tmp_path,
     assert _outputs(proj, skip=(PASS1,)) == want
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="send_signal(SIGINT) is unsupported on Windows, and CTRL_C_EVENT "
+           "goes to the whole console group including the test runner. The "
+           "path is covered on Linux, where this passes.")
 def test_an_interrupted_run_leaves_parseable_state_and_resumes(tmp_path,
                                                                stub_bin):
     # symptom: a run killed mid-write left the half-written file as the only
@@ -578,3 +583,193 @@ def test_the_run_says_which_gpu_stages_share_one_device(tmp_path, stub_bin):
     proc = proj2.run(expect=1)           # signalp6/tmbed are not installed
     assert "at most 1 of them runs at a time" in proc.stderr
     assert "SAME card" in proc.stderr
+
+
+# --- longest-processing-time-first ------------------------------------
+# symptom: every stage with no dependencies is ready in the first round and
+# stage_workers is 4, so the first four IN TABLE ORDER started. On the
+# 455,571-protein run that handed workers to cluster (109 s) and dbcan
+# (10 min) while signalp and tmbed — nearly an hour each on a set an order
+# of magnitude smaller — queued behind them.
+def _wave_one(ma):
+    """The stages a fresh run finds ready in its first round."""
+    return [st["name"] for st in ma.STAGES if not st["deps"]]
+
+
+def test_the_first_wave_no_longer_goes_to_the_shortest_stages_in_table_order(
+        ma):
+    ready = _wave_one(ma)
+    before = ready[:4]
+    after = sorted(ready, key=ma.stage_priority, reverse=True)[:4]
+    # what it used to pick, and why that was wrong
+    assert before == ["emapper", "pfam", "dbcan", "diamond"]
+    assert {"dbcan", "diamond"} & set(after) == set()
+    # every stage that now claims a first-round worker is an hours-class one
+    assert all(ma.stage_priority(n) == 3 for n in after), after
+    assert after == ["emapper", "pfam", "signalp", "tmbed"]
+
+
+def test_a_short_stage_never_outranks_a_long_one_wherever_the_table_puts_it(
+        ma):
+    order = sorted(_wave_one(ma), key=ma.stage_priority, reverse=True)
+    # interpro is tenth in the table and the longest stage in the pipeline;
+    # cluster and smorf are seconds and sit on either side of it.
+    for short in ("cluster", "smorf", "dbcan", "diamond"):
+        assert order.index("interpro") < order.index(short), (
+            f"{short} is dispatched before interpro: {order}")
+
+
+def test_equal_cost_stages_keep_table_order(ma):
+    # the sort has to be stable, or the run log reorders itself between
+    # releases for no reason a reader could explain.
+    names = [st["name"] for st in ma.STAGES]
+    order = sorted(names, key=ma.stage_priority, reverse=True)
+    for rank in (3, 2, 1):
+        same = [n for n in order if ma.stage_priority(n) == rank]
+        assert same == [n for n in names if ma.stage_priority(n) == rank], rank
+
+
+def test_every_stage_declares_a_cost_and_it_is_a_known_rank(ma):
+    for st in ma.STAGES:
+        assert "cost" in st, f"{st['name']} declares no cost"
+        assert st["cost"] in (1, 2, 3), (st["name"], st["cost"])
+    assert set(ma.STAGE_COSTS) == {st["name"] for st in ma.STAGES}
+
+
+def test_an_unknown_stage_name_raises_rather_than_ranking_as_trivial(ma):
+    # a .get(name, 1) default would silently rank a stage added without a
+    # cost as seconds-class, which is the bug this ordering exists to fix.
+    with pytest.raises(KeyError):
+        ma.stage_priority("no_such_stage")
+
+
+def test_a_stage_nothing_waits_on_never_outranks_one_integrate_needs(ma):
+    by_name = {st["name"]: st for st in ma.STAGES}
+    depended_on = {d for st in ma.STAGES for d in st["deps"]}
+    orphans = [st["name"] for st in ma.STAGES
+               if st["name"] not in depended_on and st["deps"]] + \
+              [st["name"] for st in ma.STAGES
+               if st["name"] not in depended_on and not st["deps"]]
+    assert "smorf" in orphans, orphans
+    floor = min(ma.stage_priority(d) for d in by_name["integrate"]["deps"])
+    for name in orphans:
+        if name == "join":                 # the terminal stage, waits on all
+            continue
+        assert ma.stage_priority(name) <= floor, (
+            f"{name} blocks nothing yet outranks a stage integrate is "
+            f"waiting for")
+
+
+def test_the_cost_rank_never_enters_a_cache_signature(ma):
+    # scheduling order cannot change a stage's output, so changing it must
+    # not recompute anything.
+    for st in ma.STAGES:
+        assert not any("cost" in k for k in st["keys"]), st["name"]
+    cfg = {"full_content_digest": False, "tool_args": {}}
+    cheap = dict(name="x", cost=1, inp=lambda c, p: [], keys=[],
+                 out=lambda p: [])
+    dear = dict(cheap, cost=3)
+    assert ma.signature(cheap, cfg, None) == ma.signature(dear, cfg, None)
+
+
+def test_the_scheduler_sorts_the_ready_set_before_it_caps_at_stage_workers(
+        ma):
+    # the sort is worthless below the `len(futures) >= workers` break, and
+    # wrong after gpu_lease, which hands the card to whichever gpu stage it
+    # sees first.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    decide = src.index("                run_now.append(name)")
+    srt = src.index("run_now.sort(key=stage_priority, reverse=True)", decide)
+    lease = src.index("run_now, waiting = gpu_lease(", decide)
+    cap = src.index("if len(futures) >= workers:", decide)
+    assert decide < srt < lease < cap
+
+
+# --- the lock and a killed run ----------------------------------------
+# symptom: atexit does not run on SIGTERM or SIGHUP, so a run stopped by
+# `kill`, by a scheduler's time limit, or by a closing ssh session left a lock
+# file behind naming a pid that no longer exists. On the same host the next
+# run can prove it is dead; from another node of a cluster it cannot, and the
+# resume became a stale-lock refusal needing --force-unlock.
+@pytest.mark.skipif(os.name == "nt",
+                    reason="TerminateProcess runs no handler on Windows; "
+                           "SIGTERM cannot be delivered to a child there")
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGHUP"])
+def test_a_killed_run_releases_the_results_lock(tmp_path, stub_bin, signame):
+    sig = getattr(signal, signame, None)
+    if sig is None:
+        pytest.skip(f"{signame} does not exist here")
+    proj = _searchable(tmp_path, tmp_path / f"k{signame}")
+    env = dict(os.environ, STUB_SLEEP="10", PYTHONHASHSEED="0")
+    proc = subprocess.Popen(
+        [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        cwd=proj.root)
+    lock = proj.rpath(".metaannot.lock")
+    assert _wait_for(lambda: os.path.exists(lock)), "the lock was never taken"
+    proc.send_signal(sig)
+    out, err = proc.communicate(timeout=60)
+    assert not os.path.exists(lock), \
+        f"the lock survived {signame}:\n{err[-2000:]}"
+    assert f"stopping on {signame}" in err
+    assert "releasing the results lock" in err
+    assert proc.returncode == -sig or proc.returncode == 128 + int(sig), \
+        f"exit status {proc.returncode} is neither 128+N nor a signal death"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="see above")
+def test_a_run_killed_that_way_resumes_without_force_unlock(tmp_path,
+                                                            stub_bin):
+    # the whole point: the next invocation must not need --force-unlock.
+    ref = _searchable(tmp_path, tmp_path / "kref")
+    ref.run()
+    want = _outputs(ref, skip=(PASS1,))
+    proj = _searchable(tmp_path, tmp_path / "kres")
+    env = dict(os.environ, STUB_SLEEP="10", PYTHONHASHSEED="0")
+    proc = subprocess.Popen(
+        [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        cwd=proj.root)
+    assert _wait_for(lambda: os.path.exists(proj.rpath(".metaannot.lock")))
+    proc.send_signal(signal.SIGTERM)
+    proc.communicate(timeout=60)
+    again = proj.run(env={"STUB_SLEEP": "0"})
+    assert "--force-unlock" not in again.stderr
+    assert "already running here" not in again.stderr
+    assert _outputs(proj, skip=(PASS1,)) == want
+
+
+def test_the_signals_that_can_strand_a_lock_are_all_handled(ma):
+    # SIGINT is deliberately absent: Python raises KeyboardInterrupt for it,
+    # which unwinds through the lock's `with` and runs atexit, so a handler
+    # here would replace an orderly stop with an abrupt one.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("_release_lock_on_signal(sig, _frame)")
+    tail = src[i:i + 4000]
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        assert f'"{name}"' in tail, f"{name} is not registered"
+    assert "SIGINT" not in tail
+    assert "os._exit" in tail, \
+        "sys.exit would wait for the stage pool's workers"
+
+
+def test_the_signal_handler_touches_nothing_that_takes_a_lock(ma):
+    # A Python signal handler runs IN THE MAIN THREAD, between two bytecodes
+    # of whatever that thread was doing, so any lock the interrupted frame
+    # holds is still held and is not reentrant. The first version of this
+    # handler called log() -> sys.stderr.write, whose buffer lock is exactly
+    # that; on a run logging a progress line per stage per minute the signal
+    # eventually lands mid-write and the process HANGS instead of releasing
+    # the lock. CI caught it on one job of seven -- a race, so a behavioural
+    # test cannot be relied on to catch a regression. This pins the rule.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("def _release_lock_on_signal(sig, _frame):")
+    body = src[src.index("release_results_lock()", i):
+               src.index("os._exit(128 + int(sig))", i)]
+    for banned in ("log(", "sys.stderr", "_LOGFH", "print(", ".flush()",
+                   "f\"", "format("):
+        assert banned not in body, (
+            f"{banned!r} in the signal handler: it either takes a lock or "
+            "allocates through one. Pre-format at registration and use "
+            "os.write(2, ...)")
+    assert "os.write(2," in body, "the message must go out on the raw fd"

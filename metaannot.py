@@ -65,6 +65,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -531,6 +532,23 @@ DEFAULT_CONFIG = {
     # aborts the stage on any device, hours in, with nothing written. 0
     # disables the cap and restores the old behaviour.
     "tmbed_max_len": 3000,
+    # TMbed writes nothing until it finishes, so one invocation over a large
+    # proteome risks days of work on a single process. The input is split into
+    # chunks of about this many residues and each is committed as it lands, so
+    # an interrupted run resumes instead of starting over. It costs one ProtT5
+    # load per chunk, which is why the default is millions of residues and not
+    # thousands: under 5M (roughly 17k average proteins) there is exactly one
+    # chunk and the behaviour is what it always was. 0 disables the split.
+    "tmbed_chunk_residues": 5000000,
+    # A chunk that fails leaves its finished predictions behind and its
+    # proteins in results/topology/tmbed_failed.tsv. False stops the run there
+    # so nothing downstream reads a partial topology set by accident; True
+    # accepts the shortfall deliberately.
+    "tmbed_allow_partial": False,
+    # A device that has stopped responding fails every remaining chunk the
+    # same way, slowly. Stop after this many in a row rather than working
+    # through all of them. 0 = never stop early.
+    "tmbed_max_consecutive_failures": 2,
     "interpro_applications": "Pfam,NCBIfam,Gene3D,SUPERFAMILY,PANTHER,SMART,CDD,PIRSF",
     "hhblits_iterations": 2,
     "hhblits_workers": 4,
@@ -560,13 +578,36 @@ DEFAULT_CONFIG = {
         "VFC0272": 1,                        # housekeeping in a virulence coat
     },
     # Per-database e-value, overriding thresholds.diamond_evalue for that tag
-    # alone. One threshold cannot fit every database: BAGEL is 262 bacteriocin
-    # sequences with a median length of 15 residues, and no 15-residue
-    # alignment can reach 1e-10, so at the pipeline default that search was
-    # incapable of a hit before it started and its 0 hits against 38,204
-    # proteins said nothing about the biology. Empty = one threshold for all.
+    # alone. One threshold cannot fit every database: a bacteriocin database
+    # is built from peptides an order of magnitude shorter than VFDB's
+    # 350-residue proteins, and no short alignment can reach 1e-10, so at the
+    # pipeline default that search is close to incapable of a hit before it
+    # starts. Empty = one threshold for all.
     #   diamond_evalues: {bagel: 1e-3}
+    #
+    # A caution the 0-hit BAGEL run on this pipeline earned: check WHAT was
+    # built before tuning the threshold. Those 262 "sequences" of median
+    # length 15 were BAGEL4's motif SEED set, not its bacteriocins, and no
+    # e-value turns a blastp against 15-residue seeds into a bacteriocin
+    # search. diamond_db_check now says so instead of offering this knob.
     "diamond_evalues": {},
+
+    # Per-database minimum percent identity, overriding
+    # thresholds.diamond_min_pident. Applied twice on purpose: as DIAMOND's
+    # own --id during the search, so the table stays small, and again when the
+    # table is read, so a file adopted from elsewhere or produced before the
+    # floor existed keeps the same promise.
+    #
+    # 50 for these three because their hits are read as claims about a
+    # PARTICULAR protein, not as a family assignment. On a 455,571-protein
+    # run CARD returned 39,138 hits and VFDB 107,219 at the 30% default; above
+    # 50% they are 4,661 and 21,623. The rest are the usual metagenome background
+    # -- a 32%-identity match to a beta-lactamase over half a query is a hit
+    # against the fold, not evidence that this protein confers resistance, and
+    # reporting it as "carries an AMR gene" is the error a reviewer would find
+    # first. BAGEL's peptides are short enough that a low-identity alignment
+    # over them is close to meaningless.
+    "diamond_min_pidents": {"card": 50, "vfdb": 50, "bagel": 50},
 
     "thresholds": {
         "diamond_evalue": 1e-10,
@@ -1319,6 +1360,7 @@ class Paths:
         self.fold_clusters = f"{R}/foldseek/fold_clusters.tsv"
         self.final = f"{R}/annotation_final.tsv"
         self.summary = f"{R}/bin_summary.tsv"
+        self.tier_coverage = f"{R}/tier_coverage.tsv"
         # Whether the evidence sources that reach the same protein agree
         # about it, which coverage numbers alone cannot say.
         self.agreement = f"{R}/source_agreement.tsv"
@@ -1675,20 +1717,13 @@ def _count_segments(labels, chars):
 def parse_tmbed(path):
     """tmbed --out-format 0 (3-line): header, sequence, per-residue labels.
     H/h transmembrane helix, B/b transmembrane beta strand, S signal."""
-    # Streamed: the 3-line format carries every sequence, so reading the whole
-    # file into a list cost as much memory as the FASTA itself.
-    out, pid, pending = {}, None, 0
-    with opener(path) as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                pid, pending = line[1:].split()[0], 2
-            elif pid is not None and pending == 2:
-                pending = 1                      # the sequence line
-            elif pid is not None and pending == 1:
-                out[pid] = (_count_segments(line, "Hh"),
-                            _count_segments(line, "Bb"))
-                pid, pending = None, 0
+    # Streamed through iter_tmbed_records, which is also what stage_tmbed
+    # counts chunks with: one definition of a complete record, so a file
+    # truncated mid-write cannot be read as short here and full there.
+    out = {}
+    for hdr, _seq, lab in iter_tmbed_records(path):
+        out[hdr[1:].split()[0]] = (_count_segments(lab, "Hh"),
+                                   _count_segments(lab, "Bb"))
     warn_if_no_records(path, len(out), "topologies")
     return out
 
@@ -1957,6 +1992,66 @@ def id_prefix_candidates(pid, limit=3):
     return out
 
 
+# A merged search database is the normal case for a metaproteomics run, and
+# its tiers do not annotate alike. The Pittsburgh one is four: uhgpL_ (395,467
+# UHGP proteins), OIDECCNN_ (43,139 Prokka calls off the matched metagenome),
+# uhgpSM_ (14,797) and ampS_ (2,168). A single "94% have an eggNOG hit" hides
+# that one of those tiers arrives with precomputed annotations while another
+# is ORFs nobody has ever seen, and the difference is the whole reason the
+# proteome was merged in the first place.
+#
+# 12 is where a prefix stops being a source label and starts being part of
+# the id: one Prokka locus tag per MAG would give hundreds, and a table with
+# a row each answers no question anyone asked.
+MAX_ID_TIERS = 12
+
+
+def id_key_shape(pid):
+    """The identifier under a tier tag, with its digit runs masked.
+
+    A merged database has two things worth telling apart and they are easy to
+    confuse. The TIER TAG says which source a protein came from and is what
+    id_tiers reports. The KEY says what the identifier actually is, and it
+    lives BEHIND the tag:
+
+        uhgpL_MGYG000004906_01237   ->  tier uhgpL_    key MGYG#_#
+        uhgpSM_MGYG000009567_01280  ->  tier uhgpSM_   key MGYG#_#
+        OIDECCNN_00158              ->  tier OIDECCNN_ key #
+        ampS_AMP10.000_478          ->  tier ampS_     key AMP#.#_#
+
+    Two tiers sharing a key are the same identifier namespace under two
+    labels, which is exactly the case emapper_strip_id_prefix exists for: one
+    eggNOG row annotates a protein under every tag it appears with, and a tag
+    left out of that list loses its whole tier.
+
+    Digit RUNS are masked, not digits, because widths vary within one
+    namespace: the Prokka tier of the database this was written for runs
+    OIDECCNN_00001 to OIDECCNN_1712297, and 5-, 6- and 7-digit accessions are
+    all one key space. Masking per digit would split it into three.
+    """
+    m = PREFIX_DELIM_RE.search(pid)
+    tail = pid[m.end():] if m else pid
+    return re.sub(r"\d+", "#", tail) or "(empty)"
+
+
+def id_tiers(ids, max_tiers=MAX_ID_TIERS):
+    """{prefix: count} when the ids look like a merged database, else {}.
+
+    The prefix is everything up to and including the first _ | : or . - the
+    same delimiter set id_prefix_candidates uses. Returns {} when there is
+    only one prefix (nothing to split) or more than max_tiers (the prefix is
+    part of the id, not a label). Ids with no delimiter at all group under "".
+    """
+    counts = {}
+    for pid in ids:
+        m = PREFIX_DELIM_RE.search(pid)
+        key = pid[:m.end()] if m else ""
+        counts[key] = counts.get(key, 0) + 1
+        if len(counts) > max_tiers:
+            return {}
+    return {} if len(counts) < 2 else counts
+
+
 def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
                     diagnose_rows, strip_prefixes=()):
     want = {pid for pid, _ in read_fasta(faa)}
@@ -2078,6 +2173,60 @@ def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
     cov = len(seen) / len(want)
     log(f"emapper reuse: scanned {n_scanned} rows, matched {len(seen)} "
         f"({100*cov:.1f}% of the protein set)")
+    # Per tier, because one headline coverage over a merged database is an
+    # average of things that are not alike: a public catalogue tier arrives
+    # with precomputed annotations and a tier assembled from this study's own
+    # reads does not, and 94% overall can be 99% and 30%.
+    tiers = id_tiers(want)
+    tier_cov = {}
+    if tiers:
+        hit = {k: 0 for k in tiers}
+        for i in seen:
+            m = PREFIX_DELIM_RE.search(i)
+            k = i[:m.end()] if m else ""
+            if k in hit:
+                hit[k] += 1
+        shape_of = {}
+        for pref, n in sorted(tiers.items(), key=lambda kv: -kv[1]):
+            tier_cov[pref] = (n, hit[pref])
+            ex = next((i for i in want if i.startswith(pref)), pref)
+            shape_of.setdefault(id_key_shape(ex), []).append(pref)
+            log(f"emapper reuse:   {pref or '(no prefix)':20s} "
+                f"{hit[pref]:>8,}/{n:<8,} {100.0 * hit[pref] / n:5.1f}%")
+            if not hit[pref]:
+                # Zero is not a small number, it is a different kind of
+                # answer. A tier at 5% has a table that mostly misses; a tier
+                # at 0% has no table keyed on its identifiers at all, and
+                # every one of its proteins will be reported 4_dark by
+                # construction rather than by biology. On the run this was
+                # written for that is the AMPSphere tier -- 2,168 identified
+                # proteins, 30% of the whole dark fraction, and no eggNOG
+                # table anywhere on the machine is keyed on AMP/SPHERE ids.
+                # The headline coverage was 98.4%, so nothing else said it.
+                log(f"emapper reuse: tier {pref or '(no prefix)'} matched "
+                    f"NONE of its {n:,} protein(s). Not a low number -- a "
+                    "zero, which is what a tier whose identifiers no "
+                    "configured table is keyed on looks like. Every one of "
+                    "them will bin as 4_dark for want of a join, not for "
+                    "want of biology. Either add a table for it to "
+                    "emapper_precomputed, or record that this tier is "
+                    "unannotated by construction so the dark fraction is "
+                    "read with that in mind", "WARN")
+        # A tier tag left out of emapper_strip_id_prefix while a tier sharing
+        # its key space is in it loses the whole table for that tier, and the
+        # symptom is a plausible-looking coverage number rather than an error.
+        strip = tuple(strip_prefixes or ())
+        for shape, prefs in shape_of.items():
+            if len(prefs) < 2:
+                continue
+            miss = [p for p in prefs if p not in strip]
+            if strip and miss and len(miss) < len(prefs):
+                log(f"emapper reuse: {', '.join(prefs)} share the identifier "
+                    f"key {shape}, but emapper_strip_id_prefix lists only "
+                    f"{[p for p in prefs if p in strip]}. "
+                    f"{', '.join(miss)} will not be bridged to the same "
+                    "table rows, so that tier reports as unannotated when it "
+                    "is only unjoined. Add it.", "WARN")
     if bridged:
         log(f"emapper reuse: {len(bridged)} of those proteins matched only "
             "after emapper_strip_id_prefix was removed from the fasta id")
@@ -2130,6 +2279,9 @@ def prepare_emapper(sources, faa, out, report, transform, min_cov, warn_cov,
             fh.write(f"id_transform\t{transform}\n")
             fh.write(f"recommended_transform\t{recommend}\n")
             fh.write(f"recommended_strip_id_prefix\t{best_pref}\n")
+            for pref, (n, hit) in tier_cov.items():
+                fh.write(f"tier_{pref or 'none'}_proteins\t{n}\n")
+                fh.write(f"tier_{pref or 'none'}_annotated\t{hit}\n")
 
     if cov < min_cov:
         die(f"only {100*cov:.1f}% of proteins matched (emapper_min_coverage "
@@ -2249,6 +2401,24 @@ def diamond_evalue_for(cfg, tag):
         die(f"{where} must be a number, not {raw!r}")
 
 
+def diamond_min_pident_for(cfg, tag):
+    """The identity floor this DIAMOND database is filtered at.
+
+    Per-database for the same reason the e-value is: one number cannot fit a
+    reference database whose hits are read as "this protein IS that one"
+    (CARD, VFDB, BAGEL, floored at 50) and one read as "this protein is in
+    that family" (where 30 is the useful setting).
+    """
+    over = (cfg.get("diamond_min_pidents") or {})
+    raw = over[tag] if tag in over else cfg["thresholds"]["diamond_min_pident"]
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        where = (f"diamond_min_pidents.{tag}" if tag in over
+                 else "thresholds.diamond_min_pident")
+        die(f"{where} must be a number, not {raw!r}")
+
+
 def best_possible_evalue(letters, typical_len):
     """The smallest e-value a hit against this database could ever reach.
 
@@ -2288,6 +2458,75 @@ def _fasta_lengths(path, cap=200000):
     return out
 
 
+# BAGEL4 ships two different things and they look alike on disk: the
+# bacteriocin SEQUENCE files, and the motif seed set its HMM/regex step is
+# built from - headers like LE-nisin, MA-lantibiotic, ggmotif, lasso, with a
+# median length of 15 residues. The seed set is what got built into a DIAMOND
+# database on a real run, and it returned exactly 0 hits against 38,204
+# proteins. The e-value advice below was the wrong answer to that: blastp
+# against 15-residue seeds is a search for those fifteen residues, not for the
+# molecules they mark, and no threshold makes it into a bacteriocin search.
+#
+# 25 residues, not 40: mature nisin is 34, so a real bacteriocin database can
+# be genuinely short and must not be accused of being a seed set.
+MOTIF_SEED_MAX_LEN = 25
+MOTIF_SEED_MARKERS = ("ggmotif", "lasso", "motif", "seed")
+
+
+def diamond_source_fasta(cfg, tag, path):
+    """A FASTA on disk this .dmnd was built from, or "".
+
+    .fas is the name `doctor --fix` stages beside the database; a
+    sources.diamond entry that is a local path rather than a URL is the other
+    way a config records where the sequences came from.
+    """
+    stem = os.path.splitext(path)[0]
+    named = ((cfg.get("sources") or {}).get("diamond") or {}).get(tag, "")
+    cands = ([named] if named and os.path.isfile(named) else []) + \
+        [stem + ext for ext in (".fas", ".faa", ".fasta")]
+    for cand in cands:
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def motif_seed_evidence(cfg, tag, path, typical):
+    """Why this database looks like a motif seed set rather than sequences.
+
+    Returns a list of human-readable reasons, empty when it looks like a
+    normal protein database. Two signals, either sufficient: a typical
+    sequence too short to be a protein at all, and headers carrying the words
+    a seed set uses. The headers are only readable when a source FASTA is
+    beside the .dmnd, since `diamond dbinfo` reports counts and nothing else.
+    """
+    why = []
+    if typical is not None and typical < MOTIF_SEED_MAX_LEN:
+        why.append(f"its typical sequence is {typical:.0f} residues, shorter "
+                   "than any whole protein")
+    fasta = diamond_source_fasta(cfg, tag, path)
+    if fasta:
+        found, prefixed, n = set(), False, 0
+        with opener(fasta) as fh:
+            for line in fh:
+                if not line.startswith(">"):
+                    continue
+                n += 1
+                tok = (line[1:].split() or [""])[0].lower()
+                # LE- and MA- are checked as a PREFIX of the accession, not as
+                # a substring: "gamma-haemolysin" contains "ma-".
+                prefixed = prefixed or tok.startswith(("le-", "ma-"))
+                low = line.lower()
+                found |= {m for m in MOTIF_SEED_MARKERS if m in low}
+                if n >= 200:
+                    break
+        if prefixed:
+            found.add("LE-/MA- accession prefixes")
+        if found:
+            why.append(f"{os.path.basename(fasta)} carries "
+                       + ", ".join(sorted(found)) + " in its headers")
+    return why
+
+
 def diamond_db_profile(cfg, tag, path):
     """(typical_len, letters, provenance) for a DIAMOND database.
 
@@ -2323,15 +2562,8 @@ def diamond_db_profile(cfg, tag, path):
     else:
         why = "diamond is not installed, so the .dmnd cannot be read"
 
-    stem = os.path.splitext(path)[0]
-    src = ((cfg.get("sources") or {}).get("diamond") or {}).get(tag, "")
-    # .fas is the name doctor --fix stages beside the database; a sources entry
-    # that is a local path rather than a URL is the other way a config records
-    # where the sequences came from.
-    cands = ([src] if src and os.path.isfile(src) else []) +         [stem + ext for ext in (".fas", ".faa", ".fasta")]
-    for cand in cands:
-        if not os.path.isfile(cand):
-            continue
+    cand = diamond_source_fasta(cfg, tag, path)
+    if cand:
         lens = sorted(_fasta_lengths(cand))
         if lens:
             return (lens[len(lens) // 2], sum(lens),
@@ -2345,12 +2577,15 @@ def diamond_db_check(cfg, tag, path):
     """(refusal, warning) for one configured DIAMOND database; either may be
     None. A missing file is the caller's business, not this function's.
 
-    Both of these were real. A `diamond makedb` that had failed left a
+    All three of these were real. A `diamond makedb` that had failed left a
     zero-byte .dmnd, which the stage would have searched, reporting no hits -
-    the same output as a real absence of virulence factors. And BAGEL built
-    correctly, 262 sequences of median length 15, then returned exactly 0 hits
-    against 38,204 proteins at --evalue 1e-10, because a 15-residue peptide
-    cannot reach 1e-10: the search was incapable of a hit before it started.
+    the same output as a real absence of virulence factors. A database whose
+    sequences are too short for the configured e-value cannot produce a hit
+    however good the alignment. And the BAGEL database that prompted both
+    checks turned out to be neither: it was built from BAGEL4's motif SEED
+    set, 262 entries of median length 15, so its 0 hits against 38,204
+    proteins were not a threshold problem at all and lowering --evalue would
+    have produced meaningless hits instead of meaningless silence.
     """
     try:
         size = os.path.getsize(path)
@@ -2370,6 +2605,28 @@ def diamond_db_check(cfg, tag, path):
                 "would report 0 hits, which is indistinguishable from a real "
                 f"absence. Rebuild it: diamond makedb --in <fasta> -d {stem}"), None
     ev = diamond_evalue_for(cfg, tag)
+    weight = (cfg.get("diamond_weights") or {}).get(tag)
+    # A database that cannot answer is also holding a scoring weight that says
+    # it can contribute to the export ranking.
+    note = (f" It also carries diamond_weights {tag}: {weight}, which claims "
+            "it can contribute to the score.") if weight else ""
+    seed = motif_seed_evidence(cfg, tag, path, typical)
+    if seed:
+        # Deliberately INSTEAD of the e-value advice below, not alongside it.
+        # Telling someone to lower --evalue here sends them to tune a
+        # threshold on a database that is the wrong kind of thing, and the
+        # tuned search still answers a question nobody asked.
+        return None, (
+            f"{tag}: this looks like a motif or seed set rather than a "
+            f"protein sequence database - {'; and '.join(seed)}. A blastp "
+            "against it searches for those residues, not for the molecules "
+            "they mark, so its hits and its 0 hits both say nothing about the "
+            "biology, and NO e-value makes that a real search. BAGEL in "
+            "particular ships both: build the database from its bacteriocin "
+            "sequence files, not from the seed set its HMM step uses. If this "
+            f"really is a database of very short peptides, set "
+            f"sources.diamond.{tag} to the FASTA so this check can see what "
+            f"it is.{note}")
     if typical is None:
         return None, (f"{tag}: {prov}, so nothing here can tell whether "
                       f"--evalue {ev:g} is reachable for this database. If it "
@@ -2378,11 +2635,6 @@ def diamond_db_check(cfg, tag, path):
     best = best_possible_evalue(letters, typical)
     if best is None or best <= ev:
         return None, None
-    weight = (cfg.get("diamond_weights") or {}).get(tag)
-    # A database that cannot hit is also holding a scoring weight that says it
-    # can contribute to the effector ranking.
-    note = (f" It also carries diamond_weights {tag}: {weight}, which claims "
-            "it can contribute to the score.") if weight else ""
     return None, (
         f"{tag}: sequences here are about {typical:.0f} residues ({prov}), and "
         f"the best e-value even a perfect alignment that long could reach is "
@@ -2413,7 +2665,8 @@ def stage_diamond(cfg, p):
     # missing one is reported above, the broken one returns 0 hits, and 0 hits
     # is what a real absence of virulence factors looks like too. Both halves
     # of this were observed on one run - a zero-byte .dmnd left by a failed
-    # makedb, and BAGEL searched at an e-value no 15-residue peptide can reach.
+    # makedb, and a BAGEL database built from a motif seed set rather than
+    # from bacteriocin sequences.
     refusals = []
     for tag, path in jobs:
         bad, warn = diamond_db_check(cfg, tag, path)
@@ -2429,12 +2682,19 @@ def stage_diamond(cfg, p):
     # thread scaling is sublinear, so 4 jobs at N/4 threads finish sooner than
     # 4 jobs at N threads in sequence.
     base_ev = float(cfg["thresholds"]["diamond_evalue"])
+    base_id = float(cfg["thresholds"]["diamond_min_pident"])
     for tag, _path in jobs:
         ev = diamond_evalue_for(cfg, tag)
         if ev != base_ev:
             log(f"{tag}: searching at --evalue {ev:g} from diamond_evalues, "
                 f"not the thresholds.diamond_evalue {base_ev:g} the other "
                 "databases use")
+        pid = diamond_min_pident_for(cfg, tag)
+        if pid != base_id:
+            log(f"{tag}: searching at --id {pid:g} from diamond_min_pidents, "
+                f"not the thresholds.diamond_min_pident {base_id:g} the other "
+                "databases use, so nothing below that identity is reported "
+                "at all")
 
     workers = min(len(jobs), max(1, int(cfg.get("diamond_workers", 4))))
     per = max(1, int(cfg["threads"]) // workers)
@@ -2454,9 +2714,14 @@ def stage_diamond(cfg, p):
         # tables it stands for were not: a killed DIAMOND left a half-written
         # <tag>.tsv that integrate read as that database's complete answer.
         with atomic_out(f"{p.diamond_dir}/{tag}.tsv") as tmp:
+            # --id as well as the reader's filter. DIAMOND applies it during
+            # the search, so a floored database writes thousands of rows
+            # instead of hundreds of thousands and the parse is not the place
+            # the promise first takes effect.
             run_cmd(["diamond", "blastp", "-q", cfg["proteins_faa"],
                      "-d", dbpath, "-o", tmp, "--very-sensitive",
                      "-e", f"{diamond_evalue_for(cfg, tag):g}",
+                     "--id", f"{diamond_min_pident_for(cfg, tag):g}",
                      "--max-target-seqs", 5, "--threads", per, "--quiet"]
                     + mem + tool_args(cfg, "diamond")
                     + ["--outfmt", "6", "qseqid", "sseqid", "pident",
@@ -2562,6 +2827,81 @@ def cuda_probe():
         return False, f"torch could not be queried ({type(e).__name__}: {e})"
 
 
+# TMbed writes nothing until it finishes. A single invocation over a whole
+# proteome is therefore an all-or-nothing bet measured in days: the run on
+# 455,571 proteins (214.9M residues) was still going after two days with an
+# empty output file, and the two before it died at 2 h 36 min with nothing
+# recoverable. Splitting the
+# input into chunks turns that into a series of checkpoints. The price is one
+# ProtT5 load per chunk, which is why the chunk count is bounded from both
+# ends: tmbed_chunk_residues sets the floor, TMBED_MAX_PARTS the ceiling.
+TMBED_MAX_PARTS = 256
+
+
+def tmbed_chunk_plan(lengths, budget, max_parts=TMBED_MAX_PARTS):
+    """Group (id, length) pairs into length-sorted, residue-budgeted chunks.
+
+    Longest first, for two reasons. ProtT5 pads every sequence in a batch out
+    to the longest one in it, so a chunk of similar lengths wastes less work
+    than one mixing 30-residue peptides with 3000-residue proteins. And
+    whatever is going to exhaust the device is in the first chunk, where it
+    costs one chunk to discover instead of the whole stage.
+
+    Returns (chunks, budget). The budget returned can be larger than the one
+    asked for: a sequence longer than the budget still needs a chunk, and a
+    budget small enough to ask for more than max_parts chunks would spend more
+    time loading weights than predicting.
+    """
+    if not lengths:
+        return [], 0
+    total = sum(n for _, n in lengths)
+    budget = int(budget or 0)
+    if budget <= 0:                      # 0 = one invocation, as before
+        return [[pid for pid, _ in lengths]], total
+    # Greedy packing closes a chunk when the NEXT sequence would overflow it,
+    # so every chunk but the last can fall short of the budget by as much as
+    # the longest sequence. A floor of total/max_parts alone therefore still
+    # overshoots the ceiling: 5000 x 100 residues against 256 parts planned
+    # 264 of them. Adding the longest sequence to the floor guarantees every
+    # non-final chunk holds more than total/max_parts, and so bounds the
+    # count. It is also what gives an over-long sequence a chunk of its own
+    # rather than dropping it.
+    budget = max(budget, -(-total // max_parts) + max(n for _, n in lengths))
+    chunks, cur, cur_n = [], [], 0
+    for pid, n in sorted(lengths, key=lambda x: (-x[1], x[0])):
+        if cur and cur_n + n > budget:
+            chunks.append(cur)
+            cur, cur_n = [], 0
+        cur.append(pid)
+        cur_n += n
+    if cur:
+        chunks.append(cur)
+    return chunks, budget
+
+
+def iter_tmbed_records(path):
+    """(header, sequence, labels) for every COMPLETE record of a 3-line file.
+
+    One definition of "complete", used by both the parser and the chunk
+    bookkeeping. The format has no trailer, so a TMbed killed mid-write leaves
+    a header and a sequence with no label line; that is not a prediction and
+    must never be counted, copied or adopted as one.
+    """
+    if not os.path.exists(path):
+        return
+    buf = []
+    with opener(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                buf = [line]
+            elif len(buf) in (1, 2):
+                buf.append(line)
+                if len(buf) == 3:
+                    yield tuple(buf)
+                    buf = []
+
+
 def stage_tmbed(cfg, p):
     if not have("tmbed"):
         die("tmbed not found (pip install tmbed && tmbed download)")
@@ -2581,51 +2921,144 @@ def stage_tmbed(cfg, p):
             "(set tmbed_use_gpu: true to make a missing GPU fatal)")
     if want != "false":
         # "Fell back to CPU" is not a detail at this scale. TMbed embeds with
-        # ProtT5 and writes nothing until the very end, so a CPU fallback on a
-        # large proteome is hours of work with no output and no way to tell it
-        # from a hang. Say the number out loud before it starts, not after.
+        # ProtT5, so a CPU fallback on a large proteome is hours of work per
+        # chunk. Say the number out loud before it starts, not after.
         usable, why = cuda_probe()
         if not usable:
             n = sum(1 for _ in read_fasta(cfg["proteins_faa"]))
             log(f"tmbed: {why}. This stage will run on CPU over {n:,} "
                 "protein(s), where it is one to two orders of magnitude "
-                "slower than on a GPU and writes nothing until it finishes, "
-                "so it cannot be told apart from a hang. Set "
-                "tmbed_use_gpu: false to accept that deliberately, true to "
-                "make it fatal, or run.topology: false to skip both topology "
-                "stages", "WARN")
-    # One over-long protein kills the whole stage, and no device setting saves
-    # it. TMbed embeds with ProtT5, whose attention score matrix is
-    # length-squared x heads: titin, at 34,350 residues, asks for 141 GB in a
-    # single allocation. Observed twice on real data — 8.79 GiB refused on a
-    # 16 GB card, then 151 GB refused on a 94 GB host under --cpu-fallback —
-    # each time after hours of work that TMbed writes only at the end, so
-    # nothing was recoverable. Cap the input instead, and record what was cut
-    # rather than letting the exclusion pass unnoticed.
+                "slower than on a GPU. Set tmbed_use_gpu: false to accept "
+                "that deliberately, true to make it fatal, or "
+                "run.topology: false to skip both topology stages", "WARN")
+
     faa = cfg["proteins_faa"]
+    out_dir = os.path.dirname(p.tmbed) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    # One over-long protein kills the whole stage, and no device setting saves
+    # it. ProtT5's attention score matrix is length-squared x heads: titin, at
+    # 34,350 residues, asks for 141 GB in a single allocation. Observed twice
+    # on real data - 8.79 GiB refused on a 16 GB card, then 151 GB refused on
+    # a 94 GB host under --cpu-fallback. Cap the input instead, and record
+    # what was cut rather than letting the exclusion pass unnoticed.
+    #
+    # Lengths only: a 455,571-protein FASTA does not fit in a list of
+    # sequences, so each chunk re-reads the file rather than holding it.
     cap = int(cfg.get("tmbed_max_len", 0) or 0)
-    if cap:
-        long_ones = [(pid, len(seq)) for pid, seq in read_fasta(faa)
-                     if len(seq) > cap]
-        if long_ones:
-            os.makedirs(os.path.dirname(p.tmbed) or ".", exist_ok=True)
-            faa = f"{p.tmbed}.capped.faa"
-            with open(faa, "w", encoding="utf-8") as fh:
-                for pid, seq in read_fasta(cfg["proteins_faa"]):
-                    if len(seq) <= cap:
+    work, excluded = [], []
+    for pid, seq in read_fasta(faa):
+        (excluded if cap and len(seq) > cap else work).append((pid, len(seq)))
+    if excluded:
+        excl = f"{out_dir}/tmbed_excluded.tsv"
+        with open(excl, "w", encoding="utf-8") as fh:
+            fh.write("protein_id\tlength\n")
+            for pid, n in sorted(excluded, key=lambda x: -x[1]):
+                fh.write(f"{pid}\t{n}\n")
+        log(f"tmbed: {len(excluded)} protein(s) longer than "
+            f"tmbed_max_len={cap} are excluded; ProtT5 attention is "
+            f"length-squared and the longest here "
+            f"({max(n for _, n in excluded)} aa) would need more memory than "
+            f"any device present. They get no topology evidence and are "
+            f"listed in {excl}", "WARN")
+
+    if not work:
+        # Nothing to predict is not a failure: a proteome of nothing but
+        # over-cap sequences, or an empty FASTA, should leave an empty
+        # prediction file rather than handing TMbed an empty input and
+        # reporting whatever it does with it. The stage is empty_ok, so the
+        # file is adoptable on a rerun.
+        with atomic_out(p.tmbed) as tmp:
+            open(tmp, "w", encoding="utf-8").close()
+        log(f"tmbed: no sequence is left to predict "
+            f"({len(excluded)} excluded by tmbed_max_len={cap}), so "
+            f"{p.tmbed} is empty and nothing is run", "WARN")
+        return
+
+    chunks, budget = tmbed_chunk_plan(work, cfg.get("tmbed_chunk_residues"))
+    total_res = sum(n for _, n in work)
+    asked = int(cfg.get("tmbed_chunk_residues") or 0)
+    log(f"tmbed: {len(work):,} protein(s), {total_res / 1e6:.1f}M residues -> "
+        f"{len(chunks)} chunk(s) of at most {budget / 1e6:.1f}M residues, "
+        f"longest sequence {max(n for _, n in work):,} aa. TMbed writes "
+        "nothing until it finishes, so each chunk is a checkpoint: an "
+        "interrupted run resumes from the last one instead of starting over."
+        + (f" The budget asked for ({asked / 1e6:.1f}M) was raised to keep "
+           f"the plan under {TMBED_MAX_PARTS} chunks, because ProtT5 is "
+           "loaded once per chunk." if asked and budget > asked else "")
+        + (" Set tmbed_chunk_residues: 0 for a single invocation."
+           if len(chunks) > 1 else ""))
+
+    # Every work protein, mapped to its chunk. Entries are removed as
+    # predictions are written, so whatever is left at the end is exactly the
+    # set that got none - taken from the files, not from the loop's own
+    # bookkeeping, because a chunk that exits 0 can still be short.
+    where = {}
+    for i, ids in enumerate(chunks):
+        for pid in ids:
+            where[pid] = i
+    lengths = dict(work)
+    parts = f"{out_dir}/tmbed_parts"
+    width = len(str(len(chunks)))
+
+    def part_paths(i):
+        tag = f"{i:0{width}d}"
+        return (f"{parts}/{tag}.faa", f"{parts}/{tag}.pred",
+                f"{parts}/{tag}.pred.part")
+
+    def already(i):
+        """A chunk counts as done when its committed output holds a record
+        for every sequence that went into it."""
+        pred = part_paths(i)[1]
+        if not os.path.exists(pred):
+            return False
+        return sum(1 for _ in iter_tmbed_records(pred)) >= len(chunks[i])
+
+    single = len(chunks) == 1 and not excluded
+    os.makedirs(parts, exist_ok=True)
+    if single:
+        # Nothing was filtered and nothing is split, so TMbed reads the
+        # original FASTA. This is the whole of the old behaviour, and it keeps
+        # a second copy of the proteome off the disk for ordinary runs.
+        inputs = {0: faa}
+    else:
+        pending = [i for i in range(len(chunks)) if not already(i)]
+        inputs = {i: part_paths(i)[0] for i in range(len(chunks))}
+        if pending:
+            # Rewritten every run rather than reused: a chunk FASTA is written
+            # before anything reads it, so a killed writer leaves a short one,
+            # and a short input would quietly shrink the chunk.
+            fhs = {i: open(inputs[i], "w", encoding="utf-8") for i in pending}
+            try:
+                for pid, seq in read_fasta(faa):
+                    fh = fhs.get(where.get(pid, -1))
+                    if fh is not None:
                         fh.write(f">{pid}\n{seq}\n")
-            excl = f"{os.path.dirname(p.tmbed)}/tmbed_excluded.tsv"
-            with open(excl, "w", encoding="utf-8") as fh:
-                fh.write("protein_id\tlength\n")
-                for pid, n in sorted(long_ones, key=lambda x: -x[1]):
-                    fh.write(f"{pid}\t{n}\n")
-            log(f"tmbed: {len(long_ones)} protein(s) longer than "
-                f"tmbed_max_len={cap} are excluded; ProtT5 attention is "
-                f"length-squared and the longest here ({long_ones and max(n for _, n in long_ones)} aa) "
-                f"would need more memory than any device present. They get no "
-                f"topology evidence and are listed in {excl}", "WARN")
-    with atomic_out(p.tmbed) as tmp:
-        cmd = ["tmbed", "predict", "-f", faa, "-p", tmp,
+            finally:
+                for fh in fhs.values():
+                    fh.close()
+
+    errors = {}                       # chunk index -> why it failed
+    consecutive = 0
+    max_consecutive = int(cfg.get("tmbed_max_consecutive_failures", 2) or 0)
+    t0, res_done = time.time(), 0
+    for i, ids in enumerate(chunks):
+        pred, part = part_paths(i)[1], part_paths(i)[2]
+        res = sum(lengths[pid] for pid in ids)
+        if already(i):
+            log(f"tmbed: chunk {i + 1}/{len(chunks)} is already predicted; "
+                "skipping")
+            res_done += res
+            continue
+        if len(chunks) > 1:
+            eta = ""
+            if res_done:
+                rate = (time.time() - t0) / res_done
+                eta = (f", ~{(total_res - res_done) * rate / 3600:.1f}h left")
+            log(f"tmbed: chunk {i + 1}/{len(chunks)}, {len(ids):,} "
+                f"sequence(s), {res / 1e6:.1f}M residues{eta}")
+        _atomic_rm(part)
+        cmd = ["tmbed", "predict", "-f", inputs[i], "-p", part,
                "--out-format", "0"] + gpu
         bs = int(cfg.get("tmbed_batch_size", 0) or 0)
         if bs:
@@ -2633,17 +3066,87 @@ def stage_tmbed(cfg, p):
         cmd += tool_args(cfg, "tmbed")
         # run_cmd, not subprocess.run. This stage is the one the progress
         # heartbeat was written for - tmbed ran 2 h 36 min and then died,
-        # twice, with nothing in the log between the command and the failure -
-        # and going straight to subprocess.run was what kept the only tool
-        # named in that example from ever emitting a progress line: no stderr
-        # ring, no heartbeat, and the tqdm bar buffered until the process
-        # ended. Nothing is lost by routing through it. run_cmd takes the env,
-        # so CUDA_VISIBLE_DEVICES still pins the device; tmbed's stdout was
-        # captured here and never read, and run_cmd sends it to /dev/null; the
-        # failure still raises RuntimeError quoting the last 15 lines of
-        # stderr. It also resolves the binary through resolve_tool, so tmbed
-        # is launched by the path `have` found rather than by a bare name.
-        run_cmd(cmd, env=env)
+        # twice, with nothing in the log between the command and the failure.
+        # run_cmd takes the env, so CUDA_VISIBLE_DEVICES still pins the
+        # device, and it resolves the binary through resolve_tool so tmbed is
+        # launched by the path `have` found rather than by a bare name.
+        try:
+            run_cmd(cmd, env=env)
+        except StageError:
+            # die() raises StageError, which IS a RuntimeError. A bare
+            # `except RuntimeError` below would swallow "tmbed not found" or a
+            # record with an empty identifier and report it as a chunk that
+            # failed, which is neither true nor retryable.
+            raise
+        except RuntimeError as e:
+            # Whatever TMbed managed to write before it died stays where it
+            # is: .pred.part is read by the concatenation below, which copies
+            # complete records only. The chunk is NOT committed, so a rerun
+            # retries it.
+            kept = sum(1 for _ in iter_tmbed_records(part))
+            msg = str(e).strip().splitlines()
+            errors[i] = msg[-1] if msg else "no message"
+            consecutive += 1
+            log(f"tmbed: chunk {i + 1}/{len(chunks)} failed after writing "
+                f"{kept}/{len(ids)} prediction(s), which are kept: "
+                f"{errors[i]}", "WARN")
+            if max_consecutive and consecutive >= max_consecutive:
+                log(f"tmbed: {consecutive} chunk(s) in a row failed, so the "
+                    f"remaining {len(chunks) - i - 1} are not attempted - a "
+                    "device that has stopped responding fails all of them the "
+                    "same way, slowly", "WARN")
+                break
+            continue
+        consecutive = 0
+        os.replace(part, pred)
+        res_done += res
+
+    # Concatenated through the record iterator rather than copied byte for
+    # byte, so a truncated tail in a salvaged .pred.part cannot reach the
+    # committed file. The record ORDER here is by length, not the order of
+    # proteins_faa; nothing reads it positionally (parse_tmbed builds a dict).
+    with atomic_out(p.tmbed) as tmp:
+        written = 0
+        with open(tmp, "w", encoding="utf-8") as out:
+            for i in range(len(chunks)):
+                pred, part = part_paths(i)[1], part_paths(i)[2]
+                src = pred if os.path.exists(pred) else part
+                for hdr, seq, lab in iter_tmbed_records(src):
+                    out.write(f"{hdr}\n{seq}\n{lab}\n")
+                    where.pop(hdr[1:].split()[0], None)
+                    written += 1
+        if where:
+            # Name the casualties in a file rather than only in the log, so
+            # the shortfall survives into the results directory and can be
+            # read back by whoever asks why a protein has no topology.
+            miss = f"{out_dir}/tmbed_failed.tsv"
+            with open(miss, "w", encoding="utf-8") as fh:
+                fh.write("protein_id\tlength\tchunk\terror\n")
+                for pid in sorted(where, key=lambda q: -lengths.get(q, 0)):
+                    i = where[pid]
+                    fh.write(f"{pid}\t{lengths.get(pid, '')}\t{i}\t"
+                             f"{errors.get(i, 'not attempted')}\n")
+            log(f"tmbed: {len(where):,} of {len(work):,} protein(s) got no "
+                f"prediction; listed in {miss}", "WARN")
+            if not cfg.get("tmbed_allow_partial"):
+                die(f"tmbed finished {written:,} of {len(work):,} "
+                    f"prediction(s) across {len(chunks)} chunk(s).\n"
+                    f"  Every completed chunk is kept in {parts}, so "
+                    "rerunning resumes from there rather than starting "
+                    "over.\n"
+                    "  A card that has stopped responding usually needs the "
+                    "machine or the WSL session restarted, not another "
+                    "attempt.\n"
+                    f"  The proteins that got nothing are listed in {miss}. "
+                    "To go on without them, set tmbed_allow_partial: true.")
+            log("tmbed: continuing with a partial topology set because "
+                "tmbed_allow_partial is on; an absent helix or strand count "
+                "here means not attempted, not absent", "WARN")
+        log(f"tmbed: {written:,} prediction(s) -> {p.tmbed}")
+
+    # Only once the committed file exists. Until then the parts ARE the
+    # result, and a run that dies between the two must be able to resume.
+    shutil.rmtree(parts, ignore_errors=True)
 
 
 def stage_cluster(cfg, p):
@@ -3710,8 +4213,15 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
         # The same per-database e-value the search used: filtering the table
         # back down to thresholds.diamond_evalue here would quietly undo a
         # diamond_evalues entry and leave the user's setting doing nothing.
+        # The same per-database identity floor the search used, for the same
+        # reason as the e-value above: reading the table back at the global
+        # thresholds.diamond_min_pident would quietly undo a
+        # diamond_min_pidents entry. It also has to be applied HERE and not
+        # only on the command line, because a <tag>.tsv adopted from another
+        # machine, or written before the floor existed, never saw --id.
+        min_pid = diamond_min_pident_for(cfg, tag)
         hits = parse_diamond(path, diamond_evalue_for(cfg, tag),
-                             th["diamond_min_qcov"], th["diamond_min_pident"])
+                             th["diamond_min_qcov"], min_pid)
         df[f"{tag}_hit"] = from_dict({k: v[0] for k, v in hits.items()}, idx)
         df[f"{tag}_pident"] = from_dict(
             {k: v[1] for k, v in hits.items()}, idx, float("nan"))
@@ -3973,6 +4483,18 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
     # used to score the full weight. Below diamond_strong_pident the weight is
     # halved rather than dropped, so a weak hit still ranks above no hit.
     strong_pid = th.get("diamond_strong_pident", 50)
+    # A database floored at or above diamond_strong_pident cannot produce a
+    # weak hit: everything that survived the filter scores full weight and the
+    # halving below is dead for it. Said once, because the alternative is a
+    # reader concluding from the config that VFDB hits are being graded by
+    # identity when in fact they cannot be.
+    floored = [t for t in dia_tags
+               if diamond_min_pident_for(cfg, t) >= strong_pid]
+    if floored:
+        log(f"{', '.join(sorted(floored))}: filtered at or above "
+            f"diamond_strong_pident={strong_pid:g}, so every surviving hit "
+            "scores the full diamond_weights value and the half-weight rule "
+            "for weak hits never applies to them")
     # VFDB is not one kind of evidence. Its own VFC category code says which,
     # and a flat weight throws that away: on a real gut metaproteome, of 3,308
     # VFDB hits the two largest categories were "Immune modulation" (965) and
@@ -4112,6 +4634,107 @@ def build_annotation(cfg, p, emit_dark=None, emit_dark_all=None):
                 f", all {n_all} of them", "WARN")
 
     return df
+
+
+# Evidence a protein can carry, as (label, column). A column absent from the
+# frame is skipped rather than reported as 0%: "this stage did not run" and
+# "this stage found nothing" are different answers and must not share a cell.
+TIER_EVIDENCE = [
+    ("eggnog", "og"), ("ko", "ko"), ("pfam", "pfam_hits"),
+    ("ncbifam", "ncbifam_hits"), ("kofam", "kofam_ko"),
+    ("interpro", "interpro_sigs"), ("dbcan", "dbcan_hits"),
+    ("cazy", "cazy"),
+]
+
+
+def write_tier_coverage(df, path, cfg=None):
+    """Coverage split by identifier prefix, for a merged search database.
+
+    bin_summary.tsv answers "what did this proteome look like"; this answers
+    "and did its parts look alike", which for a database merged from several
+    catalogues plus this study's own assembly is the question the headline
+    number hides. Writes nothing and says why when the ids are not tiered, so
+    an absent file is never ambiguous.
+
+    exclude_id_prefixes is applied FIRST. A run whose proteins_faa is the
+    whole search database rather than the identified subset carries the
+    decoys, the entrapment set and the contaminants, and on the database this
+    was written for those are the two LARGEST namespaces in the file --
+    18,318,713 rev_ and 2,280,823 ent_ against 11,379,230 uhgpL_. A tier table
+    whose top row is the decoy set is not a description of the biology, and it
+    would also spend the twelve-tier budget on namespaces that are there to be
+    ignored. They are dropped and counted out loud, never silently.
+    """
+    if cfg is not None:
+        prefixes = tuple(cfg.get("exclude_id_prefixes") or ())
+        if prefixes:
+            drop = np.asarray([str(s).startswith(prefixes) for s in df.index],
+                              dtype=bool)
+            if drop.any():
+                hits = {}
+                for s in df.index[drop]:
+                    for pre in prefixes:
+                        if str(s).startswith(pre):
+                            hits[pre] = hits.get(pre, 0) + 1
+                            break
+                log(f"tier coverage: {int(drop.sum()):,} protein(s) excluded "
+                    f"by exclude_id_prefixes {hits} before the split. Decoy, "
+                    "entrapment and contaminant namespaces are in the search "
+                    "database to be ignored, and reporting their coverage "
+                    "beside a real catalogue's would invite reading them as "
+                    "one")
+                df = df[~drop]
+    if not len(df):
+        log("tier coverage: nothing is left after exclude_id_prefixes, so no "
+            f"per-tier table is written; {os.path.basename(path)} is absent "
+            "for that reason, not because a stage failed", "WARN")
+        return False
+    tiers = id_tiers(df.index)
+    if not tiers:
+        log("protein ids are not split by a source prefix (or carry more "
+            f"than {MAX_ID_TIERS} distinct ones), so no per-tier coverage "
+            f"table is written; {os.path.basename(path)} is absent for that "
+            "reason, not because a stage failed")
+        return False
+    m = pd.Series(list(df.index), index=df.index).str.extract(
+        r"^([^_|:.]*[_|:.])", expand=False).fillna("")
+    rows = []
+    for pref, _n in sorted(tiers.items(), key=lambda kv: -kv[1]):
+        sub = df[m == pref]
+        row = {"tier": pref or "(no prefix)", "n": len(sub),
+               "pct_of_proteome": round(100.0 * len(sub) / len(df), 1)}
+        for label, col in TIER_EVIDENCE:
+            if col in sub.columns:
+                row[f"pct_{label}"] = round(
+                    100.0 * sub[col].fillna("").astype(str).ne("").mean(), 1)
+        row["pct_dark"] = round(100.0 * sub["bin"].eq("4_dark").mean(), 1)
+        row["median_export_score"] = sub["export_score"].median()
+        # The KEY under the tag, not the tag. Reported per tier because two
+        # tiers with the same key are one namespace under two labels.
+        shapes = pd.Series([id_key_shape(q) for q in sub.index]).value_counts()
+        row["key_shape"] = shapes.index[0] if len(shapes) else ""
+        row["key_shape_pct"] = round(
+            100.0 * shapes.iloc[0] / len(sub), 1) if len(shapes) else 0.0
+        rows.append(row)
+    t = pd.DataFrame(rows).set_index("tier")
+    with atomic_out(path) as tmp:
+        t.to_csv(tmp, sep="\t")
+    log(f"{len(t)} identifier tier(s) in the protein set; coverage per tier "
+        f"-> {path}")
+    shared = {}
+    for tier, shape in t["key_shape"].items():
+        shared.setdefault(shape, []).append(tier)
+    for shape, tiers in shared.items():
+        if len(tiers) > 1:
+            log(f"identifier key {shape} is shared by {', '.join(tiers)}: "
+                "these are one namespace under several tags, so the same "
+                "protein can appear once per tag, one row of a precomputed "
+                "annotation table annotates all of them, and EVERY one of "
+                "those tags has to be in emapper_strip_id_prefix or its tier "
+                "loses that table entirely", "WARN")
+    for line in t.to_string().splitlines():
+        log(line)
+    return True
 
 
 def write_summary(df, path):
@@ -4270,6 +4893,7 @@ def stage_integrate_final(cfg, p):
     with atomic_out(p.final) as tmp:
         df.to_csv(tmp, sep="\t")
     write_summary(df, p.summary)
+    write_tier_coverage(df, p.tier_coverage, cfg)
     write_source_agreement(df, p.agreement)
     log(f"wrote {p.final}")
 
@@ -4523,6 +5147,33 @@ def vram_fit_length(cfg, torch):
     return n
 
 
+def folded_already(path):
+    """A committed structure, as opposed to what a killed writer left behind.
+
+    The resume rule for this stage is "the .pdb is there, so it is folded",
+    and open() truncates the moment it is called, so a run interrupted between
+    the open and the flush leaves a 0-byte or header-only file that
+    os.path.exists cannot tell from a finished one. Every later run then
+    counted it, and the protein was permanently absent from Foldseek with
+    nothing anywhere to say why. Structures are renamed into place now, so
+    this cannot happen again, but the files already on disk from before it
+    still can.
+
+    Stops at the first coordinate line, so checking a whole directory costs
+    one short read per file rather than a full pass over gigabytes.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return False
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("ATOM"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def stage_esmfold(cfg, p):
     os.makedirs(p.structures, exist_ok=True)
     if not nonempty(p.dark):
@@ -4542,7 +5193,7 @@ def stage_esmfold(cfg, p):
     static_cap = int(cfg["max_len_structure"])
     pending = [q for q, t in read_fasta(p.dark)
                if len(t) <= static_cap
-               and not os.path.exists(f"{p.structures}/{q}.pdb")]
+               and not folded_already(f"{p.structures}/{q}.pdb")]
     if not pending:
         n_have = len(glob.glob(f"{p.structures}/*.pdb"))
         log(f"esmfold: every sequence at or under max_len_structure="
@@ -4708,15 +5359,21 @@ def stage_esmfold(cfg, p):
         for pid, seq in seqs:
             out_pdb = f"{p.structures}/{pid}.pdb"
             if os.path.exists(out_pdb):
-                skipped += 1
-                if pid not in seen:
-                    with open(out_pdb, encoding="utf-8") as fh:
-                        mp = mean_plddt(fh.read())
-                    ph.write(f"{pid}\t{len(seq)}\t"
-                             + (f"{mp:.1f}\n" if mp is not None else "NA\n"))
-                    ph.flush()
-                    seen.add(pid)
-                continue
+                if not folded_already(out_pdb):
+                    log(f"esmfold: {out_pdb} holds no atom, which is what an "
+                        "interrupted writer leaves behind; refolding it "
+                        "rather than counting it", "WARN")
+                else:
+                    skipped += 1
+                    if pid not in seen:
+                        with open(out_pdb, encoding="utf-8") as fh:
+                            mp = mean_plddt(fh.read())
+                        ph.write(f"{pid}\t{len(seq)}\t"
+                                 + (f"{mp:.1f}\n" if mp is not None
+                                    else "NA\n"))
+                        ph.flush()
+                        seen.add(pid)
+                    continue
             pdb, chunk = None, base_chunk
             why = ""
             for attempt in (0, 1):
@@ -4777,8 +5434,15 @@ def stage_esmfold(cfg, p):
                     break
                 continue
             consecutive = 0
-            with open(out_pdb, "w", encoding="utf-8") as fh:
-                fh.write(pdb)
+            # Renamed into place, never written in place. This loop runs for
+            # hours and is interrupted often — a wedged card, a bugcheck, a
+            # Ctrl-C — and the resume rule is "the file is there, so it is
+            # folded". atomic_out's temp is dot-prefixed and keeps the
+            # extension, so glob("*.pdb") never sees it and a leftover cannot
+            # come back as a structure named ".P0001.9134.7.part".
+            with atomic_out(out_pdb) as tmp_pdb:
+                with open(tmp_pdb, "w", encoding="utf-8") as fh:
+                    fh.write(pdb)
             mp = mean_plddt(pdb)
             ph.write(f"{pid}\t{len(seq)}\t"
                      + (f"{mp:.1f}\n" if mp is not None else "NA\n"))
@@ -8220,7 +8884,7 @@ UNIPEPT_KEYS = ["unipept.result", "unipept.allow_http", "unipept.api_url",
                 "unipept.consensus_min_peptides"]
 
 STAGES = [
-    dict(name="emapper", enabled="eggnog",
+    dict(name="emapper", cost=3, enabled="eggnog",
          out=lambda p: [p.emapper],
          inp=lambda c, p: [c["proteins_faa"]] + (
              [c["emapper_precomputed"]] if isinstance(c["emapper_precomputed"], str)
@@ -8229,50 +8893,62 @@ STAGES = [
                "emapper_strip_id_prefix",
                "emapper_min_coverage", "db.eggnog_data"],
          deps=[], fn=stage_emapper),
-    dict(name="pfam", enabled="pfam", out=lambda p: [p.pfam],
+    dict(name="pfam", cost=3, enabled="pfam", out=lambda p: [p.pfam],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["pfam_hmm"]],
          keys=["db.pfam_hmm"], deps=[], fn=stage_pfam),
-    dict(name="dbcan", enabled="dbcan", out=lambda p: [p.dbcan],
+    dict(name="dbcan", cost=2, enabled="dbcan", out=lambda p: [p.dbcan],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["dbcan_hmm"]],
          keys=["db.dbcan_hmm", "thresholds.dbcan_evalue"], deps=[], fn=stage_dbcan),
-    dict(name="diamond", empty_ok=True, enabled="diamond",
+    dict(name="diamond", cost=2, empty_ok=True, enabled="diamond",
          out=lambda p: [p.diamond_done],
          inp=lambda c, p: [c["proteins_faa"]] + list((c["db"].get("diamond") or {}).values()),
-         keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues"],
+         keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues",
+               "thresholds.diamond_min_pident", "diamond_min_pidents"],
          deps=[], fn=stage_diamond),
-    dict(name="signalp", enabled="topology", out=lambda p: [p.signalp],
+    dict(name="signalp", cost=3, enabled="topology", out=lambda p: [p.signalp],
          inp=lambda c, p: [c["proteins_faa"]], keys=["signalp_mode"],
          deps=[], fn=stage_signalp),
     # gpu=True: this stage takes an exclusive lease on gpu_device. tmbed held
     # 15.5 GB of a 16 GB card; see gpu_workers.
-    dict(name="tmbed", enabled="topology", gpu=True, out=lambda p: [p.tmbed],
+    # empty_ok: a proteome whose every sequence is over tmbed_max_len leaves
+    # an empty prediction file on purpose, and a rerun must be able to adopt
+    # it rather than re-deciding that there is nothing to do.
+    #
+    # tmbed_chunk_residues is deliberately NOT a key. It changes how the work
+    # is divided and therefore the ORDER of the records, but not one
+    # prediction in them, and listing it would throw away a 30-hour stage
+    # because someone tuned a checkpoint size. The two keys that DO change
+    # what is in the file - how much of a failure is tolerated - are listed.
+    dict(name="tmbed", cost=3, enabled="topology", gpu=True, empty_ok=True,
+         out=lambda p: [p.tmbed],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["gpu_device", "tmbed_use_gpu", "tmbed_max_len",
-               "tmbed_batch_size"], deps=[], fn=stage_tmbed),
-    dict(name="cluster", enabled="cluster", out=lambda p: [p.cluster],
+               "tmbed_batch_size", "tmbed_allow_partial",
+               "tmbed_max_consecutive_failures"], deps=[], fn=stage_tmbed),
+    dict(name="cluster", cost=1, enabled="cluster", out=lambda p: [p.cluster],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["thresholds.cluster_min_seq_id", "thresholds.cluster_coverage"],
          deps=[], fn=stage_cluster),
-    dict(name="ncbifam", enabled="ncbifam", out=lambda p: [p.ncbifam],
+    dict(name="ncbifam", cost=3, enabled="ncbifam", out=lambda p: [p.ncbifam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("ncbifam_hmm", "")],
          keys=["db.ncbifam_hmm", "thresholds.ncbifam_cutoff"], deps=[], fn=stage_ncbifam),
-    dict(name="kofam", enabled="kofam", out=lambda p: [p.kofam],
+    dict(name="kofam", cost=3, enabled="kofam", out=lambda p: [p.kofam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("kofam_ko_list", "")],
          keys=["db.kofam_profiles", "db.kofam_ko_list"], deps=[], fn=stage_kofam),
-    dict(name="interpro", enabled="interpro", out=lambda p: [p.interpro],
+    dict(name="interpro", cost=3, enabled="interpro", out=lambda p: [p.interpro],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["interpro_applications", "db.interproscan_sh"], deps=[], fn=stage_interpro),
-    dict(name="smorf", empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
+    dict(name="smorf", cost=1, empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
          inp=lambda c, p: [c.get("contigs_fna", "")],
          keys=["smorf_mode", "thresholds.smorf_max_len"], deps=[], fn=stage_smorf),
-    dict(name="context", enabled="context", out=lambda p: [p.context],
+    dict(name="context", cost=1, enabled="context", out=lambda p: [p.context],
          inp=lambda c, p: [c.get("gff") or "", p.emapper, p.pfam, p.signalp,
                            p.dbcan],
          keys=["gff", "context_window", "immunity_max_len", "immunity_max_gap",
                "pul_min_cazymes", "thresholds.dbcan_min_cov",
                "thresholds.dbcan_evalue"],
          deps=['emapper', 'pfam', 'signalp', 'dbcan'], fn=stage_context),
-    dict(name="integrate", enabled=None,
+    dict(name="integrate", cost=2, enabled=None,
          out=lambda p: [p.pass1, p.dark, p.dark_all],
          inp=lambda c, p: [c["proteins_faa"], p.emapper, p.pfam, p.dbcan,
                            p.signalp, p.tmbed, p.cluster, p.context,
@@ -8290,23 +8966,24 @@ STAGES = [
          # to this stage alone, since finalise never writes dark.faa.
          keys=["thresholds", "weights", "diamond_weights",
                "vfdb_category_weights", "foldseek_target_priority",
-               "diamond_evalues", "anchor_pfams",
+               "diamond_evalues",
+               "diamond_min_pidents", "anchor_pfams",
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",
                "ncbifam_uninformative_test"],
          deps=['emapper', 'pfam', 'dbcan', 'diamond', 'signalp', 'tmbed', 'cluster', 'ncbifam', 'kofam', 'interpro', 'context'], fn=stage_integrate_pass1),
     # dark_all.faa, not dark.faa: the profile searches query the whole
     # unannotated set, the structure work-list is a GPU budget.
-    dict(name="jackhmmer", empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
+    dict(name="jackhmmer", cost=3, empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
          inp=lambda c, p: [p.dark_all, c["db"].get("jackhmmer_db", "")],
          keys=["db.jackhmmer_db", "jackhmmer_iterations",
                "thresholds.jackhmmer_evalue"], deps=['integrate'], fn=stage_jackhmmer),
-    dict(name="hhblits", empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
+    dict(name="hhblits", cost=3, empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
          inp=lambda c, p: [p.dark_all, c["db"].get("hhblits_db", "")],
          keys=["db.hhblits_db", "hhblits_iterations"], deps=['integrate'], fn=stage_hhblits),
     # gpu=True: ESMFold peaked at 13.3 GB on a single short sequence, so it
     # cannot share a 16 GB card with tmbed; see gpu_workers.
-    dict(name="esmfold", empty_ok=True, enabled="structure", gpu=True,
+    dict(name="esmfold", cost=3, empty_ok=True, enabled="structure", gpu=True,
          out=lambda p: [p.struct_done],
          inp=lambda c, p: [p.dark],
          keys=["max_len_structure", "esmfold_chunk_size",
@@ -8314,7 +8991,7 @@ STAGES = [
                "esmfold_vram_cap", "esmfold_bytes_per_residue_pair",
                "esmfold_vram_reserve_gb"],
          deps=['integrate'], fn=stage_esmfold),
-    dict(name="foldseek", empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
+    dict(name="foldseek", cost=2, empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
          inp=lambda c, p: [p.struct_done],
          keys=["db.foldseek_target", "db.foldseek_extra_targets",
                "thresholds.foldseek_evalue", "foldseek_self_cluster",
@@ -8323,28 +9000,29 @@ STAGES = [
                "thresholds.foldseek_cluster_tmscore",
                "thresholds.foldseek_cluster_coverage"],
          deps=['esmfold'], fn=stage_foldseek),
-    dict(name="finalise", enabled=None,
+    dict(name="finalise", cost=2, enabled=None,
          out=lambda p: [p.final, p.summary, p.agreement],
          inp=lambda c, p: [p.pass1, p.foldseek, p.context, p.fold_clusters,
                            p.ncbifam, p.kofam, p.interpro,
                            p.hhr_done, p.jackhmmer],
          keys=["thresholds", "weights", "diamond_weights",
                "vfdb_category_weights",
-               "diamond_evalues", "anchor_pfams",
+               "diamond_evalues",
+               "diamond_min_pidents", "anchor_pfams",
                "toxin_fold_patterns", "ncbifam_uninformative_test",
                "foldseek_target_priority"],
          deps=['integrate', 'jackhmmer', 'hhblits', 'foldseek', 'context'], fn=stage_integrate_final),
-    dict(name="unipept", enabled="unipept", out=lambda p: [p.unipept_lca],
+    dict(name="unipept", cost=3, enabled="unipept", out=lambda p: [p.unipept_lca],
          inp=lambda c, p: quant_inputs(c) + [(c.get("unipept") or {}).get("result", "")],
          keys=UNIPEPT_KEYS + ["quant_table", "quant_format", "tmt",
                "peptide_only_reader", "exclude_id_prefixes"],
          deps=[], fn=stage_unipept),
-    dict(name="taxonomy", enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
+    dict(name="taxonomy", cost=1, enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
          inp=lambda c, p: [p.unipept_lca, p.final] + quant_inputs(c),
          keys=UNIPEPT_KEYS + ["db.ncbi_taxonomy", "peptide_only_reader",
                "exclude_id_prefixes", "quant_format", "tmt"],
          deps=['unipept', 'finalise'], fn=stage_taxonomy),
-    dict(name="join", enabled="join",
+    dict(name="join", cost=2, enabled="join",
          out=lambda p: [f"{p.quant_dir}/annotated_quant.tsv"],
          # taxonomy_comparison is a real input: join merges its columns and
          # resolves effective_taxid from it. Omitting it left annotated_quant
@@ -8362,6 +9040,37 @@ STAGES = [
          deps=['finalise', 'taxonomy'], fn=stage_join),
 ]
 STAGE_NAMES = [s["name"] for s in STAGES]
+
+
+# How long a stage runs, coarsely. 3 = hours, 2 = minutes, 1 = seconds, and
+# the numbers come off two real runs rather than intuition: on 38k proteins
+# interproscan took 2.8 h, signalp 56 min, tmbed 52 min, kofam 29 min, pfam
+# 27 min, ncbifam 24 min, dbcan 41 s, cluster 14 s; on 455,571 proteins
+# kofam took 14.3 h, pfam 7.2 h, ncbifam 5.6 h, dbcan 10 min, diamond 5 min,
+# cluster 109 s, and interproscan was still running after two days. Three
+# ranks is all the resolution the scheduler can use: it decides which ready
+# stage claims a worker first, not when anything finishes.
+STAGE_COSTS = {st["name"]: st["cost"] for st in STAGES}
+
+
+def stage_priority(name):
+    """Sort key for one round's ready stages: the longest one goes first.
+
+    Every stage with no dependencies is ready in the first round, and
+    stage_workers is 4, so the first four IN TABLE ORDER started and the rest
+    waited. That put cluster (109 s) and dbcan (10 min) on the box while
+    interproscan — the longest stage in the pipeline by an order of magnitude
+    — sat in the queue behind them. Longest-processing-time-first is the
+    standard greedy answer to that, and here it costs one sort of a list that
+    is never longer than 21.
+
+    Two things this must NOT do. It must not reach the cache: scheduling
+    order cannot change a stage's output, so no signature and no keys list
+    mentions cost. And it must not default: indexing STAGE_COSTS raises
+    KeyError on an unknown name, where a .get(name, 1) would quietly rank a
+    stage added without a cost as trivial and reintroduce the exact problem.
+    """
+    return STAGE_COSTS[name]
 
 
 def gpu_lease(ready, running, slots, needs_gpu):
@@ -8532,6 +9241,45 @@ def signature(stage, cfg, p):
         json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _windows_pid_alive(pid):
+    """Whether a pid names a live process on Windows, without signalling it.
+
+    Unprovable means alive, as everywhere else in the lock: a missing API, a
+    refused handle or an ambiguous exit code all answer True, and
+    --force-unlock is the escape. Only ERROR_INVALID_PARAMETER -- the answer
+    Windows gives for a pid that does not exist at all -- is taken as proof of
+    death.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:                                   # pragma: no cover
+        return True
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.DWORD]
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                            int(pid))
+        if not h:
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True
+            # STILL_ACTIVE is ambiguous with a process that exited WITH code
+            # 259, which is why it errs towards alive rather than away.
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:                                   # pragma: no cover
+        return True
+
+
 class ResultsLock:
     """One writer per results directory.
 
@@ -8560,8 +9308,12 @@ class ResultsLock:
             return True
         if os.name == "nt":
             # os.kill(pid, 0) on Windows calls TerminateProcess: asking
-            # whether a process is alive would kill it.
-            return True
+            # whether a process is alive that way would KILL it. OpenProcess
+            # asks without touching it. Answering "alive" unconditionally, as
+            # this did, meant a lock left by a crashed run on Windows could
+            # never be reclaimed and every resume needed --force-unlock -- and
+            # a crash is exactly when reclaiming has to work.
+            return _windows_pid_alive(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -12247,6 +12999,24 @@ def cmd_doctor(args):
             print("review it, then run it, or rerun doctor with --fix"
                   if missing else "nothing to install")
 
+    if args.fix and os.name == "nt":
+        # The commands come out of `requirements()` as POSIX shell -- mkdir
+        # -p, curl, tar, gunzip, hmmpress -- and are run through
+        # subprocess(shell=True), which on Windows is cmd.exe. `mkdir -p
+        # 'C:\\db'` there creates a directory called -p; curl and tar may or
+        # may not exist; and every one of them can exit 0 having done nothing,
+        # which is precisely the failure the post-install verification was
+        # written to catch. Refuse rather than half-work.
+        die("doctor --fix cannot run on Windows: the install commands it "
+            "generates are POSIX shell, and cmd.exe silently mis-executes "
+            "them (`mkdir -p C:\\db` makes a directory called -p).\n"
+            "  Write the plan and run it where the tools live:\n"
+            "    python metaannot.py doctor --config <cfg> "
+            "--install-plan install.sh\n"
+            "    wsl bash install.sh          # or Git Bash, or the Linux "
+            "host that will do the run\n"
+            "  Every other doctor check works here; only --fix is refused.")
+
     if args.fix:
         if not missing:
             print("\nnothing to install")
@@ -12394,7 +13164,83 @@ def cmd_run(args):
         log(f"metaannot {__version__} starting")
         lock = ResultsLock(p.lock, force=getattr(args, "force_unlock", False))
         lock.__enter__()
-        atexit.register(lock.__exit__)
+        # The BOUND METHOD, not a closure over `lock`. Both of these used to
+        # be reachable from a name that this function reassigns further down,
+        # and the signal handler duly called threading.Lock.__exit__ and died
+        # with "release unlocked lock" - which took the run out with an
+        # uncaught RuntimeError and exit 1 rather than releasing anything.
+        release_results_lock = lock.__exit__
+        atexit.register(release_results_lock)
+
+        def _release_lock_on_signal(sig, _frame):
+            """Release the results lock when the run is killed, not only when
+            it exits.
+
+            atexit does not run on SIGTERM or SIGHUP - Python's default
+            handler terminates the process outright - so a run stopped by
+            `kill`, by a scheduler hitting its time limit, or by a closing ssh
+            session left a lock file behind naming a pid that no longer
+            exists. On the same host the next run can prove that and reclaim
+            it; from another node of a cluster it cannot, and the resume
+            became a stale-lock refusal needing --force-unlock.
+
+            What this does NOT do: stop the tools already running. TMbed,
+            InterProScan and DIAMOND are separate processes that outlive us,
+            and the state file is what records which stages were mid-flight.
+            It releases the lock, flushes the log, and exits 128+N so a
+            wrapper script still sees a killed process rather than a clean
+            one.
+
+            Windows delivers almost none of this: subprocess.terminate() is
+            TerminateProcess, which runs no handler at all. SIGBREAK
+            (Ctrl-Break) is the one that does arrive, so it is registered too.
+            """
+            # NOTHING in here may take a lock. A Python signal handler runs
+            # IN THE MAIN THREAD, between two bytecodes of whatever that
+            # thread was doing, so any lock the interrupted frame is holding
+            # is still held while this runs and is NOT reentrant.
+            #
+            # The first version called log(), which goes through sys.stderr,
+            # whose buffer lock is exactly such a lock. On a run that emits a
+            # progress line per stage per minute the signal eventually lands
+            # mid-write, the handler blocks forever on a lock its own frame
+            # holds, and the process HANGS instead of releasing the lock --
+            # strictly worse than the stale lock this exists to prevent. CI
+            # caught it on one job of seven; it is a race, not a certainty,
+            # which is the worst kind.
+            #
+            # So: os.remove (a raw syscall, inside ResultsLock.__exit__) and
+            # os.write to fd 2, with the message pre-formatted and pre-encoded
+            # at registration time. No formatting, no buffered I/O, no locks.
+            # The cost is that the final line reaches stderr but not the log
+            # FILE, whose buffer cannot be safely touched from here.
+            release_results_lock()
+            try:
+                os.write(2, _sig_msgs.get(int(sig), b"\nstopping on a signal; "
+                                          b"results lock released\n"))
+            except OSError:
+                pass
+            # os._exit, not sys.exit: SystemExit here would unwind through the
+            # stage pool's `with`, which WAITS for its workers, and a tmbed
+            # chunk can be an hour. A kill has to mean now.
+            os._exit(128 + int(sig))
+
+        _sig_msgs = {}
+        for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+            _sig = getattr(signal, _name, None)
+            if _sig is None:
+                continue
+            _sig_msgs[int(_sig)] = (
+                f"\nWARN  stopping on {_name}: releasing the results lock "
+                f"{p.lock}. Any tool already running is a separate process "
+                "and is not stopped by this, so its output may be "
+                f"incomplete; {p.state} records which stages were running.\n"
+            ).encode("utf-8", "replace")
+            # ValueError when this is not the main thread, OSError when the
+            # platform refuses the signal. Neither is worth failing a run
+            # over: the lock still comes off on a normal exit.
+            with contextlib.suppress(ValueError, OSError, AttributeError):
+                signal.signal(_sig, _release_lock_on_signal)
 
     for name in (args.only or []) + ([args.from_stage] if args.from_stage else []):
         if name not in STAGE_NAMES:
@@ -12576,11 +13422,14 @@ def cmd_run(args):
     done = set()
     ran = adopted = skipped = 0
     failure = []
-    lock = threading.Lock()
+    # state_lock, not `lock`: the results lock taken at the top of this
+    # function is also called lock, and a closure over the name (the signal
+    # handler was one) got whichever had been assigned most recently.
+    state_lock = threading.Lock()
 
     def finish(name, action, sig=None, err=None, secs=None):
         nonlocal ran, adopted, skipped
-        with lock:
+        with state_lock:
             if err is not None:
                 state[name] = {"signature": None, "status": "failed",
                                "error": str(err)[:500],
@@ -12608,7 +13457,7 @@ def cmd_run(args):
         """Recorded before the stage starts, so that a run killed mid-write
         leaves a trace. Without it the half-written file was the only evidence
         left, and the next run adopted it as a finished one."""
-        with lock:
+        with state_lock:
             state[name] = {"signature": None, "status": "running",
                            "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
             save_state(p.state, state)
@@ -12691,6 +13540,11 @@ def cmd_run(args):
                         f"{' '.join(unmet)} to the selection."))
                     continue
                 run_now.append(name)
+            # Longest first, so a long stage late in the table does not wait
+            # behind a short one ahead of it for a worker. Python's sort is
+            # stable, so stages of equal rank keep table order and the run
+            # log reads the way it always did.
+            run_now.sort(key=stage_priority, reverse=True)
             # The GPU is not divisible the way the CPU and RAM budgets are, so
             # it is leased rather than shared. A deferred stage stays in
             # `remaining` and is reconsidered next round; it never occupies a

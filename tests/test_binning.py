@@ -1,9 +1,11 @@
 """The evidence bins: the one thing this tool exists to compute."""
 from __future__ import annotations
 
+import copy
 import itertools
 import os
 
+import pandas as pd
 import pytest
 
 import fixtures as F
@@ -490,20 +492,88 @@ def test_a_protein_over_the_length_cap_is_not_blamed_on_oom(ma, tmp_path,
 
 
 # --- the effector score ----------------------------------------------
-def test_a_weak_diamond_hit_scores_half_the_weight_of_a_strong_one(
-        ma, tmp_path, paths_for):
-    # symptom: a 31%-identity VFDB hit scored the same as a 90% one.
+def _two_vfdb_hits(ma, tmp_path, paths_for, name, **over):
+    """P_dark1 at 95% identity and P_dark2 at 31%, both against VFDB."""
     ps = F.protein_set()
-    cfg, p = paths_for("dia")
+    cfg, p = paths_for(name)
     cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    cfg.update(over)
     F.write_emapper(p.emapper, ps)
     F.write_diamond(os.path.join(p.diamond_dir, "vfdb.tsv"), [
         ("P_dark1", "VFG1", 95.0, 1e-40, 300.0, 90, "hemolysin"),
         ("P_dark2", "VFG2", 31.0, 1e-40, 300.0, 90, "hemolysin")])
-    df = ma.build_annotation(cfg, p)
+    return cfg, ma.build_annotation(cfg, p)
+
+
+def test_a_weak_diamond_hit_scores_half_the_weight_of_a_strong_one(
+        ma, tmp_path, paths_for):
+    # symptom: a 31%-identity VFDB hit scored the same as a 90% one.
+    # diamond_min_pidents emptied, because the shipped floor of 50 for VFDB
+    # now removes the weak hit before the weighting ever sees it — this is
+    # the rule as it applies to a database that is NOT floored.
+    cfg, df = _two_vfdb_hits(ma, tmp_path, paths_for, "dia",
+                             diamond_min_pidents={})
     w = cfg["diamond_weights"]["vfdb"]
     assert df.loc["P_dark1", "effector_score"] - \
         df.loc["P_dark2", "effector_score"] == w - w // 2
+
+
+def test_a_hit_below_the_databases_identity_floor_is_not_reported_at_all(
+        ma, tmp_path, paths_for):
+    # CARD, VFDB and BAGEL hits are read as claims about a PARTICULAR protein,
+    # so a 31%-identity match is not weak evidence of virulence, it is a match
+    # against the fold. On a 455,571-protein run this is the difference
+    # between 107,219 VFDB hits and 21,623.
+    cfg, df = _two_vfdb_hits(ma, tmp_path, paths_for, "dia_floor")
+    assert cfg["diamond_min_pidents"]["vfdb"] == 50
+    assert df.loc["P_dark1", "vfdb_hit"] == "VFG1"
+    assert not df.loc["P_dark2", "vfdb_hit"], \
+        "a 31% hit survived a 50% floor"
+
+
+def test_the_floor_applies_when_the_table_was_written_without_it(
+        ma, tmp_path, paths_for):
+    # a <tag>.tsv adopted from another machine, or written before the floor
+    # existed, never saw DIAMOND's --id. The reader is what keeps the promise
+    # for those, which is why the filter lives in both places.
+    _, df = _two_vfdb_hits(ma, tmp_path, paths_for, "dia_adopted")
+    assert not df.loc["P_dark2", "vfdb_hit"]
+
+
+def test_a_floored_database_says_its_half_weight_rule_is_dead(
+        ma, tmp_path, paths_for, capsys):
+    # otherwise a reader concludes from diamond_strong_pident that VFDB hits
+    # are being graded by identity, when nothing below 50 can reach the grader.
+    _two_vfdb_hits(ma, tmp_path, paths_for, "dia_said")
+    err = capsys.readouterr().err
+    said = [l for l in err.splitlines()
+            if "half-weight rule for weak hits never applies" in l]
+    assert len(said) == 1, err
+    assert "vfdb: filtered at or above diamond_strong_pident=50" in said[0]
+
+
+def test_an_unfloored_database_says_nothing_about_the_half_weight_rule(
+        ma, tmp_path, paths_for, capsys):
+    _two_vfdb_hits(ma, tmp_path, paths_for, "dia_quiet", diamond_min_pidents={})
+    assert "half-weight rule" not in capsys.readouterr().err
+
+
+def test_the_identity_floor_is_per_database_like_the_evalue(ma):
+    cfg = copy.deepcopy(ma.DEFAULT_CONFIG)
+    assert ma.diamond_min_pident_for(cfg, "card") == 50
+    assert ma.diamond_min_pident_for(cfg, "vfdb") == 50
+    assert ma.diamond_min_pident_for(cfg, "bagel") == 50
+    # anything not named falls back to the global setting
+    assert ma.diamond_min_pident_for(cfg, "merops") == \
+        cfg["thresholds"]["diamond_min_pident"] == 30
+
+
+def test_a_non_numeric_identity_floor_is_a_message_not_a_traceback(ma):
+    cfg = copy.deepcopy(ma.DEFAULT_CONFIG)
+    cfg["diamond_min_pidents"] = {"card": "half"}
+    with pytest.raises(ma.StageError) as e:
+        ma.diamond_min_pident_for(cfg, "card")
+    assert "diamond_min_pidents.card must be a number" in str(e.value)
 
 
 def _vfdb_scored(ma, tmp_path, paths_for, name, **over):
@@ -642,3 +712,211 @@ def test_the_shortlist_gate_survives_without_signalp_or_tmbed(ma, tmp_path,
     assert bool(df.loc["P_lpxtg", "surface_or_secreted"])
     assert not bool(df.loc["P_plain", "surface_or_secreted"])
     assert int(df["surface_or_secreted"].sum()) == 2
+
+
+# --- per-tier coverage ------------------------------------------------
+# symptom: a merged search database was reported by one headline coverage.
+# The real one is four tiers - uhgpL_ (395,467 UHGP proteins), OIDECCNN_
+# (43,139 Prokka calls off the matched metagenome), uhgpSM_ (14,797), ampS_
+# (2,168) - and they do not annotate alike: the public catalogue arrives with
+# precomputed annotations and the study's own assembly does not. "94% have an
+# eggNOG hit" can be 99% and 30%.
+def test_a_merged_database_is_split_into_its_identifier_tiers(ma):
+    got = ma.id_tiers(["uhgpL_MGYG01_00100", "uhgpL_MGYG01_00101",
+                       "uhgpSM_MGYG02_00100", "OIDECCNN_00158",
+                       "ampS_00001"])
+    assert got == {"uhgpL_": 2, "uhgpSM_": 1, "OIDECCNN_": 1, "ampS_": 1}
+
+
+def test_one_prefix_over_everything_is_not_a_tiered_database(ma):
+    # contig-derived ids all share k141_; splitting on it says nothing.
+    assert ma.id_tiers([f"k141_{i}_1" for i in range(50)]) == {}
+
+
+def test_ids_with_no_delimiter_are_not_a_tiered_database(ma):
+    assert ma.id_tiers(["P00001", "P00002", "P00003"]) == {}
+
+
+def test_a_prefix_per_genome_is_not_a_source_label(ma):
+    # one Prokka locus tag per MAG would give hundreds of one-row tiers.
+    ids = [f"MAG{i:04d}_00001" for i in range(ma.MAX_ID_TIERS + 5)]
+    assert ma.id_tiers(ids) == {}
+
+
+def test_swissprot_and_trembl_are_two_tiers(ma):
+    # the pipe is a delimiter too, so a UniProt-style merge splits correctly.
+    got = ma.id_tiers(["sp|P12345|A_HUMAN", "tr|Q9ABC1|B_ECOLI",
+                       "sp|P67890|C_YEAST"])
+    assert got == {"sp|": 2, "tr|": 1}
+
+
+def _tiered(ma, tmp_path, paths_for, name="tiers"):
+    """A protein set carrying two source prefixes, one annotated and one not.
+
+    The shape of the real thing: a public catalogue tier that eggNOG covers
+    and a tier assembled from this study's own reads that it does not.
+    """
+    annotated = [F.Protein(f"uhgpL_P{i:03d}", "M" + "A" * 99, ko="ko:K01234",
+                           pathway="ko00010,map00010", seed_taxid="820",
+                           description="phosphoglucomutase")
+                 for i in range(6)]
+    dark = [F.Protein(f"OIDECCNN_{i:05d}", "M" + "C" * 99) for i in range(4)]
+    cfg, p = paths_for(name)
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        annotated + dark)
+    F.write_emapper(p.emapper, annotated)
+    return cfg, p, ma.build_annotation(cfg, p)
+
+
+def test_the_tier_table_reports_each_tier_separately(ma, tmp_path, paths_for):
+    cfg, p, df = _tiered(ma, tmp_path, paths_for)
+    assert ma.write_tier_coverage(df, p.tier_coverage) is True
+    t = pd.read_csv(p.tier_coverage, sep="\t").set_index("tier")
+    assert list(t.index) == ["uhgpL_", "OIDECCNN_"], "ordered by size"
+    assert t.loc["uhgpL_", "n"] == 6 and t.loc["OIDECCNN_", "n"] == 4
+    assert t.loc["uhgpL_", "pct_of_proteome"] == 60.0
+    # the whole point: the headline would have been 60% for both
+    assert t.loc["uhgpL_", "pct_eggnog"] == 100.0
+    assert t.loc["OIDECCNN_", "pct_eggnog"] == 0.0
+    assert t.loc["uhgpL_", "pct_dark"] == 0.0
+    assert t.loc["OIDECCNN_", "pct_dark"] == 100.0
+
+
+def test_the_tier_table_skips_a_stage_that_did_not_run(ma, tmp_path,
+                                                       paths_for):
+    # "the stage did not run" and "the stage found nothing" are different
+    # answers and must not share a 0.0 cell.
+    cfg, p, df = _tiered(ma, tmp_path, paths_for, "tiers_nostage")
+    df = df.drop(columns=["kofam_ko"])
+    ma.write_tier_coverage(df, p.tier_coverage)
+    t = pd.read_csv(p.tier_coverage, sep="\t")
+    assert "pct_kofam" not in t.columns
+    assert "pct_pfam" in t.columns
+
+
+def test_an_untiered_proteome_writes_no_table_and_says_why(
+        ma, tmp_path, paths_for, capsys):
+    # an absent file must never be ambiguous between "not applicable" and
+    # "a stage failed".
+    cfg, p = paths_for("untiered")
+    ps = F.protein_set()
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, ps)
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage) is False
+    assert not os.path.exists(p.tier_coverage)
+    assert "not split by a source prefix" in capsys.readouterr().err
+
+
+def test_the_tier_table_is_written_beside_bin_summary(ma, tmp_path,
+                                                      paths_for):
+    cfg, p, df = _tiered(ma, tmp_path, paths_for, "tiers_beside")
+    assert os.path.dirname(p.tier_coverage) == os.path.dirname(p.summary)
+    assert os.path.basename(p.tier_coverage) == "tier_coverage.tsv"
+
+
+def test_decoys_and_entrapment_are_not_reported_as_tiers(ma, tmp_path,
+                                                         paths_for, capsys):
+    # symptom: proteins_faa is not always the identified subset. Run the whole
+    # search database through and its two LARGEST namespaces are rev_ and
+    # ent_ -- 18,318,713 and 2,280,823 against 11,379,230 uhgpL_ on the real
+    # one. A tier table whose top row is the decoy set is not a description of
+    # the biology, and those namespaces would also spend the twelve-tier
+    # budget on things that are there to be ignored.
+    real = [F.Protein(f"uhgpL_P{i:03d}", "M" + "A" * 99, ko="ko:K01234",
+                      pathway="ko00010,map00010", seed_taxid="820")
+            for i in range(4)]
+    junk = ([F.Protein(f"rev_uhgpL_P{i:03d}", "M" + "C" * 99) for i in range(6)]
+            + [F.Protein(f"ent_X{i:03d}", "M" + "D" * 99) for i in range(3)]
+            + [F.Protein("contam_TRYP", "M" + "E" * 99)])
+    other = [F.Protein(f"OIDECCNN_{i:05d}", "M" + "F" * 99) for i in range(2)]
+    cfg, p = paths_for("tier_decoy")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        real + junk + other)
+    F.write_emapper(p.emapper, real)
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage, cfg) is True
+    t = pd.read_csv(p.tier_coverage, sep="\t").set_index("tier")
+    assert set(t.index) == {"uhgpL_", "OIDECCNN_"}, list(t.index)
+    assert t["n"].sum() == 6, "the decoys were counted into a real tier"
+    # dropped, but never silently
+    err = capsys.readouterr().err
+    assert "excluded by exclude_id_prefixes" in err
+    assert "rev_" in err and "ent_" in err and "contam_" in err
+
+
+def test_a_proteome_of_nothing_but_decoys_writes_no_tier_table(
+        ma, tmp_path, paths_for, capsys):
+    ps = [F.Protein(f"rev_P{i:03d}", "M" + "A" * 99) for i in range(4)]
+    cfg, p = paths_for("tier_alldecoy")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, [])
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage, cfg) is False
+    assert not os.path.exists(p.tier_coverage)
+    assert "nothing is left after exclude_id_prefixes" in capsys.readouterr().err
+
+
+def test_the_tier_table_still_works_without_a_config(ma, tmp_path, paths_for):
+    # cfg is optional so the function stays callable from a notebook against a
+    # frame that has already been filtered.
+    cfg, p, df = _tiered(ma, tmp_path, paths_for, "tier_nocfg")
+    assert ma.write_tier_coverage(df, p.tier_coverage) is True
+    assert os.path.exists(p.tier_coverage)
+
+
+# --- the identifier key under the tier tag ----------------------------
+# symptom: the tier tag says which SOURCE a protein came from; the identifier
+# key says what the id actually is, and it lives behind the tag. On the real
+# database uhgpL_ and uhgpSM_ both wrap MGYG#########_##### -- one namespace
+# under two labels, which is exactly why emapper_strip_id_prefix lists both.
+# Reporting only the tag hides that, and a tag left out of that list loses its
+# whole tier to a plausible-looking coverage number rather than to an error.
+def test_the_key_under_two_tier_tags_is_recognised_as_one(ma):
+    assert ma.id_key_shape("uhgpL_MGYG000004906_01237") == "MGYG#_#"
+    assert ma.id_key_shape("uhgpSM_MGYG000009567_01280") == "MGYG#_#"
+    assert ma.id_key_shape("ent_MGYG000004906_00100") == "MGYG#_#"
+    # ...and is not confused with the other two namespaces in that database
+    assert ma.id_key_shape("OIDECCNN_00158") == "#"
+    assert ma.id_key_shape("ampS_AMP10.000_478") == "AMP#.#_#"
+
+
+def test_a_key_space_with_varying_digit_widths_stays_one_key(ma):
+    # the Prokka tier runs OIDECCNN_00001 to OIDECCNN_1712297: 5-, 6- and
+    # 7-digit accessions, 91,776 / 814,981 / 636,440 of them. Masking per
+    # digit rather than per digit RUN would split one namespace into three.
+    assert len({ma.id_key_shape(f"OIDECCNN_{n}")
+                for n in ("00001", "099999", "1712297")}) == 1
+
+
+def test_an_id_with_no_delimiter_still_has_a_shape(ma):
+    assert ma.id_key_shape("P12345") == "P#"
+
+
+def test_the_tier_table_names_the_key_and_says_which_tiers_share_it(
+        ma, tmp_path, paths_for, capsys):
+    a = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "M" + "A" * 99,
+                   ko="ko:K01234", pathway="ko00010,map00010",
+                   seed_taxid="820") for i in range(4)]
+    b = [F.Protein(f"uhgpSM_MGYG00001{i}_0200{i}", "M" + "C" * 99)
+         for i in range(3)]
+    c = [F.Protein(f"OIDECCNN_{i:05d}", "M" + "D" * 99) for i in range(2)]
+    cfg, p = paths_for("tier_keys")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), a + b + c)
+    F.write_emapper(p.emapper, a)
+    df = ma.build_annotation(cfg, p)
+    capsys.readouterr()
+    ma.write_tier_coverage(df, p.tier_coverage, cfg)
+    t = pd.read_csv(p.tier_coverage, sep="\t").set_index("tier")
+    assert t.loc["uhgpL_", "key_shape"] == "MGYG#_#"
+    assert t.loc["uhgpSM_", "key_shape"] == "MGYG#_#"
+    assert t.loc["OIDECCNN_", "key_shape"] == "#"
+    assert (t["key_shape_pct"] == 100.0).all()
+    err = capsys.readouterr().err
+    assert "identifier key MGYG#_# is shared by" in err
+    assert "emapper_strip_id_prefix" in err
+    # the tier with a key of its own must not be named as sharing one
+    assert "shared by OIDECCNN_" not in err

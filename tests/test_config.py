@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 
 import pytest
@@ -90,13 +91,23 @@ def test_home_and_env_vars_in_a_config_path_are_expanded(ma, tmp_path,
                                                          monkeypatch):
     # symptom: `~/db/Pfam-A.hmm` became <configdir>/~/db/Pfam-A.hmm and doctor
     # reported a database the user does have as missing.
-    monkeypatch.setenv("MA_TEST_DB", "/somewhere/db")
+    # Compared through abspath/normcase because resolve_paths makes every
+    # db path absolute: on Windows "/somewhere/db" acquires the current drive
+    # and "~/x" comes back from expanduser with a mixed separator, and
+    # neither of those is the bug this test is about.
+    monkeypatch.setenv("MA_TEST_DB", str(tmp_path / "db"))
     cfg = tmp_path / "c.yaml"
     cfg.write_text("db:\n  pfam_hmm: '$MA_TEST_DB/Pfam-A.hmm'\n"
                    "  dbcan_hmm: '~/dbcan.txt'\n", encoding="utf-8")
     c = ma.load_config(str(cfg))
-    assert c["db"]["pfam_hmm"] == "/somewhere/db/Pfam-A.hmm"
-    assert c["db"]["dbcan_hmm"] == os.path.expanduser("~/dbcan.txt")
+
+    def same(a, b):
+        return os.path.normcase(os.path.abspath(a)) == \
+            os.path.normcase(os.path.abspath(b))
+    assert same(c["db"]["pfam_hmm"], str(tmp_path / "db" / "Pfam-A.hmm"))
+    assert same(c["db"]["dbcan_hmm"], os.path.expanduser("~/dbcan.txt"))
+    assert "~" not in c["db"]["dbcan_hmm"]
+    assert "$MA_TEST_DB" not in c["db"]["pfam_hmm"]
 
 
 # --- finding 3 --------------------------------------------------------
@@ -477,6 +488,9 @@ def _fake_installers(tmp_path):
     return d
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="doctor --fix is refused on Windows: its install commands are\n           POSIX shell and cmd.exe mis-executes them. See\n           test_fix_is_refused_on_windows_rather_than_half_working.")
 def test_fix_verifies_afterwards_instead_of_trusting_exit_codes(tmp_path):
     # symptom: a download that wrote a 404 page exits 0. doctor re-runs its
     # checks after installing and reports UNVERIFIED rather than passing.
@@ -492,6 +506,9 @@ def test_fix_verifies_afterwards_instead_of_trusting_exit_codes(tmp_path):
            "expects" in proc.stdout
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="doctor --fix is refused on Windows: its install commands are\n           POSIX shell and cmd.exe mis-executes them. See\n           test_fix_is_refused_on_windows_rather_than_half_working.")
 def test_fix_refuses_without_confirmation(tmp_path):
     proj = _doctor_project(tmp_path,
                            db={"pfam_hmm": str(tmp_path / "db" / "Pfam-A.hmm")})
@@ -504,6 +521,9 @@ def test_fix_refuses_without_confirmation(tmp_path):
     assert proc.returncode == 1
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="doctor --fix is refused on Windows: its install commands are\n           POSIX shell and cmd.exe mis-executes them. See\n           test_fix_is_refused_on_windows_rather_than_half_working.")
 def test_fix_prints_both_totals_before_doing_anything(tmp_path):
     # the number the user approves is the one that decides whether the volume
     # survives the night, so download size and on-disk size are separate.
@@ -517,6 +537,39 @@ def test_fix_prints_both_totals_before_doing_anything(tmp_path):
         env=dict(os.environ, **_no_r_env()))
     assert "GB to download" in proc.stdout
     assert "GB on disk" in proc.stdout
+
+
+def test_fix_is_refused_on_windows_rather_than_half_working(tmp_path):
+    """`mkdir -p C:\\db` under cmd.exe makes a directory called -p.
+
+    Every command doctor generates is POSIX shell and every one of them can
+    exit 0 having done nothing there, which is exactly the failure the
+    post-install verification exists to catch -- so the answer is to refuse
+    and say where to run the plan, not to run it and report UNVERIFIED for
+    everything.
+    """
+    if os.name != "nt":
+        pytest.skip("the refusal is Windows-only")
+    proj = _doctor_project(tmp_path,
+                           db={"pfam_hmm": str(tmp_path / "db" / "Pfam-A.hmm")})
+    proc = run_metaannot("doctor", "--config", proj.config_path, "--fix",
+                         "--yes", expect=1, env=dict(_no_r_env()))
+    assert "doctor --fix cannot run on Windows" in proc.stderr
+    assert "--install-plan" in proc.stderr
+    assert "wsl bash install.sh" in proc.stderr
+
+
+def test_the_install_plan_is_still_written_on_windows(tmp_path):
+    # only --fix is refused; writing the script the user then runs elsewhere
+    # is the whole point of having an alternative to offer.
+    proj = _doctor_project(tmp_path,
+                           db={"pfam_hmm": str(tmp_path / "db" / "Pfam-A.hmm")})
+    out = str(tmp_path / "install.sh")
+    run_metaannot("doctor", "--config", proj.config_path,
+                  "--install-plan", out, expect=None, env=dict(_no_r_env()))
+    body = io.open(out, encoding="utf-8").read()
+    assert body.startswith("#!/usr/bin/env bash")
+    assert "Pfam" in body
 
 
 def test_a_manual_item_is_never_attempted(tmp_path):

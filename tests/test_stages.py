@@ -96,11 +96,13 @@ def test_an_empty_output_is_not_adopted(tmp_path, stub_bin):
 
 
 def test_a_stage_that_declares_emptiness_meaningful_is_adopted_empty(ma):
-    # diamond, smorf, jackhmmer, hhblits, esmfold and foldseek can legitimately
-    # produce nothing; every other stage cannot.
+    # diamond, smorf, jackhmmer, hhblits, esmfold, foldseek and tmbed can
+    # legitimately produce nothing; every other stage cannot. tmbed joined the
+    # list when tmbed_max_len grew teeth: a proteome whose every sequence is
+    # over the cap leaves an empty prediction file on purpose.
     empty_ok = {s["name"] for s in ma.STAGES if s.get("empty_ok")}
     assert empty_ok == {"diamond", "smorf", "jackhmmer", "hhblits", "esmfold",
-                        "foldseek"}
+                        "foldseek", "tmbed"}
 
 
 def test_a_non_empty_output_produced_elsewhere_is_adopted(tmp_path, stub_bin):
@@ -540,16 +542,47 @@ def test_an_unknown_tmbed_gpu_setting_is_refused(ma, tmp_path, paths_for,
 # tmbed's real shape: a tqdm bar redrawn in place on stderr for hours, and the
 # predictions written only at the very end.
 _TMBED_STUB = """#!/usr/bin/env python3
-import sys, time
+import os, sys, time
 a = sys.argv[1:]
 out = a[a.index("-p") + 1]
+faa = a[a.index("-f") + 1]
 for i in range(6):
     bar = "\\r 61%|###### | " + str(i * 5000) + "/38204 [2:36:04<1:39:41]"
     sys.stderr.write(bar)
     sys.stderr.flush()
     time.sleep(0.08)
+# One 3-line record per INPUT sequence, which is the part of the real tool's
+# behaviour the stage now depends on: it reconciles what it handed over
+# against what came back, so a stub that always wrote the same fixed record
+# would pass every id-handling bug straight through.
+recs, pid, seq = [], None, []
+for line in open(faa, encoding="utf-8"):
+    line = line.strip()
+    if line.startswith(">"):
+        if pid:
+            recs.append((pid, "".join(seq)))
+        pid, seq = line[1:].split()[0], []
+    elif line:
+        seq.append(line)
+if pid:
+    recs.append((pid, "".join(seq)))
+# The three ways a real run goes wrong, addressed by PROTEIN ID rather than by
+# chunk file name so a test does not have to predict how the plan was
+# numbered. FAIL: this chunk dies (after PARTIAL records, if set). DROP: it
+# exits 0 having written fewer records than it was given, which is the failure
+# no exit code reports.
+fail = set(x for x in os.environ.get("TMBED_STUB_FAIL", "").split(",") if x)
+dying = fail & set(q for q, _ in recs)
+if dying:
+    recs = recs[:int(os.environ.get("TMBED_STUB_PARTIAL", "0"))]
+elif os.environ.get("TMBED_STUB_DROP"):
+    recs = recs[:int(os.environ["TMBED_STUB_DROP"])]
 with open(out, "w", encoding="utf-8") as fh:
-    fh.write(">P1\\nMKV\\nPPP\\n")
+    for pid, seq in recs:
+        fh.write(">" + pid + "\\n" + seq + "\\n" + "i" * len(seq) + "\\n")
+if dying:
+    sys.stderr.write("\\nRuntimeError: CUDA out of memory\\n")
+    sys.exit(1)
 """
 
 
@@ -884,17 +917,35 @@ def test_a_healthy_database_is_searched_without_comment(ma, tmp_path,
     assert os.path.exists(f"{p.diamond_dir}/vfdb.tsv")
 
 
-def test_a_short_peptide_database_warns_that_the_evalue_is_unreachable(
+def test_a_seed_set_is_named_as_one_and_not_blamed_on_the_evalue(
         ma, tmp_path, paths_for, stub_bin, capsys):
-    # BAGEL's real shape: 262 sequences, median 15 residues.
+    # 262 sequences / 4009 letters is the shape of the database this pipeline
+    # actually built and searched: BAGEL4's motif SEED set, mean 15 residues,
+    # 0 hits against 38,204 proteins. The e-value was never the problem.
     db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
     cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
     ma.stage_diamond(cfg, p)
     err = capsys.readouterr().err
-    assert "incapable of a hit before it starts" in err
+    assert "motif or seed set rather than a protein sequence database" in err
     assert "15 residues" in err
-    assert "diamond_evalues" in err
-    # it still runs: this is a warning about the threshold, not a broken file
+    assert "NO e-value makes that a real search" in err
+    assert "diamond_evalues" not in err
+    # it still runs: this is a warning about what was built, not a broken file
+    assert os.path.exists(f"{p.diamond_dir}/bagel.tsv")
+
+
+def test_a_short_peptide_database_warns_that_the_evalue_is_unreachable(
+        ma, tmp_path, paths_for, stub_bin, capsys):
+    # 40-residue peptides are long enough not to be a seed set, and still
+    # cannot reach an --evalue somebody set to 1e-30.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=10480)
+    cfg, p = _dia_project(ma, tmp_path, paths_for, bagel=db)
+    cfg["diamond_evalues"] = {"bagel": 1e-30}
+    ma.stage_diamond(cfg, p)
+    err = capsys.readouterr().err
+    assert "incapable of a hit before it starts" in err
+    assert "40 residues" in err
+    assert "motif or seed set" not in err
     assert os.path.exists(f"{p.diamond_dir}/bagel.tsv")
 
 
@@ -916,6 +967,9 @@ def test_a_per_database_evalue_silences_the_warning_and_is_used(
     ma.stage_diamond(cfg, p)
     err = capsys.readouterr().err
     assert "incapable of a hit" not in err
+    # the seed-set warning is about WHAT was built and is not silenced by a
+    # threshold; only the e-value advice is.
+    assert "motif or seed set" in err
     assert "searching at --evalue 0.001 from diamond_evalues" in err
     assert ma.diamond_evalue_for(cfg, "bagel") == 1e-3
     assert ma.diamond_evalue_for(cfg, "vfdb") == \
@@ -988,8 +1042,13 @@ def test_doctor_refuses_a_zero_byte_diamond_database(tmp_path):
     assert "diamond makedb" in proc.stdout
 
 
-def test_doctor_warns_about_a_database_too_short_for_the_evalue(tmp_path,
-                                                                stub_bin):
+def test_doctor_recognises_a_motif_seed_set_rather_than_blaming_the_evalue(
+        tmp_path, stub_bin):
+    # 262 sequences / 4009 letters is the real BAGEL database that prompted
+    # both of these checks: a mean of 15 residues, which is not a short
+    # protein database but BAGEL4's motif SEED set. Advising a lower --evalue
+    # sends the reader off to tune a threshold on the wrong kind of file, and
+    # the tuned search still answers a question nobody asked.
     db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=4009)
     proj = build_project(tmp_path / "p", threads=1,
                          db={"diamond": {"bagel": db}},
@@ -1002,8 +1061,58 @@ def test_doctor_warns_about_a_database_too_short_for_the_evalue(tmp_path,
                               "hhblits": False, "jackhmmer": False,
                               "smorf": False, "effectors": False})
     proc = run_metaannot("doctor", "--config", proj.config_path)
+    assert "motif or seed set rather than a protein sequence database" in \
+        proc.stdout
+    assert "15 residues" in proc.stdout
+    assert "NO e-value makes that a real search" in proc.stdout
+    assert "diamond_evalues" not in proc.stdout, \
+        "the e-value advice is meant to be replaced here, not added to"
+
+
+def test_doctor_reads_the_headers_when_the_source_fasta_is_beside_the_db(
+        tmp_path, stub_bin):
+    # length is not the only signal, and it is the weaker one: a database of
+    # 60-residue entries whose headers say ggmotif is still a seed set.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=100, letters=6000)
+    io.open(str(tmp_path / "bagel.fas"), "w", encoding="utf-8").write(
+        "".join(f">LE-entry{i} ggmotif\n{'A' * 60}\n" for i in range(100)))
+    proj = build_project(tmp_path / "p", threads=1,
+                         db={"diamond": {"bagel": db}},
+                         run={"eggnog": True, "pfam": False, "dbcan": False,
+                              "diamond": True, "cluster": False, "join": False,
+                              "topology": False, "structure": False,
+                              "context": False, "unipept": False,
+                              "taxonomy": False, "ncbifam": False,
+                              "kofam": False, "interpro": False,
+                              "hhblits": False, "jackhmmer": False,
+                              "smorf": False, "effectors": False})
+    proc = run_metaannot("doctor", "--config", proj.config_path)
+    assert "motif or seed set" in proc.stdout
+    assert "ggmotif" in proc.stdout
+    assert "LE-/MA- accession prefixes" in proc.stdout
+
+
+def test_doctor_still_warns_about_a_database_too_short_for_the_evalue(
+        tmp_path, stub_bin):
+    # the e-value check is narrower now, not gone: 40-residue peptides are
+    # long enough not to be a seed set, and still cannot reach an --evalue
+    # that someone set to 1e-30.
+    db = F.write_dmnd(tmp_path / "bagel.dmnd", sequences=262, letters=10480)
+    proj = build_project(tmp_path / "p", threads=1,
+                         db={"diamond": {"bagel": db}},
+                         diamond_evalues={"bagel": 1e-30},
+                         run={"eggnog": True, "pfam": False, "dbcan": False,
+                              "diamond": True, "cluster": False, "join": False,
+                              "topology": False, "structure": False,
+                              "context": False, "unipept": False,
+                              "taxonomy": False, "ncbifam": False,
+                              "kofam": False, "interpro": False,
+                              "hhblits": False, "jackhmmer": False,
+                              "smorf": False, "effectors": False})
+    proc = run_metaannot("doctor", "--config", proj.config_path)
     assert "incapable of a hit before it starts" in proc.stdout
     assert "diamond_evalues" in proc.stdout
+    assert "motif or seed set" not in proc.stdout
 
 
 def test_the_per_database_evalue_also_filters_the_hit_table(ma, tmp_path,
@@ -1364,3 +1473,371 @@ def test_topology_without_cuda_warns_but_does_not_fail(ma, monkeypatch):
     monkeypatch.setattr(ma, "cuda_probe", lambda: (False, "no CUDA device"))
     ok, _ = ma.cuda_probe()
     assert ok is False
+
+
+# --- tmbed chunking ---------------------------------------------------
+# symptom: TMbed writes nothing until it finishes, so one invocation over a
+# whole proteome is an all-or-nothing bet measured in days. The run on
+# 455,571 proteins was still going after two days with an empty output file,
+# and the two before it died at 2 h 36 min with nothing recoverable.
+def test_the_chunk_plan_is_longest_first(ma):
+    # ProtT5 pads a batch out to its longest member, and whatever is going to
+    # exhaust the device should be in the FIRST chunk, not the last.
+    chunks, _ = ma.tmbed_chunk_plan([("s", 10), ("l", 500), ("m", 100)], 600)
+    assert chunks[0][0] == "l"
+    assert [q for c in chunks for q in c] == ["l", "m", "s"]
+
+
+def test_no_chunk_exceeds_the_residue_budget(ma):
+    lengths = [(f"p{i}", 50 + (i % 7) * 30) for i in range(200)]
+    chunks, budget = ma.tmbed_chunk_plan(lengths, 400)
+    by_id = dict(lengths)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert sum(by_id[q] for q in c) <= budget, c
+
+
+def test_a_sequence_longer_than_the_budget_still_gets_a_chunk(ma):
+    # the budget is a target, not a filter: dropping the sequence here would
+    # lose a protein that tmbed_max_len had already decided to keep.
+    chunks, budget = ma.tmbed_chunk_plan(
+        [("big", 9000), ("a", 10), ("b", 10)], 100)
+    assert sorted(q for c in chunks for q in c) == ["a", "b", "big"]
+    assert budget >= 9000
+
+
+def test_a_tiny_budget_cannot_ask_for_more_chunks_than_the_ceiling(ma):
+    # one ProtT5 load per chunk, so a 1-residue budget over a real proteome
+    # would spend all its time loading weights.
+    chunks, budget = ma.tmbed_chunk_plan(
+        [(f"p{i}", 100) for i in range(5000)], 1)
+    assert len(chunks) <= ma.TMBED_MAX_PARTS
+    assert budget > 1
+
+
+def test_a_zero_budget_is_one_invocation(ma):
+    chunks, budget = ma.tmbed_chunk_plan(
+        [(f"p{i}", 100) for i in range(50)], 0)
+    assert len(chunks) == 1 and len(chunks[0]) == 50
+    assert budget == 5000
+
+
+def test_every_protein_lands_in_exactly_one_chunk(ma):
+    lengths = [(f"p{i}", 1 + (i * 37) % 500) for i in range(1000)]
+    chunks, _ = ma.tmbed_chunk_plan(lengths, 2000)
+    flat = [q for c in chunks for q in c]
+    assert len(flat) == len(set(flat)) == 1000
+
+
+def test_the_chunk_plan_is_deterministic_when_lengths_tie(ma):
+    # equal lengths are ordered by id, so two runs of the same config produce
+    # the same parts and a resume matches them up.
+    lengths = [("b", 100), ("a", 100), ("c", 100)]
+    one, _ = ma.tmbed_chunk_plan(lengths, 150)
+    two, _ = ma.tmbed_chunk_plan(list(reversed(lengths)), 150)
+    assert one == two == [["a"], ["b"], ["c"]]
+
+
+def test_a_record_with_no_label_line_is_not_a_prediction(ma, tmp_path):
+    # the 3-line format has no trailer, so a killed writer leaves a header and
+    # a sequence. Counting that as done would commit a protein with no
+    # topology as though it had one.
+    f = tmp_path / "t.pred"
+    f.write_text(">P1\nMKV\niii\n>P2\nMKVA\n", encoding="utf-8")
+    assert [r[0] for r in ma.iter_tmbed_records(str(f))] == [">P1"]
+    assert set(ma.parse_tmbed(str(f))) == {"P1"}
+
+
+def test_a_missing_prediction_file_reads_as_no_records(ma, tmp_path):
+    assert list(ma.iter_tmbed_records(str(tmp_path / "nope.pred"))) == []
+
+
+def _many(n, length=200):
+    """n equal-length proteins, so the chunk plan falls out by id."""
+    return [F.Protein(f"P{i:03d}", "M" + "A" * (length - 1)) for i in range(n)]
+
+
+def _parts_dir(p):
+    return f"{os.path.dirname(p.tmbed)}/tmbed_parts"
+
+
+def test_a_split_run_predicts_every_protein_and_leaves_no_parts(
+        ma, tmp_path, paths_for, monkeypatch):
+    cfg, p = paths_for("tmbed_split")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 4 proteins per chunk
+    _stub_tmbed(tmp_path, monkeypatch)
+    ma.stage_tmbed(cfg, p)
+    assert len(ma.parse_tmbed(p.tmbed)) == 20
+    assert not os.path.exists(_parts_dir(p)), \
+        "the parts are the result until the file is committed, and rubbish " \
+        "afterwards"
+
+
+def test_a_finished_chunk_is_not_predicted_a_second_time(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # the whole point of splitting: an interrupted run resumes.
+    cfg, p = paths_for("tmbed_resume")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 5 chunks of 4
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P008,P012,P016")   # chunks 2-4
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    kept = sorted(f for f in os.listdir(_parts_dir(p)) if f.endswith(".pred"))
+    assert kept == ["0.pred", "1.pred"], kept
+    monkeypatch.delenv("TMBED_STUB_FAIL")
+    capsys.readouterr()
+    ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    assert err.count("is already predicted; skipping") == 2, err
+    assert len(ma.parse_tmbed(p.tmbed)) == 20
+
+
+def test_a_failed_chunk_keeps_what_tmbed_wrote_and_names_the_rest(
+        ma, tmp_path, paths_for, monkeypatch):
+    cfg, p = paths_for("tmbed_partial")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(8))
+    cfg["tmbed_chunk_residues"] = 800          # 2 chunks of 4
+    cfg["tmbed_allow_partial"] = True
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P004")             # chunk 1
+    monkeypatch.setenv("TMBED_STUB_PARTIAL", "1")             # 1 record, die
+    ma.stage_tmbed(cfg, p)
+    got = ma.parse_tmbed(p.tmbed)
+    assert len(got) == 5, "4 from the good chunk plus the 1 salvaged"
+    miss = f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv"
+    rows = [l.split("\t") for l in
+            io.open(miss, encoding="utf-8").read().splitlines()[1:]]
+    assert len(rows) == 3
+    assert not ({r[0] for r in rows} & set(got)), \
+        "a protein cannot be both predicted and a casualty"
+    assert all("out of memory" in r[3] for r in rows), rows
+
+
+def test_a_failed_chunk_stops_the_run_unless_partial_is_allowed(
+        ma, tmp_path, paths_for, monkeypatch):
+    # a silently short topology set shifts every bin, and nothing downstream
+    # can tell "no helix" from "never asked".
+    cfg, p = paths_for("tmbed_strict")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(8))
+    cfg["tmbed_chunk_residues"] = 800
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P004")
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_tmbed(cfg, p)
+    assert "tmbed_allow_partial: true" in str(e.value)
+    assert not os.path.exists(p.tmbed), \
+        "a partial prediction set must not be committed"
+    assert os.path.exists(_parts_dir(p)), \
+        "the finished chunks have to survive for the rerun to resume"
+
+
+def test_a_wedged_device_stops_the_run_rather_than_failing_every_chunk(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    cfg, p = paths_for("tmbed_wedged")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 5 chunks
+    cfg["tmbed_max_consecutive_failures"] = 2
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P000,P004,P008,P012,P016")
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    assert "chunk(s) in a row failed" in err
+    assert err.count("failed after writing") == 2, \
+        "the remaining chunks must not be attempted one by one"
+
+
+def test_a_chunk_that_exits_zero_but_comes_back_short_is_not_accepted(
+        ma, tmp_path, paths_for, monkeypatch):
+    # exit 0 is the tool's opinion; the reconciliation is ours.
+    cfg, p = paths_for("tmbed_short")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(4))
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_DROP", "2")       # writes 2 of 4, exit 0
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_tmbed(cfg, p)
+    assert "2 of 4" in str(e.value)
+    rows = io.open(f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv",
+                   encoding="utf-8").read().splitlines()[1:]
+    assert len(rows) == 2
+
+
+def test_a_proteome_of_nothing_but_over_cap_sequences_runs_nothing(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    cfg, p = paths_for("tmbed_allcapped")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(3, 400))
+    cfg["tmbed_max_len"] = 100
+    _stub_tmbed(tmp_path, monkeypatch)
+    ma.stage_tmbed(cfg, p)
+    assert not os.path.exists(_parts_dir(p)), "tmbed was given an empty input"
+    assert os.path.exists(p.tmbed) and os.path.getsize(p.tmbed) == 0
+    err = capsys.readouterr().err
+    assert "no sequence is left to predict" in err
+    excl = io.open(f"{os.path.dirname(p.tmbed)}/tmbed_excluded.tsv",
+                   encoding="utf-8").read().splitlines()[1:]
+    assert len(excl) == 3
+
+
+def test_the_stage_may_write_an_empty_prediction_file(ma):
+    # ...so decide() has to be willing to adopt one on a rerun.
+    assert {s["name"]: s for s in ma.STAGES}["tmbed"].get("empty_ok") is True
+
+
+def test_the_chunk_size_is_not_allowed_to_invalidate_the_cache(ma):
+    # it changes the order of the records and nothing else; listing it would
+    # throw away a 30-hour stage because someone tuned a checkpoint size.
+    st = {s["name"]: s for s in ma.STAGES}["tmbed"]
+    assert "tmbed_chunk_residues" not in st["keys"]
+    # what DOES change the contents is listed
+    assert "tmbed_allow_partial" in st["keys"]
+    assert "tmbed_max_consecutive_failures" in st["keys"]
+
+
+def test_the_chunk_plan_is_logged_before_any_prediction_starts(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    cfg, p = paths_for("tmbed_plan")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(12))
+    cfg["tmbed_chunk_residues"] = 800
+    _stub_tmbed(tmp_path, monkeypatch)
+    ma.stage_tmbed(cfg, p)
+    lines = capsys.readouterr().err.splitlines()
+    plan = [i for i, l in enumerate(lines) if "chunk(s) of at most" in l]
+    ran = [i for i, l in enumerate(lines) if "$ " in l and "tmbed predict" in l]
+    assert plan and ran and plan[0] < ran[0]
+    assert "3 chunk(s)" in lines[plan[0]]
+
+
+def test_a_die_from_inside_run_cmd_is_not_reported_as_a_chunk_failure(
+        ma, tmp_path, paths_for, monkeypatch):
+    # StageError IS a RuntimeError, so the `except RuntimeError` that turns a
+    # dead chunk into a casualty list would also swallow an abort. run_cmd
+    # raises only plain RuntimeError today, so this pins the intent rather
+    # than a live path: the monkeypatch is what a future die() in run_cmd
+    # would look like, and the stage must let it through untouched.
+    cfg, p = paths_for("tmbed_die")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(4))
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setattr(ma, "run_cmd",
+                        lambda *a, **k: ma.die("tmbed not found"))
+    with pytest.raises(ma.StageError) as e:
+        ma.stage_tmbed(cfg, p)
+    assert "tmbed not found" in str(e.value)
+    assert "failed after writing" not in str(e.value)
+    assert not os.path.exists(f"{os.path.dirname(p.tmbed)}/tmbed_failed.tsv")
+
+
+def test_emapper_coverage_is_reported_per_identifier_tier(ma, tmp_path,
+                                                          capsys):
+    # symptom: a merged search database was reported by one headline number.
+    # The real one is a public catalogue tier that arrives with precomputed
+    # annotations and a tier assembled from this study's own reads that does
+    # not; 60% overall here is 100% and 0%, and only the split says so.
+    have = [F.Protein(f"uhgpL_MGYG{i:05d}", "MKV" * 40, ko="ko:K01234",
+                      pathway="ko00010,map00010", seed_taxid="820")
+            for i in range(6)]
+    missing = [F.Protein(f"OIDECCNN_{i:05d}", "MKV" * 40) for i in range(4)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), have + missing)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), have)
+    report = str(tmp_path / "report.tsv")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), report,
+                       "exact", 0.5, 0.9, 100)
+    err = capsys.readouterr().err
+    tier_lines = [l for l in err.splitlines() if "emapper reuse:   " in l]
+    assert len(tier_lines) == 2, err
+    assert "uhgpL_" in tier_lines[0] and "100.0%" in tier_lines[0]
+    assert "OIDECCNN_" in tier_lines[1] and "0.0%" in tier_lines[1]
+    rep = dict(l.split("\t") for l in
+               io.open(report, encoding="utf-8").read().splitlines()[1:])
+    assert rep["tier_uhgpL__proteins"] == "6"
+    assert rep["tier_uhgpL__annotated"] == "6"
+    assert rep["tier_OIDECCNN__proteins"] == "4"
+    assert rep["tier_OIDECCNN__annotated"] == "0"
+
+
+def test_an_untiered_protein_set_gets_no_tier_rows(ma, tmp_path):
+    ps = [F.Protein(f"P{i:05d}", "MKV" * 40, ko="ko:K01234",
+                    pathway="ko00010,map00010", seed_taxid="820")
+          for i in range(5)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), ps)
+    report = str(tmp_path / "report.tsv")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), report,
+                       "exact", 0.5, 0.9, 100)
+    assert "tier_" not in io.open(report, encoding="utf-8").read()
+
+
+def test_a_tier_left_out_of_strip_id_prefix_is_named_while_it_can_be_fixed(
+        ma, tmp_path, capsys):
+    # symptom: uhgpL_ and uhgpSM_ wrap the SAME MGYG namespace, and one eggNOG
+    # row annotates a protein under every tag it carries. A tag missing from
+    # emapper_strip_id_prefix does not error -- its whole tier simply reports
+    # as unannotated, which reads as biology.
+    both = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(5)]
+    sm = [F.Protein(f"uhgpSM_MGYG00001{i}_0200{i}", "MKV" * 40,
+                    ko="ko:K01234", pathway="ko00010,map00010",
+                    seed_taxid="820") for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), both + sm)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), both + sm,
+                          id_prefix="uhgpL_")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100, strip_prefixes=["uhgpL_"])
+    err = capsys.readouterr().err
+    assert "share the identifier key MGYG#_#" in err
+    assert "uhgpSM_" in err
+    assert "reports as unannotated when it is only unjoined" in err
+
+
+def test_no_such_warning_when_every_sharing_tier_is_listed(ma, tmp_path,
+                                                           capsys):
+    both = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(5)]
+    sm = [F.Protein(f"uhgpSM_MGYG00001{i}_0200{i}", "MKV" * 40,
+                    ko="ko:K01234", pathway="ko00010,map00010",
+                    seed_taxid="820") for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), both + sm)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), both + sm,
+                          id_prefix="uhgpL_")
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100,
+                       strip_prefixes=["uhgpL_", "uhgpSM_"])
+    assert "reports as unannotated" not in capsys.readouterr().err
+
+
+def test_a_tier_that_matches_nothing_is_called_out_as_a_zero_not_a_low_number(
+        ma, tmp_path, capsys):
+    # symptom: the AMPSphere tier of the real run matched 0 of its 2,168
+    # proteins -- no eggNOG table on that machine is keyed on AMP/SPHERE ids
+    # -- and it is 30% of the whole dark fraction. The headline coverage was
+    # 98.4%, so nothing said so.
+    have = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(8)]
+    none = [F.Protein(f"ampS_AMP10.000_{i:03d}", "MKV" * 40) for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), have + none)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), have)
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100)
+    err = capsys.readouterr().err
+    assert "tier ampS_ matched NONE of its 3 protein(s)" in err
+    assert "not for want of biology" in err
+    # the tier that DID match must not be accused of it
+    assert "tier uhgpL_ matched NONE" not in err
+
+
+def test_a_merely_low_tier_is_not_called_a_zero(ma, tmp_path, capsys):
+    have = [F.Protein(f"uhgpL_MGYG00000{i}_0100{i}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(8)]
+    thin = [F.Protein(f"ampS_AMP10.000_{i:03d}", "MKV" * 40,
+                      ko="ko:K01234", pathway="ko00010,map00010",
+                      seed_taxid="820") for i in range(3)]
+    faa = F.write_fasta(str(tmp_path / "p.faa"), have + thin)
+    emp = F.write_emapper(str(tmp_path / "cat.annotations"), have + thin[:1])
+    ma.prepare_emapper([emp], faa, str(tmp_path / "o.annotations"), "",
+                       "exact", 0.0, 0.0, 100)
+    assert "matched NONE" not in capsys.readouterr().err
