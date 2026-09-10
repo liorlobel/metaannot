@@ -42,6 +42,26 @@ def ma():
     return _load()
 
 
+CONSOLE_PY = os.path.join(ROOT, "console", "console.py")
+
+
+@pytest.fixture(scope="session")
+def console():
+    """The console, imported as a module.
+
+    It is a plain module with pure readers and a Console object, so the tests
+    drive it directly rather than through the CLI. Registered under a name of
+    its own: nothing in the console imports metaannot, and nothing here should
+    make it look as though it did.
+    """
+    spec = importlib.util.spec_from_file_location("metaannot_console",
+                                                  CONSOLE_PY)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["metaannot_console"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 # ----------------------------------------------------------------------
 # R availability
 # ----------------------------------------------------------------------
