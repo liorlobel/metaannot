@@ -72,6 +72,39 @@ the half-weight rule for a floored database — nothing below
 `diamond_strong_pident` survives the filter — which the run now says once,
 rather than leaving the config implying a grading that cannot happen.
 
+**The identifier key, not just the source tag.** A tier tag says which SOURCE
+a protein came from; the identifier key says what the id actually is, and it
+lives behind the tag:
+
+    uhgpL_MGYG000004906_01237   tier uhgpL_     key MGYG#_#
+    uhgpSM_MGYG000009567_01280  tier uhgpSM_    key MGYG#_#
+    OIDECCNN_00158              tier OIDECCNN_  key #
+    ampS_AMP10.000_478          tier ampS_      key AMP#.#_#
+
+Four tiers over three key spaces. `uhgpL_`, `uhgpSM_` and the `ent_`
+entrapment set all wrap the same MGnify `MGYG` namespace — 31,782,562 of the
+search database's 36,637,426 records — while `OIDECCNN_` is the cohort's own
+Prokka run. Reporting only the tag hid that two tiers are one namespace under
+two labels, which is precisely the case `emapper_strip_id_prefix` exists for:
+one row of a precomputed table annotates a protein under every tag it carries,
+and a tag left out of that list does not error — its whole tier reports as
+unannotated, which reads as biology.
+
+`tier_coverage.tsv` gains `key_shape` and `key_shape_pct`; the run names any
+key shared by more than one tier; and `prepare_emapper` warns, while it can
+still be acted on, when one sharing tier is listed and another is not. Digit
+RUNS are masked rather than digits, because the Prokka tier runs
+`OIDECCNN_00001` to `OIDECCNN_1712297` — 5-, 6- and 7-digit accessions — and
+masking per digit would split one key space into three.
+
+**A tier that matches nothing is a zero, not a low number.** The AMPSphere
+tier of the 455,571-protein run matched 0 of its 2,168 proteins — no eggNOG
+table on that machine is keyed on AMP/SPHERE ids — and it is 30% of the whole
+dark fraction. The headline coverage was 98.4% (`uhgpL_` 98.94%, `OIDECCNN_`
+98.74%, `uhgpSM_` 97.23%), so nothing said so, and every one of those proteins
+bins `4_dark` for want of a join rather than for want of biology. A tier at
+0% now gets its own line naming the two ways out.
+
 **Coverage per identifier tier.** A merged search database is the normal case
 and its tiers do not annotate alike: the run this was built on is `uhgpL_`
 (395,467), `OIDECCNN_` (43,139), `uhgpSM_` (14,797) and `ampS_` (2,168), one
@@ -79,6 +112,14 @@ of which arrives with precomputed annotations and one of which is ORFs nobody
 has ever seen. `finalise` writes `results/tier_coverage.tsv` — count, share,
 percentage carrying each kind of evidence, percentage dark, median export
 score — and `emapper` logs and records the same split for its own coverage.
+
+`exclude_id_prefixes` is applied before the split. `proteins_faa` is not
+always the identified subset, and run the whole FragPipe search database
+through and its two LARGEST namespaces are the controls: 18,318,713 `rev_` and
+2,280,823 `ent_` against 11,379,230 `uhgpL_`. A tier table whose top row is
+the decoy set is not a description of the biology, and those namespaces would
+also spend the twelve-tier budget on entries that are there to be ignored.
+What is dropped is counted out loud rather than silently.
 
 Tiers are detected from the identifier prefix, and declined in the two cases
 where a prefix is not a source label: one prefix over everything, and more
