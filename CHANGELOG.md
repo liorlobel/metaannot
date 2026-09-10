@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-09-10
+
+Scheduling, resumability and thresholds, all of it forced by one 455,571-protein
+run rather than by review. Two measurements set the agenda: InterProScan started
+**27.1 hours in**, because it sits tenth in a table whose first wave included a
+ten-minute stage; and TMbed wrote **nothing at all for 39 hours** — no progress
+bar, no partial file — after two earlier attempts died at 2 h 36 min with
+nothing recoverable.
+
+Six defects were fixed along the way, two of which only appeared under test: a
+signal handler that could hang a run instead of releasing its lock, and a
+structure-resume guard placed where it could never be reached. The suite is
+green on Windows for the first time (735 tests), and on every CI job from
+Python 3.9 to 3.13.
 
 ### Added
 
