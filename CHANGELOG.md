@@ -1,5 +1,444 @@
 # Changelog
 
+## v0.5.0 — 2026-09-10
+
+One question, asked in two halves: what can be known about a run that is still
+going, from somewhere other than the tmux window that started it. Until now the
+answer was `tail -f` and a state file parsed by hand, on a machine with the
+results mounted — and eight datasets on one server is where that stops scaling.
+
+The engine half (#24) puts the run's identity, its liveness and the
+configuration it actually used on disk where a reader can find them, and makes
+`describe --json` a contract rather than a convenience. The other half (#25) is
+`console/console.py`: one stdlib-only file that reads exactly those files and
+nothing else, and writes nothing at all. (A line count stood here and was stale
+before the release was cut, because the fixes below landed in that same file. A
+number nobody can keep true is worse than none.)
+
+Two things were measured on the way. A signal landing between the lock's
+`os.open(O_EXCL)` and the `atexit` registration that removes it stranded a lock
+in **8 of 30** attempts — each one printing `interrupted.` and exiting cleanly,
+so nothing said anything had gone wrong. And `describe --json` turned out to
+have been a release behind without anyone noticing: `cost` has been on every
+stage since v0.4.0 and never reached the contract, so every stage published
+`cost: null` to whatever was reading it.
+
+### Added
+
+**A console: `console/console.py`, milestone M1 — a watcher.** It renders the
+three files a results directory already writes — `.metaannot_state.json`, the
+log and `.metaannot.lock` — as one page, for every project on the machine at
+once, with a stage table, a log tail read by byte offset, and what the run
+record says about itself. Python 3.9 and the standard library, so there is
+nothing to install and `scp` is a deployment.
+
+**It never writes a byte into a results directory**, and that is the property
+everything else is arranged around rather than a side effect. Not a lockfile,
+not a cache, not a temp file, not a log line: every reader opens `O_RDONLY`,
+the console never `chdir()`s into a watched directory so not even a core dump
+can land there, there is no `do_POST`, and the flock that stops two consoles
+fighting over one socket lives in the console's own runtime directory — a
+`--socket` inside or under a watched tree is refused, because binding there
+creates both the socket and a lock file that outlives the process. That is what
+makes pointing it at a job already three days in a non-decision, and it is
+proved rather than intended: `tests/test_console_contract.py` checks it by AST
+scan and by snapshotting a results directory around every route.
+
+**It never imports metaannot either.** Stage order, dependency edges, the
+`_run` key and the names of the files it polls all come from one
+`describe --json`, shelled out at startup and cached. A front end that
+hard-codes what a stage is called or where a state file lives drifts the day
+either changes, and the drift is invisible until someone reads a stale answer
+off a page that looks authoritative. Not importing is also what lets one file
+be copied to a machine where the engine lives at a path it was never told
+about; `--metaannot` and `--python` are how it is told.
+
+**It binds a mode-0700 UNIX socket, never a TCP port.** A `127.0.0.1` listener
+on a shared lab server is reachable by every other account on that box, and the
+alternative — a random token — leaks into `ps`, into shell history and into the
+URL bar, and would be a second access-control mechanism to keep correct. File
+permissions are the whole of it, which is why the socket's directory must be
+private and is checked for that, and why the console will not create one for
+you. Reached with `ssh -N -L 8080:<socket> <host>`; the banner prints the exact
+line for the socket it bound. The cost is documented: a UNIX-socket forward
+target needs OpenSSH 6.7 or newer on the workstation side.
+
+**And it will not tell you a run is dead.** The heartbeat is advisory — one
+failed write ends the heartbeat thread while the run carries on — and the
+engine's rule is that unprovable means alive, so a console that guessed would
+be inviting `--force-unlock` on a live run, which is the one thing that
+corrupts a results directory. It reports how long since the last sign of work,
+names what it read, hands over the `ps` line for the pid in the lock, and
+stops. Where the evidence is genuinely informative it says exactly that much: a
+`FATAL` as the newest log line while the record still says `running` is called
+the killed-mid-write shape, not death. There is no button that acts — no
+`--force-unlock`, no launch, no config edit, no `do_POST`; the handler serves
+`GET` and `HEAD`.
+
+`CONSOLE_VERSION` is `0.1.0` and is deliberately not `__version__`. One
+repository, two programs, two audiences: tying the numbers together would mean
+either bumping one nobody asked about or lying about the other.
+
+**The preflight checklist, the server-side directory picker and `doctor --json`
+are M2 and are not in this release.** Neither is config authoring (M4) or
+launching (M5). `docs/gui-design.md` describes all of them and is annotated
+with what M1 actually settled; nothing there should be looked for in this tag.
+
+**A `_run` record in the state file, with an advisory heartbeat.** The state
+file recorded what each stage did and nothing about the run, so a results
+directory opened cold — one of eight on a shared machine — could not say what
+produced it. `_run` carries `run_id`, `version`, `config_path`, `argv`, `host`,
+`pid`, `started`, `finished`, `final_status`, `heartbeat_s` and a `last_seen`
+stamped every `heartbeat_s` seconds (30 by default; `0` turns it off).
+`last_seen` is written twice, as a local-time string and as an epoch float,
+because two hosts sharing one filesystem cannot subtract each other's local
+clocks.
+
+It is advisory and nothing reclaims a lock on the strength of it. A heartbeat
+that stopped is not a process that stopped — one failed write ends the timer,
+not the run — and from another host the two are indistinguishable, so acting on
+it would trade a stale lock, which is a message and `--force-unlock`, for two
+runs writing one directory, which is silent corruption. The heartbeat exists to
+give a person the number; the decision stays theirs.
+
+**`results/config.effective.yaml`, written under the lock.** The results kept
+the stage records but not the settings behind them, and the config file beside
+them is whatever it says today rather than what it said in March — nor does it
+carry the defaults nobody wrote down, or the `--threads`/`--ram`/`--faa` the
+command line added. It is written next to the `_run` record and under the same
+lock, because a run must not be able to die between them: written apart, an
+early fatal error left a `config.effective.yaml` describing a run the state
+file had never heard of, and on a resume one that flatly contradicted the
+previous `_run` — "finished ok, threads 7, against a FASTA that does not
+exist", none of which had happened.
+
+It is deliberately not a stage output and appears in no stage's inputs. A file
+in the results root rewritten on every run would, the moment any stage listed
+it, invalidate that stage on every run — thirty-four hours of InterProScan
+spent recording what the run already knew.
+
+**`describe --json` became a contract, with a `DESCRIBE_VERSION`.** Anything
+reading that JSON is not in `metaannot.py` and cannot be fixed in the same
+commit as the engine, so it needs to be able to say "I do not understand this
+shape" instead of guessing. The document now carries the config vocabulary a
+form generator would otherwise have to infer — `path_keys`, `db_path_keys`,
+`replace_blocks`, `freeform_keys`, `retired_keys` — plus `stage_names`, `bins`,
+`quant_formats`, `run_key`, and `paths`: the files a watcher polls, named
+rather than reconstructed, so the day one of them moves the watcher moves with
+it. Those paths are absolute even with no `--config`, since a watcher that
+stored a relative one would poll whatever directory the describing process
+happened to be in.
+
+`DESCRIBE_VERSION` is bumped when a key is removed or its meaning changes, and
+not when one is added, because a reader that breaks on an unknown key was going
+to break anyway. It is its own number, like `SIGNATURE_VERSION`: a tool-version
+bump must not invalidate a stage cache, and a schema bump must not either.
+
+**`describe --json` now emits each stage's `cost`.** It was added to `STAGES`
+in v0.4.0 — the 1/2/3 rank the scheduler sorts each round's ready set by — and
+`describe` went on emitting its hardcoded seven fields, so every stage came
+back `cost: null` and a front end could not have known the field existed.
+Nothing failed, which is exactly the problem: the projection is a list of
+names. It is pinned now from both directions by a test that compares the two
+sets and fails if `STAGES` carries a field `describe` does not emit.
+`DESCRIBE_VERSION` is deliberately not bumped for it — this is an added field.
+
+### Fixed
+
+**A signal between taking the lock and arming its release stranded it, 8 times
+in 30.** `os.open(O_EXCL)` and the `atexit.register` that removes the lock used
+to have the whole of `__enter__` between them. A signal landing in that window
+left a fully written lock file behind with no hook to remove it — and the run
+exited *cleanly*, printing `interrupted.`, so nothing anywhere said a lock had
+been stranded. The next run then refused to start. The hook is armed **before**
+`__enter__` is called now, and `__exit__` on a lock that was never taken is a
+no-op, so arming it first costs nothing. The lock is also held from the instant
+the file exists rather than from the instant it is written, which is the other
+half of the same window: `__exit__` was a no-op while `self.held` was still
+False, and the file is written within microseconds so the zero-byte grace never
+applied either.
+
+**`ResultsLock.is_still_ours()` has three answers, because two was one too
+few.** A killed run can still be inside a stage when the operator decides it
+has hung, `--force-unlock`s the directory and starts a replacement; whatever
+the old run writes next must land on neither the new run's `_run` record nor
+its lock. One gate answers that for both writers — but they agree only on two
+of the three cases. "Ours" and "somebody else's" are the same answer to both.
+"No lock at all" is not: there is nothing for `__exit__` to remove, while for
+`RunRecord` a vacant path means nobody was superseded and its own final verdict
+is still worth writing. Collapsing vacant into somebody-else's cost an
+unsuperseded run its own verdict — `_run` stranded at `running` under a WARN
+announcing a handover that never happened. `True` is ours, `False` is somebody
+else's, `None` is vacant, and each caller reads it for itself. It is keyed on
+the lock file's *content*, because a lock changes hands by remove-then-create
+and a filesystem may hand the same inode straight back.
+
+**The rest of this section was found by auditing the merge itself.** Two
+branches that each passed their own tests met in one tree, and what follows is
+what reading the result turned up. None of it was reported by a user; all of it
+would have been.
+
+**The tool told an operator that a DIAMOND identity floor was not in effect
+while it was applying it.** `diamond_min_pidents` arrived in v0.4.0 mirroring
+`diamond_evalues` key for key, and the hand-written list of free-form config
+blocks was not extended to cover it — so `unknown_keys()` called
+`diamond_min_pidents.mydb` a typo. Nothing was dropped, and that is the harm
+rather than the mitigation: `report_unknown_keys()` only **logs**, and
+`load_config()` then `deep_merge`s the user's config whatever it found, so the
+floor was in force the whole time — `diamond_min_pident_for(cfg, "mydb")`
+returns the user's number — while the log said of that very key "It is being
+ignored, so this setting is NOT in effect". Told that, the one setting to
+suspect when a database's hits look wrong is the one setting the operator has
+been assured cannot be responsible. `doctor` then counted the same key as a
+failure (`ok = False`) and exited **non-zero over a config that was valid and
+working**, which stops any wrapper or CI job that gates on `doctor`. The list is
+derived from the defaults now: anything named `diamond_<something>` whose
+default is a dict has database tags for keys by construction —
+`diamond_weights`, `diamond_evalues` and `diamond_min_pidents` today, with
+`diamond_workers` excluded because it is an int — which makes the next one
+free-form on the day it is added rather than on the day somebody notices.
+`vfdb_category_weights` is deliberately still named by hand: its keys are
+VFDB's own category codes, not database tags, so it is free-form for a
+different reason.
+
+**TMbed's ETA under-promised the wait on every resume, by the whole ratio of
+resumed to new work.** The rate was the elapsed time divided by every residue
+accounted for, and a resumed chunk contributes its residues without costing any
+time — so a run resuming 90 chunks of 100 reported a tenth of the real time
+remaining, and reported it before it had predicted a single residue. That is
+the one number in this stage an operator acts on: it decides whether they wait,
+go home, or kill the run. The rate is now divided by what *this process*
+predicted, and there is no estimate at all until this process has finished a
+chunk of its own — one line without a number, rather than a number that is
+wrong.
+
+**A resumed TMbed chunk was adopted by record count, so retuning the chunk size
+duplicated and dropped predictions at once.** `tmbed_chunk_residues` is outside
+every stage signature on purpose — it changes the order of the records and not
+one prediction in them — which makes tuning it on a resume a sanctioned
+operation. It also **re-plans** which protein goes in which chunk. Chunk 3 of
+the new plan then covers a different set of proteins from the chunk 3 whose
+file is on disk, and a count-only test adopted that file whenever it happened
+to be long enough: the concatenation wrote two records for every protein in
+both plans and none for the proteins in neither, which is a topology set that
+is silently short *and* silently duplicated — precisely what `tmbed_failed.tsv`
+and `tmbed_allow_partial` exist to make loud. Adoption is by identifier now,
+and by equality rather than containment, and a chunk that does not match is
+named in a WARN and discarded rather than left where the salvage path would
+find it later. The question is also asked once, for every chunk, before
+anything is written or run: it now has side effects — a warning and a removal —
+and asking it again inside the loop would repeat the warning and re-examine a
+file it had already taken away.
+
+**`tier_coverage.tsv is absent for that reason` was said without looking at the
+file.** Results directories get re-run: last month's config tiered and this
+month's does not — `exclude_id_prefixes` grew to cover every namespace, or the
+proteome was swapped for one whose ids carry no source prefix — and the
+previous run's `tier_coverage.tsv` is then still sitting beside results that
+are new, with the log asserting it is not there. Someone opening the directory
+cold reads a table describing a proteome this run never had. The message now
+looks first, and when the file is there it says so, with its size and its date,
+at WARN rather than INFO. It is not deleted: this is the one file that is
+deliberately outside `finalise`'s declared outputs, so nothing else would
+notice it going, and metaannot does not delete what it did not just write.
+
+**An unreadable lock file stranded the lock it was being read to release.**
+`is_still_ours()` already treated bytes it could not *read* as "still ours",
+because an I/O error is not evidence that a lock changed hands. Bytes it could
+not *decode* took a different exit: `UnicodeDecodeError` is a `ValueError` and
+not an `OSError`, so the exception left through `__exit__`, which had already
+cleared `held` — stranding exactly the lock the release path exists to remove.
+One truncated multi-byte character from a torn NFS write, or a page of nulls
+where a crashed writer's payload should be, was enough. Undecodable content is
+damage rather than a rival's payload, since everything this file writes is
+ASCII JSON, so it gets the same answer for the same reason. A garbled but
+decodable file is a different question and still reads as not ours.
+
+**A superseded run could write its stale state over a replacement that had
+already finished.** The ownership gate was asked afresh on every write, so the
+verdict depended on what the replacement happened to be doing at that instant —
+and the losing sequence needs no race at all. Run A is `--force-unlock`ed and
+logs `this run no longer holds ...`; run B finishes and removes its own lock on
+the way out; A's final stamp then finds the path **vacant**, which is `None`
+rather than `False`, takes the branch that exists for a replacement which has
+not started yet, and writes A's whole stale in-memory state dict over B's
+completed results. The three-state gate is right and the branch's reasoning is
+right; what was missing is that a run told once that it lost the directory has
+lost it for good. The flag is latched now, and read before the lock is asked. A
+run that was never superseded is untouched, which is the case that branch is
+there for.
+
+**The supersession of the SIGTERM handler was undocumented in the one place it
+had to be.** `handle_sigterm_like_sigint()` still described a `SIGTERM` that
+unwinds and stamps `_run`, which is what it does for `init`, `doctor`,
+`describe`, `subset`, `report`, `object` and `run --dry-run` — and is not what
+happens to a `run` or an `all`, because `cmd_run` registers a handler over it
+the instant it has the lock, and the later registration wins. Both docstrings
+now say which subcommands each handler covers and why the later one takes
+precedence, and a test pins the order, so reversing it fails loudly instead of
+quietly changing what `kill` does to a three-day run.
+
+**The console's log pane grew without bound on the page it is meant to be left
+open on.** Every line `/api/log` delivered became a `<div>` that stayed, and the
+whole design is a tab left open for the length of a three-day run — so a stage
+emitting a few lines a second put a quarter of a million nodes in one scroller
+and the tab's memory climbed until the browser killed it. The pane keeps the
+last 2,000 lines now, ten times what the first render shows, and it says so:
+a pane holding a tail looks exactly like a pane holding the whole log, and a
+reader who believes the second concludes a stage never logged something it
+logged four hours ago. The cap is the console's, served to the page as
+`data-max` so that how much of a three-day log this program will hold is
+decided and read in one place; a page cached from a console that served no
+`data-max` bounds itself at the same 2,000, since an unbounded pane is the one
+outcome that is not acceptable. Trimming takes lines off the top, above a reader
+who has scrolled up, so the scroll position is given back exactly what the
+shortening took — and the "N earlier lines dropped" marker is cleared, not
+carried, when the pane is emptied because the log rotated.
+
+**The console ranked its NEXT rows in table order over a queue the engine takes
+longest-first.** v0.4.0 made the scheduler sort each round's ready set by
+`cost`, and `describe --json` emits that field "so a front end can order or
+annotate the table the same way" — which this console then dropped. On the
+455,571-protein run the page listed dbcan NEXT above ncbifam NEXT, the engine
+dispatched ncbifam, and dbcan did not get a worker for 27 hours. The same run
+that produced the scheduling fix produced this reading of it. The rows are
+annotated rather than reordered — the table is in the engine's stage order and
+a dependency graph read out of order is harder, not easier — and the claim is
+narrowed to what a watcher can actually establish: `nothing is blocking it`
+became `no dependency is blocking it`, with the queue said separately as a
+**ranking** and nothing more. A NEXT row names up to four of the ready stages
+ranked ahead of it and counts the rest, because on a fresh run every
+dependency-free stage is ready at once and a row that names nine of them is a
+directory listing where a sentence was wanted. What the console cannot see goes
+under the table once rather than onto every row: how many stages start together
+depends on `stage_workers` and on what is still running, and a stage that needs
+the GPU waits for `gpu_workers` however it is ranked — `gpu_lease` defers it and
+leaves it in `remaining` to be reconsidered next round. The ranking is refused
+whole rather than done partially: if any ready row lacks a usable numeric
+`cost` — an engine older than the field, a stage added to a newer one without
+it, or a `cost` arriving as a bool, a string, a null or an infinity — no row is
+ranked and the note under the table is not printed either. A partial sort over a
+missing key would rank a stage by a number this file made up, and the whole
+point of taking the order from `describe --json` is that it is the engine's
+order.
+
+**One poll of an `esmfold` run was a 455,000-entry directory walk, per open
+tab.** The part-file cache is keyed on the output directory's mtime, which is
+exactly right for a directory holding a handful of declared outputs and exactly
+wrong for the one that costs the most: `esmfold`'s declared output is
+`results/structures/.done` and the stage writes one `.pdb` per dark protein into
+that same directory, so the mtime moved between every poll and the key never
+hit. A part file is evidence and not a control, so the mtime key now has a floor
+under it: a directory is rescanned only if its mtime has changed **and** 30
+seconds have passed since the last scan, and in between the last answer stands,
+re-`stat()`ed so the size it reports is still live. `time.monotonic()` rather
+than `time()`, because an NTP step backwards over a lab server's first hour
+would otherwise park the floor for as long as the step. Noticing a part file
+half a minute late costs a sentence on one poll; the walk cost the box the run
+was on.
+
+**A dependency turned off in the config was reported as blocking, if it carried
+an old record.** `decide()` returns `disabled (run.X)` for any stage whose flag
+is falsy whatever the state file holds, `finish()` counts it as skipped, and
+`unmet_deps()` passes it — so the engine walks straight past. The console asked
+the wrong set: a dependency disabled in this config but carrying last week's
+`failed`, or a killed run's `running`, made its dependents read WAIT, "waiting
+on foldseek (failed)", over a queue that was not waiting for anything. Whether
+the engine waits is decided by the config alone; a record only decides whether
+that dependency's own row may read OFF, and those are two questions now.
+
+**A `running` record from an earlier run was rendered as this run's live
+stage.** `mark_running()` writes `{signature, status, started}` and no
+`finished` at all — which is the point of it — so the era check compared `None`
+against the run's start time, fell through to "this run", and drew a stage with
+a duration counting up, for ever, from a clock that stopped days ago. That is
+the exact shape a `kill` leaves behind, so the case is common rather than
+exotic. A record is dated by its `finished` as before, and a record still marked
+`running` — the one kind that has no `finished` at all — is dated by its
+`started` instead. One that predates this run gets its own STALE state: not the running colour at full
+strength, no duration, and a sentence saying the record was written by an
+earlier run and is not evidence that anything is running now. It stops there, as
+every verdict on this page does; what it adds is the engine's own reading, which
+is that a run reaching a stage in this state recomputes it.
+
+**"The engine carries on with every stage that does not depend on a casualty"
+was wrong, in two places on the page.** The dispatch loop is
+`while (remaining or futures) and not failure`: nothing new starts after the
+first failure. What it then does is wait for the stages already running, which
+it cannot interrupt — and an InterProScan that started an hour before the
+failure has hours left in it. The observable is the same, a run that looks busy
+long after a stage was lost, and the reason a reader would infer from the old
+sentence is the opposite of the real one. Both the failure block and the index's
+grouping rule now say what actually happens.
+
+### Documentation
+
+**Both documents described a `SIGTERM` that does not happen.** README and
+TUTORIAL said a killed run takes Ctrl-C's path — "the same `interrupted`
+message, the same `_run` stamp" — and that "the stage already running has to
+finish first, so the process does not exit immediately". That was true of the
+first version of the handler and of nothing since. Both passages are rewritten
+against the code: `run` and `all` release the lock, write one line to stderr and
+`os._exit`, and the consequence the README had backwards is now the right way
+round — a `_run` record still reading `running` is the **ordinary** trace of a
+`kill`, not evidence of a `SIGKILL` or a lost machine. Both now say what to do
+with a directory in that state, including the one thing worth checking first:
+the handler stops metaannot, not the InterProScan or DIAMOND it launched, and
+those keep writing with no lock left to keep a second writer out.
+
+**The test counts were off by roughly 490.** They are the only yardstick a
+reader has for judging whether a checkout is sound, and a fifth of the suite
+missing from them reads as a failed checkout rather than as a stale document.
+Recounted, with the R tests explained as what they are — in the default run,
+skipping rather than failing where R is absent — and pinned by a test that
+compares each figure against a real collection of this suite. The Windows
+paragraph was stale in both directions and is rewritten from the code: `doctor
+--fix` is a refusal there rather than a recipe that emits `mkdir -p`, the signal
+tests are skips rather than failures, and stale-lock reclamation is no longer a
+Windows exception at all. The console's tests have not been run on Windows and
+the paragraph says only that.
+
+**`docs/gui-design.md` said the console did not exist.** It opened "Status:
+**design, not built.** Nothing here exists yet" in a tree that ships it, and
+described a front end serving to `127.0.0.1` — the one decision the build
+reversed. It stays a design record rather than becoming a manual: the reasoning
+is what a later milestone has to argue against. Where what shipped settled a
+question differently it now carries a **Built:** note saying so, and where a
+decision was made and honoured it stands as written.
+
+**The console is documented where a reader would look for it.** A new README
+section covers what it is, the three things it refuses to do and why each makes
+it safe, the socket, the SSH forward and every flag; TUTORIAL phase 5b offers it
+beside `tail -f` in the place an operator actually meets the question; and
+CLAUDE.md gains a standing rule and an entry in the deliberate list, because the
+refusals are the design and an agent reading that file first should not try to
+help by adding a write path.
+
+### Tests
+
+The suite is 1154 passed, 1 skipped, 6 xfailed and 37 deselected on a default
+run, in three to five minutes. `-m slow` is those 37; `-m R` selects 35 that the
+default run already includes and that skip cleanly where `Rscript` is absent.
+
+Six xfails are open, over five tests, and **not one of them is new.** All five
+markers stand exactly as they did at the v0.4.0 release commit (`b846753`): one
+in `test_config.py`, one in `test_parsers.py`, one in `test_scheduler.py` and
+two in `test_taxonomy.py`, the `test_parsers.py` one parametrized `empty` /
+`header_only` and so worth two of the six items. The one that reads newest — an
+`emapper.annotations` file with no data rows raising a bare `KeyError` instead
+of the "no `#query` header" message every other malformed file gets, reachable
+by adopting a zero-row eggNOG table — has carried that marker, with that
+parametrization, since `7e665e5` (#1); the file it lives in was last touched in
+`2e26ca5` (#11). Both are ancestors of the v0.4.0 release. What changed at this release is only the count in the
+README, which said **8** against a tree that has had 6 since v0.4.0.
+
+The console arrives with two test files of its own. `test_console_contract.py`
+is the one that matters most: it proves by AST scan and by snapshotting a
+results directory around every route that nothing is written into one, and it
+pins `describe --json` from both directions — including the check that failed on
+`cost` and would fail again for the next field added to `STAGES` and not
+emitted.
+
 ## v0.4.0 — 2026-09-10
 
 Scheduling, resumability and thresholds, all of it forced by one 455,571-protein

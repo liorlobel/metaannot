@@ -1,7 +1,11 @@
 # A console for metaannot — design
 
-Status: **design, not built.** Nothing here exists yet. This document exists so
-that the first commit is not also the first design decision.
+Status: **Phase 0 and M1 shipped in v0.5.0**; M2 onwards is still design. This
+document is the design record it was written to be, not a manual — `console/`
+is documented for users in README.md. It is kept because the reasoning is what
+a later milestone has to argue against, and it is annotated **Built:** where
+what shipped settled a question differently from what is written below. Where
+a decision here was made and honoured, it stands as written.
 
 The goal is what FragPipe is to MSFragger: a front end that removes the setup
 friction without becoming a second place where the science is decided.
@@ -16,6 +20,17 @@ directory it is watching, serving one page to `127.0.0.1`.**
 It never runs a stage. It never parents a run. It never holds a path belonging
 to a different operating system than the pipeline.
 
+> **Built:** the first half, and not to `127.0.0.1`. What shipped is a watcher
+> only — M1 — and it binds a mode-0700 UNIX socket reached over `ssh -L`, never
+> a TCP port. The mitigation floated at the end of "Front end" below became the
+> design: a loopback listener on a shared lab server is reachable by every other
+> account on that box, and the token alternative leaks into `ps`, shell history
+> and the URL bar, so file permissions are the whole access control. One clause
+> got stronger in the building: the shipped console writes **nothing at all**
+> into a results directory, which is a rule the socket has to obey too — a
+> `--socket` inside or under a watched tree is refused rather than accepted,
+> because binding there creates both the socket and a lock file.
+
 ## What it is not
 
 - **Not a scheduler.** metaannot already has one, with a dependency graph, a
@@ -26,6 +41,13 @@ to a different operating system than the pipeline.
   failure mode this whole design is arranged to prevent.
 - **Not a run owner.** It attaches to nothing, so there is no reattach feature
   to write and nothing to lose when it is closed.
+
+> **Built:** both honoured, the first by a stricter route than "reads
+> `DEFAULT_CONFIG`". The shipped console does not import metaannot at all —
+> stage order, dependency edges, the `_run` key and the paths it polls come out
+> of one `describe --json`, shelled out at startup and cached. It also acquired
+> a third refusal that belongs in this list: it writes nothing into a results
+> directory, ever, which is what makes it safe to point at a running job.
 
 ---
 
@@ -131,6 +153,17 @@ in-process. `STAGES` is 21 entries carrying `name / enabled / deps / keys /
 gpu`, and `requirements()` already returns the preflight screen's exact data
 model. The UI generates itself from the engine's own definitions.
 
+> **Built:** self-describing, yes; importable, deliberately unused. `describe
+> --json` landed in Phase 0 and the console reads that instead, which is what
+> lets it be one stdlib-only file that can be `scp`'d to a machine where
+> metaannot lives at a path it was never told about. The contract is versioned
+> (`DESCRIBE_VERSION`) so a console can say "I do not understand this shape"
+> rather than guess, and it carries more than this section anticipated: the
+> config vocabulary (`path_keys`, `db_path_keys`, `replace_blocks`,
+> `freeform_keys`, `retired_keys`), each stage's `cost`, and `paths` — the
+> files a watcher polls, named rather than reconstructed, so the day one of
+> them moves the watcher moves with it.
+
 ---
 
 ## Front end: a local page, with an optional native window
@@ -139,6 +172,11 @@ model. The UI generates itself from the engine's own definitions.
 flag later renders the identical HTML in a native OS window via `pywebview`
 (525 kB, BSD-3), giving a dock entry and an app icon, and degrading to the
 browser when its system WebKit packages are absent.
+
+> **Built:** a browser, yes; `127.0.0.1`, no, and no `--window` either. The
+> reasoning that changed it is three paragraphs down, in this section, and the
+> **Built:** note under it is where the decision ended up. Nothing that shipped
+> opens a TCP port.
 
 A native-only app was seriously considered and rejected for one reason: it
 excludes the headless Linux server, which is metaannot's own documented
@@ -160,6 +198,19 @@ One argument did survive: a `127.0.0.1` listener on a shared lab server is
 reachable by every other account on that box. Mitigation: bind a `0700` UNIX
 socket (OpenSSH `-L` accepts socket forms), or port 0 plus a random token and
 an `Origin`/`Host` check.
+
+> **Built:** the first mitigation, unconditionally — there is no TCP mode to
+> fall back to. A token was rejected outright rather than kept as an option: it
+> leaks into `ps`, into shell history and into the URL bar, and it would be a
+> second access-control mechanism to keep correct. File permissions are the
+> whole of it, which is why the socket's directory has to be private and is
+> checked for that, and why the console refuses to create one for you. The
+> price is a documented one: a UNIX-socket forward target needs OpenSSH 6.7 or
+> newer on the workstation side.
+>
+> `--window` and `pywebview` did not ship and are not scheduled. The socket
+> plus `ssh -L` covers the headless server, the Mac-at-desk case and the local
+> one with no second rendering path to keep working.
 
 `tkinter` was considered because it is in the standard library and would fit
 the project's instincts. It is present in this lab's WSL Python, but it is
@@ -186,21 +237,53 @@ Until `describe --json` exists, v1 **imports** metaannot for description only an
 the names and shapes the console reads. That test is what stops the coupling
 being invisible.
 
+> **Built:** all five landed in Phase 0, and two of them differently from the
+> row above.
+>
+> The `SIGTERM` row asked for "handled as `SIGINT` is handled", and that is
+> what shipped first and was then changed. Unwinding means waiting for the
+> stage pool's workers, and a tmbed chunk or an InterProScan stage is an hour;
+> `systemd` reaches `TimeoutStopSec` long before that and sends `SIGKILL`, so
+> the lock release the row exists for is exactly what unwinding loses. `run`
+> and `all` now install a handler that removes the lock, writes one
+> pre-encoded line to fd 2 and `os._exit(128 + N)`s. Ctrl-C still unwinds and
+> still stamps `_run`; a killed run leaves the lock gone and the record still
+> reading `running`, which is the state the heartbeat exists to let a watcher
+> describe — and the reason the console must never call it death.
+>
+> The `_run` row's field list grew: `run_id`, `version`, `config_path`, `argv`,
+> `host`, `pid`, `started`, `last_seen`, `last_seen_epoch`, `heartbeat_s`,
+> `finished`, `final_status`. Two timestamps for the same instant, because two
+> hosts sharing one filesystem cannot subtract each other's local clocks.
+>
+> `tests/test_console_contract.py` exists and does more than pin names: it
+> proves by AST scan and by snapshotting a results directory around every route
+> that the console writes nothing into one.
+
 ---
 
 ## Milestones
 
-**Phase 0 — engine changes.** No UI. Proves the engine half stands alone: no
-orphaned locks after `kill`, results directories that say what produced them, a
-config record that is reproducible.
+**Phase 0 — engine changes.** ✅ **shipped, v0.5.0.** No UI. Proves the engine
+half stands alone: no orphaned locks after `kill`, results directories that say
+what produced them, a config record that is reproducible.
 
-**M1 — watch only.** Project list over N results directories, stage table from
-the state file, log tail by byte offset, heartbeat with "last output N s ago".
-No config editing, no launching. It can be pointed at a running three-day job
-on day one without touching it. *If this pane is not useful, stop here and the
-loss is one file.*
+**M1 — watch only.** ✅ **shipped, v0.5.0** as `console/console.py`
+(`CONSOLE_VERSION 0.1.0`, its own number and not `__version__`). Project list
+over N results directories, stage table from the state file, log tail by byte
+offset, heartbeat with "last output N s ago". No config editing, no launching.
+It can be pointed at a running three-day job on day one without touching it.
+*If this pane is not useful, stop here and the loss is one file.*
 
-**M2 — preflight.** `requirements()` as a checklist with a server-side
+> **Built:** the "without touching it" clause turned out to be the whole
+> design and was hardened accordingly — see the note under "What it is not".
+> `--root` scanning for results directories (three levels, re-scanned every 30
+> s) was not in this milestone as written and is in it now, because eight
+> datasets on one machine is the case the console exists for. What the
+> heartbeat pane says is bounded on purpose: how long since the last stamp,
+> what it is reading, and the `ps` line — never a verdict.
+
+**M2 — preflight.** *Not in v0.5.0.* `requirements()` as a checklist with a server-side
 directory picker and metaannot's own validators run in place. Three row types:
 OK, MISS, and **MANUAL** — MANUAL rows carry a link-out and structurally no
 button, because a GUI cannot accept a licence on your behalf.
@@ -265,3 +348,16 @@ wrong when you finally need it. Accept that trade with open eyes.
    then look like an engine bug in a user's report.
 4. **Does the single-file philosophy extend to the console?** Assumed yes: one
    stdlib-only file, deployable by `scp`.
+
+> **Built:** 3 and 4 went the way they were assumed to. `console/console.py` is
+> one stdlib-only file inside this repository, and `tests/test_console_contract.py`
+> is what that bought. The mitigation for the risk named in 3 is the banner and
+> the error page, both of which say the console is the console: a render failure
+> prints "Nothing was written to any results directory" and points at the
+> console's own stderr, so a bug here does not read as an engine bug.
+>
+> 1 and 2 are still open, and M1 was deliberately scoped so that they could
+> stay open. A watcher is right for the lab server and for a stranger's laptop
+> alike, and it commits to neither answer; M5 (launch and supervise) is where
+> the local-or-remote question has to be settled, and M2/M4 are where "which
+> users" starts to decide what the screens say.

@@ -62,6 +62,17 @@ CONSOLE_VERSION = "0.1.0"
 LOG_WINDOW = 256 * 1024
 LOG_LINES = 200
 
+# How many lines the browser keeps in the log pane. The pane is appended to by
+# byte offset for as long as the tab is open, and the whole design is that a tab
+# stays open for the length of a three-day run: nothing trimmed it, so an
+# InterProScan run emitting a few lines a second put a quarter of a million
+# <div>s in one scroller and the tab's memory climbed until the browser killed
+# it. Ten times what the first render shows, so the reader who scrolls up has
+# somewhere to scroll, and the pane says out loud when it has dropped lines -
+# a tail that looks like the whole log is the reason to bound it visibly rather
+# than quietly.
+LOG_PANE_LINES = 2000
+
 # What a poll that is not showing the log still reads, to see the level of the
 # newest line. Small on purpose: this runs every few seconds per open tab.
 PEEK_WINDOW = 4096
@@ -204,6 +215,22 @@ class Contract:
                 "empty_ok": bool(st.get("empty_ok")),
                 "keys": list(st.get("keys", ())),
                 "outputs": outs,
+                # What the scheduler sorts each round's ready set by: 1
+                # seconds, 2 minutes, 3 hours, longest dispatched first.
+                # describe --json says it is emitted "so a front end can order
+                # or annotate the table the same way", and this file dropped
+                # it, so the table listed ten NEXT rows in table order over a
+                # queue the engine was taking in a different one. None for an
+                # engine older than the field, and rank_ready() below declines
+                # to rank at all rather than invent a number for it.
+                #
+                # finite(), because a cost arrives out of a subprocess's JSON
+                # like every other number on this page: it refuses bools by
+                # name - `true` would otherwise sort as 1 and silently rank a
+                # stage - and refuses NaN and the infinities, which sort but do
+                # not order. Nothing here does arithmetic on a cost, so the
+                # float it hands back is only ever a sort key.
+                "cost": finite(st.get("cost")),
             })
         self.stage_names = [s["name"] for s in self.stages]
         self.version = doc.get("metaannot_version", "?")
@@ -588,8 +615,22 @@ def newest_part_file(out_path):
     return best
 
 
+# A floor on how often ONE output directory is scanned for a part file,
+# whatever its mtime says. The mtime key below is exactly right for a directory
+# holding a handful of declared outputs, and exactly wrong for the one that
+# costs the most: esmfold's declared output is results/structures/.done and the
+# stage writes one .pdb per dark protein into that same directory, so the
+# directory's mtime moves between every poll and the key never hits. On the
+# 455,571-protein run that was a 455k-entry walk per poll per open tab, for the
+# whole of a multi-day stage. A part file is evidence and not a control, so
+# noticing one up to half a minute late costs a sentence on one poll; walking a
+# quarter of a million directory entries every three seconds costs the box the
+# run is on.
+PART_RESCAN_S = 30.0
+
+
 class PartCache:
-    """newest_part_file, keyed on the directory's own mtime.
+    """newest_part_file, keyed on the directory's own mtime and rate-limited.
 
     Finding a part file is a scandir, and for esmfold that directory is
     structures/ with one file per dark protein - 455k entries on a real run,
@@ -598,11 +639,24 @@ class PartCache:
     when the ANSWER can change; a part file merely growing changes neither. So
     the scan happens when the directory changes and every poll in between costs
     one stat of a name already known.
+
+    And when the directory changes CONSTANTLY - which is what a stage writing
+    one file per protein into its own output directory does - the mtime key
+    invalidates on every poll and buys nothing at all. PART_RESCAN_S is the
+    floor under that case: between scans the last answer stands, re-stat()ed so
+    the size it reports is still live. The scan itself is unchanged, so a stray
+    part file in any directory is still found; it is found on the next scan
+    rather than on the next poll.
+
+    monotonic() rather than time(): this is an interval between two events in
+    one process, and an NTP step backwards over a lab server's first hour would
+    otherwise park the floor for as long as the step.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._by_out = {}              # out_path -> (dir mtime, name or None)
+        # out_path -> (dir mtime, name or None, monotonic time of that scan)
+        self._by_out = {}
 
     def newest(self, out_path):
         dst = stat_or_none(os.path.dirname(out_path))
@@ -610,7 +664,8 @@ class PartCache:
             return None
         with self._lock:
             hit = self._by_out.get(out_path)
-        if hit is not None and hit[0] == dst.st_mtime:
+        if hit is not None and (hit[0] == dst.st_mtime
+                                or time.monotonic() - hit[2] < PART_RESCAN_S):
             if hit[1] is None:
                 return None
             st = stat_or_none(os.path.join(os.path.dirname(out_path), hit[1]))
@@ -623,7 +678,8 @@ class PartCache:
         best = newest_part_file(out_path)
         with self._lock:
             self._by_out[out_path] = (dst.st_mtime,
-                                      best["name"] if best else None)
+                                      best["name"] if best else None,
+                                      time.monotonic())
         return best
 
 
@@ -901,6 +957,14 @@ class Project:
         Read once, into bytes, and everything on the page derives from that one
         parse: reading it twice inside one request is how a header and the table
         under it end up describing two different moments.
+
+        `cached` is True when this read failed and the snapshot is the last one
+        that parsed. It was called `stale` until v0.5.0, and that word now
+        belongs to a stage row: a STALE row is a `running` record left behind
+        by a run that ended, which is the sense this file already used for a
+        stale socket and a stale lock - something a dead process left. A
+        snapshot the console is re-serving because the file would not parse
+        THIS second is not that. It is a cache, and it says so.
         """
         # A state file that was there a moment ago and is not there now is
         # worth another look; one that has never been there is not.
@@ -929,14 +993,15 @@ class Project:
             if status == "ok":
                 self._good, self._good_at = obj, now
                 return {"state": obj, "status": "ok", "detail": None,
-                        "stale": False, "good_at": now}
+                        "cached": False, "good_at": now}
             if self._good is not None:
                 # Never blank the table over a transient read. The page says
                 # which moment it is showing, in the footer, always.
-                return {"state": self._good, "status": status, "detail": detail,
-                        "stale": True, "good_at": self._good_at}
+                return {"state": self._good, "status": status,
+                        "detail": detail, "cached": True,
+                        "good_at": self._good_at}
         return {"state": {}, "status": status, "detail": detail,
-                "stale": False, "good_at": None}
+                "cached": False, "good_at": None}
 
     def config_run(self, python, script, state):
         """`config["run"]` for this project, or None for "cannot tell".
@@ -1070,6 +1135,87 @@ def off_reason(key, val):
 # engine, and this string is rendered twice - the row and the pinned block.
 ROW_ERROR_MAX = 500
 
+# How many of the stages ranked ahead of a NEXT row are named in its sentence.
+# The rest are counted, by name_list(): on a fresh run every dependency-free
+# stage is ready at once, and a row that names nine of them is a directory
+# listing where a sentence was wanted.
+AHEAD_NAMED = 4
+
+
+def ready_rows(rows):
+    """The rows that are ready to start, when they can be RANKED at all.
+
+    One predicate, because rank_ready() and the note under the table have to
+    agree about it: a table that ranks its NEXT rows and a note that does not
+    explain the ranking, or the other way round, is worse than neither.
+
+    Empty when any ready row has no cost - which is what an engine older than
+    the field gives for every stage, and what a stage added to a newer engine
+    without one would give for itself. A partial sort over a missing key would
+    rank a stage by a number this file made up, and the whole point of taking
+    the order from `describe --json` is that it is the engine's order and not
+    this file's guess.
+    """
+    ready = [r for r in rows if r["state"] == "next"]
+    return [] if any(r["cost"] is None for r in ready) else ready
+
+
+def next_detail(ahead):
+    """What a NEXT row says, given what the scheduler ranks ahead of it.
+
+    `ahead` is None when the contract cannot be ranked, [] when this is the
+    stage the engine ranks first among those that are ready, and otherwise the
+    names it ranks ahead of this one.
+
+    "nothing is blocking it" was the whole sentence, and it is a claim about
+    the dependency graph that a reader takes as a claim about the queue. On the
+    455,571-protein run the page listed dbcan NEXT above ncbifam NEXT, the
+    engine dispatched ncbifam, and dbcan did not get a worker for 27 hours. So
+    the graph half is now said as the graph half, and the queue half is said
+    separately - as a RANKING and nothing more. This console does not know how
+    many workers are free or whether gpu_lease will defer a GPU stage, so it
+    says which stage is ranked ahead of which and stops there; the note under
+    the table carries the two unknowns once, rather than on every row.
+    """
+    if ahead is None:
+        rank = ""
+    elif not ahead:
+        rank = (", and of the stages that are ready the engine ranks this one "
+                "first")
+    elif len(ahead) == 1:
+        rank = ", but the engine ranks one other ready stage ahead of it: %s" \
+               % ahead[0]
+    else:
+        rank = (", but the engine ranks %d of the stages that are ready ahead "
+                "of it: %s" % (len(ahead), name_list(ahead, AHEAD_NAMED)))
+    return ("no record yet — no dependency is blocking it%s. It has not been "
+            "reached, or this run did not select it." % rank)
+
+
+def rank_ready(rows):
+    """Fill in which ready stages the engine ranks ahead of which.
+
+    v0.4.0 made the scheduler dispatch each round's ready set longest-first -
+    `run_now.sort(key=stage_priority, reverse=True)`, over cost 3 hours, 2
+    minutes, 1 seconds - and describe --json emits `cost` for exactly this,
+    "so a front end can order or annotate the table the same way". This file
+    dropped the field, so the table went on listing its NEXT rows in stage
+    order over a queue the engine was taking in a different one.
+
+    The rows are annotated rather than reordered. The table is in the engine's
+    own stage order - the strip on the index reads the same way, and a
+    dependency graph read out of order is harder, not easier - so the order
+    goes into the sentence instead.
+
+    Stable, like the engine's own sort, and over the same sequence: stages of
+    equal cost keep table order there, so they keep it here.
+    """
+    ahead = []
+    for r in sorted(ready_rows(rows), key=lambda row: -row["cost"]):
+        r["ahead"] = list(ahead)
+        r["detail"] = next_detail(r["ahead"])
+        ahead.append(r["name"])
+
 
 def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                parts=None, known=True):
@@ -1108,16 +1254,33 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
     era_known = run_started is not None
     over = run_is_over(run)
     over_when = (run or {}).get("finished") or "?"
-    # Which stages this run turned off, decided once. A stage with a record is
-    # never called off whatever the config says now: it ran, and the record is
-    # the evidence.
-    off_set, off_why = set(), {}
+    # Which stages this run turned off, decided once - and in two forms,
+    # because two different questions are asked of it below.
+    #
+    # `off_set` answers "may this stage's OWN row read OFF?", and a stage with
+    # a record is never called off whatever the config says now: it ran, and
+    # the record is the evidence.
+    #
+    # `skip_set` answers the dependency question - "will the engine WAIT for
+    # this one?" - and there the record is beside the point. decide() returns
+    # `disabled (run.X)` for any stage whose flag is falsy, whatever the state
+    # file holds, finish() then counts it as skipped and adds it to `done`, and
+    # unmet_deps() lets it pass with "a disabled dependency is fine". Reading
+    # `d in off_set` for that answered the wrong question by a record: a
+    # dependency disabled in this config but carrying last week's `failed` or a
+    # killed run's `running` fell through to `named` and its dependents were
+    # reported WAIT, "waiting on foldseek (failed)", over a run the engine had
+    # already walked straight past.
+    off_set, off_why, skip_set = set(), {}, set()
     if isinstance(cfg_run, dict):
         for st in contract.stages:
-            if st["enabled"] is None or rec_of.get(st["name"]) is not None:
+            if st["enabled"] is None:
                 continue
             val = cfg_run.get(st["enabled"], False)
-            if not val:
+            if val:
+                continue
+            skip_set.add(st["name"])
+            if rec_of.get(st["name"]) is None:
                 off_set.add(st["name"])
                 off_why[st["name"]] = off_reason(st["enabled"], val)
     rows = []
@@ -1128,7 +1291,11 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                "deps": st["deps"], "enabled_key": st["enabled"],
                "state": "none", "label": "—", "took": "—", "detail": "",
                "carried": None, "era": None, "outputs": [], "part": None,
-               "started": None, "error": None, "finished": None}
+               "started": None, "error": None, "finished": None,
+               # The scheduler's own rank, and which ready stages it puts
+               # ahead of this one. rank_ready() fills `ahead` in after the
+               # loop, when it is known which rows ended up ready at all.
+               "cost": st["cost"], "ahead": []}
         status = rec.get("status") if rec else None
         if name in odd:
             row.update(state="bad", label="?",
@@ -1177,7 +1344,10 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                 dstat = (rec_of.get(d) or {}).get("status")
                 if dstat in ("ok", "adopted"):
                     doneish += 1
-                elif d in off_set:
+                elif d in skip_set:
+                    # skip_set, not off_set: whether the ENGINE waits for this
+                    # dependency is decided by the config alone. A record only
+                    # decides whether the dependency's own row may read OFF.
                     offish.append(d)
                 elif dstat:
                     named.append("%s (%s)" % (d, dstat))
@@ -1223,10 +1393,13 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                                   "it was not selected, or the run stopped "
                                   "first." % over_when)
             else:
+                # Not "nothing is blocking it": nothing in the DEPENDENCY graph
+                # is, which is a narrower claim than the one a reader takes
+                # from a row labelled NEXT. rank_ready() below replaces this
+                # sentence with the ranked one wherever the contract carries
+                # enough to rank it.
                 row.update(state="next", label="NEXT",
-                           detail="no record yet — nothing is blocking it. It "
-                                  "has not been reached, or this run did not "
-                                  "select it.")
+                           detail=next_detail(None))
         # A state file is cumulative across runs, so a stage disabled this time
         # keeps last week's green record. Presenting that as this run's success
         # is a lie by omission, and one timestamp comparison avoids it.
@@ -1235,14 +1408,53 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                 row["era"] = "unknown"
             else:
                 row["era"] = "this"
-                fin = stamp_epoch(rec.get("finished"))
-                if fin is not None and fin < run_started:
-                    row["carried"], row["era"] = clock(fin), "earlier"
+                # `finished` for a record that reached an end; `started` for the
+                # one kind that never does. mark_running() writes {signature,
+                # status, started} and no `finished` at all, so a RUN record a
+                # killed run left behind compared None against the run's start,
+                # fell through to "this run", and rendered as THIS run's live
+                # stage - with a duration counting up, for ever, from a clock
+                # that stopped days ago. Every record carries one stamp or the
+                # other, and the one it carries is the one to date it by.
+                when = stamp_epoch(rec.get("finished"))
+                if when is None and status == "running":
+                    when = stamp_epoch(rec.get("started"))
+                if when is not None and when < run_started:
+                    row["carried"], row["era"] = clock(when), "earlier"
+        # A running record that predates this run is not this run's live stage,
+        # and it is not this console's business to say what it is instead. The
+        # engine's own reading is in decide(): "finish() never ran, so the
+        # writer was killed", and it recomputes the stage. This page may not go
+        # that far - it never asserts that anything is dead - so it says the
+        # one thing the two timestamps establish, drops the duration that was
+        # counting from the older run's clock, and leaves the verdict where
+        # every other verdict on this page is left.
+        if row["state"] == "running" and row["era"] == "earlier":
+            row.update(state="stale", label="STALE", took="—",
+                       detail="recorded as running since %s, which is before "
+                              "this run started (%s). The record was written "
+                              "by an earlier run, so it is not evidence that "
+                              "this stage is running now. When a run reaches a "
+                              "stage in this state the engine reads it as an "
+                              "interrupted write and recomputes it."
+                              % (clock(row["started"]), clock(run_started)))
         if not known and row["state"] != "off":
             row.update(state="none", label="—", carried=None, era=None,
                        detail="the state file cannot be read, so whether this "
                               "stage has run is not known from here")
-        if with_outputs and row["state"] in ("running", "ok", "adopted"):
+        # STALE is in the listing set and not in the scanning one, and the two
+        # halves are decided by different questions. What a stale row leaves a
+        # reader with is "did the killed run get anywhere before it died?", and
+        # a stat of each declared output is the only evidence on this page that
+        # answers it - the row was `running` before v0.5.0 named this case, it
+        # listed its outputs then, and dropping the listing would take away the
+        # one thing worth looking at. The part-file SCAN is the other question,
+        # "is a tool writing bytes right now", which for a record from a dead
+        # run is settled: nothing is. So a stale row is stat()ed and never
+        # walked, which is also what keeps a killed esmfold from costing a
+        # 455k-entry scandir on every poll for ever.
+        if with_outputs and row["state"] in ("running", "stale", "ok",
+                                             "adopted"):
             for rel in st["outputs"]:
                 full = os.path.join(project_path, rel)
                 fst = stat_or_none(full)
@@ -1254,6 +1466,9 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                     row["part"] = (parts.newest(full) if parts is not None
                                    else newest_part_file(full))
         rows.append(row)
+    # After the loop, because which rows ended up ready is not known until
+    # every row has been decided.
+    rank_ready(rows)
     return rows
 
 
@@ -1543,7 +1758,7 @@ def project_view(project, python, script, with_outputs=True, log=True):
     cfg_run, cfg_note = project.config_run(python, script, state)
     # Nothing parsed and there is no earlier read to fall back on: the table
     # below must not describe a directory out of an empty dict.
-    known = not (snap["status"] in ("bad", "empty") and not snap["stale"])
+    known = not (snap["status"] in ("bad", "empty") and not snap["cached"])
     rows = stage_rows(project.contract, state, cfg_run, now, with_outputs,
                       project.path, project.parts, known=known)
     failures = stage_failures(rows, now)
@@ -1575,7 +1790,7 @@ def project_view(project, python, script, with_outputs=True, log=True):
         "taken": now,
         "state_status": snap["status"],
         "state_detail": snap["detail"],
-        "state_stale": snap["stale"],
+        "state_cached": snap["cached"],
         "state_good_at": snap["good_at"],
         "state_mtime": state_stat.st_mtime if state_stat else None,
         "state_trouble": trouble,
@@ -1591,7 +1806,7 @@ def project_view(project, python, script, with_outputs=True, log=True):
         "undated_failures": undated,
         "era_note": era_note(run),
         "bucket": bucket_of(state, project.contract, rows, snap["status"],
-                            snap["stale"]),
+                            snap["cached"]),
         "heartbeat": heartbeat_view(run, now, newest_level, failures,
                                     state_ok=trouble is None,
                                     state_status=snap["status"]),
@@ -1625,7 +1840,7 @@ def state_trouble(snap, rows=()):
     and so claimed a config had been read on a directory that has none, which
     is the same species of confident wrongness this function exists to remove.
     """
-    if snap["stale"]:
+    if snap["cached"]:
         return ("The state file could not be read just now (%s), so this page "
                 "is showing the last good read, from %s — not this moment. "
                 "The table below is not blanked over a transient read."
@@ -1663,14 +1878,16 @@ def count_states(rows):
     return counts
 
 
-def bucket_of(state, contract, rows, state_status="ok", stale=False):
+def bucket_of(state, contract, rows, state_status="ok", cached=False):
     """Which group this project sorts into.
 
     Liveness first: a run that is still going and has already lost a stage is
-    still running, because the engine carries on with everything that does not
-    depend on the casualty. The failure is not hidden by that - it rides along
-    as a separate mark on the row - but burying a live run under FAILED would
-    put the one directory that still needs watching in the wrong group.
+    still running. The engine dispatches nothing new after the first failure,
+    but it cannot interrupt the stages already in flight and waits for them,
+    and an InterProScan that started an hour before the failure has hours left
+    in it. The failure is not hidden by that - it rides along as a separate
+    mark on the row - but burying a run that is still writing under FAILED
+    would put the one directory that still needs watching in the wrong group.
 
     `state_status` is here because without it a state file that would not parse
     on the first read came out as NO RECORD and was counted under "never
@@ -1679,21 +1896,35 @@ def bucket_of(state, contract, rows, state_status="ok", stale=False):
     asserted the opposite of what the console knew, on the front page, for a
     job that might be running right now.
     """
-    if not stale and state_status in ("bad", "empty"):
+    if not cached and state_status in ("bad", "empty"):
         return "unreadable" if state_status == "bad" else "blank"
     if not state:
         return "none"
     run = run_record(state, contract)
     if run:
-        final = run.get("final_status")
-        if final == "running":
+        # run_is_over(), and not a fourth reading of `final_status`, because
+        # the two pages have to answer this the same way. That function is
+        # where the rule lives - a run record only ends a run by SAYING so -
+        # and the project page's heartbeat block reads a record with no
+        # final_status as still going, out loud, in the engine's own terms:
+        # unprovable means alive. This branch enumerated the values the key can
+        # HOLD and had no branch for its absence, so such a record fell through
+        # to the row scan below and the index answered from whatever the stages
+        # happened to look like: RUNNING while a leftover row still read
+        # running, DONE once every stage was ok, UNCLEAR once v0.5.0 named the
+        # leftover STALE. Three different groups for one shape, none of them
+        # the sentence the project page was printing about it.
+        if not run_is_over(run):
             return "running"
+        final = run.get("final_status")
         if final == "failed":
             return "failed"
         if final == "ok":
             return "done"
-        if final:
-            return "interrupted"
+        return "interrupted"
+    # No run record at all - an engine older than the key, or a directory whose
+    # first stage has not written one yet. Only here are the rows the evidence,
+    # because only here is there nothing better.
     if any(r["state"] == "running" for r in rows):
         return "running"
     if any(r["state"] == "failed" for r in rows):
@@ -1713,7 +1944,7 @@ def index_item(p, python, script, now):
     snap = p.read_state()
     state = snap["state"]
     cfg_run, _ = p.config_run(python, script, state)
-    known = not (snap["status"] in ("bad", "empty") and not snap["stale"])
+    known = not (snap["status"] in ("bad", "empty") and not snap["cached"])
     rows = stage_rows(p.contract, state, cfg_run, now, False, p.path,
                       known=known)
     log_stat = stat_or_none(p.log_path)
@@ -1725,7 +1956,7 @@ def index_item(p, python, script, now):
             moved, source, moved_size = st.st_mtime, what, st.st_size
     run = run_record(state, p.contract)
     bucket = bucket_of(state, p.contract, rows, snap["status"],
-                       snap["stale"])
+                       snap["cached"])
     beat_age, heartbeat_s, beat_band = beat_of(run, now)
     return {
         "index": p.index, "name": p.name, "path": p.path,
@@ -1754,7 +1985,7 @@ def index_item(p, python, script, now):
                            and r.get("era") == "unknown"],
         "beat_age": beat_age, "beat_band": beat_band,
         "heartbeat_s": heartbeat_s,
-        "state_status": snap["status"], "state_stale": snap["stale"],
+        "state_status": snap["status"], "state_cached": snap["cached"],
         "state_detail": snap["detail"],
         "run_status": (run or {}).get("final_status"),
         "run_started": (run or {}).get("started"),
@@ -1784,7 +2015,7 @@ def broken_item(p, exc):
             "strip": [], "counts": {}, "failed": [], "carried_failed": [],
             "undated_failed": [],
             "beat_age": None, "beat_band": "none", "heartbeat_s": None,
-            "state_status": "error", "state_stale": False,
+            "state_status": "error", "state_cached": False,
             "state_detail": one_line(repr(exc), 200),
             "run_status": None, "run_started": None}
 
@@ -1933,6 +2164,11 @@ tr:last-child td { border-bottom:none; }
   opacity:.35; }
 .c-ok, .c-adopted { background:var(--ok); opacity:1; }
 .c-running { background:var(--run); opacity:1; }
+/* A RUN record left behind by an earlier run. Deliberately the running colour
+   at the not-reached opacity: it is what a running record looks like, and it
+   is not this run's. Colour is never the only channel here - the cell's title
+   and the State column both read STALE. */
+.c-stale { background:var(--run); opacity:.3; }
 .c-failed { background:var(--fail); opacity:1; }
 .c-wait, .c-next, .c-none { background:var(--wait); opacity:.3; }
 .c-bad { background:var(--warn); opacity:1; }
@@ -1943,8 +2179,12 @@ tr:last-child td { border-bottom:none; }
 .s-running { color:var(--run); } .s-ok, .s-adopted { color:var(--ok); }
 .s-failed { color:var(--fail); } .s-off { color:var(--off); }
 .s-wait, .s-next, .s-none { color:var(--dim); } .s-bad { color:var(--warn); }
+.s-stale { color:var(--warn); }
 tr.r-failed { background:var(--fail-bg); }
 tr.r-running { background:var(--run-bg); }
+/* Not r-running's background: the row is not this run's live stage, and the
+   one thing it must not do is look like one. */
+tr.r-stale td { color:var(--dim); }
 tr.r-off td { color:var(--off); }
 .chip { font-size:10px; border:1px solid var(--line); border-radius:3px;
   padding:0 4px; color:var(--dim); margin-left:5px; white-space:nowrap; }
@@ -2120,6 +2360,56 @@ PAGE_JS = """
     pane.scrollTop = pane.scrollHeight; unseen = 0; btn.hidden = true;
   };
 
+  // ---- and bounded, because the tab is meant to stay open for days --
+  // Nothing trimmed this pane. Every line /api/log delivered became a <div>
+  // that stayed, on a page the run book tells you to leave open for the length
+  // of a three-day run, so a stage emitting a few lines a second put a quarter
+  // of a million nodes in one scroller. The cap is the server's (data-max), and
+  // it is announced rather than applied quietly: a pane holding the last two
+  // thousand lines looks exactly like a pane holding the whole log, and a
+  // reader who believes the second one will conclude a stage never logged
+  // something it logged four hours ago.
+  //
+  // The || is for a page cached from a console that served no data-max; a
+  // bound this script picked is still a bound, and an unbounded pane is the
+  // one outcome that is not acceptable.
+  var cap = parseInt(pane.getAttribute('data-max'), 10) || 2000;
+  var dropped = 0, capline = null;
+  // LINES, counted, and not the pane's children. Markers share the scroller
+  // with the lines - one per rotation, and the "no log lines" placeholder the
+  // first render leaves behind - and bounding childElementCount gave each of
+  // them a slot out of the cap. Subtracting the cap's own notice by hand was
+  // the tell: it fixed the one marker whose arithmetic was obvious and left
+  // the rest, so a pane that had rotated twice held 1,998 lines under a
+  // sentence saying it keeps the last 2,000. The number the page states has
+  // to be the number the page keeps. It starts at what the server sent.
+  var shown = pane.querySelectorAll('div[class^="ln"]').length;
+
+  function trim() {
+    while (shown > cap) {
+      var first = pane.firstElementChild;
+      if (first === capline) first = capline.nextElementSibling;
+      if (!first) break;
+      // A marker is not a log line: dropping one is counted as no line and
+      // frees no slot. It goes because the lines it was about have gone.
+      if (first.className.indexOf('ln') === 0) { dropped++; shown--; }
+      pane.removeChild(first);
+    }
+    // "N new lines below" is an offer to scroll down to them, so it may not
+    // name a line the pane no longer holds. A burst bigger than the cap
+    // between two polls trims the very lines it just counted, and the button
+    // was offering 2,300 over a pane holding 2,000.
+    if (unseen > shown) unseen = shown;
+    if (!dropped) return;
+    if (!capline) {
+      capline = el('marker', '');
+      pane.insertBefore(capline, pane.firstChild);
+    }
+    capline.textContent = '— ' + dropped + ' earlier line(s) dropped from ' +
+      'this pane, which keeps the last ' + cap + '. The log file named above ' +
+      'is complete; this pane is not —';
+  }
+
   function poll() {
     var u = '/api/log?p=' + encodeURIComponent(pane.getAttribute('data-project')) +
             '&off=' + pane.getAttribute('data-off') +
@@ -2130,18 +2420,32 @@ PAGE_JS = """
         // Stick to the bottom only if you were already there. Scroll up to read
         // something and the pane freezes until you ask for the new lines.
         var stick = atBottom();
-        if (d.reset) { pane.innerHTML = ''; unseen = 0; }
+        // The pane was emptied because the log rotated or was truncated, and
+        // d.note says so. Nothing was dropped BY THE CAP, so the cap's own
+        // notice goes with the lines it was counting.
+        if (d.reset) {
+          pane.innerHTML = '';
+          unseen = 0; dropped = 0; capline = null; shown = 0;
+        }
         if (d.note) pane.appendChild(el('marker', '— ' + d.note + ' —'));
         d.lines.forEach(function (l) {
-          pane.appendChild(el('ln l-' + l.level, l.text)); unseen++;
+          pane.appendChild(el('ln l-' + l.level, l.text)); unseen++; shown++;
         });
         if (d.lines.length) {
+          var tall = pane.scrollHeight;
+          trim();
           if (stick) {
             pane.scrollTop = pane.scrollHeight; unseen = 0;
             if (btn) btn.hidden = true;
-          } else if (btn) {
-            btn.hidden = false;
-            btn.textContent = unseen + ' new lines below';
+          } else {
+            // Trimming takes lines off the TOP, above the reader, so the
+            // document shortens under them and the line they were reading
+            // would slide up the pane. Give back exactly what was taken.
+            pane.scrollTop -= (tall - pane.scrollHeight);
+            if (btn) {
+              btn.hidden = false;
+              btn.textContent = unseen + ' new lines below';
+            }
           }
         }
         pane.setAttribute('data-off', d.off);
@@ -2217,6 +2521,7 @@ def render_strip(strip):
 
 LEGEND = (("ok", "finished"), ("running", "running"), ("failed", "failed"),
           ("adopted", "reused"), ("bad", "unreadable record"),
+          ("stale", "running record from an earlier run"),
           ("wait", "not reached"), ("off", "off in the config"))
 
 
@@ -2307,7 +2612,7 @@ def render_index_body(view):
                       'not establish which run, so this console does not say '
                       'it was this one</div>'
                       % esc(", ".join(it["undated_failed"])))
-        if it["state_stale"]:
+        if it["state_cached"]:
             marks += ('<div class="muted small">state file unreadable just '
                       'now; showing the last good read</div>')
         elif it["bucket"] == "unreadable":
@@ -2410,6 +2715,12 @@ def render_row(r):
             # coming". The state file and the directory disagreeing is a real
             # fact worth saying: somebody cleaned up intermediates, or the run
             # wrote somewhere else.
+            #
+            # It is the right sentence for a STALE row too, and for the same
+            # reason: nothing is coming, because whatever was writing this
+            # stopped when the earlier run did. The line claims only what a
+            # stat established - declared here, absent here - and leaves why
+            # to the reader, which is where this page leaves every verdict.
             out.append('<div class="muted small mono">%s<br>%s</div>'
                        % (esc(o["name"]),
                           "not written yet" if r["state"] == "running"
@@ -2463,9 +2774,10 @@ def render_failures(fails, now, over=False):
                failure_lines(fails),
                "This run has ended. What is above is what it lost on the way; "
                "its own outcome is on the next line." if over else
-               "The engine carries on with every stage that does not depend "
-               "on a casualty, so a run can look entirely alive with a stage "
-               "already lost."))
+               "Nothing new starts after the first failure: the engine stops "
+               "dispatching there and waits for the stages already running, "
+               "which it cannot interrupt. Those can take hours, so a run can "
+               "still look busy long after this."))
 
 
 def failure_lines(fails):
@@ -2653,6 +2965,30 @@ def project_sig(v):
     return digest(parts)
 
 
+def queue_note(rows):
+    """What the ranking on the NEXT rows means, said once under the table.
+
+    The rows themselves claim only that the engine ranks one ahead of another,
+    which is all this console can establish. The two things it cannot see go
+    here, once, rather than as a caveat on ten rows: how many stages start
+    together is stage_workers against what is still running, and gpu_lease can
+    hold a GPU stage back however it is ranked - a deferred stage stays in
+    `remaining` and is reconsidered next round.
+
+    Empty when nothing is ranked, so an engine older than `cost` gets neither
+    the ranking nor an explanation of a ranking that is not there.
+    """
+    if not ready_rows(rows):
+        return ""
+    return ('<div class="muted small note">The NEXT rows carry the order the '
+            'engine considers them in: it sorts each round\'s ready stages '
+            'longest-first — hours, then minutes, then seconds — and '
+            'dispatches from the top of that sort. That is an order and not a '
+            'schedule. How many start together depends on stage_workers and '
+            'on what is still running, and a stage that needs the GPU waits '
+            'for gpu_workers however it is ranked.</div>')
+
+
 def render_project_body(v):
     """The live region: vitals, the state-file note, the stage table.
 
@@ -2662,8 +2998,8 @@ def render_project_body(v):
     and lose the operator's scroll each time, so they are kept apart.
     """
     counts = v["counts"]
-    order = ["running", "failed", "ok", "adopted", "bad", "wait", "next",
-             "off", "none"]
+    order = ["running", "stale", "failed", "ok", "adopted", "bad", "wait",
+             "next", "off", "none"]
     tally = ", ".join("%d %s" % (counts[k], k) for k in order if k in counts)
     if v["cfg_run_known"]:
         cfg = ('<div class="muted small note">enabled/off %s.</div>'
@@ -2672,6 +3008,7 @@ def render_project_body(v):
         cfg = ('<div class="muted small note">enabled/off: cannot tell — %s. '
                'No stage below is reported OFF on a guess; they fall back to '
                'waiting or not-yet-reached.</div>' % esc(v["cfg_note"]))
+    cfg += queue_note(v["rows"])
     # Anything actually WRONG with the state file is now said at the top of the
     # vitals block, by state_trouble(); what is left here is the quiet cases.
     if v.get("state_trouble"):
@@ -2711,7 +3048,13 @@ def render_project_body(v):
 
 
 def render_log_pane(v):
-    """Owned by the log poller alone, and never re-rendered by the fragment."""
+    """Owned by the log poller alone, and never re-rendered by the fragment.
+
+    `data-max` is the pane's cap, decided here rather than in the script for
+    the same reason LOG_LINES is decided here: how much of a three-day log this
+    console will hold is a property of the console, and one place to change it
+    is one place to read it. app.js trims to it and says so when it has.
+    """
     log = v.get("log") or {}
     lines = "".join('<div class="ln l-%s">%s</div>'
                     % (esc(l["level"]), esc(l["text"]))
@@ -2723,12 +3066,13 @@ def render_log_pane(v):
         '<span class="muted">last %d lines</span>'
         '<span class="muted">%d WARN in view</span>'
         '<span class="muted">%d FATAL in view</span></div>'
-        '<div id="logbody" data-off="%s" data-ident="%s" data-project="%d">'
+        '<div id="logbody" data-off="%s" data-ident="%s" data-project="%d" '
+        'data-max="%d">'
         '%s</div><button class="newbtn" id="lognew" hidden>new lines below</button>'
         '</div>'
         % (esc(v["log_name"]), len(log.get("lines", ())), log.get("warn", 0),
            log.get("fatal", 0), esc(log.get("off", 0)),
-           esc(log.get("ident") or ""), v["index"],
+           esc(log.get("ident") or ""), v["index"], LOG_PANE_LINES,
            lines or '<div class="marker">— no log lines —</div>')
         + '<footer>The counts above are for the lines shown, not for the whole '
           '%s log — a three-day log is never scanned end to end. Failure is not '

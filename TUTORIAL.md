@@ -246,8 +246,8 @@ that setting is silently not in effect — fix it before anything else. The
 so a misspelled `fdr` is reported rather than leaving the default quietly in
 force). What the check still cannot see inside are the free-form blocks
 (`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`,
-`vfdb_category_weights`, `diamond_evalues`), whose keys you choose — proof-read
-those by hand.
+`vfdb_category_weights`, `diamond_evalues`, `diamond_min_pidents`), whose keys
+you choose — proof-read those by hand.
 
 For anything missing, `doctor` prints the exact commands. Three ways to act on
 them, in increasing order of trust:
@@ -411,16 +411,31 @@ deciding that; it does not decide for you. The exception is a zero-byte lock,
 which is what a power loss or a hard crash leaves behind: those are removed on
 sight once they are more than a minute old.
 
-`SIGTERM` no longer strands a lock. `kill` and `systemctl stop` now unwind the
-run exactly as Ctrl-C does — same message, lock released, exit status 143 where
-Ctrl-C gives 130 — though, also exactly as Ctrl-C does, the stage already
-running has to finish first, so the process does not exit immediately.
+`SIGTERM` no longer strands a lock, but it is not Ctrl-C with a different
+number. `kill` and `systemctl stop` release the lock, print one `WARN` line to
+stderr naming the signal and the lock file, and exit **immediately** — exit
+status 143 — with no unwinding, so no `interrupted` message, no `_run` stamp,
+and no waiting for the stage that is running. Ctrl-C is the other trade: it
+unwinds, which means it waits for the running stage to finish (an hour, for
+tmbed or InterProScan) and in exchange prints `interrupted` and stamps the
+record, exit status 130. A supervisor cannot afford the wait — `systemd` would
+reach `TimeoutStopSec` and `SIGKILL` the process, losing the lock release — so
+`kill` buys the lock and gives up the trace.
 
-Which is why `--force-unlock` on a directory whose holder is still unwinding is
-safe: from the moment the lock is no longer the one that run took, it stops
-writing to `.metaannot_state.json` and stops trying to remove the lock. It says
-`this run no longer holds ...` once and exits, and the `_run` record you then
-watch is the replacement's.
+What that leaves you is a directory whose lock is gone, whose `_run` still says
+`"final_status": "running"`, and whose mid-flight stage is still recorded
+`running`. **That is the normal appearance of a `kill`, not a sign of anything
+worse.** Just rerun the same command: the next run sees the `running` record,
+says the stage's output may be truncated, and recomputes it. Check `ps` first,
+though — the signal stops metaannot, not the InterProScan or DIAMOND it
+launched, and those keep writing into the same scratch paths with no lock left
+to keep a second writer out.
+
+Ctrl-C's slow unwind is also why `--force-unlock` on a directory whose holder is
+still unwinding is safe: from the moment the lock is no longer the one that run
+took, it stops writing to `.metaannot_state.json` and stops trying to remove the
+lock. It says `this run no longer holds ...` once and exits, and the `_run`
+record you then watch is the replacement's.
 
 Monitor from another shell:
 
@@ -435,6 +450,30 @@ the directory — version, host, pid, config path, command line — and whether 
 run is still alive: `final_status` plus a `last_seen` stamped every
 `heartbeat_s` seconds. `results/config.effective.yaml` beside it is the merged
 configuration the run actually used, defaults included.
+
+Or watch it in a browser. `console/console.py` renders the same three files —
+the state file, the log and the lock — as one page, for every project on the
+machine at once, which is the difference that matters when eight datasets are
+running:
+
+```bash
+# leave this in its own tmux window on the server
+python3 console/console.py --root "$(dirname "$PROJ")"
+
+# from your laptop, in a local terminal
+ssh -N -L 8080:/run/user/1000/metaannot.sock lab-fedora
+# then open http://localhost:8080/
+```
+
+The console prints the exact `ssh` line for the socket it bound; copy that
+rather than the one above, which assumes `/run/user/1000`. It is one
+stdlib-only file with nothing to install — `scp` it to the server if it is not
+already there — and it is **read-only**: it writes nothing into any results
+directory, which is why pointing it at a job that is already three days in is
+not a decision you have to weigh. There is no button on it that does anything,
+and it will not tell you a run is dead; it tells you how long since the last
+heartbeat and hands you the `ps` line for the pid holding the lock. Deciding is
+still yours. See the README's console section for the flags.
 
 **If it dies:** rerun the same command. Completed stages are cached and skipped;
 only the failed one and its dependents rerun. Do **not** add a bare `--force` —
