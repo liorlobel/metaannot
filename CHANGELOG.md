@@ -167,7 +167,17 @@ session left a lock naming a pid that no longer exists. On the same host the
 next run can prove it is dead; from another node it cannot, and the resume
 became a stale-lock refusal needing `--force-unlock`.
 
-The handler releases the lock, flushes the log and exits 128+N. It does not
+The handler releases the lock and exits 128+N. Nothing in it may take a
+lock: a Python signal handler runs IN THE MAIN THREAD, between two bytecodes
+of whatever that thread was doing, so any lock the interrupted frame holds is
+still held and is not reentrant. The first version called `log()`, which goes
+through `sys.stderr`, whose buffer lock is exactly that -- on a run emitting a
+progress line per stage per minute the signal eventually lands mid-write and
+the process HANGS instead of releasing the lock, which is strictly worse than
+the stale lock this exists to prevent. CI caught it on one job of seven. The
+message is pre-formatted and pre-encoded at registration and goes out through
+`os.write(2, ...)`; the cost is that the final line reaches stderr but not the
+log file, whose buffer cannot be safely touched from a handler. It does not
 stop the tools already running — they are separate processes that outlive us —
 and it uses `os._exit`, because `SystemExit` would unwind through the stage
 pool's `with`, which waits for its workers, and a tmbed chunk can be an hour.

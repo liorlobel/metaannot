@@ -751,3 +751,25 @@ def test_the_signals_that_can_strand_a_lock_are_all_handled(ma):
     assert "SIGINT" not in tail
     assert "os._exit" in tail, \
         "sys.exit would wait for the stage pool's workers"
+
+
+def test_the_signal_handler_touches_nothing_that_takes_a_lock(ma):
+    # A Python signal handler runs IN THE MAIN THREAD, between two bytecodes
+    # of whatever that thread was doing, so any lock the interrupted frame
+    # holds is still held and is not reentrant. The first version of this
+    # handler called log() -> sys.stderr.write, whose buffer lock is exactly
+    # that; on a run logging a progress line per stage per minute the signal
+    # eventually lands mid-write and the process HANGS instead of releasing
+    # the lock. CI caught it on one job of seven -- a race, so a behavioural
+    # test cannot be relied on to catch a regression. This pins the rule.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("def _release_lock_on_signal(sig, _frame):")
+    body = src[src.index("release_results_lock()", i):
+               src.index("os._exit(128 + int(sig))", i)]
+    for banned in ("log(", "sys.stderr", "_LOGFH", "print(", ".flush()",
+                   "f\"", "format("):
+        assert banned not in body, (
+            f"{banned!r} in the signal handler: it either takes a lock or "
+            "allocates through one. Pre-format at registration and use "
+            "os.write(2, ...)")
+    assert "os.write(2," in body, "the message must go out on the raw fd"

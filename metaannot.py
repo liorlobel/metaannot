@@ -13195,31 +13195,52 @@ def cmd_run(args):
             TerminateProcess, which runs no handler at all. SIGBREAK
             (Ctrl-Break) is the one that does arrive, so it is registered too.
             """
-            name = getattr(sig, "name", None) or \
-                getattr(signal.Signals(sig), "name", str(sig))
-            log(f"stopping on {name}: releasing the results lock {p.lock}. "
-                "Any tool already running is a separate process and is not "
-                "stopped by this, so its output may be incomplete; "
-                f"{p.state} records which stages were running.", "WARN")
+            # NOTHING in here may take a lock. A Python signal handler runs
+            # IN THE MAIN THREAD, between two bytecodes of whatever that
+            # thread was doing, so any lock the interrupted frame is holding
+            # is still held while this runs and is NOT reentrant.
+            #
+            # The first version called log(), which goes through sys.stderr,
+            # whose buffer lock is exactly such a lock. On a run that emits a
+            # progress line per stage per minute the signal eventually lands
+            # mid-write, the handler blocks forever on a lock its own frame
+            # holds, and the process HANGS instead of releasing the lock --
+            # strictly worse than the stale lock this exists to prevent. CI
+            # caught it on one job of seven; it is a race, not a certainty,
+            # which is the worst kind.
+            #
+            # So: os.remove (a raw syscall, inside ResultsLock.__exit__) and
+            # os.write to fd 2, with the message pre-formatted and pre-encoded
+            # at registration time. No formatting, no buffered I/O, no locks.
+            # The cost is that the final line reaches stderr but not the log
+            # FILE, whose buffer cannot be safely touched from here.
             release_results_lock()
-            with contextlib.suppress(Exception):
-                sys.stderr.flush()
-            if _LOGFH:
-                with contextlib.suppress(Exception):
-                    _LOGFH.flush()
+            try:
+                os.write(2, _sig_msgs.get(int(sig), b"\nstopping on a signal; "
+                                          b"results lock released\n"))
+            except OSError:
+                pass
             # os._exit, not sys.exit: SystemExit here would unwind through the
             # stage pool's `with`, which WAITS for its workers, and a tmbed
             # chunk can be an hour. A kill has to mean now.
             os._exit(128 + int(sig))
 
+        _sig_msgs = {}
         for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
             _sig = getattr(signal, _name, None)
-            if _sig is not None:
-                # ValueError when this is not the main thread, OSError when
-                # the platform refuses the signal. Neither is worth failing a
-                # run over: the lock still comes off on a normal exit.
-                with contextlib.suppress(ValueError, OSError, AttributeError):
-                    signal.signal(_sig, _release_lock_on_signal)
+            if _sig is None:
+                continue
+            _sig_msgs[int(_sig)] = (
+                f"\nWARN  stopping on {_name}: releasing the results lock "
+                f"{p.lock}. Any tool already running is a separate process "
+                "and is not stopped by this, so its output may be "
+                f"incomplete; {p.state} records which stages were running.\n"
+            ).encode("utf-8", "replace")
+            # ValueError when this is not the main thread, OSError when the
+            # platform refuses the signal. Neither is worth failing a run
+            # over: the lock still comes off on a normal exit.
+            with contextlib.suppress(ValueError, OSError, AttributeError):
+                signal.signal(_sig, _release_lock_on_signal)
 
     for name in (args.only or []) + ([args.from_stage] if args.from_stage else []):
         if name not in STAGE_NAMES:
