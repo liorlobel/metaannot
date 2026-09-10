@@ -8,6 +8,7 @@ python metaannot.py init                        # write config.yaml
 python metaannot.py doctor                      # what is missing, and how to get it
 python metaannot.py doctor --install-plan i.sh  # a script to review, then run
 python metaannot.py doctor --fix                # download and install, after confirming
+python metaannot.py describe --json             # the config shape and stage graph, as JSON
 python metaannot.py all                         # annotate, report, R object
 ```
 
@@ -1113,10 +1114,19 @@ removed automatically only when it names a pid **on this host that is provably
 gone**. A lock written on another host, one owned by another user, a garbled
 lock file, and *every* lock on Windows — where `os.kill(pid, 0)` calls
 `TerminateProcess`, so asking whether the holder is alive would kill it — all
-read as live. Trampling a live run is silent corruption; refusing is a message.
-So an ordinary crashed run on Windows exits with `another metaannot is already
-running here` and needs `--force-unlock`, which is the escape hatch for a
-holder you are certain is gone.
+read as live. Trampling a live run is silent corruption; refusing is a
+message. So an ordinary crashed run on Windows exits with `another metaannot is
+already running here` and needs `--force-unlock`, which is the escape hatch for
+a holder you are certain is gone.
+
+The `_run.last_seen` heartbeat below does **not** change that. It is advisory:
+it tells you *how long* a lock has been silent, and nothing reclaims a lock on
+the strength of it. A heartbeat that stopped is not proof that a process
+stopped — one failed write ends the timer, not the run — and from another host
+the two are indistinguishable, so acting on it would trade a stale lock for two
+runs writing one directory. Deciding that a silent holder is dead is
+`--force-unlock`, which is a person deciding; the heartbeat is there to give
+that person the number.
 
 The one exception is a **zero-byte** lock — what a power loss, an OOM kill or a
 host bugcheck leaves behind between the `O_EXCL` create and the write. A real
@@ -1527,6 +1537,158 @@ recipe through the shell with the terminal attached, so you see curl's or
 conda's own progress rather than a metaannot heartbeat. Standalone `report` and
 `object` are outside it too — they shell out to Rscript through their own
 wrapper, which collects stderr and quotes it only on failure.
+
+### What a results directory says about itself
+
+A results directory now says what produced it and whether that is still
+happening. Neither file below is ever read back by metaannot, and neither is in
+any stage's signature, so neither can make a stage recompute.
+
+**`config.effective.yaml`** is the merged configuration the run actually used:
+the built-in defaults, then your config file, then the command line. It is not
+the same as the config file beside it, which carries none of the defaults, none
+of `--threads`/`--ram`/`--faa`, and says whatever it says today rather than
+what it said in March.
+
+**`_run`** is a record at the head of `results/.metaannot_state.json`, above the
+per-stage entries and deliberately not one of them — the key starts with an
+underscore, no stage is named that, and `--force` never clears it:
+
+```json
+"_run": {
+ "run_id": "20260901T144530-31284",
+ "version": "0.3.0",
+ "config_path": "/data/projects/gut2/config.yaml",
+ "argv": ["<script>", "run", "--config", "config.yaml"],
+ "host": "server", "pid": 31284,
+ "started": "2026-09-01T14:45:30",
+ "last_seen": "2026-09-01T19:12:00", "last_seen_epoch": 1788289920.0,
+ "heartbeat_s": 30, "finished": null, "final_status": "running"
+}
+```
+
+`argv` is `sys.argv` verbatim, so the `<script>` above is really the path of
+the `metaannot.py` that ran — useful when more than one copy is installed.
+`config_path` is the absolute path of the `--config` file, or **`null`** when
+the run was given none and took the built-in defaults — a parser that types it
+as a string meets a real file it cannot read the first time someone runs
+`metaannot.py run` without `--config`. It is the only nullable field here
+besides `finished`, which is `null` until the run ends.
+`final_status` is `ok`, `failed`, `interrupted` (Ctrl-C or `SIGTERM`), or
+`running`. A record still saying `running` with a `last_seen` from hours ago is
+a run that was `SIGKILL`ed or lost its machine — the process never got to say
+how it ended, and `last_seen` is what tells you how long ago that was. It is
+for reading, not for deciding: nothing in metaannot reclaims a lock because a
+heartbeat went quiet (see the lock section above). Both timestamps are the same
+instant: the string is local time for reading, the epoch is for arithmetic,
+because two hosts sharing one filesystem cannot subtract each other's local
+clocks. `heartbeat_s` appears in the record exactly as you set it, so an
+integer there stays an integer. Set the interval, or turn it off, with:
+
+```yaml
+heartbeat_s: 30   # seconds between last_seen stamps; 0 = no heartbeat
+```
+
+Both files carry more about your setup than the state file used to. `_run`
+records the host name, the pid, the absolute config path and the full command
+line, and `config.effective.yaml` materialises every merged setting including
+absolute input and database paths — and `.metaannot_state.json` is embedded
+whole in the `.rds` object people publish as supplementary data. Nothing in the
+defaults is credential-shaped, but `sources.*` and `tool_args` are free-form:
+if you have put a presigned URL or a token there, it now travels with the
+results.
+
+**The lock is released on `SIGTERM`**, not only on Ctrl-C. `kill`,
+`systemctl stop` and `wsl --terminate` used to end the process where it stood,
+leaving `.metaannot.lock` behind. `SIGTERM` is now handled the way Python
+already handles `SIGINT`, so it takes the same path: the same `interrupted`
+message, the same `_run` stamp, the same lock release, and the same
+recomputation of the stage that was writing.
+
+The one thing it does not share is the exit status, which is **128 + the
+signal**: `130` for Ctrl-C, `143` for `SIGTERM`. That is what a shell and
+`systemd` both expect — units carry `SuccessExitStatus=143` precisely so a
+`systemctl stop` is not recorded as a failed unit — and it is the only channel
+left in which a supervisor can tell an operator's stop from a person at a
+keyboard. What `SIGTERM` does *not* do is arrive any faster than Ctrl-C does —
+the interrupt reaches the main thread only, so a stage already running has to
+finish before the process exits, and under `systemd` a long one can still reach
+`TimeoutStopSec` and be `SIGKILL`ed with the lock intact.
+
+**A run that is unwinding stops writing when it is superseded.** Because a
+killed run now unwinds rather than dying where it stands, it can still be
+inside a stage when you decide it has hung and `--force-unlock` the directory
+for a replacement. From the moment the lock file is no longer the one that run
+took, it writes nothing further into `.metaannot_state.json` and removes no
+lock: it says `this run no longer holds ...` once, in the log, and exits. So
+the `_run` record and the lock you see afterwards belong to the run you
+started.
+
+**Two things that protects, and one it does not.** The `_run` record and the
+lock are safe. The stage that was already running is not: the executor waits
+for it, and `atomic_out` renames its result into place at the end. If the
+replacement has meanwhile finished that same stage and recorded it `"ok"`, the
+old run's output lands under the new run's valid signature, and the run after
+that reports `cached` and reads it. Nothing detects this.
+
+**So `--force-unlock` on a run that is still alive remains unsupported, and
+this did not change that.** It is what `CLAUDE.md` rule 4 and the
+troubleshooting table already say: use it only when you are certain the other
+process is gone. A run that is genuinely gone writes nothing, and none of the
+above applies. Note that two concurrent runs have always been able to overwrite
+each other's `.metaannot_state.json` — `save_state` rewrites the whole file —
+which is why one-writer-per-directory is a rule rather than a preference.
+
+### `describe`: what this build is, as JSON
+
+```bash
+python metaannot.py describe                    # a human summary
+python metaannot.py describe --json             # the machine-readable contract
+python metaannot.py describe --json --config config.yaml
+```
+
+`--json` emits one object: `default_config` (the whole config with its
+defaults), `stages` (each stage's `enabled` flag, `deps`, `outputs` and the
+config `keys` that decide whether it recomputes), `requirements` (the
+tool-and-database half of `doctor`, as data), the config vocabulary —
+`path_keys`, `db_path_keys`, `replace_blocks`, `freeform_keys`, `retired_keys`
+— and `paths`, the files a watcher polls. Those paths are absolute: as
+configured when you pass `--config`, and against the current directory
+otherwise.
+
+`requirements` is **not** everything `doctor` checks. It is the tools and
+databases, with how to obtain each. `doctor` additionally checks the inputs
+(`proteins_faa`, `quant_table`, `gff`), the `emapper_precomputed` files,
+unrecognised and retired config keys, whether each DIAMOND database is usable
+rather than merely present, the CUDA probe for `structure`/`topology`, the
+`tmt:` block against the plexes actually present, the `manifest` and whether
+its runs map to the quant columns, the `taxonomy` inputs, the `resources`
+split (threads and RAM per concurrent stage, and whether eggNOG gets
+`--dbmem`), and the `R` packages the report and the object need. Those are
+`doctor`'s own section headings — `== inputs ==`, `== precomputed emapper ==`,
+`== config ==`, `== gpu ==`, `== tmt ==`, `== manifest ==`, `== taxonomy ==`,
+`== resources ==`, `== R ==` — and the only two that `requirements` does feed
+are `== tools ==` and `== databases ==`. A preflight screen built on
+`requirements` alone can be green for a config `doctor` fails, so run `doctor`
+too.
+
+It is versioned: `describe_version` changes when a key is removed or its
+meaning changes, so a reader can refuse a shape it does not understand instead
+of guessing. The exact key set is pinned by a test, which is what makes that
+promise true rather than aspirational.
+
+It exists so that anything driving metaannot from outside reads a contract
+rather than importing private functions or scraping `--help`, which is how a
+front end drifts from the engine and starts lying. The stakes are concrete:
+most stages hash their database path **by value**, so a wrapper that rewrites
+one cosmetically — `D:\db\Pfam-A.hmm` into `/mnt/d/db/Pfam-A.hmm`, the same
+file — invalidates those stages and restarts InterProScan. Each stage's `keys`
+is the list that says which of its settings do that.
+
+Half the answer is static and half is a probe of the machine it ran on:
+`default_config`, `stages` and the versions are the same everywhere, while
+`requirements[].ok` is `shutil.which` and `os.path.exists` on `host` at
+`generated`. Read `ok` as a fact about that machine, not about metaannot.
 
 ## What has actually been run
 

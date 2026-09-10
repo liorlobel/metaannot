@@ -893,3 +893,323 @@ def test_ram_detection_falls_back_rather_than_raising(ma, monkeypatch):
 
     monkeypatch.setattr(builtins, "open", no_proc)
     assert ma.detect_ram_gb() == 0
+
+
+# ----------------------------------------------------------------------
+# what a run records about itself, and what it tells a program outside it
+# ----------------------------------------------------------------------
+def test_the_run_records_the_config_it_actually_used(ma, project):
+    # symptom: the results kept the stage records but not the settings behind
+    # them. The config file beside them is whatever it says today, carries none
+    # of the defaults that were never written down, and knows nothing of the
+    # --threads/--ram/--faa the command line added.
+    project.run("--threads", "3")
+    with open(project.rpath("config.effective.yaml"), encoding="utf-8") as fh:
+        eff = yaml.safe_load(fh)
+    assert eff["threads"] == 3, "the command line override is not recorded"
+    assert eff["thresholds"]["diamond_evalue"] == \
+        ma.DEFAULT_CONFIG["thresholds"]["diamond_evalue"]   # a silent default
+    assert os.path.isabs(eff["proteins_faa"])
+
+
+def test_the_effective_config_never_makes_a_stage_rerun(ma, project):
+    # symptom risk: it is rewritten on every run and it sits in the results
+    # root, so the moment any stage declared it an input or an output every run
+    # would recompute that stage — thirty-four hours of InterProScan to record
+    # what the run already knew.
+    cfg = ma.load_config(project.config_path)
+    p = ma.Paths(cfg)
+    for st in ma.STAGES:
+        assert p.effective_config not in st["out"](p), st["name"]
+        assert p.effective_config not in [x for x in st["inp"](cfg, p) if x], \
+            st["name"]
+    project.run()
+    proc = project.run()
+    assert "done: 0 run" in proc.stderr
+
+
+def test_describe_json_is_a_versioned_machine_readable_contract(ma, project):
+    # symptom: a front end had to import private functions and scrape --help to
+    # learn the config shape and the stage graph, so it drifted from the engine
+    # silently — and most stages hash their database path by VALUE, so a front
+    # end that rewrites one cosmetically restarts InterProScan.
+    proc = run_metaannot("describe", "--json", "--config",
+                         project.config_path)
+    doc = json.loads(proc.stdout)
+    assert doc["describe_version"] == ma.DESCRIBE_VERSION
+    assert doc["metaannot_version"] == ma.__version__
+    assert doc["signature_version"] == ma.SIGNATURE_VERSION
+    assert doc["stage_names"] == list(ma.STAGE_NAMES)
+    assert doc["default_config"] == ma.DEFAULT_CONFIG
+    assert doc["run_key"] == ma.RUN_KEY
+    # the files a watcher polls, named rather than reconstructed
+    assert doc["paths"]["state"].endswith(".metaannot_state.json")
+    assert doc["paths"]["effective_config"].endswith("config.effective.yaml")
+
+
+def test_describe_json_carries_the_keys_that_decide_a_rerun(ma, project):
+    # the list a front end has to know before it "helpfully" normalises a
+    # database path: these are what signature() hashes by value.
+    doc = json.loads(run_metaannot("describe", "--json", "--config",
+                                   project.config_path).stdout)
+    by = {st["name"]: st for st in doc["stages"]}
+    assert [st["name"] for st in doc["stages"]] == list(ma.STAGE_NAMES)
+    for st in ma.STAGES:
+        seen = by[st["name"]]
+        assert seen["keys"] == list(st["keys"])
+        assert seen["deps"] == list(st["deps"])
+        assert seen["enabled"] == st["enabled"]
+        assert seen["outputs"], f"{st['name']} declares no outputs"
+    assert "db.pfam_hmm" in by["pfam"]["keys"]
+
+
+def test_describe_carries_the_preflight_data_model(ma, tmp_path):
+    # requirements() already returns the preflight screen's exact data model;
+    # the point of --json is that nothing has to re-derive it.
+    #
+    # NO --config, deliberately. Written against the `project` fixture this
+    # asserted [] == [] - that config has every database-backed stage off, so
+    # requirements() returned nothing and the per-entry shape assertion below,
+    # the only one that says what the data model IS, never ran once. Stripping
+    # `note` from every entry left all four describe tests green.
+    doc = json.loads(run_metaannot("describe", "--json",
+                                   cwd=str(tmp_path)).stdout)
+    cfg = ma.load_config(None)
+    want = ma.requirements(cfg, ma.Paths(cfg))
+    assert len(want) >= 10, "the defaults must exercise a real requirement set"
+    assert [r["id"] for r in doc["requirements"]] == [r["id"] for r in want]
+    for r in doc["requirements"]:
+        assert set(r) == {"id", "label", "ok", "kind", "cmds", "manual",
+                          "note", "size_gb", "disk_gb"}
+    assert {r["kind"] for r in doc["requirements"]} == {"tool", "db"}
+    # `ok` is a probe of THIS machine, not a property of metaannot, so the
+    # answer has to say which machine gave it.
+    assert doc["host"] and doc["generated"]
+
+
+# The contract `describe_version` promises not to break silently. Changing
+# either set means REMOVING or renaming something a reader outside this file
+# depends on, which is exactly what DESCRIBE_VERSION is for: bump it in the
+# same commit, and update this test. Adding a key is not a bump and not a
+# failure here, which is why both sets are compared as supersets of nothing -
+# they are compared exactly.
+DESCRIBE_TOP_LEVEL = {
+    "describe_version", "metaannot_version", "signature_version", "generated",
+    "host", "config_path", "config", "default_config", "path_keys",
+    "db_path_keys", "replace_blocks", "freeform_keys", "retired_keys",
+    "stage_names", "stages", "bins", "quant_formats", "paths", "run_key",
+    "requirements",
+}
+# `cost` joined in v0.4.0 (1 seconds / 2 minutes / 3 hours, what the scheduler
+# sorts each round's ready set by). DESCRIBE_VERSION is NOT bumped for it: the
+# README's rule is that the version moves when a key is removed or its meaning
+# changes, and a consumer reading the seven fields it knew about is unaffected
+# by an eighth appearing. It is pinned here so the next addition is a decision
+# rather than an accident.
+DESCRIBE_PER_STAGE = {"name", "enabled", "deps", "keys", "gpu", "empty_ok",
+                      "outputs", "cost"}
+
+
+def test_describe_version_pins_the_shape_it_versions(ma, project):
+    # symptom: describe_version pinned NOTHING. The only test compared the
+    # output to its own source (`doc["describe_version"] == DESCRIBE_VERSION`,
+    # which cannot fail), so a reviewer deleted nine documented fields -
+    # path_keys, db_path_keys, replace_blocks, freeform_keys, retired_keys,
+    # bins, quant_formats and the per-stage gpu and empty_ok - left the version
+    # at 1, and the whole suite stayed green. Five of the nine are named in the
+    # README paragraph that sells the versioning.
+    doc = json.loads(run_metaannot("describe", "--json", "--config",
+                                   project.config_path).stdout)
+    assert set(doc) == DESCRIBE_TOP_LEVEL, \
+        "the top-level contract changed; bump DESCRIBE_VERSION if a key went"
+    for st in doc["stages"]:
+        assert set(st) == DESCRIBE_PER_STAGE, \
+            f"{st['name']}: the per-stage contract changed"
+    assert doc["describe_version"] == ma.DESCRIBE_VERSION
+
+
+def test_describe_hands_back_copies_not_the_engines_own_objects(ma, project):
+    # symptom: every sibling field was copied (list(PATH_KEYS),
+    # sorted(REPLACE_BLOCKS), dict(RETIRED_KEYS)) but `config` and
+    # `default_config` were the live objects. cmd_describe serialises at once
+    # and cannot tell, but describe() is the in-process entry point the console
+    # is meant to use, and a caller normalising the doc it got back was writing
+    # into this process's own defaults.
+    cfg = ma.load_config(project.config_path)
+    doc = ma.describe(cfg, ma.Paths(cfg), project.config_path)
+    assert doc["default_config"] is not ma.DEFAULT_CONFIG
+    assert doc["config"] is not cfg
+    doc["default_config"]["threads"] = "corrupted"
+    doc["default_config"]["run"]["eggnog"] = "corrupted"
+    doc["config"]["thresholds"]["diamond_evalue"] = "corrupted"
+    assert ma.DEFAULT_CONFIG["threads"] != "corrupted"
+    assert ma.DEFAULT_CONFIG["run"]["eggnog"] != "corrupted", "nested, too"
+    assert cfg["thresholds"]["diamond_evalue"] != "corrupted"
+
+
+def test_the_paths_a_watcher_polls_are_absolute(tmp_path):
+    # symptom: with no --config, resolve_paths never ran, so `paths.state` was
+    # "results/.metaannot_state.json" - relative to whatever cwd the describe
+    # process happened to have. The README's headline command block is exactly
+    # this invocation, and calls `paths` the watcher's poll list; a watcher
+    # storing those strings polls the wrong directory.
+    doc = json.loads(run_metaannot("describe", "--json",
+                                   cwd=str(tmp_path)).stdout)
+    for name, path in doc["paths"].items():
+        assert os.path.isabs(path), f"paths.{name} is relative: {path}"
+    for st in doc["stages"]:
+        for out in st["outputs"]:
+            assert os.path.isabs(out), f"{st['name']} output is relative: {out}"
+    assert not os.path.exists(os.path.join(str(tmp_path), "results"))
+
+
+def test_the_effective_config_temp_is_one_the_documented_sweep_finds(
+        ma, tmp_path, monkeypatch):
+    # symptom: write_effective_config reimplemented atomic_out and produced
+    # `results/config.effective.yaml.<pid>.tmp` - no leading dot, no .part - so
+    # it was the one leftover in the tree that the documented sweep,
+    # `find results -name '.*.part.*'`, could not find. And it sits in the
+    # results ROOT, the directory an operator opens cold.
+    seen = []
+
+    def spy(cfg, fh, **kw):
+        seen.append(fh.name)
+        fh.write("spied: true\n")
+
+    monkeypatch.setattr(ma.yaml, "safe_dump", spy)
+    target = os.path.join(str(tmp_path), "config.effective.yaml")
+    ma.write_effective_config(target, {"threads": 3})
+    tmp = os.path.basename(seen[0])
+    assert tmp.startswith("."), f"{tmp} is not a dotfile"
+    assert ma.ATOMIC_SUFFIX in tmp, f"{tmp} carries no {ma.ATOMIC_SUFFIX}"
+    assert tmp.endswith(".yaml"), "atomic_out preserves the extension"
+    assert os.path.exists(target) and not os.path.exists(seen[0])
+
+
+def test_a_failed_effective_config_write_leaves_nothing_behind(ma, tmp_path,
+                                                               monkeypatch):
+    # the other thing the bespoke temp skipped: atomic_out's
+    # `except BaseException: _atomic_rm(tmp)`. An exception inside safe_dump
+    # stranded the temp for good.
+    def boom(cfg, fh, **kw):
+        fh.write("half a config\n")
+        raise RuntimeError("yaml gave up")
+
+    monkeypatch.setattr(ma.yaml, "safe_dump", boom)
+    with pytest.raises(RuntimeError):
+        ma.write_effective_config(
+            os.path.join(str(tmp_path), "config.effective.yaml"),
+            {"threads": 3})
+    assert os.listdir(str(tmp_path)) == [], \
+        f"left behind: {os.listdir(str(tmp_path))}"
+
+
+@pytest.mark.parametrize("bad", [True, -1, "thirty", None, float("inf")])
+def test_a_mistyped_heartbeat_is_fatal_the_way_its_sibling_is(project, bad):
+    # symptom: progress_interval_s dies with a precise message; heartbeat_s
+    # warned and silently disabled itself for a non-number, silently clamped a
+    # negative to 0, and - because bool is an int - turned `heartbeat_s: true`
+    # into a ONE-SECOND heartbeat that rewrote the state file every second for
+    # the length of the run.
+    project.write_config(heartbeat_s=bad)
+    proc = project.run(expect=1)
+    assert "heartbeat_s must be a number of seconds" in proc.stderr
+    assert repr(bad) in proc.stderr or str(bad) in proc.stderr
+
+
+def test_the_recorded_heartbeat_keeps_the_type_the_config_gave_it(project):
+    # symptom: `max(0.0, float(interval))` wrote 30.0 where the config and the
+    # documented example both say 30, and a strictly-typed reader with an
+    # integer field there fails on the real file.
+    project.write_config(heartbeat_s=30)
+    project.run()
+    with open(project.rpath(".metaannot_state.json"), encoding="utf-8") as fh:
+        rec = json.load(fh)["_run"]
+    assert rec["heartbeat_s"] == 30
+    assert isinstance(rec["heartbeat_s"], int) and \
+        not isinstance(rec["heartbeat_s"], bool)
+
+
+def test_describe_creates_no_results_directory(project):
+    # asking what metaannot is must not leave fifteen directories behind for
+    # the next person to wonder about.
+    run_metaannot("describe", "--json", "--config", project.config_path)
+    assert not os.path.exists(project.results)
+
+
+def test_describe_pins_the_contents_a_console_reads_not_only_the_key_set(
+        ma, tmp_path, monkeypatch):
+    # symptom: DESCRIBE_TOP_LEVEL and DESCRIBE_PER_STAGE pin the KEY SET and
+    # nothing else, so the document could be hollowed out and stay green.
+    # Every one of these passed the full suite: emptying all nine documented
+    # vocabulary fields (path_keys, db_path_keys, replace_blocks,
+    # freeform_keys, retired_keys, bins, quant_formats, and the per-stage gpu
+    # and empty_ok), replacing every stage's `outputs` with [p.state],
+    # pointing paths.lock and paths.log at the state file, and forcing every
+    # requirements[].ok True. A console reads the VALUES: `outputs` is what a
+    # progress view watches, `paths.lock` is what tells it a run is live, and
+    # `ok` is the preflight screen itself.
+    #
+    # NO --config, so requirements() covers the whole default set and has
+    # something to be false about; chdir so the subprocess and the in-process
+    # comparison resolve the same relative database paths.
+    monkeypatch.chdir(tmp_path)
+    doc = json.loads(run_metaannot("describe", "--json",
+                                   cwd=str(tmp_path)).stdout)
+    cfg = ma.load_config(None)
+    cfg["results_dir"] = doc["paths"]["results_dir"]
+    p = ma.Paths(cfg)
+
+    # the config vocabulary, item for item and not merely present
+    assert doc["path_keys"] == list(ma.PATH_KEYS)
+    assert doc["db_path_keys"] == list(ma.DB_PATH_KEYS)
+    assert doc["replace_blocks"] == sorted(ma.REPLACE_BLOCKS)
+    assert doc["freeform_keys"] == sorted(ma.FREEFORM)
+    assert doc["retired_keys"] == dict(ma.RETIRED_KEYS)
+    assert doc["bins"] == list(ma.BIN_ORDER)
+    assert doc["quant_formats"] == sorted(ma.ALL_FORMATS)
+    for empty in ("path_keys", "db_path_keys", "replace_blocks",
+                  "freeform_keys", "retired_keys", "bins", "quant_formats"):
+        assert doc[empty], f"{empty} is empty; an empty vocabulary teaches " \
+                           "a form generator nothing"
+
+    # the files a watcher polls: each is the file it claims to be, and no two
+    # of them are the same file.
+    assert doc["paths"] == {"results_dir": p.R, "state": p.state,
+                            "lock": p.lock, "log": p.logfile,
+                            "effective_config": p.effective_config}
+    assert len(set(doc["paths"].values())) == len(doc["paths"]), \
+        "two of the paths a watcher polls point at one file"
+
+    # every stage's real outputs, and the two boolean flags that decide how a
+    # console treats a stage rather than merely describing it.
+    by = {st["name"]: st for st in doc["stages"]}
+    for st in ma.STAGES:
+        want = list(st["out"](p))
+        assert by[st["name"]]["outputs"] == want, f"{st['name']} outputs"
+        assert p.state not in want, f"{st['name']} claims the state file"
+    assert [s["name"] for s in doc["stages"] if s["gpu"]] == \
+        [st["name"] for st in ma.STAGES if st.get("gpu")]
+    assert any(s["gpu"] for s in doc["stages"]), "no stage is marked gpu"
+    assert [s["name"] for s in doc["stages"] if s["empty_ok"]] == \
+        [st["name"] for st in ma.STAGES if st.get("empty_ok")]
+    assert any(s["empty_ok"] for s in doc["stages"]), "no stage is empty_ok"
+
+    # `ok` is a probe of this machine, so it has to carry the probe's answer.
+    want = ma.requirements(cfg, p)
+    # Every field, not just id and ok. A reviewer defeated the narrower pin by
+    # blanking label, note, cmds and manual - the fields a preflight screen
+    # renders and the install plan is built from - and the whole suite stayed
+    # green. A contract pinned by key presence is not pinned.
+    assert doc["requirements"] == [
+        {k: v for k, v in r.items()} for r in want], \
+        "describe's requirements no longer match requirements() field for field"
+    assert any(r["note"] for r in doc["requirements"]), \
+        "every note is blank; the preflight screen would render nothing"
+    assert any(r["cmds"] for r in doc["requirements"]), \
+        "no requirement carries an install command"
+    assert all(r["label"] for r in doc["requirements"]), \
+        "a requirement with no label cannot be shown to anyone"
+    assert not all(r["ok"] for r in doc["requirements"]), \
+        "nothing here is installed, so a document in which everything is " \
+        "present is not reporting a probe at all"
