@@ -1594,6 +1594,97 @@ def test_a_finished_chunk_is_not_predicted_a_second_time(
     assert len(ma.parse_tmbed(p.tmbed)) == 20
 
 
+def test_a_committed_chunk_is_adopted_by_identity_and_not_by_record_count(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # symptom: a chunk counted as done when its file held at least as many
+    # records as the chunk had proteins, and never asked WHICH proteins. The
+    # plan is not fixed across a resume -- tmbed_chunk_residues is outside the
+    # stage signature on purpose, so tuning it between an interrupted run and
+    # its resume is allowed, and it re-plans the chunks. Chunk 2 of the new
+    # plan then adopts the file chunk 2 of the OLD plan wrote, and the
+    # concatenation writes two records for every protein in both plans and
+    # none for the proteins in neither.
+    cfg, p = paths_for("tmbed_replan")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 5 chunks of 4
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P008")             # chunk 3 dies
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    monkeypatch.delenv("TMBED_STUB_FAIL")
+
+    cfg["tmbed_chunk_residues"] = 600          # re-planned: 7 chunks of 3
+    capsys.readouterr()
+    ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    assert "a DIFFERENT set of proteins" in err, \
+        "a chunk of the old plan was adopted, or dropped, without a word"
+    assert "is already predicted; skipping" not in err, \
+        "no chunk of the old plan covers the same proteins as a new one"
+    recs = list(ma.iter_tmbed_records(p.tmbed))
+    assert len(recs) == 20, "a protein was predicted twice, or not at all"
+    assert sorted(ma.parse_tmbed(p.tmbed)) == [f"P{i:03d}" for i in range(20)]
+
+
+def test_a_chunk_whose_plan_still_matches_is_adopted_as_before(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # the direction that matters on every ordinary resume: proving identity
+    # must not turn a resumable run back into a run that starts over. Same
+    # plan, same proteins, same files -- and nothing is predicted twice.
+    cfg, p = paths_for("tmbed_replan_same")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(12))
+    cfg["tmbed_chunk_residues"] = 800          # 3 chunks of 4
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P008")             # the last chunk
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    monkeypatch.delenv("TMBED_STUB_FAIL")
+    capsys.readouterr()
+    ma.stage_tmbed(cfg, p)
+    err = capsys.readouterr().err
+    assert err.count("is already predicted; skipping") == 2, err
+    assert "a DIFFERENT set of proteins" not in err
+    assert len(list(ma.iter_tmbed_records(p.tmbed))) == 12
+
+
+def test_the_first_chunk_of_a_resume_reports_no_eta_rather_than_a_wrong_one(
+        ma, tmp_path, paths_for, monkeypatch, capsys):
+    # symptom: the ETA divided THIS process's elapsed time by a residue count
+    # that already included every chunk skipped as "already predicted", so the
+    # first progress line of a resume -- the line an operator reads, and the
+    # line a console puts in front of them -- was wrong by the whole ratio of
+    # resumed to new work, and was quoted before a single residue had been
+    # predicted here.
+    cfg, p = paths_for("tmbed_eta")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), _many(20))
+    cfg["tmbed_chunk_residues"] = 800          # 5 chunks of 4
+    _stub_tmbed(tmp_path, monkeypatch)
+    monkeypatch.setenv("TMBED_STUB_FAIL", "P012,P016")        # chunks 4 and 5
+    with pytest.raises(ma.StageError):
+        ma.stage_tmbed(cfg, p)
+    monkeypatch.delenv("TMBED_STUB_FAIL")
+    capsys.readouterr()
+    ma.stage_tmbed(cfg, p)
+
+    lines = [l for l in capsys.readouterr().err.splitlines()
+             if "sequence(s)," in l]
+    assert len(lines) == 2, lines
+    assert "h left" not in lines[0], \
+        "an ETA was quoted from three chunks this process did not predict"
+    assert "h left" in lines[1], \
+        "the estimate must come back as soon as there is real work to rate"
+
+
+def test_the_eta_rates_only_the_work_this_process_did(ma):
+    # 1000 residues in an hour, 3000 left: three hours, whatever else the run
+    # adopted on the way in.
+    assert ma.tmbed_eta_hours(3600.0, 1000, 3000) == pytest.approx(3.0)
+    # nothing predicted here yet, so there is no rate and nothing to say
+    assert ma.tmbed_eta_hours(3600.0, 0, 3000) is None
+    # and nothing left to do is not an estimate of zero, it is no estimate
+    assert ma.tmbed_eta_hours(3600.0, 1000, 0) is None
+
+
 def test_a_failed_chunk_keeps_what_tmbed_wrote_and_names_the_rest(
         ma, tmp_path, paths_for, monkeypatch):
     cfg, p = paths_for("tmbed_partial")

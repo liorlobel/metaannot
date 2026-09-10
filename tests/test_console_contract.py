@@ -286,6 +286,50 @@ def test_the_log_prefix_the_console_parses_is_the_prefix_the_engine_writes(
     assert lines[2].get("cont") is True    # the continuation keeps the level
 
 
+def test_the_cost_the_console_ranks_by_is_the_one_the_scheduler_sorts_by(
+        console, ma):
+    """The console annotates its NEXT rows with the engine's dispatch order,
+    and it takes that order from `cost` in `describe --json` - the field the
+    engine emits "so a front end can order or annotate the table the same way".
+
+    Pinned against stage_priority() itself rather than against the numbers,
+    because the coupling is the point: the day a stage's cost changes, or the
+    day the scheduler stops sorting by it, the console must move with it and
+    not carry on annotating a queue that is no longer there.
+    """
+    contract = console.Contract(describe())
+    cost = {st["name"]: st["cost"] for st in contract.stages}
+    for name, value in cost.items():
+        assert value == ma.STAGE_COSTS[name], name
+    # every stage, so the ranking is never a partial sort over a missing key
+    assert all(value is not None for value in cost.values())
+    # and the console's order over one ready set is the engine's own
+    ready = ["dbcan", "diamond", "cluster", "ncbifam", "kofam", "interpro"]
+    rows = [{"name": n, "state": "next", "detail": "", "ahead": [],
+             "cost": cost[n]} for n in ready]
+    console.rank_ready(rows)
+    # `ahead` IS the rank: the stage with none ahead of it is dispatched first.
+    console_order = [r["name"]
+                     for r in sorted(rows, key=lambda r: len(r["ahead"]))]
+    engine_order = list(ready)
+    engine_order.sort(key=ma.stage_priority, reverse=True)
+    assert console_order == engine_order
+
+
+def test_a_running_record_carries_a_start_and_never_a_finish():
+    """Which run a record belongs to is one timestamp comparison, and for a
+    record left behind by mark_running() the only timestamp there is is
+    `started`. Comparing `finished` alone made every such record this run's,
+    however old it was - so the shape mark_running writes is pinned here.
+    """
+    with open(METAANNOT_PY, encoding="utf-8") as fh:
+        engine = fh.read()
+    body = engine.split("def mark_running(", 1)[1].split("\n    def ", 1)[0]
+    assert '"status": "running"' in body
+    assert '"started": time.strftime' in body
+    assert '"finished"' not in body
+
+
 def test_heartbeat_seconds_are_read_from_the_record_not_assumed(console):
     """The engine writes `heartbeat_s` into `_run` precisely so a reader need
     not know its defaults; the console's bands are computed from it."""

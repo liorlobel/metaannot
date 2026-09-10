@@ -56,6 +56,103 @@ def test_nested_freeform_database_blocks_do_not_warn(ma, block):
     assert ma.unknown_keys(body, ma.DEFAULT_CONFIG) == []
 
 
+def test_every_per_database_diamond_block_is_free_form(ma):
+    # symptom: `diamond_min_pidents` arrived mirroring `diamond_evalues` key
+    # for key and was left out of the hand-written FREEFORM list, so
+    # unknown_keys() reported `diamond_min_pidents.mydb` as a typo. The floor
+    # was not dropped -- report_unknown_keys() only logs and load_config()
+    # deep_merges the user's config regardless, so diamond_min_pident_for()
+    # honoured it throughout -- which makes it worse rather than better: the
+    # run filtered at the user's number while the tool said "It is being
+    # ignored, so this setting is NOT in effect", and `doctor` failed the
+    # config (ok = False, exit 1) over a setting that was in force. The rule,
+    # not the one omission: a block keyed by db.diamond's tags is free-form
+    # by construction, so it is DERIVED from the defaults rather than listed,
+    # and the next one added cannot repeat this.
+    derived = {k for k, v in ma.DEFAULT_CONFIG.items()
+               if k.startswith("diamond_") and isinstance(v, dict)}
+    assert "diamond_min_pidents" in derived and "diamond_evalues" in derived
+    assert derived <= ma.FREEFORM, \
+        f"per-database DIAMOND block(s) {sorted(derived - ma.FREEFORM)} are " \
+        "not free-form, so a user database cannot be given one of them"
+    # ...and it is derived rather than restated, so adding a block is enough.
+    assert set(ma.PER_DIAMOND_DB_BLOCKS) == derived
+    # `diamond_workers` is an int, not a per-database map, and must not be
+    # swept in by the name alone: it has a fixed key set of none.
+    assert "diamond_workers" not in ma.FREEFORM
+
+
+def test_a_user_database_can_be_given_every_per_database_diamond_setting(
+        ma, tmp_path, capsys):
+    # the whole of the promise `db.diamond`/`sources.diamond` make: a database
+    # the user adds is a database like the five stock ones, and every knob that
+    # is per-database applies to it.
+    body = {"db": {"diamond": {"mydb": str(tmp_path / "mine.dmnd")}},
+            "sources": {"diamond": {"mydb": "https://example.invalid/m.gz"}}}
+    for block in sorted(ma.PER_DIAMOND_DB_BLOCKS):
+        body[block] = {"mydb": 42}
+    cfg_file = tmp_path / "c.yaml"
+    cfg_file.write_text(yaml.safe_dump(body), encoding="utf-8")
+    cfg = ma.load_config(str(cfg_file))
+    assert ma.unknown_keys(body, ma.DEFAULT_CONFIG) == []
+    assert "unrecognised key" not in capsys.readouterr().err
+    # and the settings are in force, rather than merely tolerated
+    assert ma.diamond_evalue_for(cfg, "mydb") == 42.0
+    assert ma.diamond_min_pident_for(cfg, "mydb") == 42.0
+    assert (cfg.get("diamond_weights") or {}).get("mydb") == 42
+
+
+def test_a_user_added_diamond_database_can_have_an_identity_floor(
+        ma, tmp_path, capsys):
+    # The same promise as the test above, pinned WITHOUT the symbol the fix
+    # introduced: that one loops over PER_DIAMOND_DB_BLOCKS, so on a build
+    # that predates it -- which is every build that still has the defect --
+    # it dies of AttributeError before it can say anything about identity
+    # floors, and an AttributeError is not a report of this behaviour. This
+    # one names the one setting the defect was about and asks only what the
+    # operator asks: is the floor accepted, is it in force, and does `doctor`
+    # agree that it is.
+    dbfile = tmp_path / "mine.dmnd"
+    dbfile.write_bytes(b"")
+    body = {"db": {"diamond": {"mydb": str(dbfile)}},
+            "diamond_min_pidents": {"mydb": 55}}
+    cfg_file = tmp_path / "floor.yaml"
+    cfg_file.write_text(yaml.safe_dump(body), encoding="utf-8")
+
+    # accepted: a tag the user defined in db.diamond is not a typo anywhere a
+    # per-database block is keyed by those same tags.
+    assert ma.unknown_keys(body, ma.DEFAULT_CONFIG) == []
+    cfg = ma.load_config(str(cfg_file))
+    assert "unrecognised key" not in capsys.readouterr().err
+    # in force: this is the number the search is filtered at, and it is the
+    # half the old warning denied -- it said the setting was NOT in effect
+    # while load_config had already merged it in.
+    assert ma.diamond_min_pident_for(cfg, "mydb") == 55.0
+    # the stock floors are untouched by the user's block, and a tag with no
+    # entry still falls through to the global threshold.
+    assert ma.diamond_min_pident_for(cfg, "card") == \
+        float(ma.DEFAULT_CONFIG["diamond_min_pidents"]["card"])
+    assert ma.diamond_min_pident_for(cfg, "unmentioned") == \
+        float(ma.DEFAULT_CONFIG["thresholds"]["diamond_min_pident"])
+
+    # and doctor agrees. Two runs over one project differing ONLY in the
+    # floor, because doctor's exit status depends on which tools and
+    # databases this machine has: what is pinned is that adding the floor
+    # neither names a key as unrecognised nor changes the verdict. It used to
+    # do both -- ok = False, exit 1, over a setting that was being honoured.
+    proj = build_project(tmp_path / "floorproj",
+                         db={"diamond": {"mydb": str(dbfile)}})
+    without = run_metaannot("doctor", "--config", proj.config_path,
+                            expect=None)
+    proj.write_config(diamond_min_pidents={"mydb": 55})
+    withfloor = run_metaannot("doctor", "--config", proj.config_path,
+                              expect=None)
+    out = withfloor.stdout + withfloor.stderr
+    assert "diamond_min_pidents" not in out, out
+    assert withfloor.returncode == without.returncode, \
+        "the identity floor changed doctor's verdict on a config that works"
+
+
 def test_unknown_key_inside_a_checked_block_is_still_found(ma):
     body = {"thresholds": {"diamond_evalu": 1e-5}}
     assert ma.unknown_keys(body, ma.DEFAULT_CONFIG) == ["thresholds.diamond_evalu"]

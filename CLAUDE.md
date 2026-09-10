@@ -103,11 +103,22 @@ it names; do not force the file through another format.
 10. **Report numbers, do not summarise them away.** If 71% of proteins land in
    the KO-less bins, say 71%. If a stage warns, surface the warning.
 
+11. **To watch a run, use the console; do not write something that touches the
+   results directory.** `python3 console/console.py --root <dir>` on the
+   machine doing the run serves one read-only page over a mode-0700 UNIX
+   socket, reached with `ssh -N -L 8080:<socket> <host>` and a browser. It is
+   safe to point at a job that is already running precisely because it writes
+   nothing anywhere near it. `tail -f results/metaannot.log` and reading
+   `.metaannot_state.json` are fine too. Writing into a results directory in
+   order to monitor one is not — see rule 4: one writer per results directory,
+   and a watcher that writes is a second writer.
+
 ## Where things live
 
 | | |
 |---|---|
 | tool | `metaannot.py` (this directory) |
+| console | `console/console.py` — a read-only watcher, its own program |
 | config | `config.yaml` |
 | databases | the large storage array, **not** the OS disk |
 | results | one directory per project, on the large array |
@@ -145,3 +156,10 @@ it names; do not force the file through another format.
 - A repeated sample name in an `.fp-manifest` is a **fraction**, not a
   duplicate. Fraction rows are collapsed to one sample; the manifest is only
   refused when the rows genuinely disagree about the design.
+- The console's three refusals are the design, not gaps to fill. It writes
+  nothing into a results directory; it does not import metaannot, taking
+  everything it knows from `metaannot.py describe --json`; and it never asserts
+  that a run is dead, because a stopped heartbeat is not a stopped process and
+  the engine's rule is that unprovable means alive. So there is no `do_POST`,
+  no `--force-unlock` button and no death verdict to add. `CONSOLE_VERSION` is
+  its own number and does not track `__version__`.

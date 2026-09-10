@@ -50,8 +50,8 @@ An unrecognised key in `config.yaml` is reported with a spelling suggestion
 rather than silently ignored — `run: {unipep: true}` used to leave the stage
 disabled with nothing said. The check stops at the free-form blocks
 (`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`, `vfdb_category_weights`,
-`diamond_evalues`), whose keys are user-chosen and cannot be checked, so a
-typo there is silent and simply has no effect. Proof-read those blocks by hand.
+`diamond_evalues`, `diamond_min_pidents`), whose keys are user-chosen and
+cannot be checked, so a typo there is silent and simply has no effect. Proof-read those blocks by hand.
 The `analysis:` block is **not** free-form and **is** checked: its keys are
 exactly the Rmd's params, so `fdrr: 0.01` is reported rather than written into
 the Rmd header as a spurious param while `fdr: 0.05` stays quietly in force.
@@ -73,14 +73,76 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run is about **589 passed, 35 skipped, 8 xfailed, 33
-deselected**, in two to four minutes depending on the machine. On Windows four
-of those come back as failures instead: a path test asserting forward slashes,
-a `doctor --fix` recipe emitting `mkdir -p`, a SIGINT test, and stale-lock
-reclamation, which `_holder_is_alive` deliberately disables on Windows because
-`os.kill(pid, 0)` there calls `TerminateProcess` — asking whether the holder is
-alive would kill it. All four are POSIX assumptions in the tests, not defects
-in the tool.
+A healthy default run on this tree is **1154 passed, 1 skipped, 6 xfailed, 37
+deselected**, in three to five minutes depending on the machine. Those numbers
+are the only yardstick you have for deciding whether your checkout is the one
+this document describes, so they are counted rather than estimated. The 37
+deselected are the `slow` marker, and they are the second command above.
+`pytest -q -m R` selects the 35 R tests, which the default run **already
+includes**: they skip rather than fail when `Rscript` or one of its packages is
+absent, so on a machine with no R the same run reports 1119 passed and 36
+skipped. The single skip here is a Windows-only test pinning a refusal that
+cannot happen on POSIX.
+
+Windows is not run from this machine, so what follows is read off the code and
+the test markers rather than measured. `doctor --fix` there is not a recipe
+that emits `mkdir -p` any more — since v0.4.0 it is an outright refusal, because
+every command it generates is POSIX shell handed to `cmd.exe`, where
+`mkdir -p C:\db` creates a directory called `-p` and each step can exit 0 having
+done nothing. It names the alternative instead: `doctor --install-plan
+install.sh` on Windows, then `wsl bash install.sh` where the tools live.
+`--install-plan` itself still works there and every other `doctor` check runs;
+only `--fix` is refused. The three `--fix` tests carry that as their skip
+reason on Windows, and a fourth runs **only** on Windows to pin the refusal —
+it is the one skip in the count above.
+
+Eight test functions that signal a child process are skipped there as well,
+eight collected items in a default run, because
+`test_a_killed_run_releases_the_results_lock` is parametrized `SIGTERM` and
+`SIGHUP` for two of them while
+`test_a_killed_runs_tail_never_lands_on_the_run_that_replaced_it` carries the
+`slow` marker and is deselected. They do not all carry the same reason.
+`test_an_interrupted_run_leaves_parseable_state_and_resumes` is the `SIGINT`
+one: `send_signal(SIGINT)` is unsupported on Windows and `CTRL_C_EVENT` goes to
+the whole console group including the test runner. The other seven —
+`test_a_killed_run_releases_the_results_lock`,
+`test_a_run_killed_that_way_resumes_without_force_unlock`,
+`test_a_run_killed_with_sigterm_releases_the_results_lock`,
+`test_a_sigterm_releases_the_lock_and_leaves_a_resumable_trace`,
+`test_a_sigtermed_run_is_exactly_the_case_the_heartbeat_exists_for`,
+`test_ctrl_c_unwinds_and_stamps_where_a_sigterm_cannot` and
+`test_a_killed_runs_tail_never_lands_on_the_run_that_replaced_it` — are skipped
+because `TerminateProcess` runs no handler on Windows, so a `SIGTERM` cannot be
+delivered to a child there at all and none of what they assert (a released
+lock, a `128 + N` exit status, the WARN line the handler writes) can happen.
+All eight are verified under Linux.
+
+Five of those seven markers are new in v0.5.0 and were **deduced, not
+measured**: they arrived with the console's engine half (#24), which added
+signal tests on a machine that is not the machine they describe, and the
+deduction rests on the same `TerminateProcess` fact the markers written before
+them give. If you run the suite on Windows and one of the five would in fact
+have passed, the marker is wrong and worth removing — that is a better failure
+than the silent red it replaced.
+
+**One further test signals a child and carries no Windows marker whatsoever**,
+so it is not a skip there: it runs.
+`test_the_run_heartbeat_advances_while_a_stage_is_running` sends a `SIGTERM`
+only to stop the run, and everything it asserts afterwards — that the lock
+survives, that a second run refuses it — is what `TerminateProcess` leaves
+behind anyway, so it is left alone deliberately rather than overlooked. Read
+the count above as "eight items are skipped on Windows", not as "the signal
+tests are handled on Windows".
+
+The old note here also listed a path test asserting forward slashes among the
+Windows failures. That one is gone: v0.4.0 rewrote
+`test_home_and_env_vars_in_a_config_path_are_expanded` to compare
+`os.path.normcase(os.path.abspath(...))` instead of POSIX strings, so it is
+separator-agnostic and passes on both. Stale-lock reclamation is no longer a
+Windows exception either: `_holder_is_alive` asks `OpenProcess`, which answers
+without touching the process, rather than `os.kill(pid, 0)`, which there calls
+`TerminateProcess`. The console's tests are new in this release and have not
+been run on Windows at all, so nothing here can say how they behave.
 
 Offline, and needs none of the external tools: where a stage shells out to
 hmmsearch, DIAMOND or MMseqs2 the binary is a stub on `PATH` that writes a
@@ -95,10 +157,18 @@ coming back rather than to describe an intended feature. A handful are
 `xfail(strict)`: those name guards that are still missing, so a fix turns them
 green instead of being forgotten — and because they are strict, a fix that
 lands without removing the marker fails the suite rather than passing quietly.
-The ones open today are live defects the tool documents rather than hides: an
-`annotation_pass1.tsv` that is not reproducible across a resume, a Unipept
-lineage truncated at the first blank rank, and a `pept2lca` file matching
-nothing dying with a bare `'verdict'`.
+Six are open today, over five tests, and they are live defects the tool
+documents rather than hides: an `annotation_pass1.tsv` that is not reproducible
+across a resume; a Unipept lineage truncated at the first blank rank; a
+`pept2lca` file matching nothing dying with a bare `'verdict'`; an
+`emapper.annotations` file with no data rows raising a bare `KeyError` instead
+of the "no `#query` header" message every other malformed file gets (two of the
+six — the same test over an empty file and a header-only one); and a DIAMOND
+database disabled with `""` vanishing without trace, because `resolve_paths()`
+drops empty `db.diamond` entries before `doctor` ever sees them, so nothing
+anywhere records that you turned it off. That last one is a wish rather than a
+regression — the behaviour the tool has today is the one the DIAMOND section
+below describes — and the marker is what keeps the wish from being forgotten.
 
 ## A worked example
 
@@ -1574,12 +1644,17 @@ the run was given none and took the built-in defaults — a parser that types it
 as a string meets a real file it cannot read the first time someone runs
 `metaannot.py run` without `--config`. It is the only nullable field here
 besides `finished`, which is `null` until the run ends.
-`final_status` is `ok`, `failed`, `interrupted` (Ctrl-C or `SIGTERM`), or
-`running`. A record still saying `running` with a `last_seen` from hours ago is
-a run that was `SIGKILL`ed or lost its machine — the process never got to say
-how it ended, and `last_seen` is what tells you how long ago that was. It is
-for reading, not for deciding: nothing in metaannot reclaims a lock because a
-heartbeat went quiet (see the lock section above). Both timestamps are the same
+`final_status` is `ok`, `failed`, `interrupted` (Ctrl-C) or `running`. A record
+still saying `running` with a `last_seen` from hours ago is most often the
+**ordinary** trace of a `kill`: `SIGTERM` releases the lock and exits without
+unwinding, so nothing stamps a verdict on the way out and `running` is simply
+the last thing the record was ever told (the next section spells out why that
+is the right trade). It is also what a `SIGKILL`, a lost machine or a wedged
+process leaves behind, and from the record alone those cases are
+indistinguishable — which is the point of writing it down rather than
+interpreting it. `last_seen` tells you how long ago the process last said
+anything. It is for reading, not for deciding: nothing in metaannot reclaims a
+lock because a heartbeat went quiet (see the lock section above). Both timestamps are the same
 instant: the string is local time for reading, the epoch is for arithmetic,
 because two hosts sharing one filesystem cannot subtract each other's local
 clocks. `heartbeat_s` appears in the record exactly as you set it, so an
@@ -1600,29 +1675,66 @@ results.
 
 **The lock is released on `SIGTERM`**, not only on Ctrl-C. `kill`,
 `systemctl stop` and `wsl --terminate` used to end the process where it stood,
-leaving `.metaannot.lock` behind. `SIGTERM` is now handled the way Python
-already handles `SIGINT`, so it takes the same path: the same `interrupted`
-message, the same `_run` stamp, the same lock release, and the same
-recomputation of the stage that was writing.
+leaving `.metaannot.lock` behind. `run` and `all` now install a handler for
+`SIGTERM`, `SIGHUP` and (on Windows) `SIGBREAK` that does exactly three things:
+it removes the lock file, it writes one line to stderr, and it calls
+`os._exit(128 + N)`.
 
-The one thing it does not share is the exit status, which is **128 + the
-signal**: `130` for Ctrl-C, `143` for `SIGTERM`. That is what a shell and
-`systemd` both expect — units carry `SuccessExitStatus=143` precisely so a
-`systemctl stop` is not recorded as a failed unit — and it is the only channel
-left in which a supervisor can tell an operator's stop from a person at a
-keyboard. What `SIGTERM` does *not* do is arrive any faster than Ctrl-C does —
-the interrupt reaches the main thread only, so a stage already running has to
-finish before the process exits, and under `systemd` a long one can still reach
-`TimeoutStopSec` and be `SIGKILL`ed with the lock intact.
+**That is a different path from Ctrl-C, deliberately, and the difference is
+worth knowing before you `kill` a run.** The handler does not unwind, so there
+is no `interrupted` message, no `_run` stamp, and no waiting for the stage that
+is running. Ctrl-C is the opposite trade: `SIGINT` is left as Python's default,
+raises `KeyboardInterrupt`, unwinds through the stage pool's `with` — which
+**waits for its workers** — and only then prints `interrupted` and stamps the
+record. Unwinding on `SIGTERM` was tried and taken out again, because waiting
+is precisely what a supervisor cannot afford: a tmbed chunk or an InterProScan
+stage is an hour, `systemd` hits `TimeoutStopSec` long before that and sends
+`SIGKILL`, and the lock release that is the whole point of handling the signal
+is then lost. So `SIGTERM` buys the lock at the cost of the trace, and Ctrl-C
+buys the trace at the cost of the wait. The one line the handler does write is
+pre-formatted and pre-encoded at registration and goes out through
+`os.write(2, ...)` — a handler runs between two bytecodes of the main thread,
+so touching `sys.stderr`'s buffer lock can deadlock the process it was meant to
+release — and it names the signal, the lock file, and the fact that any tool
+already running is a separate process this does not stop. It reaches stderr but
+not `results/metaannot.log`, whose buffer cannot be flushed from a handler.
 
-**A run that is unwinding stops writing when it is superseded.** Because a
-killed run now unwinds rather than dying where it stands, it can still be
-inside a stage when you decide it has hung and `--force-unlock` the directory
-for a replacement. From the moment the lock file is no longer the one that run
-took, it writes nothing further into `.metaannot_state.json` and removes no
-lock: it says `this run no longer holds ...` once, in the log, and exits. So
-the `_run` record and the lock you see afterwards belong to the run you
-started.
+The exit status is **128 + the signal**: `130` for Ctrl-C, `143` for `SIGTERM`,
+`129` for `SIGHUP`. That is what a shell and `systemd` both expect — units carry
+`SuccessExitStatus=143` precisely so a `systemctl stop` is not recorded as a
+failed unit — and it is the channel in which a supervisor tells an operator's
+stop from a person at a keyboard. Note that only `run` and `all` install the
+handler, and only once they have taken the lock: every other subcommand, and
+`run --dry-run`, still takes the unwinding path on `SIGTERM`, which costs
+nothing because none of them holds a lock.
+
+**So what a `kill`ed directory looks like, and what to do with it.** The lock is
+gone, so the next run starts without `--force-unlock`. `_run` still says
+`"final_status": "running"` with `"finished": null` — see above; that is the
+signature of this path, not evidence of anything worse. The stage that was
+mid-flight is still recorded `"running"` because `mark_running()` stamped it
+before it started, and the next run reads that, says `the previous run was
+interrupted while this stage was writing, so its output may be truncated;
+recomputing`, and redoes it. You do not have to `--force` anything, and you
+should not delete anything.
+
+The one thing to check first is `ps`. The handler stops metaannot, not the
+tools metaannot launched: an InterProScan, a DIAMOND or a TMbed started by the
+killed run is a separate process that keeps going, writing into the same scratch
+paths under the results directory, and the lock that would have kept a second
+writer out is already released. So before restarting a `kill`ed run, confirm the
+children are actually gone.
+
+**A run that is unwinding stops writing when it is superseded.** That is the
+Ctrl-C case, and the reason it matters is that a run can still be inside a stage
+when you decide it has hung and `--force-unlock` the directory for a
+replacement. From the moment the lock file is no longer the one that run took,
+it writes nothing further into `.metaannot_state.json` and removes no lock: it
+says `this run no longer holds ...` once, in the log, and exits. So the `_run`
+record and the lock you see afterwards belong to the run you started. A
+`SIGTERM`ed run cannot reach that path at all — it is gone before it could write
+anything — which protects the replacement just as effectively and says nothing
+about it.
 
 **Two things that protects, and one it does not.** The `_run` record and the
 lock are safe. The stage that was already running is not: the executor waits
@@ -1689,6 +1801,108 @@ Half the answer is static and half is a probe of the machine it ran on:
 `default_config`, `stages` and the versions are the same everywhere, while
 `requirements[].ok` is `shutil.which` and `os.path.exists` on `host` at
 `generated`. Read `ok` as a fact about that machine, not about metaannot.
+
+## The console: watching a run without touching it
+
+`console/console.py` is a read-only watcher for results directories. It is one
+stdlib-only file — Python 3.9 or newer, nothing to install, deployable by `scp`
+— and it serves one page: a list of the directories it watches, and per
+directory a stage table read out of `.metaannot_state.json`, a log tail, the
+lock, and what the run record says about itself. It is `CONSOLE_VERSION`
+`0.1.0`, and that number is deliberately not `__version__`: the console and the
+engine ship in one repository but they are two programs with two audiences, and
+tying their versions together would mean either lying about one of them or
+bumping a number nobody asked about.
+
+**It never writes a byte into a results directory.** Not a lockfile, not a
+cache, not a temp file, not a log line. That is not politeness, it is the
+entire reason it is safe to point at a three-day job that is already running:
+every reader opens `O_RDONLY`, the console never `chdir()`s into a watched
+directory so not even a core dump can land there, there is no `do_POST`, and
+the one file it does create — a `flock` that stops two consoles fighting over
+one socket — lives in the console's own runtime directory and is refused
+outright if you try to put it anywhere near a watched tree. The rule is
+enforced rather than intended: `tests/test_console_contract.py` proves it by
+AST scan and by snapshotting a results directory around every route.
+
+**It never imports metaannot either.** Stage order, dependency edges, the
+`_run` key and the names of the files it polls all come from
+`describe --json`, shelled out once at startup and cached. This is the
+difference between a front end that stays true and one that starts lying: most
+stages hash their database path by value, a console that hard-codes what a
+stage is named or where a state file lives drifts the day either changes, and
+the drift is invisible until somebody reads a stale answer off a page that
+looks authoritative. `docs/gui-design.md` is the design record for that choice.
+
+Run it on the host that writes the results directories — it reads local files,
+so it has to be where they are:
+
+```bash
+# on the machine that runs the pipeline
+python3 console/console.py --root /data/projects
+
+# from your workstation, once
+ssh -N -L 8080:/run/user/1000/metaannot.sock lab-fedora
+# then open http://localhost:8080/
+```
+
+It binds a **mode-0700 UNIX socket**, never a TCP port. File permissions are
+the whole access control, by decision: a `127.0.0.1` listener on a shared lab
+server is reachable by every other account on that box, and a token would leak
+into `ps`, shell history and the URL bar. A UNIX-socket forward target needs
+OpenSSH 6.7 or newer on your side. The console prints the exact `ssh -L` line
+for the socket it actually bound, so you can copy it rather than reconstruct
+it, and any free local port will do.
+
+The flags are few. Results directories are named as bare arguments or with
+`--project` (repeatable, and identical); `--root` (repeatable) scans a tree
+three levels deep for them instead — deep enough for
+`<root>/<dataset>/results`, shallow enough not to wander into a 200 GB Foldseek
+tmp directory — and re-scans every 30 seconds, so a directory created later is
+picked up and keeps the number it was given. `--socket PATH` overrides where to
+bind. Leave it off **and `$METAANNOT_CONSOLE_SOCK` unset** and the console picks
+the first private directory it can find from `$XDG_RUNTIME_DIR`,
+`/run/user/<uid>`, `~/.cache/metaannot-console` and
+`/tmp/metaannot-console-<uid>`, and puts `metaannot.sock` in it. If
+`$METAANNOT_CONSOLE_SOCK` **is** set, that is the flag's default value and the
+search never happens: the variable is treated exactly as if you had typed
+`--socket` yourself, refusals included. That matters because the two paths are
+not equivalent — the console creates the last component of a directory of its
+own choosing, and creates nothing at all for a path you named, so a
+`$METAANNOT_CONSOLE_SOCK` pointing into a directory that is not there yet is a
+refusal rather than a `mkdir`. Either way the directory has to be one no other
+account can reach, and a socket path inside or under anything the console is
+watching is refused outright — but a *candidate* that fails the privacy test is
+only passed over, with a line on stderr, for the next one in the list.
+`--metaannot PATH` is the engine to ask for the contract, defaulting to the
+`metaannot.py` next to the `console/` directory; `--python PATH` is the
+interpreter that runs it, defaulting to the one running the console.
+`--interval S` is the fastest the page will poll, default 3 seconds, floor
+0.5 — `0` used to be accepted and turned every open tab into a fetch loop
+against an NFS mount.
+
+**It will not tell you a run is dead.** That is a decision, not an omission.
+The heartbeat in `_run.last_seen` is advisory — one failed write ends the
+heartbeat thread while the run carries on — and the engine's own rule is that
+unprovable means alive. So the console says how long it has been since the last
+sign of work, names what it is reading, hands you the `ps -p <pid> -o
+pid,etime,stat,args` line for the pid in the lock file, and stops there. Where
+the evidence really is informative it says so and no more: a `FATAL` as the
+newest log line while the record still says `running` is the killed-mid-write
+shape, and it is called that rather than called death. The verdict is yours,
+and the action that follows from it is `--force-unlock` on the engine, which is
+a person deciding.
+
+Which is the other half of the same decision: **there is no button that acts.**
+No `--force-unlock`, no launch, no config edit, no `do_POST` — the HTTP handler
+implements `GET` and `HEAD` and nothing else. A watcher that cannot act cannot
+act wrongly on a directory you care about, and that is what makes "point it at
+the running job and see" a reasonable first thing to do rather than a decision.
+
+The preflight checklist, the server-side directory picker, a `doctor --json` to
+feed them and the config authoring described in `docs/gui-design.md` are later
+milestones and are **not** in this release. This is M1, a watcher, and it is
+deliberately the whole of it: if the pane is not useful, the loss is one file.
 
 ## What has actually been run
 

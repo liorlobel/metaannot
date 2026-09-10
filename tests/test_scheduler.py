@@ -758,7 +758,12 @@ def test_the_signals_that_can_strand_a_lock_are_all_handled(ma):
     # here would replace an orderly stop with an abrupt one.
     src = io.open(METAANNOT_PY, encoding="utf-8").read()
     i = src.index("_release_lock_on_signal(sig, _frame)")
-    tail = src[i:i + 4000]
+    # The span is the handler plus its registration, anchored on the
+    # registration itself rather than on a count of characters: the rationale
+    # written beside it grows, and a fixed 4000 characters silently stopped
+    # short of the loop this is about, which reads as "SIGTERM is not
+    # registered" when SIGTERM is registered eleven lines further down.
+    tail = src[i:src.index("signal.signal(_sig, _release_lock_on_signal)", i)]
     for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
         assert f'"{name}"' in tail, f"{name} is not registered"
     assert "SIGINT" not in tail
@@ -788,6 +793,64 @@ def test_the_signal_handler_touches_nothing_that_takes_a_lock(ma):
     assert "os.write(2," in body, "the message must go out on the raw fd"
 
 
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM"),
+                    reason="there is no SIGTERM to install a handler for")
+def test_the_sigterm_handler_cmd_run_installs_supersedes_the_unwinding_one(
+        ma, project, tmp_path, monkeypatch):
+    """Two handlers claim SIGTERM, and which one a `kill` reaches decides what
+    a three-day run leaves behind. main() installs the unwinding one - SIGTERM
+    raises KeyboardInterrupt, so the run stops the way Ctrl-C stops it - and
+    cmd_run then installs _release_lock_on_signal over it, which releases the
+    lock and os._exit()s without unwinding. The later registration wins, so for
+    `run` and `all` the unwinding one never runs.
+
+    That is the behaviour that is wanted, and the three tests below pin what it
+    leaves behind. What was unpinned was the ORDER, which is the whole of it:
+    swap the two registrations and every one of those tests still describes a
+    run that now waits for its stage to finish - a TMbed chunk is an hour -
+    and under systemd reaches TimeoutStopSec and is SIGKILLed with the lock
+    still on disk. Nothing else would have said so."""
+    names = [n for n in ("SIGTERM", "SIGHUP", "SIGBREAK")
+             if getattr(signal, n, None) is not None]
+    saved = {n: signal.getsignal(getattr(signal, n)) for n in names}
+    # cmd_run gets far enough to open the run's log into ma._LOGFH and to put
+    # a RunRecord in ma._RUN, both module globals it never puts back. Setting
+    # each to its own value registers monkeypatch's restore, so this tmp
+    # project's log handle does not outlive its directory and catch every
+    # later log() in the session, and no later test stamps a record that
+    # belongs to this one.
+    monkeypatch.setattr(ma, "_LOGFH", ma._LOGFH)
+    monkeypatch.setattr(ma, "_RUN", ma._RUN)
+    try:
+        ma.handle_sigterm_like_sigint()
+        unwinding = signal.getsignal(signal.SIGTERM)
+        assert unwinding not in (saved["SIGTERM"], signal.SIG_DFL), \
+            "main()'s handler is not the one in force before cmd_run runs"
+
+        # cmd_run as far as its own registration and no further: it takes the
+        # lock, registers, and only then refuses a proteins_faa that is not
+        # there. Nothing is run, and the refusal is the stop point rather than
+        # a monkeypatch, so the order being pinned is the real one.
+        args = argparse.Namespace(config=project.config_path, threads=None,
+                                  ram=None, faa=str(tmp_path / "gone.faa"),
+                                  results_dir=None, dry_run=False,
+                                  force_unlock=False, only=None,
+                                  from_stage=None, force=False)
+        with pytest.raises(ma.StageError) as e:
+            ma.cmd_run(args)
+        assert "proteins_faa not found" in str(e.value)
+
+        now = signal.getsignal(signal.SIGTERM)
+        assert now is not unwinding, \
+            "cmd_run's handler no longer supersedes the unwinding one, so a " \
+            "killed run waits for its stage instead of releasing the lock"
+        assert getattr(now, "__name__", "") == "_release_lock_on_signal", \
+            f"SIGTERM is handled by {now!r}, not by cmd_run's releaser"
+    finally:
+        for n in names:
+            signal.signal(getattr(signal, n), saved[n])
+
+
 # --- the engine half of the console: signals, the run record, the heartbeat --
 def _paused_inside_a_stage(proj, **env):
     """A run started in the background and caught while a stage is running.
@@ -808,6 +871,12 @@ def _paused_inside_a_stage(proj, **env):
     return proc
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="TerminateProcess runs no handler on Windows, so a child cannot be "
+           "sent SIGTERM there and nothing this test asserts - the released "
+           "lock, the 128+N status, the WARN line - can happen. Deduced from "
+           "the platform rather than measured on it.")
 def test_a_run_killed_with_sigterm_releases_the_results_lock(tmp_path,
                                                              stub_bin):
     # symptom: the lock is released by an atexit hook, and SIGTERM's default
@@ -827,6 +896,12 @@ def test_a_run_killed_with_sigterm_releases_the_results_lock(tmp_path,
     assert proc.returncode == 143
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="TerminateProcess runs no handler on Windows, so a child cannot be "
+           "sent SIGTERM there and nothing this test asserts - the released "
+           "lock, the 128+N status, the WARN line - can happen. Deduced from "
+           "the platform rather than measured on it.")
 def test_a_sigterm_releases_the_lock_and_leaves_a_resumable_trace(tmp_path,
                                                                   stub_bin):
     # The engine's SIGTERM handler deliberately does NOT unwind: it releases
@@ -851,6 +926,12 @@ def test_a_sigterm_releases_the_lock_and_leaves_a_resumable_trace(tmp_path,
     proj.run(env={"STUB_SLEEP": "0"})            # and it still resumes
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="TerminateProcess runs no handler on Windows, so a child cannot be "
+           "sent SIGTERM there and nothing this test asserts - the released "
+           "lock, the 128+N status, the WARN line - can happen. Deduced from "
+           "the platform rather than measured on it.")
 def test_a_sigtermed_run_is_exactly_the_case_the_heartbeat_exists_for(
         tmp_path, stub_bin):
     # Because the handler os._exit()s, nothing stamps the run record on the
@@ -870,6 +951,12 @@ def test_a_sigtermed_run_is_exactly_the_case_the_heartbeat_exists_for(
     assert run["finished"] is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="neither half can be delivered on Windows: TerminateProcess runs "
+           "no handler for the SIGTERM, and send_signal(SIGINT) is "
+           "unsupported there. Deduced from the platform rather than "
+           "measured on it.")
 def test_ctrl_c_unwinds_and_stamps_where_a_sigterm_cannot(tmp_path, stub_bin):
     # The two paths differ ON PURPOSE, which an earlier version of this file
     # asserted the opposite of. SIGINT is left as Python's default, so it
@@ -923,6 +1010,12 @@ def _run_record(proj):
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="TerminateProcess runs no handler on Windows, so a child cannot be "
+           "sent SIGTERM there and nothing this test asserts - the released "
+           "lock, the 128+N status, the WARN line - can happen. Deduced from "
+           "the platform rather than measured on it.")
 def test_a_killed_runs_tail_never_lands_on_the_run_that_replaced_it(
         tmp_path, stub_bin):
     """The operator sequence this whole round of fixes is about, end to end.
@@ -1227,6 +1320,52 @@ def test_a_lock_we_cannot_read_is_still_released_by_its_owner(ma, tmp_path,
     assert gone.is_still_ours() is None
 
 
+def test_a_lock_we_cannot_decode_is_still_released_by_its_owner(ma, tmp_path):
+    """The same rule one layer down, where it did not hold: the ownership
+    check reads the lock as TEXT, and UnicodeDecodeError is a ValueError, not
+    an OSError, so the arm that answers "unprovable means alive" could not
+    catch it. Undecodable bytes - a torn NFS write cutting a multi-byte
+    character, a page of nulls where a crashed writer's payload should be -
+    therefore raised out of __exit__, which had already cleared `held`: the
+    lock stayed on disk and the second __exit__ was a no-op, which is the
+    exact stranding the OSError arm exists to prevent."""
+    lk = tmp_path / ".metaannot.lock"
+    lock = ma.ResultsLock(str(lk))
+    lock.__enter__()
+    lk.write_bytes(b'{"pid": 1, "host": "\xff\xfe\x80 not utf-8"}')
+    assert lock.is_still_ours() is True, \
+        "a lock we cannot decode is one we have no evidence has changed hands"
+    lock.__exit__()
+    assert not lk.exists(), "an undecodable lock was stranded by its own owner"
+
+
+def test_the_other_readers_of_the_lock_and_the_state_take_the_same_bytes(
+        ma, tmp_path, capsys):
+    """The same class of bug checked where it could land next. Every other
+    reader on this path already guards ValueError, which UnicodeDecodeError is
+    a subclass of, so each one answers rather than raising - and each answers
+    the way that path answers an unreadable file, which is not the same answer
+    twice."""
+    lk = tmp_path / ".metaannot.lock"
+    lk.write_bytes(b"\xff\xfe not utf-8, and not JSON either")
+    # __enter__: a lock it cannot make sense of is a lock it cannot disprove,
+    # so it refuses rather than trampling one that may be live.
+    with pytest.raises(ma.StageError) as e:
+        ma.ResultsLock(str(lk)).__enter__()
+    assert "already running here" in str(e.value)
+    with ma.ResultsLock(str(lk), force=True):
+        assert json.loads(lk.read_text(encoding="utf-8"))["pid"] == os.getpid()
+
+    # load_state: undecodable is unreadable, and a run that cannot read the
+    # state must adopt nothing rather than die on the way in.
+    st = tmp_path / ".metaannot_state.json"
+    st.write_bytes(b'{"pfam": {"sig": "\xff\xfe"}}')
+    capsys.readouterr()
+    got = ma.load_state(str(st))
+    assert got.unreadable and dict(got) == {}
+    assert "state file unreadable" in capsys.readouterr().err
+
+
 def test_a_run_whose_lock_vanishes_still_records_how_it_ended(ma, tmp_path):
     # symptom: the ownership gate answered False for a missing lock, and
     # RunRecord refused to write on anything but True - so an operator's `rm`,
@@ -1287,6 +1426,13 @@ def test_the_lock_release_hook_is_armed_before_the_lock_is_taken(
         raise Boom
 
     monkeypatch.setattr(ma.ResultsLock, "__enter__", spy)
+    # The spy stops the lock, not the lines above it: cmd_run has already
+    # opened this tmp project's log into ma._LOGFH by then, and nothing puts
+    # it back. Setting each global to its own value registers monkeypatch's
+    # restore, so the handle does not outlive the directory and go on
+    # catching every later log() in the session.
+    monkeypatch.setattr(ma, "_LOGFH", ma._LOGFH)
+    monkeypatch.setattr(ma, "_RUN", ma._RUN)
     args = argparse.Namespace(config=project.config_path, threads=None,
                               ram=None, faa=None, results_dir=None,
                               dry_run=False, force_unlock=False)
@@ -1336,6 +1482,31 @@ def test_a_superseded_runs_final_verdict_does_not_overwrite_the_live_record(
     assert on_disk["pid"] == -1 and on_disk["final_status"] == "running", \
         "a superseded run wrote its verdict over the live run's record"
     assert rec.superseded
+
+
+def test_a_superseded_run_stays_superseded_once_the_directory_goes_quiet(
+        ma, tmp_path):
+    """symptom: the gate re-read the lock on every write, so it answered for
+    the instant it was asked rather than for what had already happened. The
+    sequence needs no race: A is --force-unlocked and says "no longer holds",
+    B then FINISHES and removes its own lock, and A's final stamp finds the
+    path vacant - None, not False - takes the "no replacement exists to be
+    corrupted" branch, and writes A's whole stale state dict over B's finished
+    results. Being told once is final."""
+    rec, state_path = _superseded(ma, tmp_path)
+    assert rec._tick() is False and rec.superseded    # A is told, once
+    finished = {"_run": {"pid": -1, "final_status": "ok",
+                         "finished": "2026-09-09T01:00:00"},
+                "pfam": {"status": "ok", "sig": "b"}}
+    ma.save_state(state_path, finished)
+    os.remove(rec.owner.path)          # B is done, and released its lock
+
+    rec.stamp("interrupted")
+    on_disk = json.load(open(state_path, encoding="utf-8"))
+    assert on_disk["_run"] == finished["_run"], \
+        "a superseded run overwrote the record of the run that replaced it"
+    assert on_disk.get("pfam"), \
+        "B's stage records went with it: the whole state dict was replaced"
 
 
 def test_a_superseded_runs_heartbeat_writes_nothing_and_stops(ma, tmp_path):

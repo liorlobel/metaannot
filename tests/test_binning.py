@@ -809,6 +809,63 @@ def test_an_untiered_proteome_writes_no_table_and_says_why(
     assert "not split by a source prefix" in capsys.readouterr().err
 
 
+def test_a_declined_tier_table_names_the_one_an_earlier_run_left_behind(
+        ma, tmp_path, paths_for, capsys):
+    # symptom: "...is absent for that reason, not because a stage failed" was
+    # a claim about a file nobody had looked at. Re-run a results directory
+    # with a config that no longer tiers -- a different proteome, or
+    # exclude_id_prefixes grown to cover everything -- and the PREVIOUS run's
+    # table is still sitting beside results that are new, while the log says
+    # it is not there at all. Whoever opens that directory reads a table
+    # describing a proteome this run never had.
+    cfg, p = paths_for("untiered_stale")
+    ps = F.protein_set()
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, ps)
+    df = ma.build_annotation(cfg, p)
+    old = "tier\tn\npreviousL_\t7\n"
+    with open(p.tier_coverage, "w", encoding="utf-8") as fh:
+        fh.write(old)
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage) is False
+    err = capsys.readouterr().err
+    assert "not split by a source prefix" in err, "it still says why"
+    assert "is NOT absent" in err and "not this run's" in err, err
+    assert "absent for that reason" not in err, \
+        "the run described a file that is on disk in front of it as absent"
+    # what the line must NOT do is guess where the file came from. Nothing
+    # here can tell an earlier run's leftover from a table an operator copied
+    # in to compare against, and "left here by an EARLIER run" told the second
+    # of those two people something false about their own file. The claim is
+    # the one that holds either way: it is not this run's.
+    assert "left here by an EARLIER run" not in err, err
+    # named, not removed: metaannot deletes nothing under a results directory
+    # that it did not just write, and this file is nobody's declared output --
+    # tier_coverage.tsv is deliberately outside finalise's `out` list -- so
+    # nothing would record its going either.
+    with open(p.tier_coverage, encoding="utf-8") as fh:
+        assert fh.read() == old, \
+            "the previous run's table was deleted rather than named"
+
+
+def test_the_same_is_said_when_the_exclusions_leave_nothing(
+        ma, tmp_path, paths_for, capsys):
+    # the other way this table is declined, and it carries the same claim.
+    ps = [F.Protein(f"rev_P{i:03d}", "M" + "A" * 99) for i in range(4)]
+    cfg, p = paths_for("tier_alldecoy_stale")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"), ps)
+    F.write_emapper(p.emapper, [])
+    df = ma.build_annotation(cfg, p)
+    with open(p.tier_coverage, "w", encoding="utf-8") as fh:
+        fh.write("tier\tn\nold_\t3\n")
+    capsys.readouterr()
+    assert ma.write_tier_coverage(df, p.tier_coverage, cfg) is False
+    err = capsys.readouterr().err
+    assert "nothing is left after exclude_id_prefixes" in err
+    assert "is NOT absent" in err and "not this run's" in err, err
+    assert os.path.exists(p.tier_coverage)
+
+
 def test_the_tier_table_is_written_beside_bin_summary(ma, tmp_path,
                                                       paths_for):
     cfg, p, df = _tiered(ma, tmp_path, paths_for, "tiers_beside")

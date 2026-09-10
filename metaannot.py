@@ -33,7 +33,7 @@ Requires: python3, pandas, pyyaml. External tools are needed only by the
 stages that use them; `doctor` reports which are missing.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # Bumped only when the MEANING of a stage's output changes, so that existing
 # results become genuinely invalid. It is deliberately not __version__: tying
@@ -774,13 +774,40 @@ def deep_merge(base, override, prefix=""):
     return out
 
 
+# Every per-database DIAMOND block: one whose keys are the tags of db.diamond
+# rather than a fixed vocabulary. DERIVED from the defaults rather than listed,
+# because the list was already wrong when it was written by hand:
+# `diamond_min_pidents` arrived in v0.4.0 mirroring `diamond_evalues` key for
+# key and was left out, so unknown_keys() called `diamond_min_pidents.mydb` a
+# typo. Nothing was dropped, and that is the harm rather than the mitigation:
+# report_unknown_keys() only LOGS, and load_config() then deep_merges the
+# user's config whatever it found, so the floor WAS in force -
+# diamond_min_pident_for(cfg, "mydb") returned the user's number - while the
+# tool said of it "It is being ignored, so this setting is NOT in effect".
+# The operator is told the exact opposite of what the run is doing, so the
+# one setting to suspect when the hits look wrong is the one they have been
+# told cannot be responsible. `doctor` then counts the same key as a failure
+# (ok = False) and exits non-zero over a config that is valid and working, so
+# a wrapper or CI job that gates on doctor stops on a setting that is being
+# honoured.
+#
+# Anything named `diamond_<something>` whose default is a dict is one of these
+# by construction (`diamond_workers` is an int and so is not), which is what
+# makes the next one free-form on the day it is added instead of on the day
+# somebody notices. `vfdb_category_weights` is deliberately NOT derived here:
+# its keys are VFDB's own stable category codes, not database tags, so it is
+# free-form for a different reason and is named as such below.
+PER_DIAMOND_DB_BLOCKS = frozenset(
+    k for k, v in DEFAULT_CONFIG.items()
+    if k.startswith("diamond_") and isinstance(v, dict))
+
 # Blocks whose keys the user defines: a database tag, a tool name, a predictor
 # name. Everything else has a fixed key set, so an unrecognised key there is a
 # typo rather than an addition. `analysis` is deliberately NOT here: its keys
 # are exactly the Rmd's params, so `min_lfC` or `design_formla` is a typo that
 # used to run the wrong statistics with nothing said.
-FREEFORM = {"tool_args", "diamond_weights", "vfdb_category_weights",
-            "diamond_evalues", "db.diamond", "sources.diamond"}
+FREEFORM = {"tool_args", "vfdb_category_weights",
+            "db.diamond", "sources.diamond"} | set(PER_DIAMOND_DB_BLOCKS)
 
 
 def unknown_keys(user, default, prefix=""):
@@ -2904,6 +2931,33 @@ def tmbed_chunk_plan(lengths, budget, max_parts=TMBED_MAX_PARTS):
     return chunks, budget
 
 
+def tmbed_eta_hours(elapsed, res_new, res_left):
+    """Hours of prediction still to do, or None when there is no rate yet.
+
+    Named, and outside the loop, because it is the one number in this stage an
+    operator acts on: it decides whether they wait, go home, or kill the run -
+    and on a resume it is the FIRST line they see, and the line a console puts
+    in front of them.
+
+    `res_new` is the residues THIS PROCESS predicted, never every residue
+    accounted for. Dividing the elapsed time by the latter counted every chunk
+    a resume skipped as work this process had done in no time at all, so the
+    rate came out lower by the whole ratio of resumed to new work: a run
+    resuming 90 chunks of 100 reported a tenth of the real time remaining, and
+    reported it before it had predicted a single residue. Under-promising the
+    wait is not a rounding error - it is what a person plans an evening, or a
+    cluster reservation, around.
+
+    None rather than 0 while res_new is 0: there is nothing to base an
+    estimate on, and saying "~0.0h left" is exactly the claim that was wrong.
+    The caller prints no ETA at all until this process has finished a chunk of
+    its own, which on a resume is one line without an estimate.
+    """
+    if res_new <= 0 or res_left <= 0 or elapsed <= 0:
+        return None
+    return res_left * (elapsed / res_new) / 3600.0
+
+
 def iter_tmbed_records(path):
     """(header, sequence, labels) for every COMPLETE record of a 3-line file.
 
@@ -3032,22 +3086,67 @@ def stage_tmbed(cfg, p):
                 f"{parts}/{tag}.pred.part")
 
     def already(i):
-        """A chunk counts as done when its committed output holds a record
-        for every sequence that went into it."""
+        """A chunk counts as done when its committed output holds a record for
+        exactly the proteins THIS plan put in it - by identifier, not by count.
+
+        Counting was enough only while the plan could not change between a run
+        and its resume. It can, and deliberately so: tmbed_chunk_residues is
+        outside every stage signature (it changes the ORDER of the records and
+        nothing else), so tuning it on a resume is a sanctioned operation -
+        and it RE-PLANS the chunks. Chunk 3 then covers a different set of
+        proteins from the chunk 3 whose file is on disk, and a count-only test
+        adopts that file whenever it happens to be long enough. The
+        concatenation below then writes two records for every protein in both
+        plans and none for the proteins in neither: a topology set that is
+        silently short AND silently duplicated, which is the one failure
+        tmbed_failed.tsv and tmbed_allow_partial exist to make loud.
+
+        Equality, not "contains them all": a committed chunk that holds this
+        plan's proteins PLUS others is just as much a chunk of the old plan,
+        and adopting it duplicates every extra protein that this plan gave to
+        some other chunk.
+
+        A mismatch is said out loud and the file is discarded rather than left
+        where it is. Left there, it is still what the concatenation salvages
+        if the re-prediction then fails (`src = pred if os.path.exists(pred)`),
+        which is the same silent adoption reached the long way round. Removing
+        it is not the deletion CLAUDE.md rule 5 is about: tmbed_parts is this
+        stage's own scratch, written by it, rewritten by it every run - the
+        chunk FASTAs already are - and removed wholesale the moment the
+        predictions are committed.
+        """
         pred = part_paths(i)[1]
         if not os.path.exists(pred):
             return False
-        return sum(1 for _ in iter_tmbed_records(pred)) >= len(chunks[i])
+        have = {hdr[1:].split()[0] for hdr, _s, _l in iter_tmbed_records(pred)}
+        want = set(chunks[i])
+        if have == want:
+            return True
+        log(f"tmbed: {pred} holds {len(have):,} prediction(s) for a DIFFERENT "
+            f"set of proteins from the {len(want):,} this run's chunk "
+            f"{i + 1}/{len(chunks)} covers ({len(have & want):,} in common), "
+            "so it is not adopted and the chunk is predicted again. That is "
+            "what a changed tmbed_chunk_residues does: the size is outside "
+            "the stage signature on purpose, so tuning it is allowed, but it "
+            "re-plans which protein goes in which chunk and the parts of the "
+            "old plan cannot be read as the new one's", "WARN")
+        _atomic_rm(pred)
+        return False
 
     single = len(chunks) == 1 and not excluded
     os.makedirs(parts, exist_ok=True)
+    # Asked ONCE, before anything is written or run, and read from here on.
+    # already() now says something when the answer is no - and discards the
+    # file it is refusing - so asking it again per chunk in the loop below
+    # would repeat the warning and re-examine a file it had already removed.
+    done = {i: already(i) for i in range(len(chunks))}
     if single:
         # Nothing was filtered and nothing is split, so TMbed reads the
         # original FASTA. This is the whole of the old behaviour, and it keeps
         # a second copy of the proteome off the disk for ordinary runs.
         inputs = {0: faa}
     else:
-        pending = [i for i in range(len(chunks)) if not already(i)]
+        pending = [i for i in range(len(chunks)) if not done[i]]
         inputs = {i: part_paths(i)[0] for i in range(len(chunks))}
         if pending:
             # Rewritten every run rather than reused: a chunk FASTA is written
@@ -3066,20 +3165,23 @@ def stage_tmbed(cfg, p):
     errors = {}                       # chunk index -> why it failed
     consecutive = 0
     max_consecutive = int(cfg.get("tmbed_max_consecutive_failures", 2) or 0)
-    t0, res_done = time.time(), 0
+    # Two counters, because they answer different questions. res_done is every
+    # residue accounted for, adopted chunks included, and says how much work is
+    # LEFT; res_new is what this process actually predicted, and is the only
+    # thing its elapsed time may be divided by. See tmbed_eta_hours.
+    t0, res_done, res_new = time.time(), 0, 0
     for i, ids in enumerate(chunks):
         pred, part = part_paths(i)[1], part_paths(i)[2]
         res = sum(lengths[pid] for pid in ids)
-        if already(i):
+        if done[i]:
             log(f"tmbed: chunk {i + 1}/{len(chunks)} is already predicted; "
                 "skipping")
             res_done += res
             continue
         if len(chunks) > 1:
-            eta = ""
-            if res_done:
-                rate = (time.time() - t0) / res_done
-                eta = (f", ~{(total_res - res_done) * rate / 3600:.1f}h left")
+            hours = tmbed_eta_hours(time.time() - t0, res_new,
+                                    total_res - res_done)
+            eta = "" if hours is None else f", ~{hours:.1f}h left"
             log(f"tmbed: chunk {i + 1}/{len(chunks)}, {len(ids):,} "
                 f"sequence(s), {res / 1e6:.1f}M residues{eta}")
         _atomic_rm(part)
@@ -3125,6 +3227,7 @@ def stage_tmbed(cfg, p):
         consecutive = 0
         os.replace(part, pred)
         res_done += res
+        res_new += res
 
     # Concatenated through the record iterator rather than copied byte for
     # byte, so a truncated tail in a salvaged .pred.part cannot reach the
@@ -4672,6 +4775,60 @@ TIER_EVIDENCE = [
 ]
 
 
+def _decline_tier_coverage(path, why, level="INFO"):
+    """Say that no per-tier table was written, and describe what is actually
+    on disk while saying it. Always returns False, the way its callers do.
+
+    "... is absent for that reason, not because a stage failed" is the whole
+    value of this message, and it was a claim about a file nobody had looked
+    at. Results directories are re-run: last month's config tiered and this
+    month's does not - exclude_id_prefixes grew to cover every namespace, or
+    the proteome was swapped for one whose ids carry no source prefix - and
+    the PREVIOUS run's tier_coverage.tsv is then still sitting beside results
+    that are new, with the log asserting it is not there. Someone opening the
+    directory cold reads a table describing a proteome this run never had, and
+    the one line that could have warned them said the opposite.
+
+    Named rather than removed, deliberately, and the standing rule is only
+    half the reason. metaannot deletes nothing under a results directory that
+    it did not itself just write (CLAUDE.md rule 5): a file that vanishes with
+    no record of why is the failure that rule exists for, and an operator who
+    put something there on purpose - a table copied in from the run this one
+    is being compared against - would lose it to a config change they made for
+    an unrelated reason. The second half is that this file is nobody's
+    declared output: tier_coverage.tsv is deliberately outside finalise's
+    `out` list, so no signature covers it, nothing rewrites it and nothing
+    else would notice it going. A truthful sentence naming the file, its size
+    and when it was written costs nothing and can be acted on in one command;
+    deleting somebody's data on a guess cannot be undone.
+    """
+    base = os.path.basename(path)
+    if not os.path.exists(path):
+        log(f"{why}, so no per-tier coverage table is written; {base} is "
+            "absent for that reason, not because a stage failed", level)
+        return False
+    # WARN whatever the caller asked for: an absent file is a non-event, while
+    # a stale one beside fresh results is a thing to act on, and the two must
+    # not go by at the same volume.
+    #
+    # What it does NOT say is where the file came from, because nothing here
+    # knows: an earlier run of this directory is the usual answer, but the
+    # docstring above is about the operator who copied in the table of the run
+    # this one is being compared against, and telling that operator their file
+    # is a leftover would be as wrong as calling it absent. The one thing that
+    # is true either way - it is not this run's - is the thing worth acting on.
+    log(f"{why}, so no per-tier coverage table is written by this run. "
+        f"{base} is NOT absent, though: {_file_note(path)} is sitting here "
+        "already, and whatever wrote it - an earlier run of this directory, "
+        "or somebody who copied in the table of the run this one is being "
+        "compared against - it is not this run's and does not describe this "
+        "run's proteome. Nothing here removes it - metaannot never deletes "
+        "anything under a results directory that it did not just write - so "
+        "delete it yourself or read it for what it is; this run will not "
+        "update it.", "WARN")
+    return False
+
+
 def write_tier_coverage(df, path, cfg=None):
     """Coverage split by identifier prefix, for a merged search database.
 
@@ -4679,7 +4836,9 @@ def write_tier_coverage(df, path, cfg=None):
     "and did its parts look alike", which for a database merged from several
     catalogues plus this study's own assembly is the question the headline
     number hides. Writes nothing and says why when the ids are not tiered, so
-    an absent file is never ambiguous.
+    an absent file is never ambiguous - and, when a re-run declines a table
+    the previous run did write, says that too rather than describing the file
+    still on disk as absent; see _decline_tier_coverage.
 
     exclude_id_prefixes is applied FIRST. A run whose proteins_faa is the
     whole search database rather than the identified subset carries the
@@ -4710,17 +4869,14 @@ def write_tier_coverage(df, path, cfg=None):
                     "one")
                 df = df[~drop]
     if not len(df):
-        log("tier coverage: nothing is left after exclude_id_prefixes, so no "
-            f"per-tier table is written; {os.path.basename(path)} is absent "
-            "for that reason, not because a stage failed", "WARN")
-        return False
+        return _decline_tier_coverage(
+            path, "tier coverage: nothing is left after exclude_id_prefixes",
+            "WARN")
     tiers = id_tiers(df.index)
     if not tiers:
-        log("protein ids are not split by a source prefix (or carry more "
-            f"than {MAX_ID_TIERS} distinct ones), so no per-tier coverage "
-            f"table is written; {os.path.basename(path)} is absent for that "
-            "reason, not because a stage failed")
-        return False
+        return _decline_tier_coverage(
+            path, "protein ids are not split by a source prefix (or carry "
+            f"more than {MAX_ID_TIERS} distinct ones)")
     m = pd.Series(list(df.index), index=df.index).str.extract(
         r"^([^_|:.]*[_|:.])", expand=False).fillna("")
     rows = []
@@ -9516,6 +9672,25 @@ class ResultsLock:
             # we go on behaving as its owner: release it on the way out, and
             # go on stamping until something says otherwise.
             return True
+        except UnicodeDecodeError:
+            # The same answer, for the same reason, to the same question asked
+            # one layer down: bytes we cannot DECODE are no more evidence that
+            # the lock changed hands than bytes we cannot READ. It needs an arm
+            # of its own because UnicodeDecodeError is a ValueError and NOT an
+            # OSError, so the arm above cannot catch it - and an exception
+            # leaving here leaves through __exit__, which has already cleared
+            # `held`, stranding the very lock the release path exists to
+            # remove. That is the exact regression the OSError arm was written
+            # to prevent, reached by a byte instead of by an errno: one
+            # truncated multi-byte character from a torn NFS write, or a page
+            # of nulls where a crashed writer's payload should be, and the
+            # lock outlives the run that owns it.
+            #
+            # It says nothing about a lock somebody else wrote: everything
+            # this file writes is ASCII JSON, so undecodable content is
+            # damage, not a rival's payload. A garbled but DECODABLE file is a
+            # different answer and still reads as not ours below.
+            return True
         if not raw:
             # Zero bytes is our own abandoned create - __enter__ marks the
             # lock held before it writes - unless we did get the payload out,
@@ -9772,6 +9947,26 @@ class RunRecord:
         is not skippable - it is the only record of how the run ended - so it
         writes whether the lock comes or not.
         """
+        # LATCHED, and asked before the lock is: a run that has been told once
+        # that it lost the directory has lost it for good, and nothing it can
+        # observe afterwards may give it back. Re-asking the lock every time
+        # made the verdict depend on what the REPLACEMENT happened to be doing
+        # at that instant, and the losing sequence needs no race at all: A is
+        # --force-unlocked and logs "no longer holds", B finishes and removes
+        # its own lock on the way out, and A's final stamp then finds the path
+        # VACANT - None, not False - takes the branch below, and writes A's
+        # whole stale in-memory state dict over B's completed results. That
+        # branch's reasoning holds only for a replacement that has not STARTED
+        # yet; it cannot tell that one from a replacement that has FINISHED,
+        # and this flag is the only thing that can. A run that was never
+        # superseded is unaffected, which is the case the None branch is for.
+        if self.superseded:
+            # Set here too, not only where the flag is raised: a tick already
+            # past its wait() when the flag went up must not be left waking
+            # every interval for the rest of the unwind, and an Event that is
+            # already set costs nothing to set again.
+            self._stop.set()
+            return False
         # `is False`, not falsiness: only a lock somebody else now holds
         # stops the write. A vacant path (None) means no replacement exists to
         # be corrupted, and this run's own verdict is worth more than the
@@ -13817,6 +14012,29 @@ def cmd_run(args):
             # chunk can be an hour. A kill has to mean now.
             os._exit(128 + int(sig))
 
+        # This registration DELIBERATELY SUPERSEDES the one main() made before
+        # it: handle_sigterm_like_sigint() turns SIGTERM into a
+        # KeyboardInterrupt so the process unwinds, and the later registration
+        # of a handler for the same signal is the one that runs. For `run` and
+        # `all`, from here on, a kill does not unwind.
+        #
+        # Which is the behaviour a long run needs, and the reason is latency.
+        # Unwinding reaches the main thread only, and it then has to leave the
+        # stage pool's `with` - ThreadPoolExecutor.__exit__ JOINS its workers,
+        # and a TMbed chunk can be an hour. Under systemd that wait runs into
+        # TimeoutStopSec and the unit is SIGKILLed, which loses the lock
+        # release entirely: the one thing both handlers exist to guarantee.
+        # Releasing it here, from a handler that returns to nobody, is worth
+        # more than the trace the unwinding one would have left - so the run
+        # that was killed goes on record as `_run.final_status: "running"` with
+        # a last_seen that stops advancing, and that is what a reader has to
+        # be able to describe rather than a defect to be fixed.
+        #
+        # Never reordered, then, and never made conditional. The precedence is
+        # pinned by the test named
+        # ...cmd_run_installs_supersedes_the_unwinding_one in
+        # tests/test_scheduler.py, and what a killed run leaves behind by the
+        # three tests beside it.
         _sig_msgs = {}
         for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
             _sig = getattr(signal, _name, None)
@@ -14260,7 +14478,29 @@ _STOP_SIGNUM = None
 
 
 def handle_sigterm_like_sigint():
-    """Make SIGTERM unwind, the way SIGINT already does.
+    """Make SIGTERM unwind, the way SIGINT already does - for the subcommands
+    that do not go on to install a handler of their own.
+
+    WHAT THIS COVERS, and it is not `run`. main() installs this before it
+    parses anything, so it is in force for `init`, `doctor`, `describe`,
+    `subset`, `report` and `object`, for `run --dry-run` (which takes no lock
+    and so never reaches the registration below), and for the opening moments
+    of `run`/`all`: loading the config, the three settings cmd_run validates
+    itself (threads, progress_interval_s, heartbeat_s), making the results
+    directories, opening the log, and taking the lock. That is the whole of
+    it. NOT the tool and input checks, which read like opening moments and
+    are not: `proteins_faa not found` and everything beside it come AFTER the
+    registration below, so a SIGTERM landing on them is already cmd_run's to
+    handle - which is the right way round, since by then there is a lock on
+    disk to release.
+    The instant cmd_run has the lock it registers _release_lock_on_signal over
+    this handler for SIGTERM, SIGHUP and SIGBREAK, and the later registration
+    wins: for the rest of that process - including, in `all`, the report and
+    the object that run after the pipeline - a SIGTERM does NOT unwind. That
+    supersession is deliberate; the reason is at the registration, and
+    test_the_sigterm_handler_cmd_run_installs_supersedes_the_unwinding_one
+    pins the order so that reversing it fails loudly instead of quietly
+    changing what `kill` does to a three-day run.
 
     The results lock is released by an atexit hook, and atexit runs only if the
     interpreter unwinds. Python's default SIGINT raises KeyboardInterrupt, so
@@ -14268,15 +14508,18 @@ def handle_sigterm_like_sigint():
     where it stands, so `kill`, `systemctl stop` and `wsl --terminate` all left
     .metaannot.lock behind - and a lock that cannot be disproved (written on
     another node, or any lock at all on Windows) reads as a live run, so the
-    next run refuses to start until someone passes --force-unlock.
+    next run refuses to start until someone passes --force-unlock. A short
+    subcommand holds no lock, but it is the same mechanism that gives it an
+    orderly stop: buffers flushed, temp files removed by their `with`, exit
+    status 143 rather than death by signal.
 
     The handler raises KeyboardInterrupt rather than exiting, and that is the
-    whole point: a SIGTERMed run then takes exactly the path Ctrl-C already
+    whole point: a SIGTERMed process then takes exactly the path Ctrl-C already
     takes - the same unwinding, the same `except KeyboardInterrupt` in main(),
-    the same `_run` stamp, the same WARN line word for word, the same
-    recomputation of the stage that was writing, and the same atexit lock
-    release. Leaving the same trace as an interrupt is the behaviour being
-    asked for; a second, differently-worded shutdown path is not.
+    the same `_run` stamp where there is a record to stamp, the same WARN line
+    word for word, and the same atexit lock release. Leaving the same trace as
+    an interrupt is the behaviour being asked for; a second, differently-worded
+    shutdown path is not.
 
     The ONE thing the two do not share is the exit status, which is why the
     signal number is recorded here: main() reports 128 + it, so Ctrl-C is 130
@@ -14285,16 +14528,19 @@ def handle_sigterm_like_sigint():
     logged as a failed unit - and 130 for a SIGTERM would tell a supervisor
     that a user pressed Ctrl-C when none did. The exit status is the only
     channel left in which a supervisor can tell an operator's stop from a
-    person at a keyboard, so it is the one place the two differ.
+    person at a keyboard, so it is the one place the two differ. cmd_run's
+    handler keeps that convention on its own account: it os._exit(128 + N).
 
     It inherits SIGINT's latency too: the interrupt reaches the main thread
     only and ThreadPoolExecutor's __exit__ waits for the stage that is running,
     so under systemd a long stage can still reach TimeoutStopSec and be
-    SIGKILLed. Releasing the lock is what this fixes; killing a running tool
-    promptly is a different change. It also inherits SIGINT's behaviour under a
-    storm of signals: one arriving inside threading's own shutdown abandons the
-    executor join and the process dies of the signal instead. That is Python's
-    default SIGINT semantics, which is what was asked for.
+    SIGKILLed. That latency is exactly why `run` supersedes this handler rather
+    than keeping it - see the registration in cmd_run - and it is harmless for
+    the subcommands that are left here, none of which runs a stage pool. It
+    also inherits SIGINT's behaviour under a storm of signals: one arriving
+    inside threading's own shutdown abandons the executor join and the process
+    dies of the signal instead. That is Python's default SIGINT semantics,
+    which is what was asked for.
     """
     def raise_keyboard_interrupt(signum, frame):
         global _STOP_SIGNUM

@@ -10,6 +10,7 @@ file mid-rewrite, a log that rotated, a heartbeat four hours old and a results
 directory that has nothing in it yet, and none of those may produce a traceback,
 a blank page, or a claim that a run is dead.
 """
+import copy
 import http.client
 import json
 import os
@@ -166,12 +167,12 @@ def test_an_unreadable_state_file_falls_back_to_the_last_good_read(
                     "finished": stamp(time.time())}}))
     project = console.Project(0, results.path, contract)
     first = console.project_view(project, sys.executable, METAANNOT_PY)
-    assert first["state_stale"] is False
+    assert first["state_cached"] is False
     assert [r["state"] for r in first["rows"]][0] == "ok"
 
     results.raw_state("{ this is not json")
     second = console.project_view(project, sys.executable, METAANNOT_PY)
-    assert second["state_stale"] is True
+    assert second["state_cached"] is True
     assert [r["state"] for r in second["rows"]][0] == "ok"    # not blanked
     assert second["state_good_at"] == pytest.approx(first["taken"], abs=5)
     html = console.render_project(second, contract)
@@ -1812,7 +1813,7 @@ def test_a_stage_record_that_is_not_an_object_is_a_bad_row(console, results,
     assert row["state"] == "bad"
     assert row["label"] == "?"
     assert "not an object" in row["detail"]
-    assert "nothing is blocking it" not in row["detail"]
+    assert "no dependency is blocking it" not in row["detail"]
 
 
 def test_a_stage_the_contract_does_not_know_is_named_not_dropped(console,
@@ -2884,7 +2885,15 @@ def test_the_failure_block_is_past_tense_over_a_run_that_has_ended(console,
                                                                    contract):
     """final_status failed, finished 26 h ago, and the page still said "The
     engine carries on with every stage that does not depend on a casualty".
-    Nothing is carrying on; the run is over."""
+    Nothing is carrying on; the run is over.
+
+    What this pins is the SUPPRESSION, so it names the live sentence that
+    actually ships - whatever that sentence currently is. Asserting the retired
+    wording is absent stopped being a test of anything the moment the wording
+    was retired: no branch of render_failures can emit it, so the assertion
+    could not fail whichever branch the page took. The reintroduction guard
+    lives with the block that replaced it.
+    """
     now = time.time()
     state = running_state(contract, age=26 * 3600, started_ago=30 * 3600)
     state[contract.run_key].update(final_status="failed",
@@ -2897,8 +2906,10 @@ def test_the_failure_block_is_past_tense_over_a_run_that_has_ended(console,
     html = console.render_project(v, contract)
     assert "1 stage failed in this run" in html
     assert "has failed in this run" not in html
-    assert "The engine carries on" not in html
     assert "This run has ended" in html
+    # the live half of the same ternary, which is the thing being suppressed
+    assert "Nothing new starts after the first failure" not in html
+    assert "still look busy" not in html
     for phrase in FORBIDDEN:
         assert phrase not in html.lower(), phrase
 
@@ -3063,13 +3074,14 @@ def test_a_corrupt_state_file_does_not_produce_twenty_one_positive_rows(
     assert v["state_known"] is False
     assert {r["state"] for r in v["rows"]} == {"none"}
     html = console.render_project(v, contract)
-    assert "nothing is blocking it" not in html
+    assert "no dependency is blocking it" not in html
     assert "no record yet" not in html
     assert "the state file cannot be read, so whether this stage has run" in html
     # and a directory where nothing has run still reads the old way
     results.write(contract.state_name, "{}")
     fresh = view_of(console, results, contract, log=False)
-    assert "nothing is blocking it" in console.render_project(fresh, contract)
+    assert "no dependency is blocking it" in console.render_project(fresh,
+                                                                   contract)
 
 
 def test_an_output_missing_from_a_finished_stage_is_not_still_coming(console,
@@ -3515,3 +3527,506 @@ def test_a_corrupt_state_file_does_not_deny_what_the_config_told_it(
     assert "progress below is known" in html
     assert "come from the config file, which was read" in html
     assert "corrupt state file, not an empty directory" in html
+
+
+# ======================================================================
+# The v0.5.0 audit. Every test below fails against the console as it was
+# tagged, and each one is named for the sentence the page was getting wrong.
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# 1. the console could not see `cost`, so its NEXT rows misled
+# ----------------------------------------------------------------------
+
+def queued_run(results, contract, running=("emapper", "pfam", "signalp",
+                                           "tmbed")):
+    """The auditor's reproduction, with the real run's config: four stages on
+    the box and six ready behind them, at stage_workers 4.
+
+    Returns the `run:` block for the caller to monkeypatch in. A config in the
+    directory would put a YAML parser between the test and what it is about,
+    which is the order of the six.
+    """
+    on = {name: True for name in
+          {st["enabled"] for st in contract.stages if st["enabled"]}}
+    for flag in ("structure", "smorf", "context", "jackhmmer", "hhblits",
+                 "unipept", "taxonomy", "join"):
+        on[flag] = False
+    now = time.time()
+    state = running_state(contract, age=10, started_ago=3600)
+    for name in running:
+        state[name] = {"signature": None, "status": "running",
+                       "started": stamp(now - 1800)}
+    results.state(state)
+    return on
+
+
+def test_a_ready_stage_says_which_other_ready_stages_the_engine_takes_first(
+        console, results, contract, monkeypatch):
+    """v0.4.0 made the scheduler dispatch each round's ready set longest-first
+    and `describe --json` emits `cost` "so a front end can order or annotate
+    the table the same way". Contract dropped the field, so the page rendered
+    the queue in table order: dbcan NEXT, diamond NEXT, cluster NEXT, then
+    ncbifam, kofam and interpro. The operator reads the first NEXT as the stage
+    about to start; the engine starts ncbifam, and on the run this comes from
+    dbcan did not get a worker for over 27 hours.
+    """
+    on = queued_run(results, contract)
+    monkeypatch.setattr(console.Project, "config_run",
+                        lambda self, py, sc, st: (on, "test"))
+    v = view_of(console, results, contract, log=False)
+    rows = {r["name"]: r for r in v["rows"]}
+    ready = [r["name"] for r in v["rows"] if r["state"] == "next"]
+    assert ready == ["dbcan", "diamond", "cluster", "ncbifam", "kofam",
+                     "interpro"], ready
+    # the row a reader would have taken for the next stage names the three the
+    # engine ranks ahead of it
+    assert "ncbifam" in rows["dbcan"]["detail"], rows["dbcan"]["detail"]
+    assert rows["dbcan"]["ahead"] == ["ncbifam", "kofam", "interpro"]
+    # cost 3 first, and among equals the engine's own table order, because its
+    # sort is stable over exactly this sequence
+    assert rows["ncbifam"]["ahead"] == []
+    assert rows["kofam"]["ahead"] == ["ncbifam"]
+    assert rows["cluster"]["ahead"] == ["ncbifam", "kofam", "interpro",
+                                        "dbcan", "diamond"]
+    assert "ranks this one first" in rows["ncbifam"]["detail"]
+    # the table is still in the engine's stage order - the annotation carries
+    # the queue, not the row order
+    names = [r["name"] for r in v["rows"]]
+    assert names.index("dbcan") < names.index("ncbifam")
+    html = console.render_project(v, contract)
+    assert html.index(">dbcan<") < html.index(">ncbifam<")
+    assert "longest-first" in html
+
+
+def test_the_ranking_claims_an_order_and_never_a_schedule(console, results,
+                                                          contract,
+                                                          monkeypatch):
+    """The console does not know how many workers are free, and gpu_lease can
+    defer a GPU stage however it is ranked. So the page says which stage is
+    ranked ahead of which, and the two things it cannot see are said once,
+    under the table, rather than as a caveat on ten rows."""
+    on = queued_run(results, contract)
+    monkeypatch.setattr(console.Project, "config_run",
+                        lambda self, py, sc, st: (on, "test"))
+    html = console.render_project(view_of(console, results, contract,
+                                          log=False), contract)
+    assert "an order and not a schedule" in html
+    assert "stage_workers" in html and "gpu_workers" in html
+    for claim in ("starts next", "will start next", "starts in ",
+                  "about to start"):
+        assert claim not in html, claim
+    for phrase in FORBIDDEN:
+        assert phrase not in html.lower(), phrase
+
+
+def test_an_engine_with_no_cost_field_ranks_nothing_rather_than_guessing(
+        console, results, contract, monkeypatch):
+    """`cost` arrived in v0.4.0. Pointed at an older engine the console gets a
+    contract with none at all, and a rank invented here would be exactly the
+    drift taking the stage list from `describe --json` exists to prevent."""
+    older = copy.deepcopy(contract)
+    for st in older.stages:
+        st["cost"] = None                    # what describe --json omitted
+    on = queued_run(results, older)
+    monkeypatch.setattr(console.Project, "config_run",
+                        lambda self, py, sc, st: (on, "test"))
+    project = console.Project(0, results.path, older)
+    v = console.project_view(project, sys.executable, METAANNOT_PY, log=False)
+    rows = {r["name"]: r for r in v["rows"]}
+    assert rows["dbcan"]["state"] == "next"
+    assert rows["dbcan"]["ahead"] == []
+    assert "ranks" not in rows["dbcan"]["detail"], rows["dbcan"]["detail"]
+    assert "no dependency is blocking it" in rows["dbcan"]["detail"]
+    html = console.render_project(v, older)
+    assert "longest-first" not in html
+    assert "an order and not a schedule" not in html
+
+
+def test_a_ready_row_does_not_say_nothing_is_blocking_it(console, results,
+                                                         contract,
+                                                         monkeypatch):
+    """"nothing is blocking it" is a claim about the dependency graph that a
+    reader takes as a claim about the queue, and for a cost-1 stage sitting
+    behind three cost-3 stages the reader's version is false. The graph half is
+    now said as the graph half."""
+    on = queued_run(results, contract)
+    monkeypatch.setattr(console.Project, "config_run",
+                        lambda self, py, sc, st: (on, "test"))
+    html = console.render_project(view_of(console, results, contract,
+                                          log=False), contract)
+    assert "nothing is blocking it" not in html
+    assert "no dependency is blocking it" in html
+
+
+# ----------------------------------------------------------------------
+# 2. a RUN record from a killed run rendered as this run's live stage
+# ----------------------------------------------------------------------
+
+def test_a_running_record_older_than_this_run_is_not_this_runs_live_stage(
+        console, results, contract):
+    """mark_running() writes {signature, status, started} and never a
+    `finished`, and which run a record belongs to was decided from `finished`
+    alone. So a run that was killed left `status: running` behind, the next
+    run's page rendered those as ITS live stages, and the duration counted up
+    from the dead run's clock - 30 hours and climbing, over a run 20 minutes
+    old.
+    """
+    now = time.time()
+    state = running_state(contract, age=10, started_ago=1200)
+    state["interpro"] = {"signature": None, "status": "running",
+                         "started": stamp(now - 30 * 3600)}
+    results.state(state)
+    v = view_of(console, results, contract, log=False)
+    row = next(r for r in v["rows"] if r["name"] == "interpro")
+    assert row["state"] == "stale" and row["label"] == "STALE"
+    assert row["era"] == "earlier" and row["carried"] is not None
+    # the duration that was counting from a clock that stopped is gone
+    assert row["took"] == "—"
+    assert "before this run started" in row["detail"]
+    assert v["counts"].get("running") is None
+    html = console.render_project(v, contract)
+    assert "from an earlier run" in html
+    # and the page still refuses the verdict it always refused
+    for phrase in FORBIDDEN:
+        assert phrase not in html.lower(), phrase
+
+
+def test_a_running_record_from_this_run_is_still_this_runs_live_stage(
+        console, results, contract):
+    """The other half of the same comparison. A record stamped after the run
+    started is this run's, reads RUN, and counts up."""
+    now = time.time()
+    state = running_state(contract, age=10, started_ago=7200)
+    state["interpro"] = {"signature": None, "status": "running",
+                         "started": stamp(now - 3600)}
+    results.state(state)
+    v = view_of(console, results, contract, log=False)
+    row = next(r for r in v["rows"] if r["name"] == "interpro")
+    assert row["state"] == "running" and row["label"] == "RUN"
+    assert row["era"] == "this" and row["carried"] is None
+    assert row["took"] == "1h00m"
+
+
+def test_a_stale_row_still_lists_the_outputs_its_stage_declared(
+        console, results, contract, monkeypatch):
+    """Naming this case STALE took the row out of the set that lists declared
+    outputs, and the listing is the one piece of evidence a reader of a STALE
+    row actually wants: whether the earlier run got anywhere before it stopped.
+    The row was `running` before v0.5.0 and it listed them then.
+
+    The part-file SCAN is the other half and it stays gone, because it answers
+    a different question - "is a tool writing bytes into this directory right
+    now" - and the row's own sentence has already said that this record is not
+    evidence of that. One stat per declared output; no walk of a directory
+    holding 455k structures.
+    """
+    now = time.time()
+    os.makedirs(os.path.join(results.path, "interpro"))
+    results.write(os.path.join("interpro", "interproscan.tsv"), "x" * 4096)
+    scans = []
+    monkeypatch.setattr(console.PartCache, "newest",
+                        lambda self, out: scans.append(out))
+    state = running_state(contract, age=10, started_ago=1200)
+    state["interpro"] = {"signature": None, "status": "running",
+                         "started": stamp(now - 30 * 3600)}
+    results.state(state)
+    v = view_of(console, results, contract, log=False)
+    row = next(r for r in v["rows"] if r["name"] == "interpro")
+    assert row["state"] == "stale"
+    assert [o["name"] for o in row["outputs"]] == ["interpro/interproscan.tsv"]
+    assert row["outputs"][0]["there"] is True
+    assert row["outputs"][0]["size"] == 4096
+    assert "interproscan.tsv" in console.render_project(v, contract)
+    # listed, and not walked
+    assert row["part"] is None
+    assert scans == [], scans
+
+
+def test_the_index_counts_a_stale_record_as_no_running_stage(console, results,
+                                                             contract):
+    """The index reads the same rows, and a killed run's leftovers were a
+    running stage there too - a strip cell in the live colour and a tally
+    reading "1 running" over a directory nothing is writing.
+
+    It was called "does not put the project in the live group" and asserted
+    `bucket == "done"` for it, which was true of the old console as well: this
+    run record carries `final_status: "ok"` and bucket_of answers from the
+    record, before any row is looked at. The group is not what a leftover can
+    move. What it CAN move is everything the index builds out of the rows -
+    the strip and the counts - and those are what this pins, along with the
+    row-scan fallback that is the one place a row does decide a group.
+    """
+    now = time.time()
+    state = {contract.run_key: {
+        "run_id": "20260101T000000-1", "version": "0.4.0",
+        "host": "lab-fedora", "pid": 4242, "started": stamp(now - 600),
+        "last_seen": stamp(now - 30), "last_seen_epoch": now - 30,
+        "heartbeat_s": 30, "finished": stamp(now - 60), "final_status": "ok"}}
+    state["interpro"] = {"signature": None, "status": "running",
+                         "started": stamp(now - 30 * 3600)}
+    results.state(state)
+    iv = console.index_view([console.Project(0, results.path, contract)],
+                            sys.executable, METAANNOT_PY)
+    it = iv["projects"][0]
+    assert [c["state"] for c in it["strip"] if c["name"] == "interpro"] == [
+        "stale"]
+    assert it["counts"].get("running") is None
+    assert it["counts"]["stale"] == 1
+    # decided by the record, and the record says the run finished ok
+    assert it["bucket"] == "done"
+    # and the fallback under it, which is the one place a ROW picks the group:
+    # a state file with no run record at all to read. One leftover is not a
+    # live run there either - it is nothing this console can call.
+    rows_only = [{"state": c["state"]} for c in it["strip"]]
+    assert console.bucket_of({"interpro": {}}, contract,
+                             rows_only) == "unknown"
+    index = console.render_index(iv, contract)
+    assert "running record from an earlier run" in index      # the legend
+    assert ".c-stale" in console.PAGE_CSS
+
+
+def test_a_run_record_that_never_says_it_ended_is_live_on_both_pages(
+        console, results, contract):
+    """The index badge and the project page have to answer "is this run over?"
+    the same way, and for the one record shape that never says, they did not.
+
+    run_is_over() is where that rule lives: a run record ends a run by SAYING
+    so, and a missing `final_status` is not that statement - which is the
+    engine's own doctrine, unprovable means alive, and why the heartbeat block
+    prints "read here as still going" over exactly this shape. bucket_of
+    enumerated the values the key can hold and had no branch for its absence,
+    so the index answered from the stages instead: DONE once they were all ok,
+    and UNCLEAR once v0.5.0 stopped calling a leftover `running`. Neither is a
+    thing the page beside it was saying.
+    """
+    now = time.time()
+    run = {"run_id": "20260101T000000-1", "version": "0.4.0",
+           "host": "lab-fedora", "pid": 4242, "started": stamp(now - 600),
+           "last_seen": stamp(now - 30), "last_seen_epoch": now - 30,
+           "heartbeat_s": 30}                 # and no final_status, ever
+    # every stage green under a record that never recorded a finish: the old
+    # index called this DONE while the page under it said the run was alive
+    state = {contract.run_key: dict(run)}
+    for name in contract.stage_names:
+        state[name] = {"signature": "a", "status": "ok", "seconds": 5.0,
+                       "finished": stamp(now - 120)}
+    results.state(state)
+    v = view_of(console, results, contract, log=False)
+    assert v["heartbeat"]["running"] is True
+    assert "read here as still going" in " ".join(v["heartbeat"]["lines"])
+    assert v["bucket"] == "running"
+
+    # and the shape this came from: the same record with a leftover `running`
+    # from a run that ended 30 hours ago. The leftover is not the evidence -
+    # the record is - and both pages read the record the same way.
+    state = {contract.run_key: dict(run),
+             "interpro": {"signature": None, "status": "running",
+                          "started": stamp(now - 30 * 3600)}}
+    results.state(state)
+    v = view_of(console, results, contract, log=False)
+    row = next(r for r in v["rows"] if r["name"] == "interpro")
+    assert row["state"] == "stale"
+    assert v["heartbeat"]["running"] is True
+    assert v["bucket"] == "running"
+    iv = console.index_view([console.Project(0, results.path, contract)],
+                            sys.executable, METAANNOT_PY)
+    assert iv["projects"][0]["bucket"] == "running"
+
+
+# ----------------------------------------------------------------------
+# 3. a disabled stage with an old record blocked nothing, and was reported
+#    as blocking
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", ["failed", "running"])
+def test_a_disabled_dependency_with_a_record_still_does_not_block(
+        console, results, contract, monkeypatch, status):
+    """A stage with a record is never called OFF - it ran, and the record is
+    the evidence - and the dependency logic read that same set to decide what
+    the ENGINE waits for. It is not the same question: decide() returns
+    `disabled (run.X)` for any stage whose flag is falsy, whatever the state
+    file holds, and finish() then adds it to `done`. So a dependency this
+    config has turned off, carrying an earlier run's `failed` or a killed run's
+    `running`, was reported as "waiting on dbcan (failed)" over a run the
+    engine had already walked straight past.
+    """
+    off = {name: False for name in
+           {st["enabled"] for st in contract.stages if st["enabled"]}}
+    off["context"] = True
+    monkeypatch.setattr(console.Project, "config_run",
+                        lambda self, py, sc, st: (off, "test"))
+    now = time.time()
+    old = stamp(now - 5 * 86400)
+    # each written the way the engine writes it: finish() stamps `finished`,
+    # mark_running() stamps `started` and nothing else.
+    state = running_state(contract, age=10, started_ago=600)
+    state["dbcan"] = ({"signature": None, "status": "failed",
+                       "error": "hmmsearch exited 1", "finished": old}
+                      if status == "failed" else
+                      {"signature": None, "status": "running",
+                       "started": old})
+    results.state(state)
+    v = view_of(console, results, contract, log=False)
+    rows = {r["name"]: r for r in v["rows"]}
+    # context reads emapper, pfam, signalp and dbcan; all four are off
+    assert rows["context"]["state"] == "next", rows["context"]["detail"]
+    assert "dbcan" not in rows["context"]["detail"]
+    # and the deliberate half is untouched: a stage with a record is not OFF
+    assert rows["dbcan"]["state"] != "off"
+    assert rows["dbcan"]["enabled_key"] == "dbcan"
+
+
+def test_a_dependency_that_is_merely_unfinished_still_blocks(console, results,
+                                                             contract,
+                                                             monkeypatch):
+    """The other half. An ENABLED dependency with no record is the case the
+    WAIT row exists for, and nothing above may weaken it."""
+    on = {name: True for name in
+          {st["enabled"] for st in contract.stages if st["enabled"]}}
+    monkeypatch.setattr(console.Project, "config_run",
+                        lambda self, py, sc, st: (on, "test"))
+    results.state(running_state(contract, age=10, started_ago=600))
+    v = view_of(console, results, contract, log=False)
+    row = next(r for r in v["rows"] if r["name"] == "context")
+    assert row["state"] == "wait"
+    assert "dbcan" in row["detail"]
+
+
+# ----------------------------------------------------------------------
+# 4. the part cache never hit for the one stage it was written for
+# ----------------------------------------------------------------------
+
+def test_the_part_cache_bounds_the_scan_of_a_directory_that_keeps_changing(
+        console, results, monkeypatch):
+    """esmfold's declared output is results/structures/.done and the stage
+    writes one .pdb per dark protein into that same directory, so the
+    directory's mtime moves between every poll and the mtime key never hits.
+    On the 455,571-protein run that was a 455k-entry walk per poll per open
+    tab, for the whole of a multi-day stage.
+    """
+    out = os.path.join(results.path, "structures", ".done")
+    os.makedirs(os.path.dirname(out))
+    scans = []
+    real = console.newest_part_file
+    monkeypatch.setattr(console, "newest_part_file",
+                        lambda p: (scans.append(p), real(p))[1])
+    cache = console.PartCache()
+    stamp_at = time.time()
+    for _ in range(20):
+        # what one more .pdb landing in structures/ does, and nothing else
+        stamp_at += 3
+        os.utime(os.path.dirname(out), (stamp_at, stamp_at))
+        assert cache.newest(out) is None
+    assert len(scans) == 1, "the directory was re-scanned %d times" % len(scans)
+
+
+def test_the_part_cache_still_finds_a_part_file_that_appears(console, results,
+                                                             monkeypatch):
+    """The floor is a rate limit, not a blindfold: a stray part file is real
+    evidence and the console still finds it, on the next scan rather than on
+    the next poll."""
+    out = os.path.join(results.path, "structures", ".done")
+    os.makedirs(os.path.dirname(out))
+    cache = console.PartCache()
+    assert cache.newest(out) is None
+    part = os.path.join(os.path.dirname(out), "..done.4242.140.part")
+    with open(part, "w") as fh:
+        fh.write("z" * 900)
+    monkeypatch.setattr(console, "PART_RESCAN_S", 0.0)
+    found = cache.newest(out)
+    assert found is not None and found["size"] == 900
+    assert found["name"] == "..done.4242.140.part"
+
+
+# ----------------------------------------------------------------------
+# 5. the log pane grew for as long as the tab was open
+# ----------------------------------------------------------------------
+
+def test_the_log_pane_is_capped_and_says_so_when_it_drops_lines(console,
+                                                                results,
+                                                                contract):
+    """Every line /api/log delivered became a <div> that stayed, on a page the
+    run book tells you to leave open for the length of a three-day run. The cap
+    is the server's, so there is one place it is decided, and it is announced:
+    a pane holding the last two thousand lines looks exactly like a pane
+    holding the whole log.
+    """
+    results.log("[    1.0s] INFO  hello\n")
+    v = view_of(console, results, contract)
+    html = console.render_project(v, contract)
+    assert 'data-max="%d"' % console.LOG_PANE_LINES in html
+    # a cap under what the first render already puts in the pane would trim on
+    # the first poll, before a single line had arrived
+    assert console.LOG_PANE_LINES >= console.LOG_LINES
+    js = console.PAGE_JS
+    assert "data-max" in js and "pane.removeChild" in js
+    assert "dropped from " in js and "which keeps the last " in js
+    # and the notice is a node in the pane, not a console.log nobody sees
+    assert "pane.insertBefore(capline" in js
+
+
+def test_the_log_pane_keeps_the_number_of_lines_its_notice_claims(console):
+    """The notice the pane writes into itself says it "keeps the last 2000",
+    and the trim loop has to make that sentence true. It bounded
+    `pane.childElementCount`, which is not a count of lines: one marker per
+    rotation and the "no log lines" placeholder from the first render live in
+    that same scroller, and each of them took a slot out of the cap. The loop
+    subtracted its OWN notice by hand and nothing else, which is the tell - a
+    pane that had rotated twice held 1,998 lines under a sentence promising
+    2,000.
+
+    The button carried the same miscount the other way. `unseen` counted every
+    line appended and nothing ever took the trimmed ones back off it, so after
+    a burst larger than the cap "N new lines below" offered to scroll to lines
+    the pane no longer held.
+
+    Both are cosmetic and both are numbers this page states out loud, which is
+    the whole reason the cap is announced rather than applied quietly. There is
+    no JavaScript engine in this suite, so what is pinned is the source: the
+    bound is a line count, and the offer is clamped to it. A DOM stub written
+    here would pin the stub.
+    """
+    js = console.PAGE_JS
+    # comments stripped, because the comment above the loop names the old
+    # bound in order to explain it and would otherwise answer for it
+    code = "\n".join(re.sub(r"//.*", "", line) for line in js.splitlines())
+    # lines, not children - the retired bound, by name, so it cannot come back
+    assert "childElementCount" not in code
+    assert "while (shown > cap)" in js
+    assert "var shown = pane.querySelectorAll(" in js   # what the server sent
+    # `shown` moves for a line appended and for a line dropped, and for
+    # nothing else: a marker is removed without freeing a slot
+    assert "unseen++; shown++;" in js
+    assert "{ dropped++; shown--; }" in js
+    # and the offer may not name a line that is gone
+    assert "if (unseen > shown) unseen = shown;" in js
+    # a rotation empties the pane, so both counters go with the lines
+    assert "unseen = 0; dropped = 0; capline = null; shown = 0;" in js
+
+
+# ----------------------------------------------------------------------
+# 6. the failure block described a scheduler that does not exist
+# ----------------------------------------------------------------------
+
+def test_the_failure_block_says_what_the_scheduler_does_at_a_failure(
+        console, results, contract):
+    """The block said "The engine carries on with every stage that does not
+    depend on a casualty". It does not: the dispatch loop is
+    `while (remaining or futures) and not failure`, so the first failure ends
+    dispatch and what follows is a drain of whatever is already in flight -
+    which is why a run can still look busy for hours afterwards.
+    """
+    results.state(failed_mid_run(contract))
+    html = console.render_project(view_of(console, results, contract,
+                                          log=False), contract)
+    assert "Nothing new starts after the first failure" in html
+    assert "cannot interrupt" in html
+    # this run has NOT ended, so the past-tense half must not ship - the other
+    # side of the boundary its own test pins from the ended end
+    assert "This run has ended" not in html
+    # and the retired sentence is guarded here, where the block that replaced
+    # it is under test: unconditionally, against ever coming back
+    assert "The engine carries on" not in html
+    for phrase in FORBIDDEN:
+        assert phrase not in html.lower(), phrase
