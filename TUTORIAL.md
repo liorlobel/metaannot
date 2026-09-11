@@ -951,7 +951,8 @@ groups — went through fifteen of the twenty-one stages: `emapper` (reuse),
 `interpro`, `signalp`, `tmbed`, `esmfold`, `foldseek`, `integrate`, `finalise`
 and `join`. The report knitted and the QFeatures object built from that run on
 R 4.6.1, not from synthetic data. Final bins were 47.6 / 28.2 / 19.0 / 1.0 /
-0.4 / 3.8%, and the dark bin fell from 9,731 proteins on eggNOG alone to 1,462.
+0.4 / 3.8%, and the dark bin fell from 11,106 proteins on eggNOG alone to
+1,462 — 9,644 rescued.
 
 A FragPipe **TMT** run followed on a second dataset — 8 plexes, 88 channels, 75
 biological samples, 455,571 proteins — so `quant_format: fragpipe_tmt` is not a

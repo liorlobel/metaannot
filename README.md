@@ -1916,8 +1916,11 @@ twenty-one stages ran on that input: `emapper` (reuse), `pfam`, `dbcan`,
 
 Final bins: `1_ko_pathway` 47.6%, `2_ko_orphan` 28.2%, `3_annotated_no_ko`
 19.0%, `3d_duf_only` 1.0%, `3s_structure_only` 0.4% (141 proteins), `4_dark`
-3.8%. Dark rescue took 9,731 proteins dark on eggNOG alone down to 1,462 —
-8,686 rescued, of which KOfam alone supplied a KO to 8,129 that eggNOG missed.
+3.8%. Dark rescue took 11,106 proteins dark on eggNOG alone down to 1,462 —
+9,644 rescued, of which KOfam alone supplied a KO to 8,129 that eggNOG missed,
+and 6,372 of the 11,106 got their KO from KOfam. The eggNOG-only figure
+reconciles with the join described above: 17,377 proteins had no eggNOG KO, and
+6,271 of them carried an eggNOG `PFAMs` entry, leaving 11,106.
 ESMFold built 1,821 models, 993 of them passed the pLDDT gate, and Foldseek
 returned 21,791 hits over PDB and AlphaFold Swiss-Prot plus 664 self-clustered
 fold groups.
