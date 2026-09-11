@@ -153,6 +153,38 @@ it names; do not force the file through another format.
   logs how many cells that was). Summing zeros as real values turns
   missingness into fold change. Set it false only to reproduce someone else's
   numbers.
+- A **FIFO** at an input works where the run reads that input **once**, and is
+  refused immediately where it reads it more than once. That is the design, and
+  the boundary is measured rather than assumed: a pipe can be drained once, so
+  `mkfifo p; zcat big.faa.gz > p &` really does feed this tool from a disk with
+  no room on it — at `quant_table`, at `manifest` and at each
+  `emapper_precomputed` entry, which a default run opens once each — and cannot
+  work at `proteins_faa`, which it opens three times. The counts come from
+  `INPUT_READ_SITES` and are computed for the config in hand, so the answer
+  changes with the config; `doctor` prints them. **Do not quote the default
+  list at somebody**: with `run.taxonomy` on the manifest is read twice and a
+  pipe there is refused, and the database paths are in the plan too —
+  `unipept.result` once, and each `.dmp` under `db.ncbi_taxonomy` once per
+  stage that builds a taxonomy, which is two when `run.taxonomy` and
+  `taxon_rank` are both set. On `quant_format: fragpipe_tmt` the plan counts
+  the files inside the run directory — each plex's level file, its annotation,
+  its `psm.tsv` where `tmt.min_purity` reads one — because `quant_table` names
+  a directory there and a directory is not what gets opened. One read in the
+  plan is CONDITIONAL and marked: `peptide_features()` re-reads the quant
+  table with the peptide-only reader when the full one refuses it, which turns
+  on the table and not on the config, so the plan counts it (a pipe cannot be
+  promised) and a measurement of a completed run is not held to it. Read the
+  row. Where a pipe is allowed, `run`
+  opens it non-blocking, says on the log that it is waiting, and waits
+  `fifo_wait_s` (6 hours) **for each next byte** before dying with the path in
+  the message and with whether anything was holding the write end. A stream
+  that ends early is an error, not a short file. `doctor` never waits at all
+  and refuses a FIFO on the row, because a command whose job is to answer
+  before the run is worthless if it can block. Do not "fix" any of it: a `run`
+  that refused every pipe would remove a working workflow, a `run` that waited
+  at a multi-read input would sell six hours for a failure it could have
+  reported in the first second, and a `doctor` that waited would remove the
+  only thing that can tell you about the pipe first.
 - A repeated sample name in an `.fp-manifest` is a **fraction**, not a
   duplicate. Fraction rows are collapsed to one sample; the manifest is only
   refused when the rows genuinely disagree about the design.

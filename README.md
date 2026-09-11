@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1154 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1539 passed, 1 skipped, 6 xfailed, 37
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 37
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 35 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1119 passed and 36
+absent, so on a machine with no R the same run reports 1504 passed and 36
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1608,6 +1608,179 @@ conda's own progress rather than a metaannot heartbeat. Standalone `report` and
 `object` are outside it too — they shell out to Rscript through their own
 wrapper, which collects stderr and quotes it only on failure.
 
+### A FIFO at an input: only where the run reads that input once
+
+Every parser in `metaannot.py` reads through one function, `opener()`, and a
+named pipe is the one input state where what it should do is genuinely
+contested. The rule is short and the reason it is this rule was measured, not
+argued:
+
+> **A FIFO can be drained exactly once, so it works at an input this run opens
+> exactly once — and is refused, immediately, at an input it opens more than
+> once.**
+
+`mkfifo p; zcat big.faa.gz > p &` is how you feed this tool from a disk you
+have no room on, and it is a supported input where the rule allows it, for a
+plain stream and a gzipped one alike. Where it does not, the refusal is at the
+first open and says why:
+
+```
+input/proteins.faa: this is a FIFO, and this run reads that input 3 times:
+  - stage_emapper -> prepare_emapper -> read_fasta
+  - stage_integrate_pass1 -> build_annotation -> read_fasta (ids and lengths)
+  - stage_integrate_pass1 -> build_annotation -> read_fasta (the dark work-lists)
+A FIFO can be drained EXACTLY ONCE. ... Write the stream to a real file first
+```
+
+**Which inputs those are is worked out from your config, not from a list in a
+document.** `INPUT_READ_SITES` in `metaannot.py` names, per input, every place
+a run opens it and the condition under which that read happens; `run` and
+`doctor` both compute the plan for the config in front of them, because the
+answer changes with it — a project with `run.unipept` on reads its quant table
+once more than one without, so a pipe that works in the first config does not
+work in the second. `doctor`'s row for a FIFO prints the count and the reads.
+
+On a default label-free project the plan is: `proteins_faa` **3** (the emapper
+stage, then the integrate stage twice), `quant_table` **1**, `manifest` **1**,
+each `emapper_precomputed` entry **1**. So a pipe works at all of those but
+the FASTA. That is a change: `quant_table` and `manifest` were read three
+times and twice before, in a way nothing could see — `header_columns()` opened
+the table and then `read_delim_table()` opened it for the delimiter and pandas
+opened it for the body, and the join read the manifest once for the column
+mapping and again for the design. Those reads are now one open each.
+
+**Turn a stage on and the plan changes, which is the point of computing it.**
+With `run.taxonomy` on and a feature-level table, `manifest` is **2** — the
+join reads it through `read_feature_table()`, and so does the taxonomy stage
+through `peptide_features()`, which reaches the same reader. With
+`unipept.result` set, `stage_unipept` ingests that export and returns before
+it ever opens the quant table, so `quant_table` does **not** gain a read from
+it. With `run.eggnog` off, `emapper_precomputed` is **0**. The plan is derived
+from the same functions `doctor` uses to decide which stages open which input,
+so a row and a refusal cannot disagree about it.
+
+**The database paths are in the plan too.** `db.ncbi_taxonomy` names a
+directory, and `nodes.dmp`, `names.dmp`, `merged.dmp` and `delnodes.dmp`
+inside it are read by `NCBITaxonomy()` — once with `run.taxonomy` on, once
+more when `taxon_rank` is set, because `stage_join` builds its own. So on a
+config with both, a pipe cannot work at any of them and the refusal says so;
+on a config with one, it can. `unipept.result` is read once. All of them used
+to be read through bare `open()` calls outside the choke point, which is to
+say a FIFO at any of them hung the run with no exit status and the results
+lock still held.
+
+**A TMT quant tree is in the plan file by file.** With `quant_format:
+fragpipe_tmt`, `quant_table` names the run DIRECTORY and not a table, and a
+directory is not something any reader opens — so what the plan counts is what
+the readers really open: each plex's `ion.tsv` (or `peptide.tsv`), each plex's
+annotation file, and `psm.tsv` where `tmt.min_purity` reads one. Every stage
+that consumes the tree opens each of them once, so with the taxonomy stage and
+`run.join` both on a pipe cannot work at any of them and the refusal says so;
+with one consumer it can. The annotation and `psm.tsv` are counted separately
+from the level file because the peptide-only reader never opens them.
+
+**One read in the plan is conditional, and it is marked as one.** Under
+`peptide_only_reader: auto`, which is the default, a taxonomy or unipept stage
+that meets a quant table the full reader REFUSES re-reads it with the
+peptide-only reader — a second open of the same path, and whether it happens
+is a property of the table rather than of your config. The plan cannot promise
+it will not, so it counts it: a pipe at a quant table a peptide stage opens is
+refused rather than blessed, and the refusal lists that read as the
+conditional one it is. `peptide_only_reader: always` skips the full reader
+altogether, which is one open again.
+
+**`report` reads your metadata through the same open.** On a TMT project the
+contrasts are derived from `analysis.metadata`, which is a path you wrote in
+the config, and it goes through the same gate every reader here uses. `report`
+sets no read plan — it is not a run — so the honest single-read default
+applies: a FIFO there is announced and streamed, and a second open of the same
+drained pipe is refused by name instead of blocking with no exit status.
+
+The **signature digest** is deliberately not in that plan, and it is the
+subtle one. Every input listed in a stage's signature is also read by
+`_content_digest()`, so on a regular file each of these paths is opened once
+more than the numbers above. It is not counted because it never touches a
+stream: `_open_regular_binary()` opens the path, `fstat`s the **descriptor**
+and refuses anything that is not a regular file, so the digest cannot drain a
+pipe and cannot be raced into doing so by a path that changes under a stat.
+
+```yaml
+fifo_wait_s: 21600   # seconds to wait for the NEXT BYTE on a FIFO; 0 refuses one
+```
+
+At a single-read input, the read is announced before it waits:
+
+```
+[   12.4s] INFO     eggnog | input/cat.emapper.annotations.gz: this is a FIFO, and
+                            this run reads it exactly once, so it is read as a live
+                            stream. Each read waits up to 21600s for the next byte
+                            (`fifo_wait_s`); a live writer streams straight through
+                            and nothing else will be logged until one appears.
+```
+
+(one line on stderr and in `metaannot.log`; wrapped here to fit the page.)
+
+The path is **opened once, non-blocking, and that same descriptor is what the
+parser reads.** That is the whole design, and it is not an implementation
+detail: opening the read end of a FIFO and closing it again sends the writer
+on the other side `EPIPE`, so a check that probed the path and then let the
+reader open it again would destroy the stream it was meant to protect. There
+is no probe. `O_NONBLOCK` makes the open return instead of wait, and it also
+releases a writer that is already blocked in its own `open()`; `fstat()` on
+the descriptor — never a second stat on the path — says what was really
+opened; and the flag comes off again before the read, because a non-blocking
+descriptor raises `EAGAIN` the moment a healthy writer pauses, which would
+turn a working pipe into an intermittent failure.
+
+**`fifo_wait_s` bounds every read, not only the first.** A writer that
+attaches, sends half a table and then holds the write end open without writing
+again is the same hang one read further in, so the setting is an *idle*
+timeout: each read waits that long for the next byte. A writer that is
+streaming never comes near it.
+
+**When the wait runs out, the message says which silence this is.** These are
+two different problems with two different remedies, and telling the operator
+the wrong one is worse than telling them nothing:
+
+```
+input/x.faa: this is a FIFO and nothing is holding the write end - nothing has
+opened it in 21600s (`fifo_wait_s`) ... Start the writer before the run
+
+input/x.faa: this is a FIFO, something IS holding the write end, and it has not
+written a byte in 21600s (`fifo_wait_s`). The writer is attached, so starting
+another one is not the fix ... raise `fifo_wait_s`
+```
+
+**A stream that stops early is a failure, not a shorter result.** A writer
+that wrote half a FASTA and died used to yield the half and no error at all,
+which is the worst outcome available here, because the number at the end of it
+is wrong and looks right. A pipe now fails if the writer closed without
+writing a byte, and — for a plain stream — if it stopped in the middle of a
+line. A **gzipped** stream is the stronger form and is what to pipe when you
+have the choice: gzip carries an end-of-stream marker, so a truncation is
+caught wherever it happens rather than only when it happens mid-line. A plain
+writer killed exactly on a line boundary is a case no amount of looking at the
+bytes can catch, and that limit is stated here rather than left to be found.
+
+**Six hours is the default because the two costs are not symmetric.** Waiting
+too long costs only the tail of a mistake already made, and it costs it
+visibly — the wait is announced before it starts. Waiting too briefly costs a
+workflow that works: the writer this has to survive is not the shell one-liner
+above but a producer that is itself a queued job on a shared cluster, where
+waits run to hours. The upper bound is a run holding an exclusive lock on its
+results directory the whole time it waits, so a job started at the end of a
+working day should have failed with a message by the next morning rather than
+still be sitting on the open. Set `fifo_wait_s: 0` if you never pipe anything
+in and would rather a FIFO were refused on the spot. A **socket**, a **device
+node** or a **directory** is refused at once whatever this is set to: nothing
+there is ever going to become a table, and `doctor` names which of the three
+it found rather than offering you all of them.
+
+`doctor` is unaffected and never waits at all — it reads every path through
+its own non-blocking probe, and that asymmetry is deliberate: a command whose
+job is to answer *before* the run is worthless if it can block, while a `run`
+that refused every pipe would be removing something that works.
+
 ### What a results directory says about itself
 
 A results directory now says what produced it and whether that is still
@@ -1770,7 +1943,8 @@ otherwise.
 
 `requirements` is **not** everything `doctor` checks. It is the tools and
 databases, with how to obtain each. `doctor` additionally checks the inputs
-(`proteins_faa`, `quant_table`, `gff`), the `emapper_precomputed` files,
+(`proteins_faa`, `quant_table`, `gff`, `contigs_fna`), the
+`emapper_precomputed` files,
 unrecognised and retired config keys, whether each DIAMOND database is usable
 rather than merely present, the CUDA probe for `structure`/`topology`, the
 `tmt:` block against the plexes actually present, the `manifest` and whether
@@ -1801,6 +1975,225 @@ Half the answer is static and half is a probe of the machine it ran on:
 `default_config`, `stages` and the versions are the same everywhere, while
 `requirements[].ok` is `shutil.which` and `os.path.exists` on `host` at
 `generated`. Read `ok` as a fact about that machine, not about metaannot.
+
+### `doctor --json`: what this machine can do with this config
+
+```bash
+python metaannot.py doctor --json --config config.yaml
+python metaannot.py doctor --json --config config.yaml --install-plan i.sh
+```
+
+The sibling of `describe --json`, and deliberately shaped like it: the header
+is spelled key for key the same way (`metaannot_version`, `signature_version`,
+`generated`, `host`, `config_path`, plus `doctor_version` and
+`describe_version`, so one call tells you the level of both contracts), and
+`requirements` is `describe --json`'s `requirements` array element for element
+— the same function, not a re-shaping of it. `cmds`, `size_gb`, `disk_gb` and
+`note` live there and nowhere else; every check points back into it by
+`requirement_id`.
+
+What `doctor` adds is `checks`: **one entry per line the printed report
+prints**, in the same order, under the same section headings. `detail` is the
+printed sentence rather than a second wording of it, so the terminal and a
+front end cannot come to disagree about the same config. `sections` carries the
+`== ... ==` headings so a table reproduces the grouping instead of inventing
+one.
+
+Each check names **which enabled stages it kills**:
+
+| field | means |
+|---|---|
+| `status` | `ok` / `warn` / `fail` / `skip`. The printed report has a fifth mark: `doctor_mark()` prints `MANUAL` rather than `MISS` for a `fail` whose remedy is one doctor will not fetch, so `status: "fail"` maps to `MISS` **or** `MANUAL` and the other three are one for one with `OK` / `WARN` / `-` |
+| `blocks` | enabled stage names that die without this — joins to `describe --json`'s `stage_names` |
+| `blocks_commands` | `run`, `report` or `object`: a whole command refuses or dies, and no stage does. A `fail` can name **only** these — a missing `limma` is `blocks: []`, `blocks_commands: ["report", "object"]` |
+| `degrades` | enabled stages that run anyway and produce less |
+| `expect` / `found` | the right kind of thing, and what is actually there |
+| `depth` | how far the check looked: `config`, `existence`, `kind`, `header`, `parsed`, `probe`. A ratchet enforced in both directions — `header`/`parsed` must carry a `caveat`; `existence`/`kind` must carry a `found` that is evidence of a stat (an `unset` one is not); and `config`, which is a claim that **nothing** outside the config was consulted, forbids a real `found` — so a row can neither hide a read nor claim one it did not make |
+| `remedy` | `auto` / `manual` / `config` / `input` / `none` — which affordance to offer |
+| `fails_reason` | `stage_or_command_dies` or `setting_ignored` |
+
+**The exit status is derivable from the document and nothing else.**
+`verdict.rule` says it in a sentence: 1 if and only if some check has
+`status: "fail"`, otherwise 0. `ok`, `exit_status` and `verdict.fails` all come
+off that one expression, and `$?` is that expression too, so a caller reading
+the JSON and a supervisor reading the status cannot disagree. A check fails
+exactly when something the config asks for dies on it, and the row names what:
+an enabled **stage** in `blocks`, or a whole **command** in `blocks_commands`,
+which is a failure with no stage in it at all. `status == "fail"` if and only
+if `fails_reason` is set, and `fails_reason == "stage_or_command_dies"` if and
+only if `blocks` or `blocks_commands` is non-empty — the value is named for
+both halves because it was named for one, and three of the four places the
+rule was written down then copied that name's sentence and dropped the command
+class entirely. There is **exactly one** declared
+exception and it names itself: an unrecognised config key is ignored by `run`,
+so no stage dies, but the setting the config asks for is silently not in
+effect and the run answers a different question than the config asked; that
+check fails with `fails_reason: "setting_ignored"` and an empty `blocks`. It
+stays a failure deliberately — `doctor` has always exited 1 on a misspelled
+key, and demoting it to a warning would change the exit status for a real
+class of config, which is not a call to make inside a contract change. Every
+other row in the document obeys the rule without exception: if it fails, an
+enabled stage or a whole command dies on it.
+
+`scope.statement` is a literal sentence the engine authors and a front end
+renders verbatim:
+
+> A check that passes says the thing exists, is the right kind of thing, and is
+> not empty. It does not say the thing is correct inside: doctor does not parse
+> FASTA files, quant tables or sequence databases FOR THEIR CONTENT. Four
+> checks do read into a file to answer their own question - the DIAMOND
+> usability check, the TMT plex annotations, the manifest and the quant table's
+> header line - and each says which on its own row, in depth and caveat. An
+> input that passes every check here can still fail the stage that reads it.
+
+That is the boundary, and `depth` is what keeps it honest per row rather than
+as a promise in a docstring: four checks do read past a file's existence — the
+DIAMOND usability check, each plex's TMT annotation file, the manifest itself
+(`read_manifest`, in full, because the mapping check has no runs to map
+without it) and `pd.read_csv(nrows=0)` on the quant table's header line — and
+each of those carries a `caveat` naming exactly what it opened. The DIAMOND one is the
+reason the caveat is **derived and not declared**: what it reads depends on
+the host. With `diamond` on PATH it reads the database header
+(`diamond dbinfo`, `depth: "header"`); without it — the ordinary state the
+first time anyone runs `doctor` — it falls back to the source FASTA beside the
+database and reads up to 200,000 records for a length profile, plus 200
+deflines for the motif-seed signal, which is `depth: "parsed"`. A zero-byte
+`.dmnd` is refused on `os.path.getsize` alone and reads nothing at all
+(`depth: "kind"`). Nothing in the shape can carry a parse result; there is no
+`rows`, no `columns`, no record count and no id list, which is what stops this
+growing into a different program.
+
+**Every one of those reads goes through one gate, and `doctor` opens nothing
+the gate has not already opened.** `regular_readable()` proves a path with an
+`os.open(O_RDONLY | O_NONBLOCK)` and an `fstat()` on the descriptor, and
+`_deep_readable()` wraps it for `doctor`, handing back the row's sentence
+alongside the verdict. That is not fastidiousness about stats. `os.path.exists()`
+is **true** for a FIFO and a read-only `open()` of a FIFO with no writer does
+not return until somebody writes: a FIFO at a plex's annotation file used to
+make `doctor` wait for ever — no document and no exit, which is worse than any
+traceback, because a caller waiting on the process has nothing to time out
+against either. `O_NONBLOCK` is
+what makes that open return instead of wait; `fstat()` on the descriptor is
+the only "is this a regular file" test that cannot be raced by the path
+changing underneath; and opening at all is the only test a permission cannot
+lie to, since `os.path.getsize()` answers happily for a file nobody may read.
+Every deep check keeps a wide `except` behind the gate as well, because the
+whole history of this class is that the next path state was one nobody had
+thought of. **No state of any path `doctor` is pointed at can stop it printing
+a document or stop the process exiting** — the six configured input keys and
+the TMT tree's plex directories, level files and annotation files, through
+absent, empty, directory, dangling symlink, FIFO, socket, device node,
+unreadable directory and unreadable file — and a test walks all of them, with
+a timeout, so a future hang fails a test rather than wedging a suite.
+
+"The right kind of thing" is **derived, never assumed**. `expect.kind` is
+`file` for every quant format but one, and `dir` for `fragpipe_tmt`, which
+reads the run directory holding the per-plex folders;
+`expect.derived_from: ["quant_format"]` names the key that decided, so a ninth
+format changes the value and not the schema. Its full vocabulary is `file`,
+`dir`, `on_path`, `probe` (the host was asked — CUDA, an import,
+`requireNamespace`), `setting` (a claim about the config and nothing else) and
+`r_package`. `expect.members` carries the siblings the engine's **own** test
+requires beside the thing named — the four `hmmpress` files for an HMM
+library, `.dbtype` and `.index` for a Foldseek target, the `nodes.dmp` inside
+a taxdump directory — and is empty where that test names none, as for
+`hhblits_db`, whose `_prefix_exists()` accepts any non-empty sibling of the
+stem. `found.kind` names what is really there — `file`, `dir`, `empty_file`,
+`empty_dir`, `symlink_broken`, `absent`, `unset`, `other` (present, and
+neither a regular file nor a directory: a FIFO, a socket, a device node) and
+`unreadable` (there, and this process may not read it — a directory with no
+read bit, or a file whose mode or ACL refuses an `open()`) — so a consumer
+never has to do arithmetic on `bytes`, and a dangling symlink is reported as
+one instead of as a plain absence. `unreadable` is reached for a **file** as
+well as a directory, which it was not until now: `os.path.getsize()` is a stat
+and answers happily for a mode-000 file, so four rows that branch on
+`kind == "file"` used to report `ok` for one while `run` died on "Permission
+denied" in the stage that opened it. `other` is not a curiosity: `os.path.exists()`
+is **true** for a FIFO, so `run` does not refuse one and every row that read
+`absent` for it told an operator the opposite of what happens. What `run` does
+with one is its own section below; what matters here is that the two commands
+answer differently on purpose, and `doctor` is the one that may never wait.
+
+**`other` is three things, and `found.other_kind` says which.** It is `fifo`,
+`socket`, `char_device` or `block_device`, and `null` for every other `kind`.
+It is a new KEY and not a new `kind`, so `DOCTOR_VERSION` does not move and a
+consumer that has never heard of it keeps every answer it had. It exists
+because a sentence derived from `kind` alone is written for one of the three
+and printed over all of them: a UNIX socket at `proteins_faa` published "dies,
+but not at once ... A FIFO in particular is not refused on sight ... waits
+`fifo_wait_s`", and a socket cannot be opened as a file at all — `os.open()`
+itself fails on it. (The **errno** is deliberately not published any more: this
+was written down as `ENXIO` and measured as `EOPNOTSUPP`, and which one you get
+is the OS's business. What decides who dies is that it is an `OSError`, which
+nothing downstream catches.) The verb,
+the FIFO paragraph and the phrase naming what is there are all keyed on it
+now.
+
+**Two questions, not one: WHEN the open ends and WHAT it ends with.** They
+part company on a character device, which answers at once — so the "when"
+predicate is true of it — and raises a `StageError` from the `die()` at the
+bottom of `_open_for_read()`, which `peptide_features()` catches and re-reads
+around. `input:manifest` is the row where that matters, because it is the row
+that names an exception and computes `blocks` from it: on a char device it
+published "it dies with an `OSError` … every stage that opens a quant table on
+this format goes with it" beside its own `blocks: ["join"]`, and `blocks` was
+the right half — driven, the taxonomy stage fell back to the peptide-only
+reader and finished. Both are computed from one predicate now, which also
+corrects the opposite error: a **socket** and a **block device** share the
+`other` bucket with the FIFO and end in an `OSError`, so they cost every
+reader and `blocks` used to under-claim them.
+
+**`found.kind` has a tenth value and it is `null`.** A row can carry a
+non-null `found` whose `kind` is `null`, and it means *this build did not
+compute it*, never *nothing is there*: every `requirements` row, the CUDA probe
+and every row in the `R` block answer with one boolean — `have()`,
+`_exists()`, `_pyhas()`, `torch.cuda`, `requireNamespace()` — which cannot
+tell an absent database from a directory or an unpressed library. In the
+default document those are the **majority** of the rows, so a consumer
+switching on `found.kind` needs a `null` arm, and `found.present` is what
+carries the answer there. The `db:diamond:<tag>:usable` rows are **not** in
+that list and were wrongly named in it in three places: they are built from
+`_found()` and carry a real kind, which makes them the document's own
+counterexample to the sentence they were named in. The ordinal above is
+derived from `DOCTOR_FOUND_KINDS`, and the families that really carry a null
+are `DOCTOR_NULL_KIND_ROWS`; a test recomputes the first and drives a document
+to check the second.
+
+`--json` **replaces** the printed report on stdout, exactly as
+`describe --json` does, and `log()` already writes to stderr, so the stream
+stays clean even when the config has typos in it. `--install-plan FILE` still
+writes its file — it is a side effect the operator asked for, not output — and
+`install_plan` in the document records the path, what went in and what was left
+out. **`--fix` with `--json` is refused by argparse, which exits 2**, not by
+`die()`, which exits 1 and so could not be told apart from "problems found":
+`--fix` reads stdin for its confirmation and streams progress to stdout, and a
+document written while a 123 GB download is half done describes nothing. The
+honest loop is `doctor --json`, decide, `doctor --install-plan`, run it,
+`doctor --json` again.
+
+`totals` carries both sizes as raw floats, plus the two things that make them
+readable: `counted` / `not_counted` (MANUAL items are in neither total, so the
+figures are a floor rather than the whole job) and `unsized` — the ids where
+the `0.0` in `requirements[]` means "nobody estimated this", not "free". The
+printed report hides anything under 0.05 GB, which is how a large Java
+distribution came to look like no download at all.
+
+It is versioned the way `describe --json` is: `doctor_version` moves when a key
+is removed or its meaning changes, never when one is added. One clause is
+added, because this document has enums a consumer switches on — **adding a
+value to a closed enum is a meaning change and is a bump**. The closed sets are
+`status`, `remedy`, `fails_reason`, `depth`, the `blocks_commands` vocabulary,
+`found.kind` and `expect.kind` — seven, and the last two joined the list after
+they were found outside it, which is the difference between a contract and a
+suggestion: this page tells you to switch on `found.kind` rather than compute
+`bytes > 0`, and a `fifo` or an `unreadable` appearing there would not have
+been a version bump. Both of those states now have a name **in** the set, and
+`fails_reason`'s first value was renamed in the same pass, neither of which is
+a bump only because `doctor_version` 1 has not shipped: it and this page are
+in the same unreleased change set, so there is no consumer to break.
+`finding`, the stage names in `blocks`, and every `detail` and `caveat` are
+open: a consumer that meets an unfamiliar value there keeps `status` and
+renders `detail`.
 
 ## The console: watching a run without touching it
 
@@ -1950,7 +2343,7 @@ condition>)`; only a failure of the QFeatures constructor itself falls back to
 a SummarizedExperiment, with the peptide assay in `metadata()$peptides`. Check
 the class of the object you get back.
 
-A test suite does ship, in `tests/` — `conftest.py`, `fixtures.py` and thirteen
+A test suite does ship, in `tests/` — `conftest.py`, `fixtures.py` and sixteen
 test modules — so the plumbing described here is reproducible offline from what
 you have; see **Tests** above. What does not ship is a benchmark script, and
 the datasets themselves are not redistributable, so the run figures above

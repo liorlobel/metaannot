@@ -1,5 +1,1396 @@
 # Changelog
 
+## Unreleased
+
+`doctor --json`, the other half of the contract `describe --json` started. The
+console's milestone M2 is a preflight checklist — can this config actually run,
+here, now — and it was blocked on this: the console never imports metaannot, so
+everything it knows it gets by shelling out and parsing stdout, and `doctor`
+had no stdout a program could read.
+
+The scope was fixed before anything was written, and both halves of it were
+arrived at the hard way:
+
+> Doctor checks that a required input EXISTS, is the RIGHT KIND of thing, and
+> is NOT EMPTY. It does not parse. A file that passes doctor can still be wrong
+> inside, and doctor says so.
+>
+> Doctor fails an input exactly when an enabled stage will die on it.
+
+Holding the second sentence turned up **twenty-four** live false verdicts, in
+four waves, and every one of them has an entry under Fixed. The fourth wave
+also turned up something worse than a wrong verdict, and it has its own group:
+four states of a path on which `doctor` printed NO DOCUMENT AT ALL, one of
+them by never returning.
+
+Seven were in the shipped `doctor`, all of them the same bug: the verdict was
+one boolean — `ok &= r["ok"]`, `ok &= good or label == "gff"` — folded over
+every check, with no idea which stage cares about which. Correcting those
+changes `doctor`'s exit status for real configs, which is the point — the first
+of them failed the ordinary annotate-without-MS-quant run that `run` exits 0
+on.
+
+Seven more were in the first draft of this document, found by reading every
+row against the stage function it describes a second time, and they are the
+more interesting half: a row that names the stages it kills can be
+confidently, specifically wrong in a way one boolean never could. Two claimed
+stages that return or fall back before they ever open the file — `stage_unipept`
+with `unipept.result` set, and the peptide readers, which re-read with the
+peptide-only reader when the full one refuses. Two branched on
+`found.present`, or on wording written for "absent", while asserting they had
+checked the KIND. One guarded a check on the wrong config key, so a stage that
+dies went unnamed. One probed for a backend the stage stopped requiring. And
+one produced no row at all — the most expensive false pass there is, because
+there is nothing in the document to be wrong and so nothing can notice.
+
+Five more survived both readings and were found by RUNNING every row instead:
+one of them printed no document at all, because a directory at `manifest`
+reached `read_manifest`, which opens the path with `open()` and raised an
+`IsADirectoryError` that the `except StageError` beside it does not catch. A
+command that prints nothing has no contract; every other row in the document
+went down with the one that could not be read.
+
+**The counts in these paragraphs are the FALSE VERDICTS, and they are not the
+number of entries under Fixed.** That section also carries one attribution
+that was never a verdict, twenty-eight corrections to what the document says
+about ITSELF, one ENGINE defect a verdict uncovered, four states of a path
+that produced no document, ten defects the sixth reading corrected, twelve
+defects the seventh reading corrected, seventeen defects the eighth reading
+corrected, and seven defects the ninth reading corrected —
+eighty entries that change no config's
+`doctor` verdict. The engine defect was missing from this sentence while it accounted
+for thirty-two of thirty-three; a test now sums every clause of it against the
+groups that are not false verdicts, so a new group cannot be left out of it. The sentence here used to
+claim the two numbers were the same, which they never were — so the section is
+now grouped under headings that carry their own counts, and a test in
+`tests/test_docs.py` counts the entries under each heading against the number
+written in it. The tests behind the verdicts themselves are one per verdict,
+each driving the stage — or, for `proteins_faa`, the `run` command — into the
+state the row claims.
+
+### Added
+
+**`metaannot.py doctor --json`.** One object on stdout and nothing else,
+exactly as `describe --json` does it. The header is describe's header key for
+key, and `requirements` is describe's `requirements` array element for element
+— the same `requirements(cfg, p)` call, not a re-shaping of it, so `cmds`,
+`size_gb`, `disk_gb` and `note` have one home and a check reaches them through
+`requirement_id`. What doctor adds is `checks`: one entry per line the printed
+report prints, in print order, under the same `== ... ==` headings, with
+`detail` being **the printed sentence itself** rather than a second wording of
+it. The two renderings cannot drift, and a test asserts every sentence in the
+document appears in the terminal output.
+
+**Every check names which enabled stages it kills.** `blocks` is a list of
+stage names that joins straight to `describe --json`'s `stage_names`;
+`blocks_commands` carries `run`, `report` and `object` for the failures where a
+whole command refuses and no stage dies; `degrades` carries the stages that run
+anyway and produce less. The exit status is a fold over those:
+`status == "fail"` if and only if `fails_reason` is set, and
+`fails_reason == "stage_or_command_dies"` if and only if
+`blocks`/`blocks_commands` is non-empty. `verdict.rule` states it as a sentence
+in the document, so a consumer that understands nothing else can still compute
+the status a newer doctor produced. `fails_reason` has **two** values, not the
+three the design sketch proposed: every "config contradiction" this vocabulary
+can express turned out to kill something outright — `run.taxonomy` without
+`run.unipept` is `stage_taxonomy` dying on a `unipept_lca` nothing wrote — so
+it is reported as `stage_or_command_dies` with that stage, or that command,
+named, and a value nothing emits is a branch nobody exercises. The value is
+named for both halves because it was first named for one; see the entry under
+Fixed.
+
+**`requires` and `degraded_by` on every stage**, and on `describe --json`'s
+per-stage object. This is the attribution `blocks` is built from, and it could
+not be read off `requirements()`, which gates on `run:` flags with inline
+boolean logic (`if R.get("pfam") or R.get("dbcan") or R.get("ncbifam") or
+R.get("jackhmmer")` for hmmer) and so knows that *something* wants hmmsearch
+but not which stage dies without it. Adding it to `describe --json` does **not**
+move `DESCRIBE_VERSION`: the rule at that constant is that a version moves when
+a key is removed or its meaning changes, and nothing was. It is a deliberate
+decision rather than an accident, which is what
+`test_describe_emits_every_field_a_stage_dict_carries` and the exact key-set
+pin in `tests/test_config.py` exist to force.
+
+**`scope.statement`** — the first scope sentence above, as a literal string the
+engine authors and a front end renders verbatim. "and doctor says so" is half
+the rule, and a console that has to write that sentence itself becomes its
+second home.
+
+**A per-check `depth`** (`config`, `existence`, `kind`, `header`, `parsed`,
+`probe`) and a `caveat` on every row that went past a file's existence.
+"doctor does not parse" was already false as an unqualified claim — the DIAMOND
+usability check, each plex's TMT annotation file, `read_manifest` on the
+manifest itself and `pd.read_csv(nrows=0)` on the quant header are four checks
+that read into files, all of them shipped and all of them legitimate. Now each
+says so on its own row. The enum is documented as a **ratchet rather than a
+menu**: a fifth needs a reason written down at the constant, and the ratchet
+bites in both directions — see Fixed.
+
+**`found.kind` names the state instead of leaving it to arithmetic**: `file`,
+`dir`, `empty_file`, `empty_dir`, `symlink_broken`, `absent`, `unset`, `other`
+and `unreadable` — plus `null`, which is a value and means "this build did not
+compute it"; see Fixed for both of those. A dangling symlink has always been
+rejected "for the right reason by accident" — `os.path.exists` follows the link
+and answers False — and a volume that is not mounted is how that happens here.
+It is now reported as what it is, in the printed report as well.
+
+**`expect` says what the right kind of thing is, and which key decided.**
+`expect.derived_from: ["quant_format"]` on the quant table, because `file`
+versus `dir` is config-dependent: only `fragpipe_tmt` reads a directory. A
+front end renders the reason without carrying its own copy of the eight-format
+table.
+
+**`remedy`: `auto` / `manual` / `config` / `input` / `none`.**
+`requirements()[].manual` is overloaded — `dbentry()` sets it to
+"no path configured" for a key nobody filled in, while SignalP 6 and
+InterProScan set it to a licence and a version-specific distribution. The first
+wants an edit box, the second a link-out and structurally no button. The split
+is in `remedy`; `requirements()[].manual` is left exactly as it was, and so is
+the printed `MANUAL` mark, which an operator reads as "doctor will not fetch
+this" and which is true of both.
+
+**`totals` says what it leaves out.** `counted` / `not_counted` (MANUAL items
+are in neither figure, so both totals are a floor rather than the whole job)
+and `unsized` — the ids where the `0.0` in `requirements[]` means "not
+estimated" rather than "free", which is how a large Java distribution came to
+look like no download at all. `accuracy: "indicative"` and
+`basis: "hand-maintained"` are there to branch on, and the sentence CLAUDE.md
+tells an operator to repeat about those numbers lives in `totals.detail` rather
+than in whatever is rendering them.
+
+**`DOCTOR_VERSION`, with the clause `DESCRIBE_VERSION`'s rule does not have.**
+Same rule — bumped when a key is removed or its meaning changes, never when one
+is added — plus: **adding a value to a closed enum is a meaning change and is a
+bump.** The closed sets are `DOCTOR_STATUSES`, `DOCTOR_REMEDIES`,
+`DOCTOR_FAIL_REASONS`, `DOCTOR_DEPTHS`, `DOCTOR_COMMANDS`,
+`DOCTOR_FOUND_KINDS` and `DOCTOR_EXPECT_KINDS` — seven, the last two added
+under Fixed below after they were found outside the set; `finding`, the stage
+names and every `detail` are open and may grow freely. Pinned by an exact
+key-set test in the style of the one that protects `describe --json`, which
+exists because a version constant that pins nothing let nine documented fields
+be deleted while the suite stayed green.
+
+**`doctor` now checks `contigs_fna`.** It never did, though `stage_smorf` dies
+with "run.smorf needs contigs_fna pointing at the assembly" — so any
+`run.smorf: true` config passed doctor and died at run time.
+
+### Fixed
+
+104 entries, in fifteen groups. Each heading carries its own count and
+a test counts the entries under it, because the prose above this section has
+already claimed a number twice that the list below it did not have — and the
+reason the two never matched is that "false verdict" and "entry" are not the
+same thing: a correction to what the document says about itself changes no
+config's exit status and is grouped separately here.
+
+#### Seven false verdicts in the shipped `doctor`
+
+**A missing `quant_table` no longer fails an annotate-only run.** `stage_join`
+logs "quant table not found, skipping join" and *returns*, and `run.join` is
+true in `DEFAULT_CONFIG`, so an ordinary annotate-without-MS-quant config
+completed and exited 0 while `doctor` exited 1 on it. It is now a warning that
+names `join` in `degrades` — and it becomes a failure the moment `run.unipept`
+or `run.taxonomy` is on, because `peptide_features()` reads the table and has
+no skip branch. Same file, same check id, opposite verdict: severity is a
+property of the config, not of the input. A **zero-byte** quant table is fatal
+either way, because `os.path.exists` is true so `stage_join` never takes its
+skip branch and dies in the reader instead. Missing is survivable; empty is
+not, and only a per-state check can say that.
+
+**A missing DIAMOND database is a warning, not a failure**, and the fatal case
+is the opposite one. `stage_diamond` logs "diamond database missing, skipping"
+for each absent database and searches the rest, writing an empty `.done` marker
+when none of them exist; what it dies on is a database that is PRESENT and
+cannot answer — `diamond_db_check`'s refusal, which is a zero-byte `.dmnd` from
+a failed `makedb`. Those are now two checks about one file, with different
+depths and different verdicts. On the default config this alone was four
+spurious failures.
+
+**A set-but-missing `gff` now fails.** `cmd_doctor` did `ok &= good or label ==
+"gff"`, so a `gff` pointing at nothing printed `MISS` and still exited 0 —
+while `stage_context` calls `die()` on exactly that. An *empty* `gff` is
+correctly a warning: the stage logs, writes an empty context table and returns.
+
+**`emapper_precomputed` is no longer checked when `run.eggnog` is off.** It was
+folded into the verdict with no guard, so a stale path failed doctor even when
+the only stage that reads it was not running.
+
+**A `manifest` that is set and absent is contingent, and says so.**
+`read_manifest` is reached from `read_feature_table` and directly from
+`stage_join` — there is no `read_protein_table` in this tool; the
+protein-level path is inline in `stage_join` — and both are downstream of
+`stage_join`'s early return — so with the quant table gone, nothing opens the manifest. It is
+a warning with `depends_on: ["input:quant_table"]` and a sentence saying it
+turns fatal the moment the quant table is restored, which a test drives both
+ways.
+
+**The `== tmt ==` block no longer fails a config nothing reads.** It ran on
+`quant_format == "fragpipe_tmt"` alone and every `MISS` inside it set the
+verdict, so a TMT config with `run.join`, `run.unipept` and `run.taxonomy` all
+off exited 1 — on a config where no enabled stage opens the quant tree at all.
+It is now skipped, with one line saying why.
+
+**`taxonomy_source` with `run.taxonomy` off is a warning.** `resolve_taxonomy()` logs
+"falling back to eggnog" and carries on, so nothing dies; doctor was failing it.
+
+#### One attribution, which corrected no verdict at all
+
+The `== R ==` block is new in this release, so there was no shipped verdict to
+correct. What it fixes is the ATTRIBUTION — where a failure that kills no stage
+is recorded — and it sat above the wave marker for a release with nothing
+saying it was not one of the seven.
+
+**A missing required R package blocks `report` and `object`, which are
+commands and not stages**, and each of the fourteen packages is its own row
+with its own install line — `BiocManager::install` or `install.packages`,
+decided by Bioconductor membership — because a preflight checklist offers its
+affordance per row.
+
+#### Seven false verdicts in the first draft of this document
+
+Verdicts this document itself got wrong, each found by reading the row against
+the stage function it describes and fixed with a test that drives that
+function.
+
+**A `taxon_rank` with `run.taxonomy` off asked for no taxdump at all.**
+`requirements()` gated the `ncbi_taxonomy` entry on `run.taxonomy`, so on
+`run.join: true` + `taxon_rank: genus` the row did not EXIST — and
+`requirement_effect()`'s taxon_rank condition, which is written for exactly
+this case, was reading an entry nothing had produced. `stage_join` →
+`resolve_taxonomy` → `collapse_taxon_rank` dies there with `taxon_rank='genus'
+needs db.ncbi_taxonomy`, and `collapse_taxon_rank`'s own log is what walks an
+operator into that config: on every run with no rank it explains what raw seed
+taxids cost and tells them to set one. The gate is now `run.taxonomy or
+(run.join and taxon_rank)`, fixed where the row is PRODUCED rather than where
+its effect is read, and tested in both directions.
+
+**A zero-byte or directory `unipept.result`, and the same for the pept2lca
+cache, passed both Unipept rows.** They asserted `depth: "kind"` — "also asked
+what kind of thing it is and whether it is empty" — computed that answer, and
+then branched on `found.present`, which a zero-byte file and a directory both
+satisfy. `stage_unipept`'s own test is `os.path.exists()` too, so it takes the
+ingest branch and `read_unipept_result` dies on "Could not determine
+delimiter"; a zero-byte CACHE is worse, because `getsize > 0` means it is not
+adopted, every peptide is still to do, and with `allow_http` false the stage
+dies on "the cache is incomplete" — the very message that row exists to
+pre-empt. This was the first scope sentence broken by doctor's own data.
+
+**The `== manifest ==` block claimed stages that never open a manifest.** It
+asked `quant_consumers()`, which is "who names the quant table", where the
+question is "who calls `read_manifest`" — so with `unipept.result` set, the
+manifest gone and join and taxonomy off, `doctor` exited 1 naming `unipept`
+while `run` exited 0. `read_manifest` is reached from two places only:
+`read_feature_table`'s fragpipe_peptide/fragpipe_ion branch and `stage_join`'s
+own diann/fragpipe branch. On the MSstats formats the design is in the table,
+and `read_fragpipe_tmt` logs "`manifest` is ignored for quant_format
+'fragpipe_tmt'" and reads the annotation files instead — so on four of the
+eight formats a missing manifest kills nothing at all, and it now says so on
+one row instead of failing the config.
+
+**The `== tmt ==` refusal rows claimed the two stages that fall back.**
+`peptide_features()` catches `StageError` from the full reader and re-reads
+with the peptide-only reader — "Quantification is still unavailable, only the
+taxonomy work continues" — and `read_fragpipe_tmt_peptides` never opens an
+annotation file, resolves a reference or checks a sample name for collisions.
+So a reference conflict, an unreadable annotation, a duplicated sample name and
+an unmatched reference are join's death and nobody else's, unless
+`peptide_only_reader: never` says refuse rather than fall back. Three lists
+come out of that where one was being used: who opens the tree at all (a
+missing plex directory or level file is fatal to every reader), who dies when
+the FULL reader refuses, and whose OUTPUT a tree that reads perfectly but
+describes a ragged design degrades — which is join alone, because the taxonomy
+stages take peptides out of it and never touch an intensity. On a config with
+join off those rows are now warnings, which is also what stops them tripping
+`_check()`'s own "a failure names what it costs" invariant and taking the
+command down with an AssertionError.
+
+**`req:esmfold` failed a host where ESMFold runs.** `requirements()` probed
+`_pyhas("esm")` while `stage_esmfold` tries fair-esm and THEN transformers and
+dies only if both fail — and on a current card the transformers route is the
+only one that builds, because `fair-esm[esmfold]` needs an openfold pinned to a
+2022 commit whose CUDA kernels do not compile against a modern toolkit at all.
+The requirement now accepts either backend, its install line names
+transformers, and its note still names fair-esm as what the stage prefers when
+it is importable.
+
+**A directory at `proteins_faa` claimed that `run` refuses.** Absent, dangling
+symlink and directory were one branch whose wording was written for "absent":
+`detail` said "`run` refuses before any stage starts" and the row carried
+`blocks_commands: ["run"]` and `depth: "existence"`. `cmd_run`'s guard is
+`os.path.exists()`, which is TRUE for a directory — `run` does not refuse, it
+schedules everything and each stage dies as it opens the path — so the one
+machine-readable claim a preflight screen would gate the `run` button on was
+false, over a row that had stat'd the path and knew better. The same wording
+bug (with the verdict right) was on `gff` and `contigs_fna`, whose stages guard
+with `os.path.exists` too. And `_finding()` answered `empty` for an EMPTY
+DIRECTORY where a file was expected, indistinguishable in the document from a
+zero-byte file — which on `gff` is the difference between a warning and a
+failure. It now takes the expected kind and answers `wrong_kind`.
+
+**`taxonomy:format` was guarded on `unipept.result` for both stages.** Right
+for unipept, which returns after ingesting the export and never reaches its own
+format check; wrong for taxonomy, whose `die("the taxonomy comparison needs
+peptide-level input")` is guarded on nothing at all — it reads `p.unipept_lca`
+whoever wrote it and then calls `peptide_features()` itself. A protein-level
+`quant_format` with `unipept.result` set and `run.taxonomy` on was a false pass
+on a stage that dies in its first seconds.
+
+#### Six claims the first draft made about ITSELF
+
+Not verdicts, but the half a consumer cannot check:
+
+**A row's `caveat` is now derived from what the check opened, not declared
+beside it.** Both DIAMOND usability rows hard-coded `depth: "header"` and "read
+from the DIAMOND header and a sequence-length profile; the sequences themselves
+were not parsed", whatever `diamond_db_profile()` had actually done. With
+`diamond` not on PATH — the ordinary state the first time anyone runs doctor —
+it falls through to `_fasta_lengths()`, which reads up to 200,000 FASTA
+records, sequence lines and all, and `motif_seed_evidence()` then reads 200
+deflines; the caveat asserted the opposite of what had just happened, on the
+one field whose whole job is to qualify "doctor does not parse". A zero-byte
+`.dmnd`, meanwhile, is refused on `os.path.getsize` alone and opens nothing.
+`diamond_db_check()` now returns what it read as tokens and doctor turns those
+into the depth and the sentence, so the three cases say three different things.
+
+**`depth` is a ratchet in BOTH directions.** It was enforced upward only —
+`header` and `parsed` must carry a caveat — and nothing stopped a row claiming
+it had looked deeper than it had, which every "no path configured" requirement
+row was doing with `depth: "kind"` over a path nobody had named. `_check()` now
+refuses an `existence`/`kind` row with a null `found`, and those rows report
+`depth: "config"` and a null `found`, which is what "this build did not compute
+it" is supposed to look like.
+
+**`expect.because` said "found on PATH by `have()`" for two requirements that
+are not on PATH.** InterProScan is tested with `_exists(db["interproscan_sh"])`
+and ESMFold with `_pyhas()`, so a preflight screen told an operator to put
+InterProScan on PATH when the fix is a config key. Both now say what was
+actually probed, carry the config key in `config_keys`, and — for InterProScan
+— go through `dbentry()`'s "no path configured" marker, so an unfilled
+`db.interproscan_sh` gets `remedy: "config"` (an edit box) instead of landing
+on the licence side of the split `_remedy_for()` exists to make. A path that IS
+set and not there is still `manual`: that one really is a version-specific Java
+distribution.
+
+**`expect.members` is populated, and says why where it is empty.** It was
+never passed a value anywhere in the file, though the cases it was written for
+were all right there: the four `hmmpress` siblings `_pressed()` requires,
+`foldseek_target`'s `.dbtype` and `.index`, the `nodes.dmp` inside a taxdump,
+the `eggnog.db` inside an eggNOG data directory. It carries the engine's OWN
+test, never the files a tool would merely like to find — which is why
+`hhblits_db`'s is empty and its `because` says so: `_prefix_exists()` accepts
+any non-empty sibling of the stem.
+
+**`found.kind` and `expect.kind` are inside the versioned set.** `_found()`'s
+docstring and the README both tell a consumer to switch on `found.kind` and
+never to compute `bytes > 0` for itself, and `expect.kind`'s values were
+enumerated in no constant, no document and no test — so adding `fifo` or
+`unreadable` to one, or a sixth kind to the other, would not have been a bump
+and a console's switch would have fallen through in silence. Both are now
+closed sets beside the version constant under the same rule, enforced in
+`_check()` where the rows are made. Closing a vocabulary is not itself a bump:
+it adds a promise rather than changing a meaning.
+
+**`expect.kind: "probe"` on a config row is now `"setting"`.** It collided with
+`depth: "probe"` and meant the opposite of it: those rows carry `depth:
+"config"` and `found: null` — they consult nothing outside the config — while a
+`depth: "probe"` row asks the HOST. `probe` now means the same thing in both
+fields, and a test asserts that a row whose `expect.kind` is `probe` has
+`depth: "probe"` too.
+
+
+#### Five more false verdicts, found by running every row
+
+The third wave, and the reason it exists: the first two were readings. These
+were found by driving every row and comparing what `doctor` said with what
+`run` did on the same config.
+
+**A directory at `manifest` produced NO DOCUMENT AT ALL.** `_manifest_checks`
+branched on `found.present`, which a directory satisfies, and fell through to
+`read_manifest(path)` guarded only by `except StageError` — while
+`read_manifest` opens through `opener()`, which is `open()`, so a directory
+raised `IsADirectoryError`: `rc=1`, a traceback on stderr and nothing on
+stdout. Every other row went with it — the tools, the databases, the resources
+and the whole R block — and a consumer got no verdict about any of them. The
+manifest is the one input the earlier directory fix did not reach. It now has
+the same split the others have, made BEFORE `read_manifest`, with two
+different costs behind it: an EMPTY manifest dies inside `read_manifest` with a
+`StageError` that `peptide_features()` catches and re-reads around, so it costs
+`join` alone, while any other wrong kind raises an `OSError` that nothing
+catches, so it costs every reader. The `except` is widened to `OSError` as
+well, as a backstop the branch above should now make unreachable — an
+unreachable backstop costs one row in a document that survives, and a missing
+one costs the document. A test walks every configured input path through all
+nine states — absent, empty, directory, dangling symlink, FIFO, socket, device
+node, unreadable directory and unreadable file — and asserts stdout parses as
+JSON in all fifty-four cells.
+
+**`req:ncbi_taxonomy` failed a `join` that skips.** `stage_join`'s first act is
+`if not os.path.exists(quant_table): log("quant table not found, skipping
+join"); return`, before `resolve_taxonomy` and before anything else it
+requires — so with the quant table absent, nothing `join` declares can kill it.
+With `taxon_rank: genus`, no taxdump and no quant table, `doctor` exited 1
+naming `req:ncbi_taxonomy` while `run` exited 0 on "done: 4 run, 0 adopted, 17
+skipped", and `run.taxonomy` is off by default, so that is the MORE COMMON half
+of the configs. doctor already held the contingency twice —
+`input:quant_table` says `degrades: ["join"]` on the same document, and
+`_manifest_checks` gates its whole verdict on the same `os.path.exists` — and
+applied it nowhere near the requirement rows. It is one predicate now, and the
+rows it decides carry `depends_on: ["input:quant_table"]`.
+
+**`input:contigs_fna` claimed `blocks: ["smorf"]` whatever is installed.**
+`stage_smorf` dies at the top only for an absent or unset assembly; past that
+guard the BINARY decides. With an ORF finder on PATH a directory is handed to
+it and the stage dies; with none installed the path is never opened at all —
+the stage logs "neither smorf(inder) nor macrel is installed", writes an empty
+`smorf.faa` and returns, and `run` exits 0. The row's comment about the
+inversion against its own tools is true of the absent branch and had been
+copied onto this one. Measured on a machine with no `smorf`, no `smorfinder`
+and no `macrel`: `doctor` 1, `run` 0 — and the test that pinned it ran on that
+same machine, so the suite was green-lighting a verdict false in its own
+environment. The verdict is read off the probe now, and the test drives both
+sides of it with a stub on PATH rather than trusting the laptop.
+
+**Two tool probes disagreed with their own stages.** `req:kofamscan` probed
+`have("exec_annotation")` while `stage_kofam` accepts `exec_annotation` OR
+`kofamscan`, so a host with only the second was told `blocks: ["kofam"]` about
+a stage that runs. `req:smorf` probed `have("smorf") or have("macrel")` while
+`stage_smorf` also accepts `smorfinder`. Both probes now accept what their
+stage accepts, `smorf_tools()` is the single probe the stage, `requirements()`
+and `doctor` all share, and a test asserts each documented name is enough on
+its own.
+
+**A FIFO at `proteins_faa` claimed that `run` refuses.** `_found()` had no
+branch for anything that is neither a regular file nor a directory, so a FIFO,
+a socket or a device node came out as `kind: "absent", present: false` — and
+the row then said `blocks_commands: ["run"]` and "run refuses before any stage
+starts", while `cmd_run`'s `os.path.exists()` is TRUE for one and schedules
+everything. The identical false claim a directory used to produce, one path
+state over. `present` is `os.path.exists()`'s own answer now, and the state has
+a name.
+
+#### One engine defect a verdict uncovered
+
+**`stage_context` wrote a context table with NO COLUMNS.** The `input:gff` row
+says an empty GFF "writes a table with no rows, exactly as the unset case
+does". It did not: the unset branch writes
+`pd.DataFrame(columns=["protein_id"])`, while a GFF that parsed to nothing fell
+through to `pd.DataFrame([]).to_csv()`, which writes one newline and no header
+at all — so `context.tsv` was one byte, `nonempty()` was true, and
+`parse_context`'s `pd.read_csv` raised `EmptyDataError: No columns to parse
+from file`. `integrate` ALWAYS runs, so that killed every run with
+`run.context` on whose GFF produced no rows: `doctor` 0, `run` 1, "FATAL stage
+'integrate' failed: No columns to parse from file". A HEADER-ONLY GFF with no
+CDS records is the same defect through a different door, and that one is
+outside `doctor`'s scope entirely — the file is neither missing nor empty, so
+`doctor` reports `ok` for it and must, which is why the fix had to be the
+engine's. Both branches write the column now, and a test asserts the two files
+are byte-identical.
+
+#### Six claims the third reading corrected
+
+**`verdict.rule` dropped the whole `blocks_commands` class**, and it is the
+statement of the rule a consumer actually parses, because it is IN the
+document. It said a check fails exactly when an enabled STAGE dies on it, or
+the declared `setting_ignored` exception — neither of which covers
+`r:package:limma`, which is `status: "fail"`, `blocks: []`, `blocks_commands:
+["report", "object"]` and no stage anywhere. `TUTORIAL.md` said the same thing;
+`doctor()`'s docstring and the README's closing sentence had it right, so three
+renderings of one rule disagreed and the loosest was the machine-readable one.
+The reason value is renamed from `stage_dies` to `stage_or_command_dies` in the
+same pass: a name that has to be explained away is a name that gets mis-copied,
+and it had been, three times. That is a renamed value in a closed enum and
+would be a `doctor_version` bump under this file's own rule — except that
+`doctor_version` 1 is in this same unreleased change set and has never shipped,
+so there is no consumer to break. The config sweep could not have caught
+this — and it is `CONFIGS` in `tests/test_doctor_json.py`, a named list the
+tests parametrise over, not the 768-way product this sentence used to claim:
+`no_r_env()` strips `Rscript` from PATH for every subprocess `doctor` call, so
+no R failure is ever in a swept document and `blocks_commands` never appeared
+in one. The sweep carries a `no_faa` config now, and the R rows get
+the sweep's own invariants in process.
+
+**`expect.because` was still assumed for every `tool` row.** The blanket branch
+returned "found on PATH by `have()`; every stage that uses it dies first" for
+every tool — and on `req:smorf` it returned that beside `blocks: []` and
+`degrades: ["smorf"]`, so one object contradicted itself. This is the defect the
+`interproscan` and `esmfold` fixes above set out to kill, left standing on the
+branch they did not take. Both halves are derived now: the probe from a table
+driven against `requirements()` one executable name at a time, and the cost
+from the same `requirement_effect()` call that fills `blocks` and `degrades`.
+
+**`found.kind`'s null is documented, and the two missing states have names.**
+The README enumerated seven values "so a consumer never has to do arithmetic on
+bytes" while `_check()` explicitly admits one more — its guard is `not in
+(None,) + DOCTOR_FOUND_KINDS` — and every requirement row, the CUDA probe and
+the whole R block emit a non-null `found` whose `kind` is `null`, which in the
+default document is the MAJORITY of the rows. The null is
+deliberate and means "this build did not compute it"; the defect was that
+nothing said so while both the constant and the README told a consumer to
+switch on the field. `other` and `unreadable` join the set at the same time —
+the comment beside the constant had named both as values that "would not have
+been a bump", while `_found()` was answering `absent` for both.
+
+**The depth ratchet did not bite downward for `skip` rows.** `config` is
+defined as "consulted nothing outside the config", and every skipped input row
+was stat'ing its path to fill `found` and then reporting `config` — while a TMT
+root row was claiming `kind` over a `quant_table` nobody had configured. The
+guard is symmetric now in both senses: an unset `found` is not evidence of a
+stat, and a real one forbids the `config` claim. `_stat_depth()` derives it, so
+no row writes its own.
+
+**The count of checks that read INTO a file is derived.** The document said
+"three checks" in PUBLISHED text — the `caveat` on every
+`tmt:<plex>:annotation` row — while its own `scope.statement` said four, and
+"go past a header" was not even the same predicate, since the quant-table check
+reads the header line and nothing else. Four places were counting by hand.
+`DOCTOR_DEEP_CHECKS` is the tuple now; nothing counts it, and a test asserts no
+hand-written count of "checks" is left in the file.
+
+**`read_protein_table` and `taxon_map` do not exist.** Four sentences added
+by this change set named a `read_protein_table` that has never been in this
+tool — `read_manifest` is reached from `read_feature_table` and from
+`stage_join`, whose protein-level path is inline `pd.read_csv` plus column
+detection — and two more named a `taxon_map`, where the function that logs
+"falling back to eggnog" is `resolve_taxonomy()`. A test now walks every
+backticked call this section writes and refuses one the tool and the suite do
+not define, which is why the two invented names are written here without their
+parentheses.
+
+#### Five more false verdicts, from a differential sweep against `run`
+
+The fourth wave, and the reason it exists: the three before it read the rows
+against the engine. This one RAN both — every configured input through every
+state a path can be in, `doctor` against the real `run`, and compared the exit
+statuses. Four of the five below came out of a single cell of that table.
+
+**A mode-000 input passed every check that branches on `kind == "file"`.**
+`_found()` reached `unreadable` only when `os.listdir()` or
+`os.path.getsize()` raised, and `getsize()` is a STAT: it needs search
+permission on the parent directory and nothing at all on the file, so a
+regular file nobody may open answered its own size cheerfully and came back
+`kind: "file"`. Measured, four rows said `ok` while `run` exited 1 on
+"Permission denied" — `proteins_faa` (`emapper`), `quant_table` (`join`),
+`gff` (`context`) and `emapper_precomputed` (`emapper`). Shared FragPipe or
+eggNOG output on a cluster is the ordinary way an input gets into this state,
+and the remedy is a permission, which is exactly what `unreadable` exists to
+say and could not: the state had a name in `DOCTOR_FOUND_KINDS`, a sentence in
+`_present_kind_phrase()` and a `finding`, and was reachable for a DIRECTORY
+only. `os.access()` now answers alongside `getsize()`, `PATH_STATES` in the
+suite gained the `unreadable_file` it never had, and the four rows are tested
+by driving `run` and asserting the stage it dies in is the stage the row
+NAMES.
+
+**`gpu:topology` was identical for all three values of the key it names.**
+`stage_tmbed` maps `tmbed_use_gpu` onto three different command lines — `auto`
+to `--use-gpu --cpu-fallback`, `true` to `--use-gpu --no-cpu-fallback`, `false`
+to `--no-use-gpu` — and the row was `warn` / `blocks: []` /
+`degrades: ["tmbed"]` for all three. Two of those are wrong in opposite
+directions. TMbed tolerates a missing or failing GPU only under
+`--cpu-fallback`, so under `true` on a CPU-only host every chunk fails, every
+protein lands in `tmbed_failed.tsv`, and the stage dies on "tmbed finished 0
+of N prediction(s)" — unless `tmbed_allow_partial` is on, in which case it
+returns with an EMPTY prediction file, which is a degradation and not a death.
+So the verdict is fatal, and which of the two it is depends on a SECOND key
+the row never mentioned. Under `false` nothing is fatal, but the row still
+advised "Set `tmbed_use_gpu: false`" to an operator who had already set it —
+and the slowness there is not a fallback, it is the configuration. The three
+command lines are `TMBED_GPU_MODES` now, read by the stage and by the row, and
+a stub `tmbed` that refuses `--no-cpu-fallback` drives the fatal half.
+
+**`input:contigs_fna` EMPTY asserted an outcome only the host decides.** It
+said `stage_smorf` "hands the empty assembly to whichever ORF finder is
+installed and writes an empty candidate list" — two claims welded together,
+and which one happens depends on whether an ORF finder is on PATH: with none
+the assembly is never opened at all. That is the exact fault the DIRECTORY
+branch one state over had already been corrected for, left standing on the
+neighbouring branch. It reads `smorf_tools()` now and carries
+`depends_on: ["req:smorf"]` like its neighbour.
+
+**A requirement row promised that restoring the quant table would make it
+fatal, where it would not.** TWO conditions take `join` out of a requirement's
+`blocks` — an absent quant table, and, for `ncbi_taxonomy`, an empty
+`taxon_rank` — and the contingency sentence is about only the first.
+`depends_on` was derived beside `requirement_effect()` rather than from it
+("join is on, the quant table is gone, and join's `requires` tuple names this
+id"), so on `taxon_rank: ""` it sent an operator to restore a file that would
+change nothing. `requirement_effect()` takes the contingency as a parameter
+now and the row asks it the actual question: would restoring the quant table
+put `join` in `blocks`.
+
+**The TMT level file's only test was `os.path.exists()`.** `tmt:<plex>:
+level_file` fired when the file was absent and said nothing about any other
+state — while `read_fragpipe_tmt`'s guard is the same `os.path.exists()`, so
+it does not die there either. Driven one state at a time on that reader: a
+DIRECTORY raises `IsADirectoryError` out of `header_columns()`, a chmod-000
+file raises `PermissionError` there, an EMPTY one gets past it and dies in
+`read_delim_table` with pandas' `EmptyDataError`, and a FIFO does not raise at
+all — it blocks. None is a `StageError`, none is caught downstream, and all of
+them cost every consumer of the tree. The row is a three-way split now, like
+every other input in the file.
+
+#### Four states of a path that produced no document at all
+
+Worse than a wrong verdict, and the reason the fix below is structural rather
+than a fifth branch. A command that prints nothing has no contract: every
+other row — the tools, the databases, the resources, the R block — goes down
+with the one that could not be read, and there is nothing in the document to
+be wrong, so nothing can notice. Three previous rounds each fixed the site
+that had just been caught.
+
+**A FIFO at a plex's annotation file made `doctor` HANG INDEFINITELY.** Not
+fail — hang. `tmt_annotation_path()` guards only `os.path.exists()`,
+`read_tmt_annotation()` goes straight to `opener()`, which at the time was a
+bare `open()`, and a read-only open of a FIFO with no writer used to block
+with nothing to interrupt it. No document AND no
+exit, which is worse than any traceback, because a caller waiting on the
+process has nothing to time out against either.
+
+**A chmod-000 annotation file, and a directory at the same path, printed a
+traceback and zero bytes of stdout.** `PermissionError` and
+`IsADirectoryError` are `OSError`s, and the `except` beside the call was
+`StageError` alone — the identical shape as the `manifest` directory two waves
+ago, at the one site that fix had not reached.
+
+**A chmod-000 plex directory took the document down from an `os.listdir()`
+inside an f-string.** The level-file row was building a helpful "`{pdir}`
+holds …" sentence, and a directory nobody may list raises `PermissionError`
+out of the `sorted(os.listdir(pdir))[:8]` in the middle of it. A sentence's
+garnish may not be able to fail; it goes through a `_dir_sample()` that cannot
+raise.
+
+**A FIFO at `--config` hung every subcommand, not just `doctor`.**
+`load_config()` guards `os.path.exists()` and `os.path.isdir()`, and neither is
+false for a FIFO, so `run`, `describe` and `doctor` all blocked on the open.
+It is a named refusal now.
+
+And the fix is one gate, not a fifth branch. `regular_readable()` proves a path
+with an `os.open(O_RDONLY | O_NONBLOCK)` and an `fstat()` on the descriptor:
+`O_NONBLOCK` is what makes a FIFO return instead of wait, `fstat()` is the only
+"is this a regular file" test that cannot be raced by the path changing under
+a stat, and opening at all is the only test a permission cannot lie to.
+`_deep_readable()` wraps it for `doctor` and hands back the sentence as well
+as the verdict; every check that reads into a file goes through it, and each
+keeps a wide `except` as the backstop for the state the gate did not
+anticipate. A test walks EVERY path `doctor` can be pointed at — the six
+configured input keys, `emapper_precomputed` among them, and the TMT tree's
+plex directories, level files and annotation files — through absent, empty,
+directory, dangling symlink, FIFO, socket, device node, unreadable directory
+and unreadable file, asserting in all 81 cases that stdout parses as JSON and
+that the process EXITS, with a timeout so a future hang fails the test instead
+of wedging the suite. `emapper_precomputed` was outside that sweep while the
+sentence said EVERY, which is the same shape of claim as the counts below: it
+is in it now, and its nine cells were clean. A second test parses
+`metaannot.py` and asserts the RULE: a function that emits rows and reads into
+a file must call `_deep_readable()` and must carry the backstop.
+
+#### Ten claims the fourth reading corrected
+
+**A FIFO at an input does not make the stage DIE — it makes `run` HANG, and
+the rows said "dies".** The differential sweep that found the mode-000 defect
+above also ran `run` on a FIFO at `proteins_faa`, `quant_table`, `manifest`
+and `gff`, one at a time, and it never returned on any of them: `read_fasta`,
+`read_manifest` and `parse_gff` all reach `open()` eventually, and a read-only
+open of a FIFO with no writer blocks. `blocks` is still the honest
+machine-readable answer — the stage does not complete either way — but "not
+one of them can get a FASTA out of this" sends an operator looking through a
+log for a failure that is never coming, and a run left overnight on it looks
+exactly like a long stage. The rows say what really happens now. `opener()` is
+deliberately NOT changed: a FIFO with a writer on the other end reads
+perfectly well, and refusing one would remove something that works. `doctor`
+is the command that may never block, which is why only `doctor` guards the
+open.
+
+**"NULL IS AN EIGHTH VALUE", beside a tuple of nine.** The third consecutive
+round to ship a wrong hand-written count, and the second of them inside the
+comment on the very constant that enforces the set being counted. The comment
+states no position at all now; `DOCTOR_NULL_KIND_NOTE` derives the ordinal
+from `DOCTOR_FOUND_KINDS` and a test recomputes the README's.
+
+**"the DIAMOND usability rows" were named in the null-`kind` list, in three
+places, and never belonged there.** `db:diamond:<tag>:usable` is built with
+`found=_found(path)` and carries a real kind, which makes it the document's
+own counterexample to the sentence it was named in. The families that really
+carry a null are `DOCTOR_NULL_KIND_ROWS` — `(prose, id glob)` pairs, not a
+sentence — and a test drives a document containing every one of them and holds
+the list against the rows that really carry one.
+
+**The count of non-verdict entries accounted for thirty-two of thirty-three.**
+"One attribution that was never a verdict and twelve corrections" left out the
+ENGINE defect, which is also an entry that changes no config's verdict. The
+sentence names every bucket now and a test sums its clauses against the groups
+that are not false verdicts.
+
+**`input:contigs_fna` wrote its own `depth`.** The present-and-wrong-kind
+branch hard-coded `depth="kind"`, which made the previous round's "`_stat_depth()`
+derives it, so no row writes its own" false — invisibly, because for a
+DIRECTORY the two agree. They stop agreeing the moment `unreadable` is
+reachable for a file, which is the fix above. `_check()` now enforces the
+ratchet in that direction as well: a row carrying a real `found` may not claim
+a depth DEEPER than its `found.kind` justifies without a `caveat` saying what
+it read. That is the structural version — the branch is fixed, and the next
+one cannot be written wrong without failing at the point the row is made.
+
+**"The 768-config sweep could not have caught this."** There is no 768-config
+sweep. `CONFIGS` in `tests/test_doctor_json.py` is a named list the doctor
+tests parametrise over, and the number was the size of a cartesian product
+nobody ever ran. The sentence names the list now, and a test checks the list
+is still there.
+
+**`smorf.faa` is `smorf_proteins.faa`.** The `contigs_fna` row told an
+operator to look for a file at a path this tool has never written;
+`Paths.smorf_faa` is `results/smorf/smorf_proteins.faa`.
+
+**`expect.derived_from` named a `tmt.annotation_glob` that has never been a
+config key.** The key is `tmt.annotation` — a pattern or a `{plex: path}` map —
+and `derived_from` exists precisely so a front end can render "this wants a
+file because <key> decided", which a key that does not exist cannot do.
+
+**`TUTORIAL.md` said the `== R ==` block "probes four packages ... and checks
+neither knitr nor pandoc".** It probes fourteen packages and checks `pandoc`, and has
+since the release that widened it; the sentence that described the old probe
+outlived it. This is what the count sweep below was for.
+
+**Every count in prose is now DERIVED or PINNED.** Three consecutive rounds
+shipped a wrong hand-written count, so the fix is the class: a test scans all
+six surfaces a count can live in — metaannot.py's comments and docstrings, the
+document `doctor --json` emits, the test suite's own comments and docstrings,
+the README, the TUTORIAL and this file's Unreleased section — for
+every "<number> <countable noun>", and requires each to be classified as
+DERIVED (recomputed from the source, right there, and compared), MEASURED (a
+fact about a dataset or a host: not recomputable, so the pin is that the
+SENTENCE STILL EXISTS and an edit cannot strand it) or PROSE (not a
+cardinality of anything this codebase has, with the reason written down). A
+new count that is none of those fails the test and is named with its context.
+`ASSIGNMENT_CLASSES` was added so the README's "five values" has something to
+be derived FROM, and the join log line is built from it.
+
+#### Six claims the fifth reading corrected
+
+**Five of the seven closed vocabularies were enforced nowhere but in the eleven
+configs the tests walk.** `_check()` guarded `found.kind` and `expect.kind` and
+wrote down the reason — a typo here should be a loud failure and not a value a
+consumer's switch falls through on — and that reason never applied to only two
+of them. Fed a near-miss straight into `_check()`, `status` accepted `"faill"`,
+`remedy` accepted `"confgi"`, `depth` accepted `"kindd"`, `fails_reason`
+accepted `"setting_ignorred"`, `blocks_commands` accepted `["repport"]`, and
+`blocks` — whose names join to `describe --json`'s `stage_names` — accepted
+`["run"]`, which is a COMMAND. `status` is the expensive one: `exit_status` is
+`1 if fails else 0` counted over `status == "fail"`, so a row that MEANS to
+fail and misspells it is a silent zero, in a branch no config in the suite
+reaches, with nothing anywhere objecting. Every one of them is guarded now, at
+the place the rows are made and before anything downstream reasons about the
+value; `blocks` and `blocks_commands` are checked against EACH OTHER, so a
+command in the stage list is refused with the sentence that ends the mistake
+rather than with "unknown stage"; and `degrades`, which is a stage list too,
+got the same guard. A table-driven test drives a near-miss into every
+vocabulary, and a second test asserts that every closed `DOCTOR_*` tuple has a
+row in that table — because the defect was an omission, and an omission is
+caught by an enumeration or not at all.
+
+**Three published sentences said a stage "dies" on a path where `run` HANGS.**
+The differential sweep's only `doctor`-against-`run` disagreements were seven
+FIFO cells, and in every one `doctor` was right and fast while `run` never
+returned — and three sentences still described that as a death.
+`precomputed_emapper:<i>` said "it dies reading this"; driven, `prepare_emapper()`
+on a FIFO was still scanning after six seconds and returned only when a writer
+arrived. `tmt:<plex>:level_file` said the reader "opens the path for the header
+and cannot read a table out of it", which is a sentence about a call that
+RETURNS; driven, `header_columns()` on a FIFO was still alive after five, while
+its SIBLING row twenty lines below in the same loop already said "or, on a FIFO
+with no writer, never returns at all". `TUTORIAL.md` told an operator that a
+directory "dies as it opens the path" and that "a FIFO or a socket behaves the
+same way". The verb is DERIVED now — `_open_outcome()` reads it off
+`found.kind`, exactly as `_stat_depth()` derives the depth and
+`_present_kind_phrase()` derives what is there — because a verb is a claim
+about a path state, and a hand-written claim about a path state is true of the
+state its author had in mind. Two more were found with it: the
+`emapper_precomputed` failure row was the one fail row in the document with no
+`_present_kind_phrase()` on it, so a FIFO there was not even named as one; and
+the `quant_table` row appended the FIFO paragraph to its `fragpipe_tmt` arm,
+where `tmt_plex_dirs()` only globs and nothing is ever opened — a hang claimed
+where there is none, which is the same defect pointing the other way.
+
+**`run` hangs on a FIFO, that is an engine defect, and it stays.** The decision
+is recorded where the primitive is rather than only here, because a CHANGELOG
+entry ages out of the file a maintainer is reading. `regular_readable()` would
+turn all seven hangs into refusals with a message, and it is deliberately not
+called from a stage, for two MEASURED reasons. It cannot tell a FIFO that will
+never be written from one being written right now — `O_NONBLOCK` returns at
+once either way and `fstat()` says `S_ISFIFO` either way — so a gate would
+refuse `mkfifo p; zcat big.faa.gz > p &`, which is how a disk-constrained
+cluster feeds this tool and which works today. And the probe is not a
+read-only observation: it opens the read end and closes it, and the producer
+gets `EPIPE` for it — driven, the writer died with `BrokenPipeError` while
+`regular_readable()` was deciding. A gate in front of a stage's open would
+destroy the stream it was meant to protect. `doctor` may never block, because a
+command whose job is to answer before the run is worthless if it hangs; `run`
+may block, because blocking on a pipe is what reading a pipe is. Two tests pin
+the capability, so a future round that decides otherwise has to retire them on
+purpose.
+
+**"a consumer reading the eight fields it knew about is unaffected by a NINTH
+appearing", over a per-stage dict that emits ten.** The fourth consecutive
+round to ship a wrong hand-written count, and this one sat above BOTH `requires`
+and `degraded_by`, which arrived together in this change set.
+`tests/test_config.py` used the identical construction for `cost` correctly and
+`DESCRIBE_PER_STAGE` in that same file lists all ten, so two files disagreed
+and the one in the shipped source was the wrong one. The comment states the
+rule without a hand-count now, and the one number it does carry is recomputed
+from the dict literal itself.
+
+**The count scanner could not see a number written in digits, did not read
+`tests/`, and read four constants where the emitted document is wider.** Three
+structural reasons the sweep that was built to end this class did not catch the
+fourth instance, all fixed here rather than in the sentence. `_COUNT_RE`
+alternated over number WORDS only, so every count written 200,000 / 200 / 9 /
+12 / 14 / 768 was invisible — 768 had been caught by a bespoke test written for
+that one string. `tests/` was not one of the surfaces, and two of the three
+stale counts this round found live there, one of them in the docstring of the
+test that counts this file's own entries. And `DMND_READS` publishes "up to
+200,000 records" and "up to 200 deflines" as caveat text on real
+`db:diamond:<tag>:usable` rows — IN the emitted document, and the sentences
+that qualify its own "doctor does not parse" — hand-written, one function away
+from the literals that decided them; both are constants now, the caveats are
+built from them, and the scan reads them. The noun alternation was missing
+`rows`, `keys`, `paths`, `fields`, `files`, `surfaces`, `records`, `deflines`
+and `reasons`, two of which were the noun of a live wrong count while they were
+missing. Reading digits without drowning in them took one rule: a digit that is
+part of a larger token is not a count, so `2.4 MB` is not "4 MB", `mode-000` is
+not "000" and `cost-3 stages` is not "3 stages", and a unit between the number
+and the noun disqualifies the pair, so "a 4 MB state file" is not four states.
+
+**Tests that passed without the fix they name.** A test that cannot fail is
+worse than no test, because the next reader believes the thing is pinned. The
+null-kind test asserted only that every row carrying a null `found.kind` is
+named by `DOCTOR_NULL_KIND_ROWS` — so putting "the DIAMOND usability rows" back
+into that constant, the exact false entry that stood for three rounds, passed
+it unchanged. It now asserts the other direction too: a glob may only name rows
+that really carry a null, and it has to name some. `_fifo_clause()`
+reaching "every row a FIFO can reach" was a claim a report made and nothing
+checked; the rows are a list now and a parametrised test drives a FIFO into
+each and holds the row against what the reader really does — with the mirror
+test that a DIRECTORY at the same path is described differently, so the fix
+cannot be one hard-coded verb. A duplicate
+FIFO-streaming test added this round was deleted in favour of the one in
+`tests/test_stages.py` that already drove it. And `NUMBER_WORDS` was defined
+twice in `tests/test_docs.py`, the second shadowing the first, so three
+assertions written against a table containing `"no": 0` were running against
+one that did not have it.
+
+#### Ten defects the sixth reading corrected, one of them the hang itself
+
+**A FIFO with no writer no longer hangs `run`: it waits, says so, and then
+dies naming the path.** Seven operator-supplied paths used to hang forever
+when a FIFO sat at them — `proteins_faa`, `quant_table`, `manifest`, `gff`,
+`emapper_precomputed`, and a TMT plex's `ion.tsv` and its annotation — all
+seven measured against the real `run`, which neither finished nor failed,
+printed nothing, and left no exit status to time out against. A previous round
+declined to fix it and wrote the reasoning into `regular_readable()`'s
+docstring, and BOTH of its reasons were correct and both were driven:
+`regular_readable()` cannot tell a FIFO nobody will write from one being
+written right now, so gating a stage on it would refuse `mkfifo p; zcat
+big.faa.gz > p &`, which is how a disk-constrained cluster feeds this tool and
+which works today; and worse, the probe is not a read-only observation — it
+opens the read end and closes it, and the writer on the other side gets
+`EPIPE`, measured, with the writer thread dying while the probe was still
+deciding.
+
+The fix keeps both of those and pays neither, by removing the thing that
+causes them: it OPENS ONCE AND KEEPS THE DESCRIPTOR. `opener()` — the single
+choke point every parser in this file reads through — now opens with
+`os.open(O_RDONLY | O_NONBLOCK)`, which on a FIFO returns at once instead of
+waiting AND releases a writer that is blocked in its own `open()`, and then
+`fstat()`s the DESCRIPTOR rather than the path, so nothing can be swapped
+underneath the decision. A regular file has the flag cleared and is read, one
+open, exactly as before. A FIFO gets a log line naming the path and saying the
+read is waiting — that alone removes the silence, which was the worst part of
+the old behaviour — and then a bounded wait for the descriptor to become
+readable; if a writer appears, `O_NONBLOCK` comes off and the read goes
+through the SAME descriptor, so the live-writer workflow is byte for byte what
+it was. If the wait expires the stage dies naming the path, the kind, and the
+setting. A socket, a device node or a directory is refused at once, naming
+what is really there. Clearing `O_NONBLOCK` before the read is not
+housekeeping: a non-blocking descriptor raises `EAGAIN` mid-stream the moment
+a writer pauses, which would have turned a working pipe into an intermittent
+failure — worse than the hang, because a hang is at least reproducible. The
+gzip branch reads the descriptor too, rather than re-opening by name;
+`emapper_precomputed` is routinely a `.gz`, so that branch is the one the
+commonest piped input goes through.
+
+**`header_columns()` opened its path with a bare `open()`, one function away
+from the gate.** It is what `refuse_isobaric_matrix()` calls before any quant
+reader runs, so a FIFO at a TMT plex's `ion.tsv` — and at `quant_table` — hung
+THERE rather than in the reader the row named. One reader outside the choke
+point is one path still hanging, which is the whole argument for there being a
+choke point. It reads through `opener()` now; `newline=""` went with the
+change and nothing moved, because the only use of the line is a
+`rstrip("\r\n")` that strips a CRLF either way.
+
+**`fifo_wait_s`, six hours, and the number is an argument rather than a
+taste.** The two costs are not symmetric. Waiting too long costs only the tail
+of a mistake already made, and it now costs it visibly, since the wait is
+announced before it starts. Waiting too briefly costs a workflow that works,
+and the writer that has to survive is not the shell one-liner — it is a
+producer that is itself a queued job on a shared cluster, where waits are
+measured in hours, so anything in minutes would refuse a correct setup while
+claiming to protect it. The upper bound is what makes it six and not sixty: a
+run holds an exclusive lock on its results directory while it waits, and a job
+started at the end of a working day should have failed with a message by the
+next morning rather than still be sitting on the open. `0` refuses a FIFO
+outright, for an operator who pipes nothing in. `doctor` is unchanged and
+still never waits at all: it reads every path through `_deep_readable()`,
+which is the asymmetry the two commands are supposed to have.
+
+**`section` was the eighth closed vocabulary and `_check()` did not guard
+it.** A typo took the TEXT command down with a bare `KeyError` out of
+`print_doctor()`'s `titles[seen]` — no document at all, which is the most
+expensive failure this command has — while under `--json` the row was dropped
+from `sections` in silence and left in `checks`. The enumeration tripwire in
+the suite could not see the omission either, because it collects the `DOCTOR_*`
+constants that are TUPLES and `DOCTOR_SECTIONS` was a list. It is a tuple now,
+`_check()` has the guard arm, the near-miss table has its row, and the
+tripwire works for it.
+
+**A malformed `found` or `expect` was accepted or crashed, rather than
+refused.** `found` was read through `.get("kind")`, so a dict built by hand
+without one answered `None` — which is a LEGAL value meaning "this build did
+not compute it" — and the row shipped a `found` that every consumer switches
+on and that says nothing. `expect` was indexed directly, so the same mistake
+was a bare `KeyError` raised from inside the function whose entire job is to
+make a malformed row impossible, and it cost the whole document. Both are
+named now, with the sentence saying which builder to use.
+
+**README.md said the suite ships "thirteen test modules"; it ships sixteen.**
+Published, and made worse by this change set rather than by drift alone.
+
+**The state sweep's own counts were one state and twelve cells stale.** The
+entry above described it as six states and thirty cells while the sweep had
+already outgrown both numbers, and it now covers `emapper_precomputed` as
+well — which is the second half of the same correction: another entry claimed
+the sweep walked EVERY path `doctor` can be pointed at while that one key was
+outside it.
+
+**`metaannot.py` pointed a reader at a `_diamond_source_fasta` this file does
+not have.** The function is `diamond_source_fasta()`; the underscored spelling
+appeared exactly once in the repository, in the docstring that named it, and
+it is quoted here without its parentheses because a test refuses a changelog
+that names a function nothing defines — which is the same rule, one surface
+over.
+
+**Two docstrings disagreed about which paths had been measured against
+`run`.** One said flatly that seven paths hang `run` indefinitely while
+`_open_outcome()`'s hedged about which of them had been measured against the
+command and which only against the reader. All seven have now been measured
+against `run`; the two say the same, stronger thing.
+
+**The count scanner's noun list was a WHITELIST, which is the defect class
+rather than the nouns missing from it.** It could not see modules,
+vocabularies, tests, callers, assertions, branches, sentences, helpers,
+functions, guards or arms — and the two wrong counts above are exactly what a
+whitelist cannot catch. The rule is negative space now: a number followed by
+something that reads as a countable noun must be classified — derived,
+measured or exempt — or the scan fails and names the sentence. It surfaced a
+pile of counts that had never been visible, each of which is now classified.
+`_emitted_prose()` is built from a real `doctor --json` document as well,
+rather than from a hand-listed set of constants, so a number in a sentence the
+document publishes is in the scan by construction rather than by somebody
+remembering to add the constant it came from.
+
+#### Twelve defects the seventh reading corrected, and the premise under them all
+
+**`mkfifo p; zcat big.faa.gz > p &` does not work at `proteins_faa` and never
+did — the premise two rounds of this change set reasoned from was false.** A
+verifier drove that workflow end to end through the real CLI at each of the
+operator-supplied inputs, with live writers. It works at `emapper_precomputed`,
+plain and gzipped. At `proteins_faa` the run FAILS at `integrate`; at
+`quant_table` it HANGS FOREVER holding the results lock while the writer takes
+`BrokenPipeError`; at `manifest` it fails after burning the whole wait. The
+reason is one sentence and nobody checked it: an ordinary run opens each of
+those inputs MORE THAN ONCE, and a FIFO can be drained exactly once. Traced
+with a `sitecustomize` shim over `builtins.open` and `os.open`, an ordinary run
+opened `proteins_faa` four times, `quant_table` four, `manifest` three and
+`emapper_precomputed` twice. So the previous round waited six hours in order to
+then fail, and quoted as advice, in the failure, a workflow that cannot work at
+that path — which is worse than the hang it replaced, because it is
+confidently wrong.
+
+**The read count is DERIVED and a test recomputes it from a driven run.**
+`INPUT_READ_SITES` names, per configured input, every site a run opens it at
+and the condition under which that read happens; `set_read_plan()` evaluates it
+against the config in hand, because the count is a property of the RUN — a
+project with `run.unipept` on reads its quant table once more than one without,
+so a pipe that works in the first config does not work in the second. It is not
+trusted: a test drives the real CLI under an open-tracing shim and fails
+naming the new reader when one appears. (It drove two configs whose answers
+differ, which was not enough; see the eighth reading below, where it became
+`test_the_read_plan_and_the_choke_point_hold_across_the_config_space`.) A hand-written list of readers is
+exactly how this went wrong the first time.
+
+**A FIFO at a path the run opens more than once is refused at the FIRST open,
+naming the count and the reads.** Not after `fifo_wait_s`, because waiting
+cannot change the arithmetic: the first reader drains the pipe and the next
+finds an empty one. The message lists the reads, says that waiting longer,
+starting the writer earlier and making it faster all change nothing, and names
+the inputs that DO take a pipe in this config — read off the plan rather than
+asserted, so it cannot go stale against a config it was not written for.
+
+**The bare opens the previous round's report said did not exist.** That report
+stated `opener()` was the only reader of the quant table. `read_delim_table()`
+opened it again for its delimiter sniff and pandas opened it a third time, and
+that bare open at `metaannot.py:7092` is where `quant_table` ACTUALLY hung —
+the `SIGABRT` stack is `read_delim_table -> read_feature_table -> stage_join`,
+and the diff never touched it. `_fasta_lengths()`, `_count_fasta()` and a bare
+`pd.read_csv(qpath)` in the protein-level branch of `stage_join` were three
+more. All four go through `opener()` now, and a test drives a run and fails
+on any open of a configured input that does not — the CLASS, rather than the
+instances that were found by hand. (It drove one config, in which the reader
+it was written for is never reached; it is part of
+`test_the_read_plan_and_the_choke_point_hold_across_the_config_space` below.)
+
+**`quant_table` and `manifest` are single-read now, so a pipe works at them.**
+`read_named_table()` reads the header and the body from ONE open, so the
+recogniser that must run before pandas does no longer costs a second open;
+`read_delim_table()` puts its sniffed line back with `_HeadRestored()` instead
+of letting pandas re-open the path, which keeps every byte pandas would have
+seen in the order it would have seen it — asserted against a table with a
+duplicate column name and an embedded quoted delimiter, because `names=` would
+not have; `stage_join` reads one header for both of its refusals; and
+`read_feature_table` reads the manifest once and uses it for both the column
+mapping and the design. `proteins_faa` stays multi-read and is refused: the
+emapper stage and the integrate stage read it in different stages at different
+times, and one of them can be adopted from cache without the other running, so
+there is nothing clean to collapse.
+
+**`header_columns()` probed and closed in front of `read_delim_table()`'s own
+open, in the same function.** That is precisely the probe-then-close pattern
+the single-open design exists to avoid, reintroduced by the fix that was meant
+to remove it: driven, a re-opening writer took three `EPIPE`s. The
+NO-EPIPE claim was falsified by driving. There is one open on that path now.
+
+**The wait's message was FALSE in a reachable case.** A writer attached at 0s
+whose first byte lands at 5s of a 3s wait got "no writer appeared ... nothing
+has opened the other end" — both halves false — and then died of `EPIPE` at
+5.01s because the reader had given up. A non-blocking one-byte read tells the
+two apart for nothing: a pipe with no writer answers end-of-file, one with a
+silent writer answers `EAGAIN`. The refusal now says which it is, and offers
+the remedy that goes with it — start a writer, or raise `fifo_wait_s`.
+
+**A stream that ended early was not an error at all, which is the worst
+outcome here.** A writer that wrote half a FASTA and died yielded
+`[("p1", "MKV"), ("p2", "MK")]` with nothing to say the input was a fragment: a
+short read looks exactly like a complete file to every reader above the stream,
+so the number at the end of the run is wrong and looks right. The gzip branch
+was already correct — gzip is FRAMED, so a missing end-of-stream marker raises
+`EOFError`, which is now translated into a `StageError` that names the path. A
+plain stream has no frame, so what it can see is that the writer closed without
+writing a byte, or that the stream stopped in the middle of a line. A writer
+killed exactly on a line boundary is a case no amount of looking at the bytes
+can catch, and that limit is written down rather than left to be found: pipe
+`.gz` when you have the choice.
+
+**`fifo_wait_s` bounded only the first byte.** An idle writer holding the write
+end open — an `O_RDWR` keeper, a producer blocked on its own input — put the
+run straight back into the hang the setting exists to prevent, one read further
+in, and back onto the results lock it holds while it waits. The bound is an
+IDLE timeout now: every read waits at most `fifo_wait_s` for the NEXT byte. A
+writer that is streaming never comes near it, which is pinned from the writer's
+side as well as the reader's.
+
+**`metaannot.py` published a Windows fallback that does not exist.** "On
+Windows there is neither ... so `opener()` falls back there to exactly the
+plain `open()` it has always used" — there is no such branch; `opener()` calls
+`_open_for_read()` unconditionally, demonstrated with `fcntl = select = None`
+and a count: one `os.open`, zero builtin `open`. It matters past the false
+sentence, because CPython's builtin `open()` adds `O_BINARY` on Windows and a
+bare `os.open()` does not, so the gzip branch — `os.fdopen(fd, "rb")`, and
+`emapper_precomputed` is routinely a `.gz` — would have read compressed bytes
+through a CRT text-mode descriptor: CRLF translation and `0x1A` treated as end
+of file. The author reached for `getattr(os, "O_NONBLOCK", 0)` and stopped one
+flag short. `_OPEN_FLAGS` carries both, and a test reaches it by giving the
+platform an `os.O_BINARY` to find.
+
+**The derived verb was published for sockets and device nodes, where it is
+false.** `_raises_promptly()` was `f["kind"] != "other"`, and `other` is one
+bucket for a FIFO, a UNIX socket AND a device node — so a socket at
+`proteins_faa` published "dies, but not at once ... A FIFO in particular is not
+refused on sight ... waits `fifo_wait_s`", while a socket cannot be opened as
+a file at all and `os.open()` itself fails on it, which is what the stage-side
+test asserts. The two halves
+of one change set contradicted each other in the emitted document, inside the
+derivation that was built to remove exactly that defect class. `found` carries
+an `other_kind` now — a new KEY, not a new `kind`, so no `DOCTOR_VERSION` bump
+— every sentence is keyed on it, and `PATH_STATES` has a `socket` and a
+`device_node` state, whose absence is why nothing caught this.
+
+**A test that could wedge the whole suite, and a DERIVED count that derived
+nothing.** `test_the_wait_is_the_configured_one_and_zero_refuses_at_once`
+called `list(read_fasta(fifo))` on the main thread with no thread, no join and
+no timeout, twenty lines below a sibling whose docstring carries exactly that
+discipline; against a reverted `opener()` it hung until `SIGKILL`. Every FIFO
+test goes through one helper with a join now, so a regression FAILS rather than
+wedges. Separately, `COUNT_PROSE["three states"]` was a DERIVED row whose
+recompute was the literal `3` — a rule with nothing under it, one level up from
+the staleness check that exists to prevent them. It derives the states from the
+sentence that enumerates them, and `test_no_derived_count_recomputes_a_literal`
+now refuses any DERIVED entry whose recompute reads nothing at all.
+
+#### Seventeen defects the eighth reading corrected, and the class under all of them
+
+The class is this: **the read plan was a hand-written table, and a
+hand-written table states a fact once per place it happens to be true.** Every
+defect in this group is that shape or a test that could not see it.
+
+**The plan under-counted `manifest`, and `doctor --json` published the wrong
+promise before the run.** `INPUT_READ_SITES["manifest"]` named one site,
+`stage_join -> read_manifest`, and missed that `read_feature_table()` opens
+the manifest itself — so it is reached from `stage_join` AND from
+`peptide_features()` in each peptide stage. Driven with `run.unipept` and
+`run.taxonomy` on and a manifest on a FIFO with a live writer, the run logged
+"this run reads it exactly once, so it is read as a live stream" and then died
+at the second open with "this run has already read it once". The `_FIFO_TAKEN`
+backstop worked exactly as designed — a message, not a hang — and everything
+above it was wrong. Worse, `doctor` had already published "A FIFO here is NOT
+refused on sight, because this run reads this input exactly once … a supported
+way to feed this tool at a single-read input" for the same config: the command
+an operator reads before committing days of compute blessed a workflow the run
+refuses. In the toy project the taxonomy stage won the race and `join` died at
+0.3s; in a real run `join` is late, so the cost is the whole pipeline.
+
+**The plan over-counted, and the refusal quoted reads the run will not
+make.** With `unipept.result` set, `stage_unipept` ingests the export
+and *returns* before `peptide_features()`, so `quant_table` was planned 2 and
+read 1 (3 and 2 with `run.taxonomy` on). With `run.eggnog` off, nothing opens
+`emapper_precomputed` and the plan said 1. And on the MSstats formats nothing
+opens the manifest at all while the plan said 1. Over-counting refuses
+a pipe that would have worked, with a message naming reads that never happen.
+
+**The sites are derived from the same predicates `doctor` reasons with.**
+`quant_consumers()`, `_peptide_readers()` and `_manifest_readers()` already
+knew every one of those facts, because `doctor`'s rows are built on them —
+which is why one surface was right and the other wrong. The plan calls them
+now, so a row and a refusal cannot answer "who opens this input" differently.
+
+**`db.ncbi_taxonomy`'s `.dmp` files hung `run` with the results lock held.**
+Four bare `open()` calls inside `NCBITaxonomy`, on paths an operator types
+into a config exactly as they type `quant_table` — 45 seconds, no output, no
+exit status, lock not released. This is the original failure mode of the whole
+change set, intact, in the one class of path nobody had swept: an `input:` row
+made a path feel operator-supplied and a `db:` row made it feel like
+infrastructure, and an `open()` cannot tell the difference. They go through
+`opener()` now and they are in the plan, which also makes the count real: a
+config with `run.taxonomy` AND `taxon_rank` builds two `NCBITaxonomy` objects
+and reads every `.dmp` twice, so a pipe cannot work there and the refusal says
+so; with one of them, it can.
+
+**`unipept.result` was read through a bare `pd.read_csv(sep=None,
+engine="python")`.** A sixth reader of an operator-supplied path outside the
+choke point, found by tracing every open a real run makes of every path its
+config names rather than by reading the list of readers somebody had written.
+It goes through `read_delim_table()` now, which is one open, one sniff and the
+C parser instead of the slow one.
+
+**`subset --quant` hung on a FIFO, and `subset` had never been swept at all.**
+`cmd_subset()`'s protein-level branch was `pd.read_csv(args.quant, …)` — a
+path a user types on a command line, which is as operator-supplied as a path
+gets — and it blocked with no exit status. Every sweep in this suite had
+driven `run` and nothing else.
+
+**`doctor` re-opened the quant table by name after proving it.**
+`_manifest_checks()` probed with `regular_readable()` and then let pandas open
+the path again: a stat and an open with instructions in between, which is the
+race every other check in that file was rewritten to remove. It also split the
+header with pandas' own sniffer while the run splits it with `_sniff_sep()`,
+so `doctor` could pre-check a mapping against a different set of columns from
+the one the run would see. `_open_regular_text()` is `doctor`'s opener now —
+`_open_for_read()` with the waiting arm removed — and the header goes through
+the shared `_header_cells()`.
+
+**The plan test drove two configs and the choke-point test drove one.** A
+verifier reverted `read_delim_table()`'s `opener(path)` back to a bare
+`open()` — the very reader the last report named as "where `quant_table`
+actually hung" — and the whole suite came back byte-identical. It is not dead
+code: `read_delim_table` is the second reader of `quant_table` under
+`quant_format: msstats_protein` and of `analysis.metadata`. Both tests are one
+sweep over the CONFIG SPACE now — every quant format crossed with the run
+flags that move the answer — and the paths it watches are taken from the
+CONFIG rather than from the table under test, so an input nobody listed cannot
+hide. The same revert now fails seven of its points.
+
+**An input with no plan that is read twice is a failure, not a gap.** A path
+with no entry is treated as single-read, which is the hang with the refusal
+switched off — so the sweep asserts it, and that is the assertion
+`db.ncbi_taxonomy` would have failed for as long as it has existed.
+
+**The `_OPEN_FLAGS` test could only agree with itself.** It monkeypatched the
+constant with its own recomputation and then asserted that its own expression
+had the `O_BINARY` bit: driven, deleting `| getattr(os, "O_BINARY", 0)` from
+`metaannot.py` left both C1 tests passing. Same shape as the C4 defect this
+change set had just fixed, one level up, in the test written for it. It stubs
+`os.O_BINARY` BEFORE importing the module and reads `_OPEN_FLAGS` off it,
+which separates the trees: `0x8004` with the term, `0x4` without.
+
+**A character device published a sentence that contradicted its own row.**
+`_open_for_read()` falls through to `die()` for a device node and `die()`
+raises a `StageError`, which `peptide_features()` catches — measured, a
+taxonomy run over a char-device manifest logged "falling back to the
+peptide-only reader" and returned 30 rows. The `input:manifest` row keyed its
+sentence on `_raises_promptly()`, true of a character device because a
+character device answers at once, and so published "it dies with an OSError …
+every stage that opens a quant table on this format goes with it" beside its
+own `blocks: ["join"]`. `_dies_with_a_stage_error()` is the predicate now, the
+sentence and `blocks` are both computed from it, and it fixes an under-claim
+in the other direction too: a socket and a block device share the `other`
+bucket with the FIFO and end in an `OSError`, which the old
+`empty or kind == "other"` test read as survivable.
+
+**Two FIFO tests still wedged rather than failing.**
+`test_header_columns_on_a_fifo_waits_and_then_dies` and
+`test_prepare_emapper_on_a_fifo_waits_and_then_dies` each called the reader on
+the MAIN thread inside `pytest.raises` — the assertion that cannot fail, since
+against an unbounded opener the call does not raise, it blocks. Found the only
+way this class can be found: by reverting the bound and running the suite
+under a watchdog that tells a wedge from a slow test by where the main thread
+is standing.
+
+**"A socket fails ENXIO at `os.open()`" is wrong on the platform it was
+measured on.** It is `EOPNOTSUPP`. The errno is the OS's to choose and is
+published nowhere now; what is asserted, in the code and in the prose, is that
+an `OSError` comes out of the open, which is the half that decides who dies.
+
+**`cmd_doctor()` computed the run's read plan and not the run's wait.**
+`set_read_plan()` was called and `set_fifo_wait()` was not, so `doctor`
+reasoned about a wait the run would not use. Latent — the FIFO clause reaches
+for `DEFAULT_CONFIG['fifo_wait_s']` explicitly — and fixed anyway, because
+"doctor reasons about the run's settings" has to be true of all of them or it
+is not a rule.
+
+**Two `doctor` rows quoted a pandas message this program can no longer
+produce.** They promised "Could not determine delimiter" for a zero-byte
+`unipept.result`, which was pandas' python-engine sniffer talking; with the
+reader through `opener()` it is "No columns to parse from file". The reader
+refuses in this file's own words now, the sentence lives in one constant both
+rows quote, and a test drives the reader and holds the row against what came
+out.
+
+**The README had the two before-counts swapped.** `quant_table` was read three
+times and `manifest` twice, not the other way round.
+
+**`DESCRIBE_PER_STAGE` grew `requires` and `degraded_by` without an entry
+here.** The change is right and was explained in a comment beside it — the two
+fields are on `STAGES`, `describe --json` emits them, and
+`test_describe_emits_every_field_a_stage_dict_carries` in the console contract
+is what forces the decision — but a tripwire that asks for a deliberate
+decision is not satisfied by a comment the changelog does not carry.
+`DESCRIBE_VERSION` does not move: nothing was removed or redefined.
+
+#### Seven defects the ninth reading corrected, and the class under all of them
+
+The class is a **claim about a read that nothing measured**: a read the plan
+did not know about, a read no sweep ever drove, or a refusal this file assumed
+somebody else's program would make. The eighth reading replaced the
+hand-written table with functions; this one drove the commands and the configs
+the functions had still never been asked about.
+
+**The read plan had no entry of any kind for a `fragpipe_tmt` tree, and that
+is `db.ncbi_taxonomy`'s defect one input over.** `quant_table` names a
+DIRECTORY on that format, and a directory is not something any reader opens —
+the per-plex `ion.tsv`/`peptide.tsv`, each plex's annotation file and, when
+`tmt.min_purity` reads one, its `psm.tsv` are. `_quant_table_sites()` returned
+`()` for the format on the grounds that a pipe at the setting itself never
+reaches an open, which is true and beside the point. Driven, a two-plex tree
+with `run.taxonomy` and `run.join` on opened every file under it twice with no
+plan entry to say so — an unplanned path is treated as single-read, so this
+was the hang with the refusal that exists to prevent it switched off. The
+paths now expand the way `_taxdump_paths()` expands its directory, and the
+files only the FULL reader opens are their own input, because the peptide-only
+reader it falls back to never opens an annotation and a site claiming it did
+would be a false read in a refusal message.
+
+**The plan under-counted the quant table wherever the peptide-only fallback
+can run.** `peptide_features()` calls the full reader, CATCHES its refusal and
+re-reads the same table with `read_feature_peptides()` — a second open of one
+operator-supplied path — and the plan said one. Driven with a manifest whose
+one run matches no column, `run.taxonomy` on and `run.join` off: two opens,
+plan said one, and `doctor --json` published the single-read promise for it.
+The site is planned now and MARKED, because it is the one read in the plan
+that turns on the FILE rather than on the config: `planned_reads()` counts it,
+which is the FIFO question — a pipe is drained by its first reader whether or
+not the second open was conditional — and `certain_reads()` does not, which is
+what a measurement of a completed run is held against.
+
+**`auto_contrasts()` read `analysis.metadata` through a bare `pd.read_csv()`,
+and `metaannot report` used to HANG on it with no exit status.** On a TMT project the
+report takes its contrasts from the operator's metadata, and that path was
+read twice: once by `header_columns()` in `_tmt_report_design()`, which is
+gated and which printed "this is a FIFO, and this run reads it exactly once,
+so it is read as a live stream", and then here. The second open found a
+drained pipe with no writer on it and blocked there — no further output,
+nothing to time out against, and `fifo_wait_s: 0`, which exists to refuse a
+FIFO outright, made no difference at all, because it bounds `opener()` and a
+bare pandas open has no wait to bound. The promise was printed one line before
+the silence. The read goes through `opener()`; the second open is refused by
+name instead, which is what `_FIFO_TAKEN` is for. A command that can hang is
+exactly as bad as a stage that can hang, and `report` holds no results lock
+only by accident.
+
+**`report` and `object` had never been swept, which is why the reader above
+survived.** The sweep that found a bare `pd.read_csv()` in `cmd_subset` drove
+`run`, `doctor` and `subset`, and a command nobody drives is a command whose
+readers nobody sees. It drives `describe`, `report` and `object` too now.
+`describe` and `object` open no operator-supplied path at all — the measured
+answer for them, asserted as one, so the day either grows a reader the sweep
+says so instead of passing on an empty trace.
+
+**`doctor`'s manifest promise was guarded by nothing in
+`tests/test_doctor_json.py`.** The correction this whole round was called for
+— no longer publishing "this run reads this input exactly once" for a manifest
+a taxonomy run reads three times — was measured by putting `_manifest_sites()`
+back the way it was: every other test in that file stayed green
+while the document published the false sentence again, and the only thing that
+fell was a plan comparison in `tests/test_stages.py`, which is a different
+file catching it as a side effect. A promise is published in the document and
+has to be pinned against the document. The new test takes its count from
+`_manifest_readers()` and not from the plan under test, because a count
+recomputed from the thing under test moves with it.
+
+**`_manifest_checks()`'s missing-manifest branch asserted who it kills instead
+of deriving it.** The wrong-kind branch beside it computes that from
+`_dies_with_a_stage_error()` — a `StageError` is a refusal `peptide_features()`
+re-reads around, an `OSError` is caught by nothing — and this one wrote the
+answer out by hand, which is how the wrong-kind branch itself once came to
+contradict its own `blocks` field. The answer does not change (`os.open()`
+raises `FileNotFoundError` on an absent path, and a driven run with the
+taxonomy stage on dies with "[Errno 2] No such file or directory" and no
+fallback); it is now the same computation rather than a second statement of
+it.
+
+**`doctor`'s `contigs_fna` row and the read plan's own comment claimed what a
+third-party ORF finder does.** The row said a path that is not a file is
+handed to `smorf`/`macrel` "which cannot read an assembly out of it", and the
+plan said a FIFO there "is refused by smorf or macrel, not by anything here".
+Nothing in this codebase establishes either, and neither is this codebase's to
+promise. The alternative — fstat the descriptor before `run_cmd` launches the
+tool — was considered and rejected, for the two facts already measured in
+`regular_readable()`'s docstring: every other check in this file opens ONCE
+and keeps the descriptor, which is what makes it both safe and free, and a
+path handed to a subprocess BY NAME cannot be checked that way, because the
+tool does its own open. Probing first is open-close-reopen, which sends a live
+writer `EPIPE` while we are still deciding, and it cannot tell a pipe with a
+writer from one without — so it would break, and then refuse, `mkfifo p; zcat
+contigs.fna.gz > p &` in order to catch a misconfiguration. Both sentences say
+what is known instead: the path is handed over as a filename, this process
+never opens it, and what happens next is that tool's answer and not this
+one's.
+
+### Changed
+
+**`doctor --fix` cannot be combined with `--json`**, and the refusal is an
+argparse mutually-exclusive group, so it **exits 2**. `die()` exits 1, which is
+also "problems found", so a caller could not have told a refused invocation
+from a failed check. `--install-plan` composes fine: the file is still written
+under `--json` and the document records it; only the line announcing it is
+suppressed, since it would otherwise land in stdout beside the JSON.
+
 ## v0.5.0 — 2026-09-10
 
 One question, asked in two halves: what can be known about a run that is still

@@ -47,6 +47,32 @@ SIGNATURE_VERSION = 1
 # a key is removed or its meaning changes; adding a key is not a bump.
 DESCRIBE_VERSION = 1
 
+# The schema of `doctor --json`. Same rule as DESCRIBE_VERSION, and for the
+# same reason: anything reading it is not in this file and cannot be fixed in
+# the same commit as the engine, so it needs to be able to say "I do not
+# understand this shape" instead of guessing. Bumped when a key is REMOVED or
+# its MEANING changes; adding a key is not a bump.
+#
+# One clause DESCRIBE_VERSION's rule does not need and this one does, because
+# this document has closed enums a consumer switches on: ADDING A VALUE TO A
+# CLOSED ENUM IS A MEANING CHANGE AND IS A BUMP. The closed sets are
+# DOCTOR_STATUSES, DOCTOR_REMEDIES, DOCTOR_FAIL_REASONS, DOCTOR_DEPTHS,
+# DOCTOR_COMMANDS, DOCTOR_FOUND_KINDS and DOCTOR_EXPECT_KINDS. Everything else
+# is an OPEN vocabulary - `finding`, the stage names in `blocks`, every
+# `detail` and every `caveat` - and a consumer that meets an unfamiliar value
+# there keeps `status` and renders `detail`, so growing one of those is not a
+# bump.
+#
+# The last two joined that list after `found.kind` and `expect.kind` were
+# found outside it: _found()'s docstring and the README both tell a consumer
+# to switch on `found.kind` and never to compute `bytes > 0` for itself, and
+# `expect.kind`'s values were enumerated in no constant, no document and no
+# test - so either could have grown a value with nothing to notice. Closing a
+# vocabulary is not itself a bump: it ADDS a promise rather than changing a
+# meaning, and a consumer that was already switching on the value is
+# unaffected.
+DOCTOR_VERSION = 1
+
 # The evidence bins, in the order build_annotation() tests them. This is the
 # single source of the bin vocabulary: the module docstring above, the report's
 # BIN_LEVELS/BIN_COLS and bin_summary.tsv all take their order from it, because
@@ -60,6 +86,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import copy
+import errno
 import fnmatch
 import glob
 import gzip
@@ -74,11 +101,12 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict, deque, namedtuple
 
 try:
     import numpy as np
@@ -89,6 +117,35 @@ try:
     import yaml
 except ImportError:
     yaml = None
+# POSIX only, and this file runs on Windows too. `fcntl` is what takes
+# O_NONBLOCK back off a descriptor before a parser reads through it, and
+# `select` is what waits a bounded time for a FIFO to become readable.
+#
+# THERE IS NO WINDOWS FALLBACK, and the comment that used to stand here said
+# there was: "opener() falls back there to exactly the plain open() it has
+# always used". It does not. opener() calls _open_for_read() unconditionally,
+# on every platform, and _open_for_read() calls os.open(). Demonstrated by
+# setting both names to None and counting: one os.open, zero builtin open.
+# The sentence was not merely decorative either - CPython's builtin open()
+# adds O_BINARY on Windows and a bare os.open() does not, so the gzip branch
+# (os.fdopen(fd, "rb"), and emapper_precomputed is routinely a .gz) would have
+# read compressed bytes through a CRT text-mode descriptor: CRLF translation
+# and 0x1A treated as end of file. The author reached for getattr(os,
+# "O_NONBLOCK", 0) and stopped one flag short; getattr(os, "O_BINARY", 0) is
+# the other half, and _OPEN_FLAGS below is where both live.
+#
+# What these two names being absent really costs is written where each is
+# used: _clear_nonblock() becomes a no-op (nothing to clear, because
+# O_NONBLOCK is 0), and _wait_readable() answers True at once, so a FIFO is
+# read straight through with no bound - which is the pre-existing Windows
+# behaviour and not a regression. Imported together because they are used
+# together and a half-available pair would be a third behaviour to reason
+# about.
+try:
+    import fcntl
+    import select
+except ImportError:                                # pragma: no cover - Windows
+    fcntl = select = None
 
 
 # ======================================================================
@@ -319,6 +376,61 @@ DEFAULT_CONFIG = {
     # deciding. This number is what that human decides on. Cheap: one small
     # file rewrite twice a minute.
     "heartbeat_s": 30,
+    # How long a reader waits for the NEXT BYTE on a FIFO before it gives up
+    # and dies naming the path, in seconds. 0 refuses a FIFO immediately.
+    #
+    # IT APPLIES ONLY WHERE A FIFO CAN WORK AT ALL, which is a much smaller
+    # set of paths than the first version of this setting assumed, and the
+    # difference was measured rather than argued. A FIFO can be drained
+    # EXACTLY ONCE, and an ordinary run opens most of its inputs more than
+    # once - so at those paths there is nothing for this number to buy. They
+    # are refused at the first open, before any wait, by the rule in
+    # _open_for_read(); see INPUT_READ_SITES for how many times each input is
+    # read and why. Driven end to end with real writers, `mkfifo p; zcat
+    # big.faa.gz > p &` worked at emapper_precomputed and failed at
+    # proteins_faa, quant_table and manifest - and it never worked at those
+    # three: the run read the pipe dry and then opened it again. Two of them
+    # were then MADE single-read, by collapsing reads that were opening one
+    # file twice for one file's worth of information, so on a default
+    # label-free project a pipe now works at quant_table, at manifest and at
+    # each emapper_precomputed entry. proteins_faa is read by two different
+    # stages at two different times and is refused. Which set applies is a
+    # property of the CONFIG, not of this comment: `doctor` prints it.
+    #
+    # So this is the bound on a SINGLE-READ path. A FIFO nobody will ever
+    # write is the same object as a FIFO somebody is about to write, and
+    # before this setting existed it was the worse half of the pair by a
+    # distance - the open blocked, `run` printed nothing, returned nothing and
+    # produced no exit status, so a caller had nothing to time out against.
+    #
+    # IT BOUNDS EVERY READ, not only the first. A writer that attaches, writes
+    # half a table and then sits there holding the write end open (an O_RDWR
+    # keeper, or a producer blocked on its own input) leaves the reader
+    # waiting for a byte that is not coming, which is the same hang one read
+    # further in. The bound is therefore an IDLE timeout: each read waits up
+    # to this long for the next byte, and a writer that is streaming never
+    # comes near it.
+    #
+    # SIX HOURS, and the number is an argument rather than a taste. The two
+    # costs are not symmetric. Waiting too long costs only the tail of a
+    # mistake that has already been made, and it now costs it VISIBLY: opener()
+    # logs the path and says it is waiting before it waits, so the silence -
+    # which was the expensive part - is gone whatever this number is. Waiting
+    # too briefly costs a workflow that works today, and the writer this has to
+    # survive is not the one in the shell one-liner above: it is a producer
+    # that is itself a QUEUED job on a shared cluster, submitted alongside the
+    # metaannot job and started whenever the scheduler gets to it. Queue waits
+    # there are routinely measured in hours, so anything in minutes would
+    # refuse a correct setup while claiming to protect it.
+    #
+    # The upper bound is what makes six and not sixty: a run holds an exclusive
+    # lock on its results directory for as long as it waits (see the lock
+    # rules), so waiting occupies something nobody else can use, and a job
+    # started at the end of a working day should have FAILED WITH A MESSAGE by
+    # the next morning rather than still be sitting on the open. Six hours is
+    # the longest wait that still satisfies that, which is why it is the
+    # default rather than a day.
+    "fifo_wait_s": 21600,
     # How many independent stages may run at once. Each gets threads //
     # stage_workers CPUs. Parallel stages multiply peak memory.
     "stage_workers": 4,
@@ -958,6 +1070,15 @@ def load_config(path):
             sys.exit(f"config not found: {path}")
         if os.path.isdir(path):
             sys.exit(f"{path} is a directory; --config takes a YAML file")
+        # A FIFO, a socket or a device node passes os.path.exists() and is not
+        # a directory, and the read below then BLOCKS FOREVER waiting for a
+        # writer - every subcommand, not just doctor, with no output and no
+        # exit. regular_readable() proves the open instead of stat'ing around
+        # it, and a mode-000 config gets a sentence here rather than a
+        # traceback further in.
+        if not regular_readable(path):
+            sys.exit(f"{path} is not a readable file; --config takes a YAML "
+                     "file this process can open")
         # yaml.safe_load keeps the LAST of two identical keys, so a config
         # that grew a second `run:` block - the shape every doc snippet has -
         # silently threw the first one away and re-enabled the stages the
@@ -1082,6 +1203,1102 @@ def die(msg):
     raise StageError(msg)
 
 
+# How long opener() waits for a writer on a FIFO, in seconds. Set from
+# config.fifo_wait_s at the start of a run, exactly as _PROGRESS_INTERVAL is
+# and for the same reason: every parser in this file reads through opener(),
+# and threading a cfg through all of them would touch code that has nothing to
+# do with pipes.
+_FIFO_WAIT = float(DEFAULT_CONFIG["fifo_wait_s"])
+
+
+def set_fifo_wait(seconds):
+    """Set the FIFO wait, refusing a boolean rather than floating it.
+
+    `fifo_wait_s: true` is a plausible way for someone to write "yes, wait",
+    and bool is an int in Python: float(True) is 1.0, so it would become a
+    ONE-SECOND wait that refuses every legitimate FIFO on a busy machine while
+    looking as though the setting had been honoured. That is exactly the
+    reading heartbeat_s was given by the same typo, and it is why that one is
+    fatal too.
+    """
+    global _FIFO_WAIT
+    if isinstance(seconds, bool):
+        raise TypeError("fifo_wait_s is a number of seconds, not a boolean")
+    _FIFO_WAIT = max(0.0, float(seconds or 0))
+
+
+# ======================================================================
+# how many times a run opens each operator-supplied path
+# ======================================================================
+# THE FACT EVERY FIFO DECISION IN THIS FILE RESTS ON, and it was never checked
+# before it was reasoned from. Two rounds argued about protecting `mkfifo p;
+# zcat big.faa.gz > p &`, and a verifier then drove that workflow end to end
+# through the real CLI at each of the four operator-supplied inputs. It works
+# at ONE of them. At the other three the run fails, or hangs holding the
+# results lock while the writer dies of EPIPE - and it never worked at them,
+# because a FIFO can be drained exactly once and an ordinary run OPENS EACH OF
+# THOSE PATHS MORE THAN ONCE. Traced with a sitecustomize shim over
+# builtins.open and os.open, on a real `run`:
+#
+#   proteins_faa         3 stream reads   emapper, then integrate twice
+#   quant_table          0..3             depends on the format and on how
+#                                         many stages want peptides
+#   manifest             0..3             the join, and each peptide stage
+#                                         through read_feature_table
+#   emapper_precomputed  1 per entry      which is why it is the one that
+#                                         works
+#   unipept.result       1                ingested once by stage_unipept
+#   db.ncbi_taxonomy     1 or 2 per .dmp  stage_taxonomy, and stage_join when
+#                                         taxon_rank is set
+#
+# THE LAST TWO ROWS ARE THIS ROUND'S, and their absence is the reason this
+# section is now written as functions instead of as a table of rows. A `db:`
+# path felt like infrastructure and an `input:` path felt operator-supplied,
+# and an open() cannot tell them apart: NCBITaxonomy() read four .dmp files
+# through bare open() calls and read_unipept_result() reached its export
+# through a bare pd.read_csv(), so a FIFO at any of them left `run` blocked in
+# the open with no exit status and the results lock still held.
+#
+# THE MANIFEST ROW IS THE OTHER CORRECTION. It said 1, flatly, and the run
+# made 3 on a config with the taxonomy stage on - because read_feature_table()
+# opens the manifest itself and is reached from stage_join AND from
+# peptide_features() in each peptide stage. `doctor --json` published "this
+# run reads this input exactly once" for that config, which is a promise the
+# run then refuses at the second open.
+#
+# A wait cannot help a path in the first column. Waiting six hours and then
+# failing is strictly worse than the hang it replaced, because the failure
+# arrives after the cost has been paid and the message that came with it
+# quoted, as advice, a workflow that cannot work at that path.
+#
+# SO THE RULE IS: a FIFO at a path this run will open more than once is
+# refused at the FIRST open, naming the count; a FIFO at a path read exactly
+# once keeps the bounded wait and streams. Everything published about the FIFO
+# workflow - the README, the TUTORIAL, CLAUDE.md, the fifo_wait_s comment, the
+# doctor rows and the refusal itself - names the paths where it works, and
+# names them by reading this table rather than by asserting them.
+#
+# WHY THESE ARE SITES AND NOT NUMBERS. A hand-written count is how this went
+# wrong the first time: the previous round's report stated that opener() was
+# the only reader of the quant table, which was false in the same function -
+# read_delim_table() opened it again, and that bare open is where quant_table
+# actually hung. A count cannot be checked against the code; a named SITE can,
+# because a test can drive a real run, watch every open of every configured
+# path, and demand that the sites it sees are exactly these.
+# test_the_read_plan_and_the_choke_point_hold_across_the_config_space in
+# tests/test_stages.py is that test, and it fails naming the new reader when
+# one is added.
+#
+# AND WHY THE SITES ARE COMPUTED RATHER THAN LISTED. A named site is still a
+# fact written down once per place it is true, which is one place too few the
+# moment a reader is reached from three stages - see the manifest above. The
+# site functions below call quant_consumers(), _peptide_readers() and
+# _manifest_readers(), which are the functions doctor's own rows ask "who
+# opens this input", so the published promise and the refusal are one
+# computation and cannot disagree.
+#
+# WHAT IS DELIBERATELY NOT IN HERE: the signature digest. _content_digest()
+# reads every input listed in a stage's `inp`, so on a REGULAR file each of
+# these paths is opened once more than the numbers above - and that is the
+# subtle one, the reason "any input in a stage signature is read at least
+# twice by construction" is true and the reason a naive count would refuse
+# emapper_precomputed, which demonstrably works. It is not in here because a
+# digest never touches a path that is not a regular file: _stat() asks
+# os.path.isfile() first, and _open_regular_binary() proves it on the
+# descriptor rather than on the path, so the digest of a FIFO is not merely
+# skipped by luck. Both halves are pinned -
+# test_the_signature_digest_never_opens_a_stream drives it.
+#
+# Each entry is (paths, sites): two functions over the config, because the
+# count is a property of THIS run and not of the program - a project with
+# run.unipept on and no `unipept.result` reads its quant table one more time
+# than one without, and a FIFO that works in the first config does not work in
+# the second - and because an input is not always one config value either.
+# emapper_precomputed is a list; db.ncbi_taxonomy is a directory whose .dmp
+# files are what get opened.
+def _cfg_paths(key):
+    """The path or paths one config setting names, with the blanks dropped.
+
+    Dotted, so a nested setting - `db.ncbi_taxonomy`, `unipept.result` - is
+    reached the same way a flat one is, and list-tolerant, because
+    `emapper_precomputed` is a LIST of paths each of which is read once.
+    Writing the list case down here is what let set_read_plan() stop carrying
+    a special case for that one key, and that special case was not free: it
+    appended its site unconditionally, so a config with `run.eggnog: false`
+    had a plan promising one read of a table that nothing would open, and the
+    refusal message would have quoted it.
+    """
+    def paths(cfg):
+        node = cfg
+        for part in str(key).split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        vals = node if isinstance(node, list) else [node]
+        return [str(v) for v in vals if v]
+    return paths
+
+
+def _taxdump_paths(cfg):
+    """The taxdump FILES a run opens, which is not what `db.ncbi_taxonomy` is.
+
+    That setting names a DIRECTORY, and a directory is not an input any reader
+    here opens: the four .dmp files inside it are. Two of them are optional,
+    and NCBITaxonomy() guards those two with os.path.exists() - so the plan
+    asks exactly the same question rather than promising a read of a file that
+    is not there. nodes.dmp and names.dmp are unconditional and are listed
+    whether or not they exist, because a path that is absent is never opened
+    and a plan entry for one costs nothing.
+    """
+    d = ((cfg.get("db") or {}).get("ncbi_taxonomy") or "")
+    if not d:
+        return []
+    out = [os.path.join(str(d), "nodes.dmp"), os.path.join(str(d), "names.dmp")]
+    return out + [q for q in (os.path.join(str(d), "merged.dmp"),
+                              os.path.join(str(d), "delnodes.dmp"))
+                  if os.path.exists(q)]
+
+
+# ----------------------------------------------------------------------
+# the sites, per input, DERIVED from the same predicates doctor reasons with
+# ----------------------------------------------------------------------
+# WHY THESE ARE FUNCTIONS OVER THE CONFIG AND NOT ROWS OF A TABLE, and it is
+# the correction this round exists for. The table that stood here wrote each
+# input's readers out by hand, one row per (stage, input) pair, and a
+# hand-written pair is a fact stated once per place it is true - so the day a
+# reader is reached from three stages, it can be remembered at one of them and
+# forgotten at the other two. That is precisely what happened to `manifest`.
+# Its row named ONE site, `stage_join -> read_manifest`, and missed that
+# read_feature_table() opens the manifest itself: on a run with the taxonomy
+# stage on, peptide_features() -> read_feature_table() opened the same
+# manifest a SECOND time, the plan still said once, and `doctor --json`
+# published "A FIFO here is NOT refused on sight, because this run reads this
+# input exactly once" for a workflow the run then killed at the second open -
+# late, after the pipe had been drained, on the command an operator reads
+# before committing days of compute.
+#
+# So the sites are now computed by the SAME functions doctor's own rows ask
+# "who opens this": quant_consumers(), _peptide_readers() and
+# _manifest_readers(). Those already knew everything the table got wrong -
+# that stage_unipept RETURNS before peptide_features() when `unipept.result`
+# is set, that the peptide stages refuse a protein-level format before they
+# open anything, that read_manifest is reached from read_feature_table on
+# fragpipe_peptide/fragpipe_ion and from stage_join's own branch on
+# diann/fragpipe and from nowhere at all on the MSstats formats. One function
+# per question means a doctor row and the read plan cannot answer it
+# differently, which is the only structural guarantee available here: the
+# published promise and the refusal are now the same computation.
+#
+# They are DEFINED here and CALLED much later in this file. That is not an
+# ordering accident: these are closures evaluated when set_read_plan() runs,
+# by which time every helper below exists, and keeping the plan beside the
+# FIFO rule it feeds is worth more than keeping it beside its helpers.
+def _proteins_faa_sites(cfg):
+    """Three stream reads on a default run, and the reason a FIFO is refused.
+
+    build_annotation() walks the fasta twice - once for ids and lengths, once
+    for the dark work-lists - and prepare_emapper() walks it again when the
+    eggNOG stage runs. The integrate reads are unconditional because the two
+    integrate stages have no run: flag at all; only the emapper one moves with
+    the config, and with `run.eggnog: false` this really is two.
+    """
+    sites = []
+    if (cfg.get("run") or {}).get("eggnog"):
+        sites.append("stage_emapper -> prepare_emapper -> read_fasta")
+    return tuple(sites) + (
+        "stage_integrate_pass1 -> build_annotation -> read_fasta "
+        "(ids and lengths)",
+        "stage_integrate_pass1 -> build_annotation -> read_fasta "
+        "(the dark work-lists)")
+
+
+# The suffix that marks a site as a read this run MAY make and not one it
+# WILL make, and the only one of its kind: peptide_features() calls the full
+# quant reader, CATCHES its refusal and re-reads the same table with the
+# peptide-only reader, so whether that second open happens is a property of
+# the TABLE and not of the config. The plan cannot predict it and must not
+# pretend the read is impossible either - so it is planned, and marked.
+#
+# Marked rather than left out, because the two questions the plan answers want
+# opposite defaults. "How many reads does a completed run make" wants the firm
+# ones (a conditional re-read that did not happen is not a defect in the
+# plan); "may this path be opened more than once", which is the FIFO rule's
+# question and the one `doctor --json` publishes an answer to, wants every
+# read that CAN happen - a pipe is drained by the first reader whether the
+# second open was conditional or not. certain_reads() is the first, and
+# planned_reads() stays the second.
+CONTINGENT_READ = " (only when the full quant reader refuses the table)"
+
+
+def _is_contingent(site):
+    return str(site).endswith(CONTINGENT_READ)
+
+
+def _peptide_fallback_readers(cfg):
+    """The peptide stages whose peptide_features() can open the table TWICE.
+
+    THE PREDICATE peptide_features() never had, and the reason a `run` with
+    the taxonomy stage on read its quant table twice while the plan said once:
+    that function reads through read_feature_table() and, when the full reader
+    REFUSES the table, re-reads the whole thing with read_feature_peptides()
+    - a second open of the same operator-supplied path, for the stages that
+    survive a refusal.
+
+    Who survives one is already answered, once, by _full_reader_refusal(), and
+    this asks it rather than repeating it - the same discipline that put
+    quant_consumers() behind every "who opens this". The MODE is the other
+    half: under `peptide_only_reader: always` peptide_features() goes straight
+    to the peptide-only reader and the full one is never called, and under
+    `never` the refusal is raised instead of caught, so the fallback can
+    ACTUALLY run on one of the three settings.
+    """
+    if str(cfg.get("peptide_only_reader", "auto")).lower() != "auto":
+        return []
+    _dies, survives = _full_reader_refusal(cfg)
+    return survives
+
+
+def _tmt_paths(cfg, kind):
+    """The per-plex files of a `fragpipe_tmt` tree, by which reader opens them.
+
+    `quant_table` is a DIRECTORY on this format, and a directory is not an
+    input any reader here opens - the per-plex tables and annotations inside
+    it are. That is db.ncbi_taxonomy's shape one input over, and it had the
+    same consequence: its .dmp files were in no plan at all and neither were
+    these, so a run with a peptide stage AND join opened every file under the
+    tree twice with the refusal that exists to catch that switched off.
+
+    `kind` splits them because their readers are not the same set. The level
+    file (ion.tsv / peptide.tsv) is opened by the full reader AND by the
+    peptide-only one; the annotation and psm.tsv are opened by the full reader
+    alone - read_fragpipe_tmt_peptides() never looks at a channel map or a
+    purity, which is measured in the sweep and is why a sentence claiming the
+    fallback re-reads an annotation would be a false claim in a refusal
+    message.
+
+    Tolerant by construction, exactly as quant_inputs() is and for the same
+    reason: this runs before any stage, on a config that may point nowhere
+    yet, and the plan is not the place a bad `tmt.plex_glob` gets reported -
+    read_fragpipe_tmt's own message is.
+    """
+    if str(cfg.get("quant_format", "")) != "fragpipe_tmt":
+        return []
+    root = cfg.get("quant_table") or ""
+    t = cfg.get("tmt") or {}
+    fname = TMT_LEVEL_FILES.get(str(t.get("level") or "ion").lower(), "ion.tsv")
+    try:
+        want_psm = float(t.get("min_purity") or 0) > 0
+        plexes = tmt_plex_dirs(root, cfg)
+    except (StageError, OSError, TypeError, ValueError):
+        return []
+    out = []
+    for plex, pdir in plexes:
+        if kind == "level":
+            out.append(os.path.join(pdir, fname))
+            continue
+        if want_psm:
+            out.append(os.path.join(pdir, "psm.tsv"))
+        with contextlib.suppress(StageError, OSError):
+            out.append(tmt_annotation_path(plex, pdir, cfg))
+    return out
+
+
+def _quant_table_paths(cfg):
+    """The file(s) `quant_table` names, which is not always the path itself."""
+    if str(cfg.get("quant_format", "")) == "fragpipe_tmt":
+        return _tmt_paths(cfg, "level")
+    return _cfg_paths("quant_table")(cfg)
+
+
+def _quant_table_sites(cfg):
+    """Every open of `quant_table`, taken off the list of its consumers.
+
+    The peptide stages read it through peptide_features(), which is one open
+    of the full reader and, when that reader refuses the table, a SECOND of
+    the peptide-only one - the contingent site above, and the only read in
+    this plan that depends on the file rather than on the config. join reads
+    it once on a feature-level format (read_named_table gives the header and
+    the body from one open) and TWICE on a protein-level one, because the
+    isobaric and per-plex refusals have to see the header before pandas is
+    allowed near the body; those two are named separately so the plan can say
+    WHICH read a drained pipe starves.
+
+    quant_format `fragpipe_tmt` used to have no sites at all, on the grounds
+    that a pipe at the setting itself never reaches an open. True, and beside
+    the point: the setting names a directory, `paths` above expands it to the
+    per-plex tables inside, and THOSE are opened once per consumer. Measured,
+    a two-plex tree with the taxonomy stage and join on opened every file
+    under it twice with no plan entry of any kind - which is the hang with
+    the refusal switched off.
+    """
+    fmt = str(cfg.get("quant_format", ""))
+    fallback = _peptide_fallback_readers(cfg)
+    sites = []
+    for st in _peptide_readers(cfg):
+        sites.append(f"stage_{st} -> peptide_features")
+        if st in fallback:
+            sites.append(f"stage_{st} -> peptide_features -> "
+                         "read_feature_peptides" + CONTINGENT_READ)
+    if "join" in quant_consumers(cfg):
+        if fmt in PROTEIN_FORMATS:
+            sites += ["stage_join -> header_columns (the isobaric and "
+                      "per-plex refusals)",
+                      "stage_join -> the protein matrix read"]
+        elif fmt == "fragpipe_tmt":
+            sites.append("stage_join -> read_feature_table -> "
+                         "read_fragpipe_tmt")
+        elif fmt in FEATURE_FORMATS:
+            sites.append("stage_join -> read_feature_table")
+    return tuple(sites)
+
+
+def _tmt_full_reader_sites(cfg):
+    """Every open of a plex's annotation (and of its psm.tsv, when
+    `tmt.min_purity` reads one), which the FULL reader alone makes.
+
+    One per consumer and no contingent site: the peptide-only reader these
+    stages fall back to takes peptides and candidate proteins out of the level
+    file and never opens either of these, so a second entry here would quote a
+    read that cannot happen.
+    """
+    if str(cfg.get("quant_format", "")) != "fragpipe_tmt":
+        return ()
+    sites = [f"stage_{st} -> peptide_features -> read_fragpipe_tmt"
+             for st in _peptide_readers(cfg)]
+    if "join" in quant_consumers(cfg):
+        sites.append("stage_join -> read_feature_table -> read_fragpipe_tmt")
+    return tuple(sites)
+
+
+def _manifest_sites(cfg):
+    """Every open of `manifest`, taken off _manifest_readers().
+
+    THE ONE THIS ROUND GOT WRONG, so the chain is spelled out to the reader
+    that actually opens the file rather than stopping at the stage: on
+    fragpipe_peptide/fragpipe_ion it is read_feature_table that calls
+    read_manifest, and read_feature_table is reached from stage_join AND from
+    peptide_features() in each of the peptide stages. On diann/fragpipe it is
+    stage_join's own protein-matrix branch instead, which is a different call
+    site for the same file. On the MSstats formats and on fragpipe_tmt nothing
+    opens it at all.
+    """
+    if not cfg.get("manifest"):
+        return ()
+    fmt = str(cfg.get("quant_format", ""))
+    sites = []
+    for st in _manifest_readers(cfg):
+        if st != "join":
+            sites.append(f"stage_{st} -> peptide_features -> "
+                         "read_feature_table -> read_manifest")
+        elif fmt in ("diann", "fragpipe"):
+            sites.append("stage_join -> read_manifest (the protein-matrix "
+                         "column mapping)")
+        else:
+            sites.append("stage_join -> read_feature_table -> read_manifest")
+    return tuple(sites)
+
+
+def _emapper_precomputed_sites(cfg):
+    """One read of EACH entry, by the one loop in prepare_emapper().
+
+    This is the input the FIFO workflow demonstrably works at, so it is in the
+    plan explicitly rather than left to the single-read default - and it is
+    gated on `run.eggnog`, which it was not: with the eggNOG stage off nothing
+    opens these tables at all, and a plan that said otherwise was quoting a
+    read the run would never make.
+    """
+    if not (cfg.get("run") or {}).get("eggnog"):
+        return ()
+    return ("stage_emapper -> prepare_emapper -> opener",)
+
+
+def _gff_sites(cfg):
+    """One read, by the context stage, and only when that stage is on."""
+    if not (cfg.get("gff") and (cfg.get("run") or {}).get("context")):
+        return ()
+    return ("stage_context -> parse_gff",)
+
+
+def _unipept_result_sites(cfg):
+    """One read of an existing pept2lca export, by stage_unipept.
+
+    An operator-supplied path that had no entry here at all until it was
+    measured: read_unipept_result() reached it through a bare pd.read_csv(),
+    outside the choke point, so a FIFO at `unipept.result` hung the run rather
+    than streaming or being refused. It is read exactly once - stage_unipept
+    ingests it and writes the copy every later stage reads instead.
+    """
+    if not ((cfg.get("unipept") or {}).get("result")):
+        return ()
+    return (("stage_unipept -> read_unipept_result",)
+            if "unipept" in enabled_stages(cfg) else ())
+
+
+def _taxdump_readers(cfg):
+    """The enabled stages that construct an NCBITaxonomy over the taxdump.
+
+    TWO of them, and only one is `run.taxonomy`: stage_join reaches
+    collapse_taxon_rank through resolve_taxonomy on any config that sets
+    `taxon_rank`, whether or not the comparison stage runs. That disjunction
+    was already written out inside requirements(), where it gates the
+    `ncbi_taxonomy` database row, and it is here now so that the row and the
+    read plan cannot disagree about who wants the taxdump - requirements()
+    calls this function rather than repeating it.
+
+    It matters twice over. A config with BOTH on reads nodes.dmp and names.dmp
+    TWICE, which makes every .dmp file a path no FIFO can satisfy; a config
+    with one of them reads each once, which is a path a FIFO can feed. Neither
+    answer was available before, because every .dmp file went through a bare
+    open() and was in no plan at all.
+    """
+    R = cfg.get("run") or {}
+    out = []
+    if R.get("taxonomy"):
+        out.append("stage_taxonomy -> NCBITaxonomy")
+    if R.get("join") and str(cfg.get("taxon_rank") or "").strip():
+        out.append("stage_join -> resolve_taxonomy -> collapse_taxon_rank "
+                   "-> NCBITaxonomy")
+    return out
+
+
+def _taxdump_sites(cfg):
+    return tuple(_taxdump_readers(cfg))
+
+
+# name -> (the paths this setting names, the sites this run reads them at).
+# `paths` is a function and not a key because an input is not always one
+# config value: emapper_precomputed is a list, and db.ncbi_taxonomy is a
+# directory whose .dmp files are the things that get opened.
+_Input = namedtuple("_Input", "paths sites")
+
+INPUT_READ_SITES = {
+    "proteins_faa": _Input(_cfg_paths("proteins_faa"), _proteins_faa_sites),
+    "quant_table": _Input(_quant_table_paths, _quant_table_sites),
+    # The per-plex files only the full TMT reader opens. A separate entry and
+    # not more sites on `quant_table`, because the two are read by different
+    # sets of readers and one list would have to over-claim for one of them.
+    "tmt.per_plex": _Input(lambda c: _tmt_paths(c, "full_reader"),
+                           _tmt_full_reader_sites),
+    "manifest": _Input(_cfg_paths("manifest"), _manifest_sites),
+    "emapper_precomputed": _Input(_cfg_paths("emapper_precomputed"),
+                                  _emapper_precomputed_sites),
+    "gff": _Input(_cfg_paths("gff"), _gff_sites),
+    "unipept.result": _Input(_cfg_paths("unipept.result"),
+                             _unipept_result_sites),
+    "db.ncbi_taxonomy": _Input(_taxdump_paths, _taxdump_sites),
+    # contigs_fna is handed to an external ORF finder as a FILENAME and is
+    # never opened by this process at all, so it has no sites - which is a
+    # real answer and not an omission.
+    #
+    # What it is NOT is a claim about a FIFO there. This comment used to say
+    # one was "refused by smorf or macrel", and nothing in this codebase
+    # establishes that: what a third-party ORF finder does with a pipe is the
+    # tool's business, and it may perfectly well block in its own open. A gate
+    # in front of run_cmd was the alternative and is measured, in
+    # regular_readable()'s own docstring, as costing more than it buys HERE
+    # and only here: every other check in this file opens ONCE and keeps the
+    # descriptor, which is what makes it both safe and free, and a path handed
+    # to a subprocess by name cannot be checked that way - the tool does its
+    # own open. Probing it first is open-close-reopen, which sends a live
+    # writer EPIPE while we are still deciding
+    # (test_probing_a_live_fifo_breaks_the_writer_on_the_other_side drives
+    # exactly that), and it cannot tell a pipe with a writer from one without,
+    # so it would refuse `mkfifo p; zcat contigs.fna.gz > p &` - a workflow a
+    # streaming ORF finder may well complete - in order to catch a
+    # misconfiguration. So the sentences stop claiming, doctor's contigs_fna
+    # row says whose answer it is, and nothing pretends to a promise this
+    # program cannot keep.
+    "contigs_fna": _Input(_cfg_paths("contigs_fna"), lambda c: ()),
+    # analysis.metadata has no entry either, and for a different reason worth
+    # writing down: every reader of it is conditional - _tmt_add_condition()
+    # consults it only to word a warning, and _tmt_report_design() runs in
+    # `report`, which is another process - so the honest count is "at most one
+    # per process", which is exactly what the no-plan default already gives a
+    # path. An entry saying 1 would be a promise this file cannot keep on the
+    # configs where the read does not happen, and the plan is checked against
+    # what a run really does.
+}
+
+# path -> the sites this run will read it at. Empty until a run sets it, and
+# EMPTY IS NOT "ZERO": a reader reached outside `run` - a unit test, `subset`,
+# a future command - has no plan, and the honest answer for a path nobody
+# planned is the single-read one, because that is the only case in which
+# waiting can pay off. The refusal is for paths a plan PROVES are read twice.
+_READ_PLAN = {}
+
+
+def set_read_plan(cfg):
+    """Work out, from this config, how often each input will be opened.
+
+    Called once at the top of `run`, beside set_fifo_wait() and for the same
+    reason: every parser in this file reads through opener(), and threading a
+    cfg down to the open would touch code that has nothing to do with pipes.
+    """
+    global _READ_PLAN
+    # The taken set is per RUN, exactly as the plan is. Nothing in a process
+    # that has computed a new plan can still be holding a stream from the old
+    # one, and leaving it behind would make a second run in one process refuse
+    # a pipe the first one legitimately read.
+    _FIFO_TAKEN.clear()
+    plan = {}
+    for _key, inp in INPUT_READ_SITES.items():
+        sites = tuple(inp.sites(cfg))
+        if not sites:
+            continue
+        for path in inp.paths(cfg):
+            plan.setdefault(_plan_key(path), []).extend(sites)
+    _READ_PLAN = plan
+    return plan
+
+
+def _plan_key(path):
+    """One spelling of a path, so the plan and the open agree about identity.
+
+    realpath, not the string: resolve_paths() has already made every config
+    path absolute, but a symlinked input and a relative reader argument would
+    otherwise be two different keys and the plan would silently miss.
+    """
+    try:
+        return os.path.realpath(str(path))
+    except OSError:                          # pragma: no cover - unreachable
+        return str(path)
+
+
+def planned_reads(path):
+    """Every site this run CAN open `path` at, in order. Never None.
+
+    The FIFO rule's question, so a conditional re-read counts: a pipe is
+    drained by its first reader whether or not the second open was contingent
+    on the first reader refusing a table.
+    """
+    return tuple(_READ_PLAN.get(_plan_key(path), ()))
+
+
+def certain_reads(path):
+    """The sites this run opens `path` at on EVERY table, in order.
+
+    The other question, and the one a measurement of a completed run has to be
+    held against: a contingent re-read that did not happen is not a defect in
+    the plan, and demanding it would make the sweep fail on the ordinary case
+    it is there to protect.
+    """
+    return tuple(s for s in planned_reads(path) if not _is_contingent(s))
+
+
+class _GzipOnFd(gzip.GzipFile):
+    """A GzipFile over a descriptor we opened, that closes it with itself.
+
+    gzip closes a file it opened by NAME and leaves a `fileobj` it was handed
+    open, which is the right default for a caller that still wants its own
+    handle and the wrong one here: the raw file is this object's only
+    reference, so without this the descriptor leaks on every .gz a run reads,
+    and on a FIFO a leaked read end is a writer that never sees the stream
+    close.
+
+    IT ALSO TRANSLATES THE TRUNCATION, which is the reason the class grew a
+    `path`. gzip is a FRAMED format: a stream that stops early is caught by
+    the missing end-of-stream marker and raises EOFError, which is exactly the
+    behaviour a plain stream has to be given by hand (see _FifoRaw). But
+    EOFError's own message names no file, and it escapes as an EOFError rather
+    than a StageError - so a writer killed half way through a piped .gz
+    produced a bare "Compressed file ended before the end-of-stream marker was
+    reached" with no path in it and nothing to say which of a run's inputs it
+    was. The bytes are the same; only the sentence changes.
+    """
+
+    def __init__(self, raw, path=""):
+        self._raw = raw
+        self._path = str(path)
+        super().__init__(fileobj=raw, mode="rb")
+
+    def _truncated(self, e):
+        return StageError(
+            f"{self._path}: the gzip stream ends before its end-of-stream "
+            f"marker, so what arrived is a TRUNCATED file and not a short "
+            f"one ({e}). Whatever was writing it stopped early - a killed "
+            "`zcat`, a full disk, a scheduler that took the job away. Nothing "
+            "here can tell how much is missing, so the run stops rather than "
+            "annotating a partial input.")
+
+    def read(self, size=-1):
+        try:
+            return super().read(size)
+        except EOFError as e:
+            raise self._truncated(e) from e
+
+    def read1(self, size=-1):
+        try:
+            return super().read1(size)
+        except EOFError as e:
+            raise self._truncated(e) from e
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._raw.close()
+
+
+def _clear_nonblock(fd):
+    """Take O_NONBLOCK back off a descriptor before a parser reads through it.
+
+    NOT tidiness, and not optional. O_NONBLOCK lives on the open file
+    DESCRIPTION, so it is still set on every read the parser goes on to make
+    through this handle - and a non-blocking read of a pipe with no bytes
+    ready fails with EAGAIN, which Python raises as BlockingIOError. On a FIFO
+    that is being written perfectly well, that is any moment the writer pauses:
+    `zcat` waiting on its own disk, a producer between records, a scheduler
+    that took the CPU away. Leaving the flag on would turn the one FIFO
+    workflow this tool supports into a failure whose likelihood depends on how
+    fast the writer happens to be, which is a worse defect than the hang it
+    replaces - a hang is at least reproducible.
+
+    The flag is wanted for the OPEN, where it is the whole point, and for
+    nothing after it.
+    """
+    if fcntl is None:                              # pragma: no cover - Windows
+        return
+    fcntl.fcntl(fd, fcntl.F_SETFL,
+                fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+
+
+def _wait_readable(fd, seconds):
+    """True when `fd` has something to read within `seconds`.
+
+    select() on the descriptor we already hold, never a second open. On a FIFO
+    this returns as soon as a writer writes - or as soon as one opens and
+    closes without writing, which is a clean end-of-file and not a failure.
+    """
+    if select is None:                             # pragma: no cover - Windows
+        return True
+    return bool(select.select([fd], [], [], seconds)[0])
+
+
+# The flags every read-only open in this file uses. Both are getattr()s of a
+# name that does not exist on every platform, and they are here together
+# because the second one was missing for exactly as long as the comment at the
+# top of this file claimed there was a Windows fallback.
+#
+# O_NONBLOCK is what makes the open of a FIFO RETURN instead of waiting for a
+# writer, and it is the only way to take the read end without joining the
+# rendezvous. It is 0 on Windows, where there is no such flag.
+#
+# O_BINARY is the one CPython's builtin open() sets for us and a bare
+# os.open() does not. It is 0 on POSIX, where every descriptor is already
+# binary, and it is the difference between reading a .gz correctly and reading
+# it through a CRT text-mode descriptor on Windows - CRLF translation and
+# 0x1A treated as end of file, on compressed bytes. Nothing in the suite can
+# reach a Windows CRT, so what is testable is that the flag is ASKED FOR:
+# test_the_read_open_asks_for_o_binary_wherever_the_platform_has_it.
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) \
+    | getattr(os, "O_BINARY", 0)
+
+
+def _fifo_writer_state(fd):
+    """"attached" or "none": is anything holding the write end right now?
+
+    THE DISTINCTION THE REFUSAL USED TO GET WRONG. A wait that expires said
+    "no writer appeared ... nothing has opened the other end", and both halves
+    are false in a reachable case: a writer that attached at 0s and whose
+    first byte lands at 5s of a 3s wait is attached the whole time, and it is
+    then killed by the EPIPE our own exit sends it. Telling that operator to
+    start a writer sends them to fix the one thing that was already right.
+
+    POSIX gives the answer for free and without consuming anything, which is
+    the part that matters on a pipe: a non-blocking read of a pipe returns 0
+    (end of file) when NO writer holds the other end, and fails with EAGAIN
+    when one does but has written nothing yet. Measured both ways on this
+    platform; poll() cannot do it here, because macOS reports neither POLLHUP
+    nor POLLIN for either state.
+
+    Called only after select() has already said there is nothing to read, so
+    the one-byte read cannot swallow data - and in the race where a byte
+    arrives between the two calls, the byte is handed back rather than
+    dropped. That is what the second return value is for.
+
+    IT SETS O_NONBLOCK AROUND ITSELF and puts the flag back, which is not
+    tidiness: the discrimination IS the EAGAIN, so a probe on a descriptor
+    whose O_NONBLOCK has already been cleared - which is every descriptor
+    after the open, by design, so that a pausing writer cannot raise
+    BlockingIOError at a parser - blocks for ever on exactly the state it was
+    called to report. Driven: an idle writer holding the write end open left
+    the reader inside this one-byte read with a two-second bound sitting
+    unused above it.
+    """
+    if fcntl is None:                              # pragma: no cover - Windows
+        return "unknown", b""
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        got = os.read(fd, 1)
+    except BlockingIOError:
+        return "attached", b""
+    except OSError:                          # pragma: no cover - gone
+        return "unknown", b""
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+    return ("none", b"") if got == b"" else ("attached", got)
+
+
+def _open_for_read(path):
+    """A descriptor open for reading `path`, or a refusal naming what is there.
+
+    THE fix for the hang, and the shape of it is the whole point: this opens
+    ONCE and keeps the descriptor. The obvious alternative - probe the path,
+    decide, then let the reader open it again - is what regular_readable()
+    does for `doctor`, and it may not be put in front of a stage, because
+    opening the read end of a FIFO and closing it again sends the writer on
+    the other side EPIPE. Driven, that killed the writer thread while the
+    probe was still deciding. A gate that destroys the stream it is protecting
+    is worse than the thing it protects against, so there is no gate here:
+    there is one open, and the descriptor it returns is the one the parser
+    reads.
+
+    O_NONBLOCK does two things at once on a FIFO, and both are needed. It
+    makes this open RETURN instead of waiting for a writer, which is what ends
+    the hang; and it is the only way to open the read end without joining the
+    rendezvous, so a writer that is already blocked in its own open() is
+    released by this call and goes on to write. Keeping the descriptor is what
+    makes that release mean something - close it again and the writer gets
+    EPIPE for its trouble.
+
+    fstat() on the DESCRIPTOR, never a stat on the path: the descriptor names
+    the object this process actually holds, so nothing can be swapped
+    underneath the decision the way a path can between a stat and an open.
+
+    What each kind gets:
+
+    * a regular file - the ordinary case, and it must stay exactly as ordinary
+      as it was. Clear the flag, read. One open, no probe, nothing new.
+    * a FIFO AT A PATH THIS RUN OPENS MORE THAN ONCE - refused AT ONCE, before
+      any wait, naming the path, the number of reads and each one of them.
+      This is the arm the previous round did not have, and not having it was
+      worse than the hang: a pipe that will be opened twice cannot be made to
+      work by waiting, because the second open finds a drained pipe however
+      patient the first one was. Measured end to end - proteins_faa fails at
+      integrate, quant_table hangs forever holding the results lock while the
+      writer takes EPIPE, manifest fails after burning the whole wait - and
+      every one of those three took the full fifo_wait_s first.
+    * a FIFO AT A SINGLE-READ PATH - SAY SO BEFORE WAITING. The log line is
+      the half of this that matters most, because the expensive part of the
+      old behaviour was not the waiting, it was the silence: a run left
+      overnight on a FIFO nobody was writing looked exactly like a long stage.
+      Then wait up to fifo_wait_s for the descriptor to become readable and
+      stream through it, so the live-writer workflow is byte for byte what it
+      was. If the wait expires, die naming the path, the setting, and WHICH of
+      the two silences this is - nothing attached at all, or something
+      attached that has not written a byte. They have different remedies and
+      the old message asserted the first for both.
+    * a FIFO AT A PATH WITH NO PLAN - treated as single-read. `run` sets a
+      plan; a unit test, `subset` and anything reached outside a run do not,
+      and the honest default for a path nobody planned is the case where
+      waiting can pay off. The refusal above is for a plan that PROVES a
+      second read, never for the absence of one.
+    * anything else - a socket, a device node, a directory. No reader in this
+      file can get a table out of any of them, at any point in the future, so
+      there is nothing to wait for and the refusal is immediate. A DIRECTORY
+      keeps the exact exception open() raised on it before - IsADirectoryError
+      with the OS's own strerror - because who that costs is documented on
+      `doctor`'s rows and settled by whether the exception is a StageError:
+      peptide_features() catches a StageError and re-reads around it, and
+      nothing catches an OSError.
+
+    Returns (fd, pushback), where `pushback` is None for everything that is
+    not a FIFO and a bytes object - usually empty - for one. That is not
+    decoration: a FIFO is read through _FifoRaw(), which bounds every read and
+    refuses a stream that stopped early, and a regular file must not pay for
+    either. The bytes are the one-byte race in _fifo_writer_state(), handed
+    back so that a byte which arrived between the select and the probe is put
+    in front of the stream instead of being lost.
+    """
+    fd = os.open(path, _OPEN_FLAGS)
+    try:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISREG(mode):
+            _clear_nonblock(fd)
+            return fd, None
+        if stat.S_ISDIR(mode):
+            # os.open() opens a directory read-only quite happily on POSIX; it
+            # is the READ that fails. Raised here so the failure names the
+            # path at the open, and raised as the same exception with the same
+            # text, because "read_manifest raises an OSError, which nothing
+            # catches" is a published claim about what a directory costs.
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR),
+                                    str(path))
+        if stat.S_ISFIFO(mode):
+            _refuse_multiread_fifo(path)
+            log(f"{path}: this is a FIFO, and this run reads it exactly once, "
+                f"so it is read as a live stream. Each read waits up to "
+                f"{_FIFO_WAIT:g}s for the next byte (`fifo_wait_s`); a live "
+                "writer streams straight through and nothing else will be "
+                "logged until one appears.")
+            if not _wait_readable(fd, _FIFO_WAIT):
+                who, pushback = _fifo_writer_state(fd)
+                if not pushback:
+                    die(_fifo_silence_message(path, who))
+            else:
+                pushback = b""
+            # Claimed only once the stream is really OURS - after the wait, not
+            # before it. An open that gave up because nothing was writing
+            # consumed nothing, so a retry at the same path is not a second
+            # drink from a drained pipe and must not be refused as one.
+            _claim_fifo(path)
+            _clear_nonblock(fd)
+            return fd, pushback
+        die(f"{path}: this is {_st_mode_phrase(mode)}, not a file. No reader "
+            "in metaannot can get a table or a FASTA out of one, now or "
+            "later, so it is refused here rather than read as bytes. Point "
+            "this setting at a regular file (or at a FIFO with a writer on "
+            "it).")
+    except BaseException:
+        # The descriptor is this function's until it hands it back, and a
+        # refusal that leaked it would leave the read end of a FIFO open for
+        # the life of the process - which, on a pipe, keeps a writer from ever
+        # seeing EPIPE and is a hang of its own.
+        os.close(fd)
+        raise
+
+
+def _fifo_silence_message(path, who):
+    """Why a FIFO produced nothing, told apart rather than guessed at.
+
+    Two silences, two remedies, and the old message asserted the first for
+    both - so a writer that was attached the whole time was reported as
+    "nothing has opened the other end", and the operator was sent to start the
+    thing that was already running.
+    """
+    if who == "attached":
+        return (f"{path}: this is a FIFO, something IS holding the write end, "
+                f"and it has not written a byte in {_FIFO_WAIT:g}s "
+                "(`fifo_wait_s`). The writer is attached, so starting another "
+                "one is not the fix: either it is still producing its first "
+                "block - raise `fifo_wait_s` - or it is stuck on something of "
+                "its own. This read is given up rather than held open, "
+                "because a reader waiting on a pipe holds the results lock "
+                "and nobody else can use the directory while it does.")
+    return (f"{path}: this is a FIFO and nothing is holding the write end - "
+            f"nothing has opened it in {_FIFO_WAIT:g}s (`fifo_wait_s`), so "
+            "there is nothing here to read and nothing is coming. Start the "
+            "writer before the run, or give this input a real file; 0 refuses "
+            "a FIFO outright.")
+
+
+# Every FIFO this process has already taken the read end of, so that a plan
+# that was WRONG still cannot become a hang. The plan is checked before the
+# wait and is the fast, honest answer; this is the backstop under it, and it
+# is a backstop rather than the mechanism because it can only fire on the
+# second open - by which time the pipe is drained and the hours are spent.
+# What it converts is the worst outcome, a silent second open that blocks
+# forever, into a message that names both reads.
+_FIFO_TAKEN = set()
+
+
+def _claim_fifo(path):
+    _FIFO_TAKEN.add(_plan_key(path))
+
+
+def _refuse_multiread_fifo(path):
+    """Refuse a FIFO at a path this run will read more than once.
+
+    AT ONCE, and that is the whole point: the previous round waited
+    fifo_wait_s here and then failed, so the operator paid six hours for a
+    message. Nothing about waiting changes the arithmetic - the pipe is
+    drained by the first reader and the second one finds an empty stream or
+    blocks on it - so the refusal must not suggest that a longer wait, or a
+    faster writer, or starting the writer earlier would have helped.
+    """
+    sites = planned_reads(path)
+    taken = _plan_key(path) in _FIFO_TAKEN
+    if len(sites) <= 1 and not taken:
+        return
+    if taken:
+        die(f"{path}: this is a FIFO and this run has already read it once. A "
+            "pipe can be drained exactly once, so there is nothing left at "
+            "this path and waiting here would block forever. Write the stream "
+            "to a real file and point this input at that file. (The plan "
+            f"expected {len(sites)} read(s) here and this is another, which "
+            "is either a conditional re-read - peptide_features() falls back "
+            "to the peptide-only reader when the full one refuses a table - "
+            "or a reader INPUT_READ_SITES does not know about. Either way the "
+            "run stops with a message instead of hanging on the open.)")
+    die(f"{path}: this is a FIFO, and this run "
+        + ("reads" if all(not _is_contingent(x) for x in sites)
+           else "can read")
+        + f" that input {len(sites)} times:\n  - " + "\n  - ".join(sites)
+        + "\n"
+        "A FIFO can be drained EXACTLY ONCE. The first reader consumes the "
+        "whole stream and every reader after it finds an empty pipe or blocks "
+        "on one, so this cannot be made to work by waiting longer, by "
+        "starting the writer earlier or by making it faster - which is why "
+        "this is refused now, at the first open, instead of after "
+        f"{_FIFO_WAIT:g}s of `fifo_wait_s`. Write the stream to a real file "
+        "first (`zcat big.faa.gz > real.faa`, then point this input at "
+        "real.faa) - a FIFO is only read as a live stream at an input this "
+        "run opens once, which " + _single_read_hint() + ".")
+
+
+def _single_read_hint():
+    """Which inputs are single-read in THIS run, named rather than asserted.
+
+    Read off the plan, because the set is a property of the config and not of
+    the program: a project with run.unipept on reads its quant table one more
+    time than one without. A sentence that named a fixed list would be the
+    same hand-written claim this whole change set keeps finding.
+    """
+    ok = sorted({p for p, s in _READ_PLAN.items() if len(s) == 1})
+    if not ok:
+        return ("this config has none of - every configured input here is "
+                "read more than once")
+    return "in this config means " + _and_list([os.path.basename(p)
+                                                for p in ok], "and")
+
+
+class _FifoRaw(io.RawIOBase):
+    """The read end of a FIFO, with a bound on every read and an end it can
+    tell apart from a truncation.
+
+    TWO DEFECTS LIVE HERE, and both were found by driving rather than by
+    reading.
+
+    FIRST, fifo_wait_s bounded only the FIRST byte. Once the stream had
+    started, the parser above went back to an ordinary blocking read - so a
+    writer that attached, wrote half a table and then sat there holding the
+    write end open (an O_RDWR keeper, a producer blocked on its own input, a
+    `tail -f` that never ends) put the run straight back into the hang the
+    setting exists to prevent, one read further in. The bound is therefore an
+    IDLE timeout: every read waits at most fifo_wait_s for the NEXT byte. A
+    writer that is streaming never comes near it, so this costs a working
+    pipeline nothing; and the reason a hang is unacceptable here is the reason
+    it was unacceptable at the open, which is that a run waiting on a pipe is
+    holding an exclusive lock on its results directory while it waits.
+
+    SECOND, and worse because it is not an error at all: A SHORT READ LOOKED
+    LIKE A COMPLETE FILE. A writer that wrote half a FASTA and died yielded
+    [("p1", "MKV"), ("p2", "MK")] and the run went on to annotate it. Nothing
+    anywhere said the input was a fragment. That is the one outcome worse than
+    either a hang or a refusal, because the number at the end of it is wrong
+    and looks right.
+
+    The gzip branch has never had that problem, and it is the model: gzip is
+    FRAMED, so a stream that stops early is missing its end-of-stream marker
+    and raises. A plain byte stream has no frame, so the only in-band evidence
+    of truncation is where it stopped, and there are exactly two signals worth
+    trusting:
+
+      * NOTHING AT ALL. A writer that attached and closed without writing a
+        byte is a writer that failed. An empty pipe is not an empty input.
+      * A PARTIAL LAST LINE. Every reader above this one is line-oriented, and
+        a stream that ends mid-line ended inside a record. That is the state
+        the half-written FASTA is in, and it is the state a killed `zcat`
+        leaves.
+
+    WHAT THAT DOES NOT CATCH is written down rather than left to be discovered:
+    a writer killed exactly on a line boundary produces a stream this cannot
+    tell from a complete one, and no amount of looking at the bytes will
+    change that. A plain FIFO is therefore the weaker form, and a GZIPPED one
+    is the strong one - the trailer makes every truncation detectable, which
+    is why the documentation recommends piping `.gz` and why
+    emapper_precomputed, the input the workflow actually works at, is
+    routinely a `.gz` already.
+
+    The line-boundary rule is applied to the RAW bytes, so it applies to the
+    plain branch and not to the compressed one, where the bytes are a deflate
+    stream and gzip's own trailer is the better test. `framed` is what says
+    which.
+    """
+
+    def __init__(self, fd, path, framed, pushback=b""):
+        self._fd = fd
+        self._path = str(path)
+        self._framed = bool(framed)
+        self._pending = bytes(pushback or b"")
+        self._seen = len(self._pending)
+        self._last = self._pending[-1:] if self._pending else b""
+        self._eof = False
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        if self._eof:
+            return 0
+        if self._pending:
+            n = min(len(buf), len(self._pending))
+            buf[:n] = self._pending[:n]
+            self._pending = self._pending[n:]
+            return n
+        while True:
+            if not _wait_readable(self._fd, _FIFO_WAIT):
+                who, extra = _fifo_writer_state(self._fd)
+                if extra:
+                    buf[:1] = extra
+                    self._seen += 1
+                    self._last = extra
+                    return 1
+                if who == "none":
+                    # The writer let go. That is end of file, not a timeout,
+                    # and the completeness rules below are what decide whether
+                    # it is an honest one.
+                    break
+                die(f"{self._path}: this is a FIFO and the writer has sent "
+                    f"nothing for {_FIFO_WAIT:g}s (`fifo_wait_s`) after "
+                    f"{self._seen} byte(s). It is still attached, so this is "
+                    "a stalled writer rather than a finished one, and what "
+                    "has arrived so far is a FRAGMENT of the input - "
+                    "annotating it would be worse than stopping. Raise "
+                    "`fifo_wait_s` if the producer is simply slow, or write "
+                    "the stream to a real file first.")
+            try:
+                data = os.read(self._fd, len(buf))
+            except InterruptedError:             # pragma: no cover - signals
+                continue
+            if data:
+                buf[:len(data)] = data
+                self._seen += len(data)
+                self._last = data[-1:]
+                return len(data)
+            break
+        self._eof = True
+        self._check_complete()
+        return 0
+
+    def _check_complete(self):
+        if self._seen == 0:
+            die(f"{self._path}: this is a FIFO and the writer closed it "
+                "without writing a single byte. An empty pipe is a writer "
+                "that failed, not an empty input, so this is an error rather "
+                "than zero records - a run that treated it as an empty file "
+                "would carry on and report an annotation of nothing.")
+        if not self._framed and self._last != b"\n":
+            die(f"{self._path}: this is a FIFO and the stream ended in the "
+                f"middle of a line, after {self._seen} byte(s). A complete "
+                "text input ends on a line boundary; this one stopped inside "
+                "a record, so whatever was writing it died early - and a "
+                "short read here is indistinguishable from a complete file to "
+                "every reader above this one, which is why it has to fail "
+                "here. Write the stream to a real file first, or pipe it "
+                "gzipped: a `.gz` carries an end-of-stream marker, so a "
+                "truncation is caught wherever it happens rather than only "
+                "when it happens mid-line.")
+
+    def close(self):
+        try:
+            if not self.closed:
+                os.close(self._fd)
+        finally:
+            super().close()
+
+
+def _st_mode_phrase(mode):
+    """What st_mode really is, for a sentence. Never raises, never guesses."""
+    for test, phrase in ((stat.S_ISSOCK, "a socket"),
+                         (stat.S_ISCHR, "a character device"),
+                         (stat.S_ISBLK, "a block device"),
+                         (stat.S_ISDIR, "a directory"),
+                         (stat.S_ISFIFO, "a FIFO")):
+        if test(mode):
+            return phrase
+    return "not a regular file"
+
+
 def opener(path):
     """Text reader for a plain or gzipped file, tolerant of bad bytes.
 
@@ -1106,11 +2323,186 @@ def opener(path):
     be set to, which is UTF-8 on a modern desktop and ASCII under a bare C
     locale. emapper_precomputed is routinely a .gz, so this is the one input
     most likely to be read differently on the server than on the laptop.
+
+    THE OPEN ITSELF is _open_for_read()'s, which is where a FIFO stops being a
+    hang and becomes either a stream, a message about the reads that make a
+    stream impossible, or a message about a writer that is not writing. Both
+    branches below wrap the SAME descriptor that function returns: re-opening
+    by path for the gzip branch would be the probe-and-reopen that breaks a
+    live writer, and emapper_precomputed is routinely a .gz, so that branch is
+    not the rare one.
+
+    A FIFO gets one extra layer and a regular file gets none. _FifoRaw() is
+    what bounds every read rather than only the first and what refuses a
+    stream that stopped early; on a regular file neither can happen, and the
+    ordinary path must stay exactly as ordinary as it was - one open, one
+    fdopen, no wrapper.
     """
-    if str(path).endswith(".gz"):
-        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8",
-                                errors="replace")
-    return open(path, encoding="utf-8", errors="replace")
+    fd, pushback = _open_for_read(path)
+    gz = str(path).endswith(".gz")
+    if pushback is None:
+        raw = os.fdopen(fd, "rb") if gz else None
+    else:
+        raw = io.BufferedReader(_FifoRaw(fd, path, framed=gz,
+                                         pushback=pushback))
+    if gz:
+        return io.TextIOWrapper(_GzipOnFd(raw, path),
+                                encoding="utf-8", errors="replace")
+    if raw is None:
+        return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+    return io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+
+
+def regular_readable(path):
+    """True only when `path` is a regular file this process can really open.
+
+    The primitive behind every "may I read this?" in this file, and the reason
+    it is an OPEN and not a stat. Three separate rounds of fixes to `doctor`
+    each came down to the same mistake made at a new place:
+
+    * os.path.isfile() and os.path.getsize() are STATS, and a stat needs only
+      search permission on the parent directory - so a mode-000 file answers
+      its size cheerfully and every test built on those two says "a file".
+    * os.path.exists() is TRUE for a FIFO, a socket and a device node, none of
+      which any reader here can get a table out of.
+    * a read-only open() of a FIFO with no writer BLOCKS FOREVER. That is the
+      worst of the three by a distance: the process neither finishes nor
+      fails, so a caller waiting on it has nothing to time out against.
+
+    O_NONBLOCK answers the third - it makes the FIFO open return at once
+    instead of waiting - and fstat() on the descriptor answers the second
+    without a race, since the descriptor cannot be swapped under it the way a
+    path can. Opening at all answers the first. The descriptor is closed
+    again immediately: this proves the permission, it does not hold it, so a
+    caller still needs its own `except OSError` around the read it goes on to
+    make.
+
+    WHY THE STAGES STILL DO NOT CALL THIS, which is now a record of a
+    decision that has been SUPERSEDED rather than a decision. The problem it
+    was written about - seven paths that hung `run` indefinitely when a FIFO
+    sat at them: proteins_faa, quant_table, manifest, gff,
+    emapper_precomputed, and a plex's ion.tsv and annotation, all seven
+    measured against `run` - is fixed, in opener(), and not by calling this.
+    The two measured facts below are why the fix has the shape it has, so
+    they are kept.
+
+    First, this function cannot tell a FIFO that will never be written from
+    one that is being written right now. O_NONBLOCK returns immediately either
+    way and fstat() answers S_ISFIFO either way, so gating a stage on it would
+    refuse EVERY FIFO - including `mkfifo p; zcat big.faa.gz > p &`, which is
+    how a disk-constrained cluster feeds this tool and which works: driven,
+    read_fasta() through opener() reads a FIFO with a live writer and yields
+    its records. That is not turning a hang into a refusal; it is removing
+    something that works in order to catch a misconfiguration.
+
+    Second, and worse: this probe is not a read-only observation of a FIFO.
+    It OPENS the read end and closes it again, and the process on the other
+    side gets EPIPE for it - driven, the writer thread died with
+    BrokenPipeError while this function was deciding. A gate in front of a
+    stage's open would therefore destroy the very stream it was meant to
+    protect.
+
+    WHAT WAS DONE INSTEAD, and why it costs neither of those. The damage in
+    the second fact comes entirely from probe -> close -> reopen, so
+    _open_for_read() does not probe: it opens ONCE with O_NONBLOCK, fstats the
+    DESCRIPTOR, and hands that same descriptor to the reader. At an input the
+    run reads ONCE, a FIFO is announced on the log and then waited on for a
+    bounded fifo_wait_s - so a live writer streams through exactly as it did
+    before, byte for byte, and a FIFO nobody will write ends in a StageError
+    naming the path instead of a silence with no exit status to time out
+    against. Both costs above are avoided because nothing is ever closed and
+    reopened.
+
+    AND THE FIRST FACT GOT SMALLER THAN IT LOOKED, which is the correction
+    this docstring most needed. "Refusing every FIFO would remove something
+    that works" is true only where a pipe CAN work, and a pipe cannot work at
+    an input a run opens more than once however carefully anything is opened:
+    driven end to end, the workflow this paragraph defends failed at three of
+    the four operator-supplied inputs and had always failed there. So a FIFO
+    at a multi-read path IS refused on sight now - see INPUT_READ_SITES - and
+    the reason that is not the mistake this paragraph warns about is that the
+    refusal is derived from the reads rather than from the stat.
+
+    So this function keeps exactly the job it always had: it is `doctor`'s
+    primitive, for the command that may never block, and the two engine
+    callers that use it - load_config() on `--config`, and
+    diamond_source_fasta() on an optional sidecar - are the two where nothing
+    streams and refusing costs nothing. The capabilities are pinned either
+    way: test_a_fifo_input_blocks_the_reader_rather_than_failing_it in
+    tests/test_stages.py holds read_fasta() on an unwritten FIFO and then
+    writes to it and asserts the records come back, and
+    test_probing_a_live_fifo_breaks_the_writer_on_the_other_side in
+    tests/test_doctor_json.py is the second fact, driven.
+    """
+    try:
+        fd = os.open(path, _OPEN_FLAGS)
+    except OSError:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+
+
+def _open_regular_binary(path):
+    """A binary handle on `path`, and only if `path` is a REGULAR file.
+
+    The one reader in this file that must never touch a stream, written down
+    as a primitive instead of left to a caller's guard. _content_digest()
+    reads a file end to end, or its two ends, to answer "has this input
+    changed"; on a FIFO that would DRAIN the pipe, and the stage that was
+    meant to read it would then find an empty stream - so the digest would
+    have destroyed the input it was there to describe, hours before anything
+    noticed.
+
+    It did not, in practice, because _stat() asks os.path.isfile() first and a
+    FIFO answers False. That is the right answer arrived at by luck: it is a
+    STAT on a PATH taken some instructions before the open, which is the exact
+    shape of race every other check in this file was rewritten to remove, and
+    a reader of _content_digest() cannot see the guard at all. Here the
+    property is structural - the descriptor is fstat'd, so what is proved is
+    what is held - and it is the descriptor's own kind that decides.
+
+    Raises the same FileNotFoundError / PermissionError open() raised, because
+    _content_digest()'s `except OSError: return None` is the published
+    behaviour for a file it cannot read; a non-regular path joins them rather
+    than getting an exception of its own.
+    """
+    fd = os.open(path, _OPEN_FLAGS)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        _clear_nonblock(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "rb")
+
+
+def _open_regular_text(path):
+    """`doctor`'s reader: one descriptor, proved regular, never a wait.
+
+    THE SECOND CHOKE POINT, and the reason there are two rather than one.
+    `run` reads through _open_for_read(), which WAITS on a FIFO because
+    waiting is what makes the live-writer workflow work there. `doctor` may
+    never wait - a command whose whole job is to answer before the run is
+    worthless if it can block - so it cannot share that opener, and for a
+    while it shared nothing at all: it probed with regular_readable() and then
+    let pandas open the path again by name, which is a stat and an open with
+    instructions in between and a different object possible between them.
+
+    Here the proof and the read are the same descriptor, exactly as they are
+    in _open_for_read(): O_NONBLOCK so the open of a FIFO returns instead of
+    joining the rendezvous, fstat on the descriptor, and a refusal for
+    anything that is not a regular file. utf-8 with errors="replace", the same
+    as opener(), so doctor and the run decode a header the same way.
+
+    It is _open_regular_binary() in text clothes and is written beside it for
+    that reason: the digest needs bytes and doctor needs lines, and both need
+    the same promise - what is read is what was proved.
+    """
+    return io.TextIOWrapper(_open_regular_binary(path), encoding="utf-8",
+                            errors="replace")
 
 
 def read_fasta(path):
@@ -2488,12 +3880,32 @@ def best_possible_evalue(letters, typical_len):
         return 0.0            # long sequences: any e-value is reachable
 
 
-def _fasta_lengths(path, cap=200000):
+# The two caps the DIAMOND fallback reads a source FASTA under. Constants
+# because both numbers are PUBLISHED - they are the caveat text on a real
+# `db:diamond:<tag>:usable` row, which is the sentence that qualifies the
+# document's own "doctor does not parse" - and they were written out by hand
+# there, one function away from the literals that decide them. That is the
+# third way a count gets to be wrong without anything noticing: it is neither
+# in a comment nor in one of the emitted constants a test reads, and it is
+# written in digits, which the prose scanner could not see either. Both ends
+# of both numbers come from here now.
+DMND_FASTA_RECORD_CAP = 200000
+DMND_DEFLINE_CAP = 200
+
+
+def _fasta_lengths(path, cap=DMND_FASTA_RECORD_CAP):
     """Sequence lengths in a FASTA, for the median. Capped: the point is the
-    shape of the database, and reading a 100 GB UniRef to learn it is not."""
+    shape of the database, and reading a 100 GB UniRef to learn it is not.
+
+    Through opener(), and the `except` had to grow with it: opener() refuses a
+    FIFO it cannot stream with a StageError, which is not an OSError, and this
+    function's contract is that a source FASTA it cannot read is a source it
+    does not have. A DIAMOND source FASTA is an optional extra signal, so a
+    pipe at one must cost the sizing, never the search.
+    """
     out, cur = [], 0
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with opener(path) as fh:
             for line in fh:
                 if line.startswith(">"):
                     if cur:
@@ -2503,7 +3915,7 @@ def _fasta_lengths(path, cap=200000):
                     cur = 0
                 else:
                     cur += len(line.strip())
-    except OSError:
+    except (OSError, StageError):
         return out
     if cur:
         out.append(cur)
@@ -2534,10 +3946,19 @@ def diamond_source_fasta(cfg, tag, path):
     """
     stem = os.path.splitext(path)[0]
     named = ((cfg.get("sources") or {}).get("diamond") or {}).get(tag, "")
-    cands = ([named] if named and os.path.isfile(named) else []) + \
+    cands = ([named] if named else []) + \
         [stem + ext for ext in (".fas", ".faa", ".fasta")]
+    # regular_readable(), not os.path.isfile(). This function's whole job is
+    # to name a path two callers then OPEN - motif_seed_evidence() reads its
+    # deflines and diamond_db_profile() reads up to 200,000 records out of it -
+    # and isfile() is a stat: it says yes to a mode-000 .fas sitting beside a
+    # shared .dmnd, and both callers then raise PermissionError. In `doctor`
+    # that used to escape an `except StageError`; in stage_diamond it kills a
+    # search that would otherwise have run perfectly well, because the source
+    # FASTA is an OPTIONAL extra signal and never the database. A source it
+    # cannot read is a source it does not have.
     for cand in cands:
-        if os.path.isfile(cand):
+        if regular_readable(cand):
             return cand
     return ""
 
@@ -2569,7 +3990,7 @@ def motif_seed_evidence(cfg, tag, path, typical):
                 prefixed = prefixed or tok.startswith(("le-", "ma-"))
                 low = line.lower()
                 found |= {m for m in MOTIF_SEED_MARKERS if m in low}
-                if n >= 200:
+                if n >= DMND_DEFLINE_CAP:
                     break
         if prefixed:
             found.add("LE-/MA- accession prefixes")
@@ -2580,7 +4001,7 @@ def motif_seed_evidence(cfg, tag, path, typical):
 
 
 def diamond_db_profile(cfg, tag, path):
-    """(typical_len, letters, provenance) for a DIAMOND database.
+    """(typical_len, letters, provenance, read) for a DIAMOND database.
 
     `diamond dbinfo` is the only thing that can read a .dmnd, and it reports
     Sequences and Letters, so the typical length it yields is the mean. When
@@ -2588,6 +4009,16 @@ def diamond_db_profile(cfg, tag, path):
     FASTA the config names or that `doctor --fix` staged beside the database,
     where the median is available. When neither is, return (None, None, why)
     and say so rather than guessing a length the check would then act on.
+
+    `read` names what was OPENED to answer, as a token and not as prose:
+    "dbinfo" for the DIAMOND header, "fasta_lengths" for the source FASTA's
+    records, "" for neither. doctor's `depth` is a ratchet and has to be
+    DERIVED from what happened rather than hard-coded beside the check, which
+    is how both usability rows came to carry "the sequences themselves were
+    not parsed" on the fallback path - the path that reads up to 200,000
+    records, sequence lines and all, to take a median. The first time anyone
+    runs doctor on a machine without diamond, that caveat asserts the exact
+    opposite of what the check just did.
     """
     why = ""
     if have("diamond"):
@@ -2609,7 +4040,7 @@ def diamond_db_profile(cfg, tag, path):
                 n, letters = got["Sequences"], got["Letters"]
                 return ((letters / n if n else 0), letters,
                         f"mean of {n} sequences / {letters} letters, from "
-                        "`diamond dbinfo`")
+                        "`diamond dbinfo`", "dbinfo")
             why = "`diamond dbinfo` reported no Sequences/Letters for this file"
     else:
         why = "diamond is not installed, so the .dmnd cannot be read"
@@ -2619,15 +4050,26 @@ def diamond_db_profile(cfg, tag, path):
         lens = sorted(_fasta_lengths(cand))
         if lens:
             return (lens[len(lens) // 2], sum(lens),
-                    f"median of {len(lens)} sequences in {cand}")
+                    f"median of {len(lens)} sequences in {cand}",
+                    "fasta_lengths")
     return (None, None,
             why + ", and no source FASTA is on disk beside it or named in "
-            f"sources.diamond.{tag}")
+            f"sources.diamond.{tag}", "")
 
 
 def diamond_db_check(cfg, tag, path):
-    """(refusal, warning) for one configured DIAMOND database; either may be
-    None. A missing file is the caller's business, not this function's.
+    """(refusal, warning, reads) for one configured DIAMOND database; either
+    of the first two may be None. A missing file is the caller's business, not
+    this function's.
+
+    `reads` is what this check OPENED, in tokens doctor turns into a `depth`
+    and a caveat: "size" (os.path.getsize and nothing in the file), "dbinfo"
+    (the DIAMOND header), "fasta_lengths" (up to 200,000 records of the source
+    FASTA, for the median) and "fasta_headers" (up to 200 of its deflines, for
+    the motif-seed signal). Which of them happen depends on whether diamond is
+    on PATH and whether a source FASTA is beside the database, so no row can
+    state it in advance - which is exactly what the two usability rows were
+    doing.
 
     All three of these were real. A `diamond makedb` that had failed left a
     zero-byte .dmnd, which the stage would have searched, reporting no hits -
@@ -2642,20 +4084,22 @@ def diamond_db_check(cfg, tag, path):
     try:
         size = os.path.getsize(path)
     except OSError:
-        return None, None
+        return None, None, ()
     stem = os.path.splitext(path)[0]
     if size < _DMND_MIN_BYTES:
         return (f"{tag}: {path} is {size} bytes, smaller than a DIAMOND "
                 "header - a failed `diamond makedb` leaves a file like this, "
                 "and searching it reports 0 hits, which reads in the output "
                 "exactly like a real absence. Rebuild it: diamond makedb "
-                f"--in <fasta> -d {stem}"), None
+                f"--in <fasta> -d {stem}"), None, ("size",)
 
-    typical, letters, prov = diamond_db_profile(cfg, tag, path)
+    typical, letters, prov, read = diamond_db_profile(cfg, tag, path)
+    reads = ("size",) + ((read,) if read else ())
     if letters is not None and (letters == 0 or not typical):
         return (f"{tag}: {path} holds no sequences ({prov}). Searching it "
                 "would report 0 hits, which is indistinguishable from a real "
-                f"absence. Rebuild it: diamond makedb --in <fasta> -d {stem}"), None
+                f"absence. Rebuild it: diamond makedb --in <fasta> -d {stem}"),\
+            None, reads
     ev = diamond_evalue_for(cfg, tag)
     weight = (cfg.get("diamond_weights") or {}).get(tag)
     # A database that cannot answer is also holding a scoring weight that says
@@ -2663,6 +4107,11 @@ def diamond_db_check(cfg, tag, path):
     note = (f" It also carries diamond_weights {tag}: {weight}, which claims "
             "it can contribute to the score.") if weight else ""
     seed = motif_seed_evidence(cfg, tag, path, typical)
+    # motif_seed_evidence opens the source FASTA whenever there is one, and
+    # reads deflines out of it whether or not it finds anything to report - so
+    # the token is owed to the row even when `seed` comes back empty.
+    if diamond_source_fasta(cfg, tag, path):
+        reads += ("fasta_headers",)
     if seed:
         # Deliberately INSTEAD of the e-value advice below, not alongside it.
         # Telling someone to lower --evalue here sends them to tune a
@@ -2678,15 +4127,15 @@ def diamond_db_check(cfg, tag, path):
             "sequence files, not from the seed set its HMM step uses. If this "
             f"really is a database of very short peptides, set "
             f"sources.diamond.{tag} to the FASTA so this check can see what "
-            f"it is.{note}")
+            f"it is.{note}"), reads
     if typical is None:
         return None, (f"{tag}: {prov}, so nothing here can tell whether "
                       f"--evalue {ev:g} is reachable for this database. If it "
                       "returns 0 hits, that may be the threshold rather than "
-                      "the biology.")
+                      "the biology."), reads
     best = best_possible_evalue(letters, typical)
     if best is None or best <= ev:
-        return None, None
+        return None, None, reads
     return None, (
         f"{tag}: sequences here are about {typical:.0f} residues ({prov}), and "
         f"the best e-value even a perfect alignment that long could reach is "
@@ -2694,7 +4143,7 @@ def diamond_db_check(cfg, tag, path):
         "incapable of a hit before it starts, so 0 hits will say nothing about "
         f"the biology. Set a per-database e-value (diamond_evalues: "
         f"{{{tag}: 1e-3}}), or record that this database needs different "
-        f"settings than the rest.{note}")
+        f"settings than the rest.{note}"), reads
 
 
 def stage_diamond(cfg, p):
@@ -2721,7 +4170,7 @@ def stage_diamond(cfg, p):
     # from bacteriocin sequences.
     refusals = []
     for tag, path in jobs:
-        bad, warn = diamond_db_check(cfg, tag, path)
+        bad, warn, _reads = diamond_db_check(cfg, tag, path)
         if bad:
             refusals.append(bad)
         elif warn:
@@ -2981,6 +4430,20 @@ def iter_tmbed_records(path):
                     buf = []
 
 
+# The three values tmbed_use_gpu may take: the flags each turns into, and
+# whether a HOST WITH NO GPU is fatal under them. It lives beside the stage
+# because it is the stage's own map, and it is a CONSTANT because doctor's
+# `gpu:topology` row has to say what each value does on a machine with no
+# device - and was saying one thing for all three, because it had no way to
+# read this. TMbed tolerates a missing or failing GPU only under
+# --cpu-fallback, which is what makes `true` the fatal one.
+TMBED_GPU_MODES = {
+    "auto":  (("--use-gpu", "--cpu-fallback"), False),
+    "true":  (("--use-gpu", "--no-cpu-fallback"), True),
+    "false": (("--no-use-gpu",), False),
+}
+
+
 def stage_tmbed(cfg, p):
     if not have("tmbed"):
         die("tmbed not found (pip install tmbed && tmbed download)")
@@ -2989,12 +4452,15 @@ def stage_tmbed(cfg, p):
     # missing/failing GPU when --cpu-fallback is given, so "auto" asks for the
     # GPU and lets it fall back rather than losing the topology evidence.
     want = str(cfg.get("tmbed_use_gpu", "auto")).strip().lower()
-    if want in ("auto", "true", "false"):
-        gpu = {"auto": ["--use-gpu", "--cpu-fallback"],
-               "true": ["--use-gpu", "--no-cpu-fallback"],
-               "false": ["--no-use-gpu"]}[want]
-    else:
-        die(f"unknown tmbed_use_gpu '{want}'; choose auto, true or false")
+    # TMBED_GPU_MODES, not an inline dict: doctor's `gpu:topology` row has to
+    # say what each value DOES on a host with no GPU, and it was saying one
+    # thing for all three because it had no way to read this. The map is the
+    # shared fact; the names in the message below are read off it too, so a
+    # fourth mode cannot be added in one place and described in the other.
+    if want not in TMBED_GPU_MODES:
+        die(f"unknown tmbed_use_gpu '{want}'; choose "
+            + _and_list(sorted(TMBED_GPU_MODES), "or"))
+    gpu = list(TMBED_GPU_MODES[want][0])
     if want == "auto":
         log("tmbed: GPU preferred, CPU fallback allowed "
             "(set tmbed_use_gpu: true to make a missing GPU fatal)")
@@ -3389,9 +4855,17 @@ def stage_interpro(cfg, p):
 
 
 def _count_fasta(path):
-    """Records in a FASTA, without holding any of it in memory."""
+    """Records in a FASTA, without holding any of it in memory.
+
+    Through opener(), like every other reader in this file. It was one of the
+    bare opens the previous round's report missed while stating that opener()
+    was the only reader there was, and a bare open is a path that can still
+    hang: this one is only ever pointed at a work-list the run wrote itself,
+    but "only ever" is a claim about today's callers and the choke point is a
+    property of the code.
+    """
     n = 0
-    with open(path, errors="replace") as fh:
+    with opener(path) as fh:
         for line in fh:
             if line.startswith(">"):
                 n += 1
@@ -3515,6 +4989,21 @@ def stage_jackhmmer(cfg, p):
                 + [src, cfg["db"]["jackhmmer_db"]])
 
 
+def smorf_tools():
+    """Which of the ORF finders stage_smorf accepts are on PATH, in its order.
+
+    One probe with three names in one place, because three copies of it had
+    already drifted apart. stage_smorf accepts `smorf` OR `smorfinder` for the
+    SmORFinder half and `macrel` for the other; requirements() probed
+    `have("smorf") or have("macrel")`, so a host with only `smorfinder`
+    installed was reported as having neither; and doctor's contigs_fna row
+    probed nothing at all and claimed the stage dies on a bad path whatever is
+    installed - which is false, because with none of these on PATH the stage
+    never opens the assembly.
+    """
+    return [t for t in ("smorf", "smorfinder", "macrel") if have(t)]
+
+
 def stage_smorf(cfg, p):
     """Small-ORF calling. Runs on CONTIGS, not proteins: Prodigal in meta mode
     discards most ORFs below ~90 nt, so bacteriocins, TA toxins and RiPPs were
@@ -3529,8 +5018,9 @@ def stage_smorf(cfg, p):
     # `smorf`; asking for the package name meant this half never ran. `meta` is
     # the metagenome-assembly mode (and the only one that takes -t); `single`
     # is for an isolate genome.
-    exe = "smorf" if have("smorf") else (
-        "smorfinder" if have("smorfinder") else None)
+    tools = smorf_tools()
+    exe = "smorf" if "smorf" in tools else (
+        "smorfinder" if "smorfinder" in tools else None)
     mode = str(cfg.get("smorf_mode", "meta")).strip().lower()
     if mode not in ("meta", "single"):
         die(f"unknown smorf_mode '{mode}'; choose meta (assembly) or "
@@ -3543,7 +5033,7 @@ def stage_smorf(cfg, p):
         made += glob.glob(f"{p.R}/smorf/smorfinder/*.faa")
     else:
         log("smorf/smorfinder not found; skipping that half", "WARN")
-    if have("macrel"):
+    if "macrel" in tools:
         run_cmd(["macrel", "contigs", "--fasta", fna,
                  "--output", f"{p.R}/smorf/macrel", "-t", cfg["threads"]]
                 + tool_args(cfg, "macrel"))
@@ -3843,7 +5333,20 @@ def stage_context(cfg, p):
         r["immunity_toxin"] = toxin
 
     with atomic_out(p.context) as tmp:
-        pd.DataFrame(rows).to_csv(tmp, sep="\t", index=False)
+        # An empty `rows` must still write the COLUMN. pd.DataFrame([]) has no
+        # columns at all, and to_csv then writes a file of one newline - one
+        # byte, so nonempty() is true, so parse_context() gets past its guard
+        # and pd.read_csv raises EmptyDataError("No columns to parse from
+        # file"). `integrate` ALWAYS runs, so that killed every run with
+        # run.context on whose GFF produced no neighbourhood rows: a zero-byte
+        # gff, or a header-only one with no CDS records. The `gff` is empty
+        # branch at the top of this function has always written the column and
+        # is the shape this has to match - an empty RESULT and an unset input
+        # are the same file, which is what doctor's `input:gff` row says they
+        # are.
+        pd.DataFrame(rows if rows else None,
+                     columns=None if rows else ["protein_id"]).to_csv(
+                         tmp, sep="\t", index=False)
 
     # An all-False context.tsv is indistinguishable from "no interesting
     # neighbourhoods found", so say what was actually loaded and what fired.
@@ -6181,10 +7684,48 @@ def unipept_http(peptides, cfg):
         "interface is NOT accepted: it has no taxon-id columns.")
 
 
+# What read_unipept_result() says about a pept2lca export with no header
+# line, written ONCE because two `doctor` rows quote it back to the operator.
+# They used to quote pandas instead - "Could not determine delimiter", the
+# message the python engine's sniffer raised - and that sentence was a fact
+# about somebody else's library pasted into this file's prose, so the day this
+# reader stopped using that engine the rows were describing an error nothing
+# could produce any more. A quote of a constant cannot drift from the constant;
+# test_the_unipept_result_rows_quote_the_refusal_the_reader_really_raises
+# drives the reader and holds the row against it.
+EMPTY_PEPT2LCA = ("this pept2lca export has no header line, so there are no "
+                  "columns to read and nothing to ingest")
+
+
 def read_unipept_result(path):
     """Ingest pept2lca output from the CLI or a previous run. Tolerant of
-    csv/tsv and of the v1/v2 column spellings."""
-    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8", encoding_errors="replace")
+    csv/tsv and of the v1/v2 column spellings.
+
+    THROUGH read_delim_table(), which is one open through the choke point, and
+    it was a bare pd.read_csv(path, sep=None, engine="python") - a SIXTH
+    reader of an operator-supplied path outside opener(). `unipept.result` is
+    a path the operator writes in the config exactly as `quant_table` is, so a
+    FIFO there hung `run` forever holding the results lock, in the same way
+    and for the same reason. It was not in the previous round's list of
+    readers because that list was read off the code rather than measured; this
+    one was found by tracing every open a real run makes of every path its
+    config names.
+
+    sep=None asked pandas' python engine to sniff the delimiter, which is the
+    same job _sniff_sep() does from the header line - and the python engine is
+    the slow parser. One open, one sniff, the C parser, and the csv/tsv
+    tolerance this docstring promises is unchanged.
+    """
+    try:
+        df = read_delim_table(path)
+    except pd.errors.EmptyDataError:
+        # A zero-byte export reaches here because stage_unipept's own test is
+        # os.path.exists(), which a 0-byte file passes. Named in this file's
+        # own words rather than left as pandas' "No columns to parse from
+        # file", which says neither which file nor what it was expected to be.
+        die(f"{path}: {EMPTY_PEPT2LCA}. Re-run 'unipept pept2lca --equate "
+            "--all -i peptides.txt -o pept2lca.csv', or clear "
+            "`unipept.result` to query the API instead.")
     ren = {"peptide": "peptide", "Peptide": "peptide",
            "taxon_id": "taxon_id", "taxon_name": "taxon_name",
            "taxon_rank": "taxon_rank"}
@@ -6219,13 +7760,33 @@ def read_unipept_result(path):
 
 class NCBITaxonomy:
     """Minimal nodes.dmp / names.dmp reader, so eggNOG seed taxids can be
-    given a lineage offline rather than through another web service."""
+    given a lineage offline rather than through another web service.
+
+    EVERY .dmp FILE GOES THROUGH opener(), and until this round none of them
+    did.
+    `db.ncbi_taxonomy` is an operator-supplied path in exactly the sense
+    `quant_table` is - somebody types it into the config and points it at a
+    directory they made - and these were four bare open() calls, so a FIFO at
+    nodes.dmp left `run` blocked inside the open with NO exit status and the
+    results lock still held, which is the original failure mode of this whole
+    change set, intact, in the one class of path nobody had swept. It was
+    disclosed as "the next place to look" and then measured: 45 seconds, no
+    output, no status, lock held.
+
+    The database paths are a CLASS and not an instance. What made them invisible
+    is that the inputs everybody argued about - proteins_faa, quant_table,
+    manifest, emapper_precomputed - are the ones with `input:` rows on doctor,
+    while a taxdump is a `db:` row and was read as infrastructure rather than
+    as something an operator hands this program. They are the same thing to an
+    open(): a path from a config, opened for reading, that may be anything the
+    filesystem can hold.
+    """
 
     def __init__(self, d):
         self.parent, self.rank, self.name = {}, {}, {}
         self.merged, self.deleted = {}, set()
         self.unresolved = set()
-        with open(os.path.join(d, "nodes.dmp")) as fh:
+        with opener(os.path.join(d, "nodes.dmp")) as fh:
             for line in fh:
                 f = [x.strip() for x in line.split("|")]
                 self.parent[f[0]], self.rank[f[0]] = f[1], f[2]
@@ -6235,19 +7796,19 @@ class NCBITaxonomy:
         # taxdump made it worse, not better.
         mp = os.path.join(d, "merged.dmp")
         if os.path.exists(mp):
-            with open(mp, encoding="utf-8") as fh:
+            with opener(mp) as fh:
                 for line in fh:
                     f = [x.strip() for x in line.split("|")]
                     if len(f) > 1 and f[0] and f[1]:
                         self.merged[f[0]] = f[1]
         dp = os.path.join(d, "delnodes.dmp")
         if os.path.exists(dp):
-            with open(dp, encoding="utf-8") as fh:
+            with opener(dp) as fh:
                 for line in fh:
                     t = line.split("|")[0].strip()
                     if t:
                         self.deleted.add(t)
-        with open(os.path.join(d, "names.dmp")) as fh:
+        with opener(os.path.join(d, "names.dmp")) as fh:
             for line in fh:
                 # Cheap substring test first: names.dmp has several million
                 # lines and only a fraction are scientific names.
@@ -6632,6 +8193,65 @@ def split_ids(v):
     return [first_token(x) for x in re.split(r"[;,]", v) if x.strip()]
 
 
+def _sniff_sep(head, path):
+    """The delimiter, from the header line alone. One rule, one place."""
+    sep = max(("\t", ",", ";", "|"), key=head.count)
+    if head.count(sep) == 0:
+        sep = "," if str(path).lower().endswith(".csv") else "\t"
+    return sep
+
+
+class _HeadRestored(io.TextIOBase):
+    """A text stream whose first line has already been read, put back.
+
+    THE PIECE THAT MAKES A TABLE SINGLE-READ. Deciding the delimiter needs the
+    header line, and pandas needs the file from the top - which is two reads of
+    the same bytes, and read_delim_table paid for it with two OPENS: its own
+    for the sniff, then pandas' own for the body. On a regular file that is
+    only wasteful. On a FIFO it is fatal and it is where the quant table
+    actually hung, in a bare open() that the round which "routed every reader
+    through the choke point" never touched.
+
+    Handing pandas the already-open handle with `names=` would be the obvious
+    alternative and is not the same file: `names=` skips pandas' own header
+    handling, so two columns called `a` stop being `a` and `a.1`. Putting the
+    line BACK keeps every byte pandas would have seen in the order it would
+    have seen it, so the frame is identical - which is asserted rather than
+    assumed, against a table with a duplicate column name and an embedded
+    quoted delimiter.
+    """
+
+    def __init__(self, head, fh):
+        self._head, self._fh = head, fh
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        if not self._head:
+            return self._fh.read(size)
+        if size is None or size < 0:
+            head, self._head = self._head, ""
+            return head + self._fh.read()
+        if len(self._head) >= size:
+            head, self._head = self._head[:size], self._head[size:]
+            return head
+        head, self._head = self._head, ""
+        return head + self._fh.read(size - len(head))
+
+    def readline(self, size=-1):
+        if self._head:
+            head, self._head = self._head, ""
+            return head
+        return self._fh.readline(size)
+
+    def __iter__(self):
+        line = self.readline()
+        while line:
+            yield line
+            line = self.readline()
+
+
 def read_delim_table(path, **kw):
     """pd.read_csv with the delimiter taken from the header line only.
 
@@ -6639,17 +8259,56 @@ def read_delim_table(path, **kw):
     combined_peptide.tsv that is ~18x slower and needs 4-6x the memory of the
     C parser for no benefit whatever: the first line already says which
     delimiter this is.
+
+    ONE OPEN, through opener(), and both halves of that sentence are fixes.
+    This function used to open the path twice - a bare open() for the sniff
+    and pandas' own open() for the body - and the bare one was the reader the
+    previous round's report said did not exist, in the same function as the
+    one it did fix. Traced, quant_table was opened four times by an ordinary
+    run and two of those were here; a FIFO hung on the second, holding the
+    results lock, while the writer took EPIPE. The sniffed line is put back
+    with _HeadRestored() rather than re-read, so pandas sees the file from byte
+    zero exactly as before.
     """
-    with open(path, "r", newline="", errors="replace", encoding="utf-8") as fh:
+    with opener(path) as fh:
+        return read_delim_stream(path, fh, **kw)
+
+
+def read_delim_stream(path, fh, **kw):
+    """read_delim_table's body, over a handle somebody else opened.
+
+    Split out so that a caller which has ALREADY opened the table - to
+    recognise it from its header before pandas is allowed near it - does not
+    have to open it a second time. `path` is still passed, and only for the
+    two things a handle cannot supply: the .csv fallback when the header holds
+    no delimiter at all, and the name in an error message.
+    """
+    head = fh.readline()
+    sep = _sniff_sep(head, path)
+    # encoding/encoding_errors are NOT set here and were before: the handle is
+    # already a decoded text stream from opener(), which states utf-8 and
+    # errors="replace" itself, and passing an encoding alongside a text handle
+    # asks pandas to decode something that is already text.
+    return pd.read_csv(_HeadRestored(head, fh), sep=sep, low_memory=False, **kw)
+
+
+def read_named_table(path, **kw):
+    """(columns, frame) for a delimited table, from ONE open.
+
+    Every caller that reads a quant table does the same two things in the same
+    order: look at the header to decide whether this is a file it may read at
+    all - refuse_isobaric_matrix() and its siblings - and then parse the body.
+    Written as two calls, that is two or three opens of one path, which is
+    what made a FIFO at quant_table impossible however long anything waited.
+    Written here, it is one.
+    """
+    with opener(path) as fh:
         head = fh.readline()
-    sep = max(("\t", ",", ";", "|"), key=head.count)
-    if head.count(sep) == 0:
-        sep = "," if path.lower().endswith(".csv") else "\t"
-    # setdefault, not a literal keyword: **kw is the caller's, and passing
-    # encoding twice is a TypeError rather than a preference.
-    kw.setdefault("encoding", "utf-8")
-    kw.setdefault("encoding_errors", "replace")
-    return pd.read_csv(path, sep=sep, low_memory=False, **kw)
+        cols = _header_cells(head, path)
+        sep = _sniff_sep(head, path)
+        df = pd.read_csv(_HeadRestored(head, fh), sep=sep, low_memory=False,
+                         **kw)
+    return cols, df
 
 
 def excluded_prefixes(cfg):
@@ -6688,13 +8347,30 @@ def header_columns(path):
     TMT flavour of msstats.csv carries unquoted commas in Protein.Description
     and dies in the C parser with a tokenising error that names neither TMT
     nor the file, so the recogniser has to run before pandas does.
+
+    Through opener(), like every other reader in this file, and it was the one
+    that was not. The consequence was exact: a FIFO at a TMT plex's ion.tsv
+    was one of the seven paths that hung `run` forever, and it hung HERE, in a
+    bare open() one function away from the choke point that was fixed. One
+    reader outside the gate is one path still hanging. `newline=""` is gone
+    with it and nothing changes: the only use of the line is
+    `rstrip("\r\n")`, which strips a CRLF whether or not the reader already
+    translated it.
+
+    IT IS STILL A WHOLE OPEN, which is why read_named_table() exists beside
+    it: a caller that wants the columns AND the body must not call this and
+    then read the table, because that is two opens and a FIFO has one. This is
+    for the callers that want the header and nothing else.
     """
-    with open(path, "r", newline="", errors="replace", encoding="utf-8") as fh:
-        head = fh.readline()
-    sep = max(("\t", ",", ";", "|"), key=head.count)
-    if head.count(sep) == 0:
-        sep = "," if path.lower().endswith(".csv") else "\t"
-    return [c.strip().strip('"') for c in head.rstrip("\r\n").split(sep)]
+    with opener(path) as fh:
+        return _header_cells(fh.readline(), path)
+
+
+def _header_cells(head, path):
+    """The column names in a header line. Shared, so one line cannot be split
+    one way for the recogniser and another way for the parser."""
+    return [c.strip().strip('"')
+            for c in head.rstrip("\r\n").split(_sniff_sep(head, path))]
 
 
 def refuse_isobaric_matrix(path, cols):
@@ -7056,9 +8732,13 @@ def read_fragpipe_tmt(root, cfg):
             die(f"plex {plex} has no {fname}: {path} does not exist "
                 f"(tmt.level is '{level}'). {pdir} contains "
                 f"{sorted(f for f in os.listdir(pdir) if f.endswith('.tsv'))}.")
-        refuse_isobaric_matrix(path, header_columns(path))
+        # One open for the header AND the body: the recogniser has to run
+        # before pandas parses this file, and calling header_columns() in
+        # front of read_delim_table() is how a plex's ion.tsv came to be
+        # opened twice - which is one open too many for a FIFO.
+        hdr, df = read_named_table(path)
+        refuse_isobaric_matrix(path, hdr)
         ann = read_tmt_annotation(tmt_annotation_path(plex, pdir, cfg), plex)
-        df = read_delim_table(path)
         cols, samples, how = _tmt_map_reporter_columns(path, df, ann, token)
         nonnum = [c for c in cols if not pd.api.types.is_numeric_dtype(df[c])]
         if nonnum:
@@ -7637,8 +9317,8 @@ def read_fragpipe_tmt_peptides(root, cfg):
         path = os.path.join(pdir, TMT_LEVEL_FILES[level])
         if not os.path.exists(path):
             die(f"plex {plex} has no {TMT_LEVEL_FILES[level]}: {path}")
-        refuse_isobaric_matrix(path, header_columns(path))
-        df = read_delim_table(path)
+        cols, df = read_named_table(path)
+        refuse_isobaric_matrix(path, cols)
         prot = "Protein" if "Protein" in df.columns else "Protein ID"
         if prot not in df.columns:
             die(f"{path}: no 'Protein' or 'Protein ID' column")
@@ -7691,8 +9371,8 @@ def read_feature_table(path, fmt, cfg):
     # msstats.csv dies in the C parser on unquoted commas in
     # Protein.Description, and a tmt-report matrix parses perfectly and is
     # already log2. Both have to be named, not guessed at downstream.
-    refuse_isobaric_matrix(path, header_columns(path))
-    df = read_delim_table(path)
+    cols, df = read_named_table(path)
+    refuse_isobaric_matrix(path, cols)
     design = None
 
     if fmt in ("fragpipe_peptide", "fragpipe_ion"):
@@ -7759,8 +9439,16 @@ def read_feature_table(path, fmt, cfg):
                 "of every plex and joins them; or use a label-free or DIA-NN "
                 "input.")
         rename = {}
-        if cfg.get("manifest"):
-            m = read_manifest(cfg["manifest"])
+        # READ ONCE, used twice. The manifest was read here and again forty
+        # lines down for the design, which is two opens of an operator-
+        # supplied path for one file's worth of information - and two opens is
+        # one too many for a FIFO, which is why `mkfifo p; cat design > p &`
+        # at `manifest` failed after burning the whole `fifo_wait_s`. One read
+        # is also one parse and one set of refusals, so a manifest that is
+        # rejected is rejected once.
+        man = read_manifest(cfg["manifest"]) if cfg.get("manifest") else None
+        if man is not None:
+            m = man
             rename, miss_rows, miss_cols = map_manifest_to_columns(
                 m, int_cols, " " + suffix)
             if miss_rows:
@@ -7814,8 +9502,8 @@ def read_feature_table(path, fmt, cfg):
             int_cols = [rename[c] for c in int_cols]
         feats = pd.concat([feats, vals], axis=1)
         design = None
-        if cfg.get("manifest"):
-            mm = read_manifest(cfg["manifest"])
+        if man is not None:
+            mm = man
             design = mm[["sample", "experiment", "bioreplicate"]].rename(
                 columns={"experiment": "group", "bioreplicate": "replicate"})
             design = design[design["sample"].isin(int_cols)]
@@ -7900,8 +9588,8 @@ def read_feature_peptides(path, fmt, cfg):
     """
     if fmt == "fragpipe_tmt":
         return read_fragpipe_tmt_peptides(path, cfg)
-    refuse_isobaric_matrix(path, header_columns(path))
-    df = read_delim_table(path)
+    cols, df = read_named_table(path)
+    refuse_isobaric_matrix(path, cols)
     pref = excluded_prefixes(cfg)
 
     if fmt in ("fragpipe_peptide", "fragpipe_ion"):
@@ -7993,6 +9681,17 @@ def peptide_features(cfg, stage):
 
 ASSIGNMENT_MODES = ("protein_unique", "taxon_unique",
                     "taxon_or_family_unique", "razor")
+# The values `assignment_class` takes in peptide_evidence.tsv and
+# feature_quant.tsv, in the order the join log reports them. A constant
+# because the README and the R object both ENUMERATE these and neither had
+# anything to enumerate FROM: the names existed only as string literals inside
+# rollup_features() and as a hand-written list of five in the prose, which is
+# precisely the arrangement that let three other counts in this change set
+# drift. The log line below is built from this tuple, so a sixth class cannot
+# be added without appearing there and failing the test that holds the README
+# against it.
+ASSIGNMENT_CLASSES = ("unique", "taxon_unique", "family_unique", "shared",
+                      "shared_unknown_taxon")
 ROLLUP_METHODS = ("sum", "median_polish")
 
 
@@ -8178,12 +9877,10 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
     n = len(feats)
     kept = feats["_assigned"].notna()
     n_fam = int((feats["_class"] == "family_unique").sum())
-    log(f"features: {n} total, {int(kept.sum())} assigned under '{mode}' "
-        f"(unique {int((feats['_class']=='unique').sum())}, "
-        f"taxon-unique {int((feats['_class']=='taxon_unique').sum())}, "
-        f"family-unique {n_fam}, "
-        f"shared {int((feats['_class']=='shared').sum())}, "
-        f"shared-unknown-taxon {int((feats['_class']=='shared_unknown_taxon').sum())})")
+    log(f"features: {n} total, {int(kept.sum())} assigned under '{mode}' ("
+        + ", ".join(f"{k.replace('_', '-')} "
+                    f"{int((feats['_class'] == k).sum())}"
+                    for k in ASSIGNMENT_CLASSES) + ")")
     if mode == "taxon_or_family_unique":
         log(f"peptide_assignment=taxon_or_family_unique: {n_fam} feature(s) "
             "kept because their candidates share an MMseqs family_id rather "
@@ -8486,13 +10183,17 @@ def stage_join(cfg, p):
     # A tmt-report matrix reads perfectly as a wide protein table and is
     # already log2, so nothing downstream would ever notice. Name it here.
     if fmt in PROTEIN_FORMATS and os.path.isfile(qpath):
-        refuse_isobaric_matrix(qpath, header_columns(qpath))
+        # ONE header read for BOTH refusals. They were two calls to
+        # header_columns(), which is two opens of the quant table before
+        # pandas has opened it a third time - the arithmetic that makes a
+        # protein-level quant table a path no FIFO can satisfy.
+        qcols = header_columns(qpath)
+        refuse_isobaric_matrix(qpath, qcols)
         # And the per-plex protein.tsv, which carries neither of that
         # function's two markers and would otherwise be quantified as a
         # label-free protein table — one plex reported as the experiment.
         refuse_per_plex_reporter_table(
-            qpath, header_columns(qpath),
-            cfg.get("feature_intensity_suffix", "Intensity"))
+            qpath, qcols, cfg.get("feature_intensity_suffix", "Intensity"))
     # A roll-up method only means something where there is something to roll
     # up. Ignored quietly, a config saying median_polish next to a DIA-NN
     # protein matrix would describe numbers the search engine produced.
@@ -8651,7 +10352,17 @@ def stage_join(cfg, p):
             "imputed low-abundance values are exactly where the KO-less "
             "fraction sits", "WARN")
     else:
-        q = pd.read_csv(qpath, sep="\t", low_memory=False, encoding="utf-8", encoding_errors="replace")
+        # Through opener(), like every other reader. This was a bare
+        # pd.read_csv(qpath) - a FIFTH reader outside the choke point, and it
+        # was found by counting the opens of a real run rather than by reading
+        # the list of readers somebody had written down, which is how the
+        # first four were missed. sep is "\t" by DECISION here (a DIA-NN or
+        # FragPipe protein matrix is tab separated) rather than sniffed, which
+        # is why this is not read_delim_table(); the encoding arguments go
+        # with the bare open, because opener() hands back text that is already
+        # decoded utf-8 with errors="replace".
+        with opener(qpath) as fh:
+            q = pd.read_csv(fh, sep="\t", low_memory=False)
 
     if fmt == "diann":
         id_col = "Protein.Group"
@@ -9029,7 +10740,7 @@ def _content_digest(path, size, mtime, full=False):
         return hit
     h = hashlib.sha1()
     try:
-        with open(path, "rb") as fh:
+        with _open_regular_binary(path) as fh:
             if full or size <= _HASH_FULL_MAX:
                 for chunk in iter(lambda: fh.read(1 << 20), b""):
                     h.update(chunk)
@@ -9079,6 +10790,26 @@ UNIPEPT_KEYS = ["unipept.result", "unipept.allow_http", "unipept.api_url",
                 "unipept.consensus_min_fraction",
                 "unipept.consensus_min_peptides"]
 
+# `requires` and `degraded_by` name, per stage, the requirements() ids this
+# stage DIES without and the ones it merely does less without. They exist
+# because requirements() cannot answer that question: it gates on run: flags
+# with inline boolean logic (`if R.get("pfam") or R.get("dbcan") or
+# R.get("ncbifam") or R.get("jackhmmer")` for hmmer), so it knows that
+# SOMETHING wants hmmsearch and not which stage dies without it - and
+# `doctor --json` has to say exactly that, or its `blocks` is prose in a JSON
+# field. They live here, beside `inp`, `keys` and `deps`, because this is the
+# place a new stage is added, and a test fails when one arrives without them.
+#
+# Every value is read off the stage FUNCTION, not off its `inp` lambda: `inp`
+# lists what the signature digests, and a stage that skips a missing input
+# still digests it. The two are not the same list, and the difference is the
+# whole point - stage_diamond digests every configured database and dies
+# without none of them, because it logs "diamond database missing, skipping"
+# and searches the rest.
+#
+# `degraded_by` entries are fnmatch patterns, so one entry can claim the
+# `diamond:<tag>` family, whose ids are created per configured database and
+# cannot be listed statically.
 STAGES = [
     dict(name="emapper", cost=3, enabled="eggnog",
          out=lambda p: [p.emapper],
@@ -9088,21 +10819,28 @@ STAGES = [
          keys=["emapper_precomputed", "emapper_id_transform",
                "emapper_strip_id_prefix",
                "emapper_min_coverage", "db.eggnog_data"],
+         requires=("eggnog-mapper", "eggnog_data"), degraded_by=(),
          deps=[], fn=stage_emapper),
     dict(name="pfam", cost=3, enabled="pfam", out=lambda p: [p.pfam],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["pfam_hmm"]],
-         keys=["db.pfam_hmm"], deps=[], fn=stage_pfam),
+         keys=["db.pfam_hmm"],
+         requires=("hmmer", "pfam_hmm"), degraded_by=(),
+         deps=[], fn=stage_pfam),
     dict(name="dbcan", cost=2, enabled="dbcan", out=lambda p: [p.dbcan],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["dbcan_hmm"]],
-         keys=["db.dbcan_hmm", "thresholds.dbcan_evalue"], deps=[], fn=stage_dbcan),
+         keys=["db.dbcan_hmm", "thresholds.dbcan_evalue"],
+         requires=("hmmer", "dbcan_hmm"), degraded_by=(),
+         deps=[], fn=stage_dbcan),
     dict(name="diamond", cost=2, empty_ok=True, enabled="diamond",
          out=lambda p: [p.diamond_done],
          inp=lambda c, p: [c["proteins_faa"]] + list((c["db"].get("diamond") or {}).values()),
          keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues",
                "thresholds.diamond_min_pident", "diamond_min_pidents"],
+         requires=("diamond",), degraded_by=("diamond:*",),
          deps=[], fn=stage_diamond),
     dict(name="signalp", cost=3, enabled="topology", out=lambda p: [p.signalp],
          inp=lambda c, p: [c["proteins_faa"]], keys=["signalp_mode"],
+         requires=("signalp6",), degraded_by=(),
          deps=[], fn=stage_signalp),
     # gpu=True: this stage takes an exclusive lease on gpu_device. tmbed held
     # 15.5 GB of a 16 GB card; see gpu_workers.
@@ -9120,29 +10858,41 @@ STAGES = [
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["gpu_device", "tmbed_use_gpu", "tmbed_max_len",
                "tmbed_batch_size", "tmbed_allow_partial",
-               "tmbed_max_consecutive_failures"], deps=[], fn=stage_tmbed),
+               "tmbed_max_consecutive_failures"],
+         requires=("tmbed",), degraded_by=(),
+         deps=[], fn=stage_tmbed),
     dict(name="cluster", cost=1, enabled="cluster", out=lambda p: [p.cluster],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["thresholds.cluster_min_seq_id", "thresholds.cluster_coverage"],
+         requires=("mmseqs2",), degraded_by=(),
          deps=[], fn=stage_cluster),
     dict(name="ncbifam", cost=3, enabled="ncbifam", out=lambda p: [p.ncbifam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("ncbifam_hmm", "")],
-         keys=["db.ncbifam_hmm", "thresholds.ncbifam_cutoff"], deps=[], fn=stage_ncbifam),
+         keys=["db.ncbifam_hmm", "thresholds.ncbifam_cutoff"],
+         requires=("hmmer", "ncbifam_hmm"), degraded_by=(),
+         deps=[], fn=stage_ncbifam),
     dict(name="kofam", cost=3, enabled="kofam", out=lambda p: [p.kofam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("kofam_ko_list", "")],
-         keys=["db.kofam_profiles", "db.kofam_ko_list"], deps=[], fn=stage_kofam),
+         keys=["db.kofam_profiles", "db.kofam_ko_list"],
+         requires=("kofamscan", "kofam_db"), degraded_by=(),
+         deps=[], fn=stage_kofam),
     dict(name="interpro", cost=3, enabled="interpro", out=lambda p: [p.interpro],
          inp=lambda c, p: [c["proteins_faa"]],
-         keys=["interpro_applications", "db.interproscan_sh"], deps=[], fn=stage_interpro),
+         keys=["interpro_applications", "db.interproscan_sh"],
+         requires=("interproscan",), degraded_by=(),
+         deps=[], fn=stage_interpro),
     dict(name="smorf", cost=1, empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
          inp=lambda c, p: [c.get("contigs_fna", "")],
-         keys=["smorf_mode", "thresholds.smorf_max_len"], deps=[], fn=stage_smorf),
+         keys=["smorf_mode", "thresholds.smorf_max_len"],
+         requires=(), degraded_by=("smorf",),
+         deps=[], fn=stage_smorf),
     dict(name="context", cost=1, enabled="context", out=lambda p: [p.context],
          inp=lambda c, p: [c.get("gff") or "", p.emapper, p.pfam, p.signalp,
                            p.dbcan],
          keys=["gff", "context_window", "immunity_max_len", "immunity_max_gap",
                "pul_min_cazymes", "thresholds.dbcan_min_cov",
                "thresholds.dbcan_evalue"],
+         requires=(), degraded_by=(),
          deps=['emapper', 'pfam', 'signalp', 'dbcan'], fn=stage_context),
     dict(name="integrate", cost=2, enabled=None,
          out=lambda p: [p.pass1, p.dark, p.dark_all],
@@ -9167,16 +10917,21 @@ STAGES = [
                "max_dark_structures", "max_len_structure",
                "exclude_id_prefixes", "toxin_fold_patterns",
                "ncbifam_uninformative_test"],
+         requires=(), degraded_by=(),
          deps=['emapper', 'pfam', 'dbcan', 'diamond', 'signalp', 'tmbed', 'cluster', 'ncbifam', 'kofam', 'interpro', 'context'], fn=stage_integrate_pass1),
     # dark_all.faa, not dark.faa: the profile searches query the whole
     # unannotated set, the structure work-list is a GPU budget.
     dict(name="jackhmmer", cost=3, empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
          inp=lambda c, p: [p.dark_all, c["db"].get("jackhmmer_db", "")],
          keys=["db.jackhmmer_db", "jackhmmer_iterations",
-               "thresholds.jackhmmer_evalue"], deps=['integrate'], fn=stage_jackhmmer),
+               "thresholds.jackhmmer_evalue"],
+         requires=("hmmer", "jackhmmer_db"), degraded_by=(),
+         deps=['integrate'], fn=stage_jackhmmer),
     dict(name="hhblits", cost=3, empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
          inp=lambda c, p: [p.dark_all, c["db"].get("hhblits_db", "")],
-         keys=["db.hhblits_db", "hhblits_iterations"], deps=['integrate'], fn=stage_hhblits),
+         keys=["db.hhblits_db", "hhblits_iterations"],
+         requires=("hhsuite", "hhblits_db"), degraded_by=(),
+         deps=['integrate'], fn=stage_hhblits),
     # gpu=True: ESMFold peaked at 13.3 GB on a single short sequence, so it
     # cannot share a 16 GB card with tmbed; see gpu_workers.
     dict(name="esmfold", cost=3, empty_ok=True, enabled="structure", gpu=True,
@@ -9186,6 +10941,7 @@ STAGES = [
                "esmfold_allow_partial", "esmfold_max_consecutive_failures",
                "esmfold_vram_cap", "esmfold_bytes_per_residue_pair",
                "esmfold_vram_reserve_gb"],
+         requires=("esmfold",), degraded_by=(),
          deps=['integrate'], fn=stage_esmfold),
     dict(name="foldseek", cost=2, empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
          inp=lambda c, p: [p.struct_done],
@@ -9195,6 +10951,7 @@ STAGES = [
                "thresholds.foldseek_cluster_evalue",
                "thresholds.foldseek_cluster_tmscore",
                "thresholds.foldseek_cluster_coverage"],
+         requires=("foldseek", "foldseek_target"), degraded_by=(),
          deps=['esmfold'], fn=stage_foldseek),
     dict(name="finalise", cost=2, enabled=None,
          out=lambda p: [p.final, p.summary, p.agreement],
@@ -9207,16 +10964,19 @@ STAGES = [
                "diamond_min_pidents", "anchor_pfams",
                "toxin_fold_patterns", "ncbifam_uninformative_test",
                "foldseek_target_priority"],
+         requires=(), degraded_by=(),
          deps=['integrate', 'jackhmmer', 'hhblits', 'foldseek', 'context'], fn=stage_integrate_final),
     dict(name="unipept", cost=3, enabled="unipept", out=lambda p: [p.unipept_lca],
          inp=lambda c, p: quant_inputs(c) + [(c.get("unipept") or {}).get("result", "")],
          keys=UNIPEPT_KEYS + ["quant_table", "quant_format", "tmt",
                "peptide_only_reader", "exclude_id_prefixes"],
+         requires=(), degraded_by=(),
          deps=[], fn=stage_unipept),
     dict(name="taxonomy", cost=1, enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
          inp=lambda c, p: [p.unipept_lca, p.final] + quant_inputs(c),
          keys=UNIPEPT_KEYS + ["db.ncbi_taxonomy", "peptide_only_reader",
                "exclude_id_prefixes", "quant_format", "tmt"],
+         requires=(), degraded_by=("ncbi_taxonomy",),
          deps=['unipept', 'finalise'], fn=stage_taxonomy),
     dict(name="join", cost=2, enabled="join",
          out=lambda p: [f"{p.quant_dir}/annotated_quant.tsv"],
@@ -9233,6 +10993,7 @@ STAGES = [
                "intensity_columns", "intensity_regex",
                "feature_intensity_suffix", "feature_exclude_suffixes",
                "export_feature_quant", "taxon_min_proteins_for_factor"],
+         requires=("ncbi_taxonomy",), degraded_by=(),
          deps=['finalise', 'taxonomy'], fn=stage_join),
 ]
 STAGE_NAMES = [s["name"] for s in STAGES]
@@ -12409,10 +14170,30 @@ def auto_contrasts(design_path, formula, factor_cols=""):
     published number for the wrong comparison. When analysis.factor_cols
     disagrees with the formula about which term that is, the two statements of
     intent conflict and stopping beats guessing.
+
+    THE READ GOES THROUGH opener(), and that is a fix rather than a tidy-up.
+    `design_path` is `analysis.metadata` on a TMT project - an operator-
+    supplied path, straight out of the config - and this was a bare
+    pd.read_csv() on it. Measured: `metaannot report` on a config whose
+    metadata was a FIFO printed "this is a FIFO, and this run reads it exactly
+    once, so it is read as a live stream", from the gated header read in
+    _tmt_report_design() one call above, and then BLOCKED HERE with no exit
+    status and no log line - and `fifo_wait_s: 0`, which exists to refuse a
+    FIFO outright, changed nothing, because a bare pandas open has no wait to
+    shorten. A command that can hang is exactly as bad as a stage that can
+    hang. Through opener() the second open is refused by name instead ("this
+    run has already read it once"), which is what _FIFO_TAKEN is for.
+
+    The separator stays a literal tab and the parse is otherwise untouched:
+    this is a routing fix, and read_delim_table()'s sniff would quietly change
+    which files parse.
     """
     if not os.path.exists(design_path):
         return ""
-    d = pd.read_csv(design_path, sep="\t", encoding="utf-8", encoding_errors="replace")
+    # encoding and errors are opener()'s, which states utf-8/replace itself -
+    # passing them alongside a decoded handle asks pandas to decode text.
+    with opener(design_path) as fh:
+        d = pd.read_csv(fh, sep="\t")
     terms = _formula_terms(formula)
     factors = [c.strip() for c in str(factor_cols or "").split(",") if c.strip()]
     cands = [t for t in terms if t in d.columns]
@@ -12602,9 +14383,12 @@ def _tmt_report_design(cfg, a, design_auto):
     same = os.path.abspath(meta_path) == os.path.abspath(design_auto)
     have = None
     if os.path.exists(meta_path):
-        have = list(pd.read_csv(meta_path, sep="\t", nrows=0,
-                                encoding="utf-8",
-                                encoding_errors="replace").columns)
+        # header_columns(), not a bare pd.read_csv(nrows=0): `analysis.metadata`
+        # is an operator-supplied path and this runs in `report`, which was
+        # never swept, so this was one more read of a configured path outside
+        # the choke point. It wants the column NAMES and nothing else, which is
+        # what header_columns() is for and is one open rather than pandas'.
+        have = header_columns(meta_path)
     if have is None or "group" not in terms:
         return
     rows = []
@@ -12785,6 +14569,25 @@ def cmd_object(args):
 
 def cmd_report(args):
     cfg = load_config(args.config)
+    # The wait, which this command was not setting while publishing it. `report`
+    # reads an operator-supplied path of its own - analysis.metadata, through
+    # auto_contrasts() - so it reaches opener()'s FIFO arm exactly as `run`
+    # does, and without this it used the MODULE DEFAULT: six hours, on a config
+    # that said three seconds. `fifo_wait_s: 0` is the one that made it plainly
+    # wrong rather than merely imprecise, because README and TUTORIAL both
+    # publish it as "refused on the spot" and `report` sat for six hours on it.
+    # Measured both ways before this line existed: `run` died at 0.3s with 0 and
+    # at 5.3s with 5, while `report` was still going at 60s with either.
+    #
+    # Not fatal on a bad value, and for cmd_doctor's reason rather than a new
+    # one: a mistyped wait is a thing to report, not a thing to refuse a report
+    # over, and `run` has already refused it loudly for the run that wrote these
+    # results. `subset` needs no call - it takes no --config, so the module
+    # default IS its setting, and the sentence it prints quotes that default.
+    try:
+        set_fifo_wait(cfg["fifo_wait_s"])
+    except (TypeError, ValueError, KeyError):
+        set_fifo_wait(DEFAULT_CONFIG["fifo_wait_s"])
     if args.results_dir:
         cfg["results_dir"] = args.results_dir
     p = Paths(cfg)
@@ -12979,9 +14782,22 @@ def requirements(cfg, p):
     if R.get("structure"):
         add(id="foldseek", label="foldseek", ok=have("foldseek"),
             cmds=[f"{M} install -y -c bioconda foldseek"], size_gb=0.1)
-        add(id="esmfold", label="fair-esm (ESMFold)", ok=_pyhas("esm"),
-            cmds=['pip install "fair-esm[esmfold]"'], size_gb=3.0,
-            note="GPU host only; pulls torch and openfold")
+        # EITHER backend, because stage_esmfold accepts either: it tries
+        # fair-esm, falls back to transformers, and dies only when BOTH
+        # imports fail. Probing "esm" alone failed a host where ESMFold runs -
+        # and on a current card that is the ORDINARY host, because fair-esm's
+        # esmfold extra needs an openfold pinned to a 2022 commit whose CUDA
+        # kernels do not compile against a modern toolkit at all. The install
+        # line names transformers for the same reason; the note keeps the
+        # fair-esm one, which is still what the stage prefers when it is there.
+        add(id="esmfold", label="ESMFold (fair-esm or transformers)",
+            ok=_pyhas("esm") or _pyhas("transformers"),
+            cmds=["pip install transformers"], size_gb=3.0,
+            note="GPU host only; pulls torch. stage_esmfold prefers fair-esm "
+                 "(pip install 'fair-esm[esmfold]') when it is importable "
+                 "and otherwise uses transformers, which ships the same "
+                 "facebook/esmfold_v1 weights and builds against a current "
+                 "toolkit")
     if R.get("topology"):
         add(id="tmbed", label="tmbed", ok=have("tmbed"),
             cmds=["pip install tmbed", "tmbed download"], size_gb=2.5,
@@ -12990,28 +14806,47 @@ def requirements(cfg, p):
             manual="academic licence required",
             note="register at services.healthtech.dtu.dk, then `pip install <tarball>`")
     if R.get("kofam"):
-        add(id="kofamscan", label="KOfamScan", ok=have("exec_annotation"),
+        # BOTH names, because stage_kofam accepts both: `exec_annotation` is
+        # the console script the bioconda package installs, and `kofamscan` is
+        # what the upstream tarball calls it. Probing the first alone reported
+        # KOfamScan missing - and doctor claimed blocks: ["kofam"] - on a host
+        # where the stage runs.
+        add(id="kofamscan", label="KOfamScan",
+            ok=have("exec_annotation") or have("kofamscan"),
             cmds=[f"{M} install -y -c bioconda kofamscan"], size_gb=0.05)
     if R.get("hhblits"):
         add(id="hhsuite", label="hhblits", ok=have("hhblits"),
             cmds=[f"{M} install -y -c bioconda hhsuite"], size_gb=0.2)
     if R.get("interpro"):
-        add(id="interproscan", label="InterProScan",
-            ok=_exists(db.get("interproscan_sh")),
-            manual="large Java distribution, version-specific",
-            note=f"see {src.get('interproscan', '')} (that directory has "
-                 "404'd before; check the current release path) -- untar, run "
-                 "`interproscan.sh -i test_proteins.fasta`, then set "
-                 "db.interproscan_sh")
+        # Two different situations behind one `manual:`, and _remedy_for()
+        # exists to tell them apart: an UNFILLED db.interproscan_sh wants an
+        # edit box, while a path that is set and not there wants the link-out
+        # to a version-specific Java distribution. Setting manual= to the
+        # licence-shaped string unconditionally put every InterProScan row on
+        # the wrong side of that split, so a preflight screen offered a
+        # link-out where the fix was a config key. dbentry()'s exact marker
+        # string is reused rather than a second spelling of it, because
+        # _remedy_for switches on that string.
+        ish = db.get("interproscan_sh") or ""
+        add(id="interproscan", label="InterProScan", ok=_exists(ish),
+            manual=("large Java distribution, version-specific" if ish
+                    else "no path configured"),
+            note=(f"see {src.get('interproscan', '')} (that directory has "
+                  "404'd before; check the current release path) -- untar, "
+                  "run `interproscan.sh -i test_proteins.fasta`, then set "
+                  "db.interproscan_sh" if ish else
+                  "set db.interproscan_sh to the interproscan.sh of an "
+                  "unpacked InterProScan distribution, then rerun doctor"))
     if R.get("smorf"):
         # SmORFinder installs its CLI as `smorf`, not `smorfinder`, so probing
         # the package name could never find it and this half was always
         # reported (and skipped) as absent.
         add(id="smorf", label="smorfinder (smorf) / macrel",
-            ok=have("smorf") or have("macrel"),
+            ok=bool(smorf_tools()),
             cmds=["pip install macrel", "pip install smorfinder"], size_gb=0.3,
             note="either one is enough to start; SmORFinder's command is "
-                 "`smorf`, macrel's is `macrel`")
+                 "`smorf` (it answers to `smorfinder` too), macrel's is "
+                 "`macrel`")
     if R.get("eggnog") and not pre:
         add(id="eggnog-mapper", label="eggnog-mapper", ok=have("emapper.py"),
             cmds=[f"{M} install -y -c bioconda eggnog-mapper"], size_gb=0.2,
@@ -13119,7 +14954,26 @@ def requirements(cfg, p):
             note="hours, and the Ca index wants ~150 GB RAM; `foldseek "
                  "databases PDB <path> tmp` is ~2 GB and still finds most "
                  "classical toxin folds")
-    if R.get("taxonomy"):
+    # Two stages want the taxdump and only one of them is run.taxonomy, which
+    # is why this gate is a disjunction rather than the single flag it was.
+    # stage_join -> resolve_taxonomy -> collapse_taxon_rank dies with
+    # "taxon_rank='genus' needs db.ncbi_taxonomy" on ANY config that asks for a
+    # rank, whether or not the comparison stage runs - and collapse_taxon_rank
+    # is itself what walks an operator into that config, since its log on the
+    # default tells them to set taxon_rank and says it needs the taxdump.
+    # Gated on run.taxonomy alone, such a config produced NO ROW AT ALL, so
+    # requirement_effect()'s taxon_rank condition - which exists for exactly
+    # this - was never consulted and doctor exited 0 on a run that dies. A
+    # missing row is the most expensive false pass there is: nothing in the
+    # document is wrong, so nothing can notice it.
+    #
+    # The disjunction itself now lives in _taxdump_readers(), which is also
+    # what the read plan counts the .dmp opens with, because those two were
+    # the same question asked in two places: "which stages want the taxdump".
+    # Asked twice, it can be answered twice, and the read-plan half was the
+    # half that did not exist at all - the four .dmp files went through a bare
+    # open() and a FIFO at any of them hung the run holding the results lock.
+    if _taxdump_readers(cfg):
         t = db.get("ncbi_taxonomy", "")
         dbentry("ncbi_taxonomy", "NCBI taxdump", t, 0.08, lambda t: [
             f"mkdir -p {q(t)}",
@@ -13246,6 +15100,24 @@ def describe(cfg, p, config_path=None):
             # the scheduler sorts each round's ready set by, so a front end
             # can order or annotate the table the same way.
             "cost": st.get("cost"),
+            # Which requirements() ids this stage DIES without, and which it
+            # merely does less without. Added for `doctor --json`'s `blocks`,
+            # and emitted here too because a field on STAGES that describe does
+            # not carry is invisible to the console that reads the contract -
+            # and because the answer is static, so a front end can say "this
+            # stage needs Pfam-A" before it ever runs doctor. DESCRIBE_VERSION
+            # does not move for it: the rule at the constant is that adding a
+            # key is not a bump, and a consumer reading the fields it already
+            # knew about is unaffected by a new one appearing. This comment
+            # said "the eight fields it knew about is unaffected by a NINTH
+            # appearing" while sitting above BOTH of the keys below, which
+            # arrived together - the fourth consecutive round to ship a
+            # hand-written count that was wrong, and the reason the scanner in
+            # tests/test_docs.py now reads digits and reads tests/ too. The
+            # dict emits ten keys, and that number is counted off the dict
+            # literal itself rather than remembered.
+            "requires": list(st.get("requires", ())),
+            "degraded_by": list(st.get("degraded_by", ())),
         } for st in STAGES],
         "bins": list(BIN_ORDER),
         "quant_formats": sorted(ALL_FORMATS),
@@ -13296,481 +15168,3478 @@ def cmd_describe(args):
     return 0
 
 
-def cmd_doctor(args):
-    cfg = load_config(args.config)
-    p = Paths(cfg)
-    ok = True
+# ======================================================================
+# doctor
+# ======================================================================
+# `doctor --json` is a contract, and the whole of it is built out of the list
+# `doctor_checks()` returns: one entry per line the human report prints, so the
+# two renderings cannot drift. `detail` IS the printed sentence, not a second
+# wording of it.
+#
+# The scope of the whole command, in one sentence the engine authors and a
+# front end renders verbatim. It lives here rather than in a README or in the
+# console, because "and doctor says so" is the half of the rule that keeps a
+# passing check from being read as a promise about the file's contents.
+#
+# The checks that READ INTO a file to answer their own question, named once.
+# The count was written by hand in four places and had already come apart: the
+# scope statement said "four" while the caveat on every tmt annotation row -
+# PUBLISHED text, in the document - still said "three", and "go past a header"
+# was not even the same predicate, since the quant-table check reads the header
+# line and nothing else. Nothing counts these by hand now; a fifth entry here
+# needs the argument at DOCTOR_DEPTHS and changes every sentence at once.
+DOCTOR_DEEP_CHECKS = ("the DIAMOND usability check",
+                      "the TMT plex annotations",
+                      "the manifest",
+                      "the quant table's header line")
+_COUNT_WORDS = ("no", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten")
 
-    if args.config and yaml is not None and os.path.exists(args.config):
-        with open(args.config, encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
-        bad = unknown_keys(raw, DEFAULT_CONFIG) if isinstance(raw, dict) else []
-        if bad:
-            print("== config ==")
-            for b in bad:
-                if b in RETIRED_KEYS:
-                    # A retired key is not a failure: the config predates a
-                    # removal, the setting is inert, and doctor exiting
-                    # non-zero over it would block a run that is otherwise
-                    # correct. Say so and carry on.
-                    print(f"  {'WARN':6s} '{b}' is no longer a setting - "
-                          f"{RETIRED_KEYS[b]}")
-                    continue
-                ok = False
-                print(f"  {'MISS':6s} unrecognised key '{b}'"
-                      + (nearest_config_key(b) or ".")
-                      + " It is being ignored, so this setting is NOT in "
-                        "effect.")
 
-    print("== inputs ==")
-    for label, path in [("proteins_faa", cfg["proteins_faa"]),
-                        ("quant_table", cfg["quant_table"]),
-                        ("gff", cfg.get("gff") or "")]:
-        if not path:
-            print(f"  {'-':6s} {label:16s} (not set)")
+def _count_word(n):
+    """A small count as an English word, so a DERIVED count still reads as
+    prose rather than as a digit dropped into a sentence."""
+    return _COUNT_WORDS[n] if n < len(_COUNT_WORDS) else str(n)
+
+
+_ORDINAL_WORDS = ("zeroth", "first", "second", "third", "fourth", "fifth",
+                  "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh",
+                  "twelfth")
+
+
+def _ordinal_word(n):
+    """A small ordinal as an English word, for the same reason _count_word()
+    exists: a sentence about the Nth member of a closed set has to be able to
+    DERIVE N from the set. The one that said "an eighth value" beside a tuple
+    of nine had been wrong for three consecutive rounds, twice inside the
+    comment on the very constant that enforces the set."""
+    return _ORDINAL_WORDS[n] if n < len(_ORDINAL_WORDS) else f"{n}th"
+
+
+def _and_list(items, word="and"):
+    """'a, b and c' - the join these sentences are written in.
+
+    `word` because the same derived list reads as a conjunction in one
+    sentence and a choice in the next ("choose auto, false or true"), and a
+    sentence that writes its own list is a sentence that can write a stale
+    one.
+    """
+    items = list(items)
+    if len(items) < 2:
+        return "".join(items)
+    return ", ".join(items[:-1]) + f" {word} " + items[-1]
+
+
+DOCTOR_DEEP_COUNT = _count_word(len(DOCTOR_DEEP_CHECKS))
+# The half-sentence a deep row owes for having read what it read. One string,
+# because a row that writes its own is a row that can write the wrong number.
+DOCTOR_DEEP_CLAUSE = (f"one of the {DOCTOR_DEEP_COUNT} checks in this command "
+                      "that read INTO a file")
+
+DOCTOR_SCOPE_STATEMENT = (
+    "A check that passes says the thing exists, is the right kind of thing, "
+    "and is not empty. It does not say the thing is correct inside: doctor "
+    "does not parse FASTA files, quant tables or sequence databases FOR THEIR "
+    f"CONTENT. {DOCTOR_DEEP_COUNT.capitalize()} checks do read into a file to "
+    "answer their own question - " + _and_list(DOCTOR_DEEP_CHECKS)
+    + " - and each says which on its own row, in depth and caveat. An input "
+    "that passes every check here can still fail the stage that reads it.")
+
+# The exit status, as a sentence naming exactly one field. A consumer that
+# understands nothing else in the document can still compute the status a
+# newer doctor produced.
+DOCTOR_VERDICT_RULE = (
+    "exit_status is 1 if and only if at least one entry in checks has status "
+    "'fail'; otherwise 0. A check fails exactly when something this config "
+    "asks for dies on it, and the row names what: an ENABLED stage in "
+    "`blocks`, or a whole COMMAND - run, report, object - in "
+    "`blocks_commands`, which is a failure with no stage in it at all. Both "
+    "carry fails_reason 'stage_or_command_dies'. There is exactly one "
+    "declared exception, carried as fails_reason 'setting_ignored': a setting "
+    "the config asks for is silently not in effect, and nothing dies. "
+    "Warnings, retired keys, MANUAL remedies and checks that do not apply to "
+    "this config never move the exit status.")
+
+# CLOSED vocabularies. A consumer switches on these, so adding a value to one
+# is a MEANING change and bumps DOCTOR_VERSION; see the constant. `finding`,
+# the `blocks` stage names and every `detail` are OPEN: a consumer that meets
+# an unfamiliar value there keeps `status` and renders `detail`.
+DOCTOR_STATUSES = ("ok", "warn", "fail", "skip")
+DOCTOR_REMEDIES = ("auto", "manual", "config", "input", "none")
+# Two values, not the three the design sketch proposed. A "config
+# contradiction" sounded like a third kind of failure and turned out not to be
+# one: every one this config vocabulary can express kills something outright -
+# run.taxonomy without run.unipept is stage_taxonomy dying on a unipept_lca
+# nothing wrote; both tmt.reference_name and tmt.reference_channel set is
+# read_fragpipe_tmt dying on the pair. Publishing a value nothing emits invites
+# a branch that never runs, and under the rule at DOCTOR_VERSION adding one
+# later is a bump - which is the right price for deciding there really is a
+# third kind.
+#
+# The first value was called `stage_dies`, and that name was a lie on every row
+# that kills a COMMAND: a missing `limma` gives status "fail", blocks [], and
+# blocks_commands ["report", "object"], and no stage dies anywhere in it. Three
+# of the four places the rule was written down had copied the name's sentence
+# and omitted that whole class - `verdict.rule`, which is IN the document and
+# so the one a consumer parses, was the loosest of them. A name a reader has to
+# be warned about is a name that will be mis-copied again, so it says both
+# halves now, and `blocks` against `blocks_commands` is still how a consumer
+# tells them apart. That is a renamed value in a closed enum and would be a
+# DOCTOR_VERSION bump under the rule above - except that doctor_version 1 has
+# never shipped: this whole document is in the same unreleased change set, so
+# there is no consumer to break and nothing to bump from.
+DOCTOR_FAIL_REASONS = ("stage_or_command_dies", "setting_ignored")
+# How deep the check looked, and it is a RATCHET rather than a menu. "doctor
+# does not parse" is already false as an unqualified claim, and the checks at
+# DOCTOR_DEEP_CHECKS make it so - that tuple is where they are counted, not
+# here, because this comment is one of the four places that were counting them
+# by hand and disagreeing: diamond_db_check reads
+# a DIAMOND header, or - when diamond is not on PATH - up to 200,000 records of
+# the source FASTA for a length profile and 200 of its deflines; the tmt block
+# reads every plex's annotation file; _manifest_checks calls read_manifest() on
+# the manifest IN FULL, because the mapping check has no runs to map without
+# it; and that mapping check calls pd.read_csv with nrows=0 on the quant
+# table's header line. Those four are grandfathered and say so per check, in
+# `caveat`. A FIFTH needs a reason written down here, not merely another use of
+# an existing value: the previous attempt at this command grew toward parsing
+# FASTA and quant tables, which is a different program. The other three depths
+# are plain: "config" consulted nothing outside the config, "existence" asked
+# only whether a path is there, "kind" also asked what kind of thing it is and
+# whether it is empty, and "probe" asked the HOST (PATH, an import, CUDA, an
+# Rscript query) rather than a file.
+#
+# The ratchet is enforced in BOTH directions, in _check(): "header" and
+# "parsed" must carry a caveat, and "existence" and "kind" must carry a
+# `found`, so a row can neither hide a read nor claim one it never made.
+DOCTOR_DEPTHS = ("config", "existence", "kind", "header", "parsed",
+                 "probe")
+# The ratchet's ORDER, which DOCTOR_DEPTHS is not a statement of: "probe" asks
+# the HOST rather than a file and stands beside this ladder rather than on top
+# of it. Anything comparing two depths compares them here.
+DOCTOR_DEPTH_ORDER = ("config", "existence", "kind", "header", "parsed")
+# `found.kind`: the states a path can be in, named so a consumer never
+# computes `bytes > 0` for itself - which _found()'s docstring and the README
+# both tell it not to. It was outside the versioned set until now, which is
+# the difference between a contract and a suggestion: adding a value would not
+# have been a bump, and a console's switch would have fallen through in
+# silence. Same rule as the other closed sets, written down once at
+# DOCTOR_VERSION and applying to all of them.
+#
+# `other` and `unreadable` were the two states this set did NOT have, and the
+# comment here used to name them both as things that "would not have been a
+# bump" - while _found() was answering `absent` for both. A FIFO at
+# proteins_faa is the case that makes it more than tidiness: os.path.exists()
+# is TRUE for one, so cmd_run's guard passes and `run` does not refuse, while
+# the row said `blocks_commands: ["run"]` and "run refuses before any stage
+# starts" - the identical false claim a directory used to produce, one path
+# state over. A directory nobody may list is the other: answering "absent"
+# there sends an operator looking for a file that is sitting exactly where
+# they put it, when the remedy is a permission.
+#
+# NULL IS ONE VALUE MORE THAN THIS TUPLE HOLDS, AND IT IS PART OF THE
+# CONTRACT. A row whose `found` is non-null may still carry `kind: null`, and
+# it means "this build did not compute it", never "nothing is there": the
+# families at DOCTOR_NULL_KIND_ROWS answer with ONE BOOLEAN (have(),
+# _exists(), _pyhas(), torch.cuda, requireNamespace) and cannot say whether
+# what failed is absent, a directory or an unpressed library. In the default
+# document those are the MAJORITY of the rows. _check() admits it explicitly -
+# the guard there is `not in (None,) + DOCTOR_FOUND_KINDS` - so a consumer
+# switching on this field has to have a null arm, and `found.present` is what
+# carries the answer on those rows.
+#
+# The POSITION of that null is deliberately not written here. It was, as "an
+# eighth value", beside a tuple of nine, and that was the THIRD consecutive
+# round to ship a wrong hand-written count - the second of them inside the
+# comment on the constant enforcing the very set being counted. It is derived
+# at DOCTOR_NULL_KIND_NOTE below and pinned against the README by a test.
+DOCTOR_FOUND_KINDS = ("file", "empty_file", "dir", "empty_dir",
+                      "symlink_broken", "absent", "unset", "other",
+                      "unreadable")
+# WHAT `other` REALLY IS, because `other` is three things and the document was
+# publishing one of them for all three. `_raises_promptly()` was
+# `kind != "other"`, so every sentence derived from it - the verb, the "not
+# refused on sight" paragraph, the wait - was written for a FIFO and then
+# printed over a UNIX socket and a device node, where it is false: driven, a
+# socket at proteins_faa published "dies, but not at once ... waits
+# fifo_wait_s", while a socket cannot be opened as a file at all - os.open()
+# itself fails on it, which is what the stage-side test asserts. Two halves of
+# one change set contradicting
+# each other in the emitted document, in the derivation that existed to stop
+# exactly that.
+#
+# A NEW KEY rather than three new `kind` values: `kind` is a CLOSED enum a
+# consumer switches on, so growing it is a meaning change and a DOCTOR_VERSION
+# bump; adding a key is not, and a consumer that has never heard of
+# `other_kind` keeps every answer it had. It is null for every kind but
+# `other`, where it is one of these.
+DOCTOR_OTHER_KINDS = ("fifo", "socket", "char_device", "block_device")
+# Which rows carry that null, as (prose, id glob) pairs rather than as a
+# sentence, so a test can drive a real document and hold the prose against the
+# rows that REALLY carry one. "the DIAMOND usability rows" was in this list in
+# three places for three rounds and was never true: `db:diamond:<tag>:usable`
+# is built with `found=_found(path)` and carries a real kind, which makes it
+# the document's own counterexample to the sentence it was named in.
+DOCTOR_NULL_KIND_ROWS = (("the requirement rows", "req:*"),
+                         ("the CUDA probe", "gpu:probe"),
+                         ("the R block", "r:*"))
+# DERIVED, and the one place this sentence is written. The README and the
+# CHANGELOG are held against it.
+DOCTOR_NULL_KIND_NOTE = (
+    "`found.kind` has a "
+    + _ordinal_word(len(DOCTOR_FOUND_KINDS) + 1)
+    + " value and it is `null`: a row may carry a non-null `found` whose "
+    "`kind` is null, and it means 'this build did not compute it', never "
+    "'nothing is there'. It is "
+    + _and_list([prose for prose, _glob in DOCTOR_NULL_KIND_ROWS])
+    + ", which answer with one boolean and cannot tell an absent database "
+    "from a directory or an unpressed library; `found.present` carries the "
+    "answer there.")
+# `expect.kind`: the kinds of thing a check can want. Enumerated nowhere at
+# all before this - not in a constant, not in the README, not in a test - so
+# nothing could have noticed a sixth appearing. "setting" is what the config
+# rows used to call "probe", which collided with `depth: "probe"` and meant
+# the opposite: those rows consult NOTHING outside the config, while a
+# `depth: "probe"` row asks the host. "probe" now means the same thing in both
+# fields - CUDA, an import, an Rscript query - and a row that says it in one
+# says it in the other.
+DOCTOR_EXPECT_KINDS = ("file", "dir", "on_path", "probe", "setting",
+                       "r_package")
+# Names that may appear in `blocks_commands`. They are metaannot SUBCOMMANDS,
+# not stages, and describe --json's stage_names will never contain them - which
+# is exactly why they are not allowed into `blocks`, where every name joins to
+# that list.
+DOCTOR_COMMANDS = ("run", "report", "object")
+
+# The printed `== ... ==` heading for each section id, in doctor's own print
+# order. Named rather than reconstructed from the id, so a console reproduces
+# the grouping an operator already knows instead of inventing "Precomputed
+# Emapper" from a slug.
+# A TUPLE, and that is load-bearing rather than a style. `section` is the
+# eighth closed vocabulary in this document and it was guarded nowhere: a
+# misspelling took the TEXT command down with a bare KeyError out of
+# print_doctor()'s `titles[seen]` - no document at all, which is the most
+# expensive failure this command has - while under --json the row was simply
+# dropped from `sections` and nothing anywhere objected. The enumeration
+# tripwire in the suite could not see it either, because it collects the
+# DOCTOR_* constants that are TUPLES and this was a list. One character, and
+# the tripwire starts working for it.
+DOCTOR_SECTIONS = (
+    ("config", "config"),
+    ("inputs", "inputs"),
+    ("precomputed_emapper", "precomputed emapper"),
+    ("tools", "tools"),
+    ("databases", "databases"),
+    ("gpu", "gpu"),
+    ("tmt", "tmt"),
+    ("manifest", "manifest"),
+    ("taxonomy", "taxonomy"),
+    ("resources", "resources"),
+    ("R", "R"),
+)
+
+# What the two size totals are worth. `accuracy`/`basis` are the fields to
+# branch on; this is the sentence to show, and it is here rather than in the
+# console because CLAUDE.md already tells the operator to report both totals
+# and to say so if one looks off "since the per-item sizes it prints are
+# hand-maintained". Written twice is written wrong.
+DOCTOR_SIZE_DETAIL = (
+    "Per-item figures are hand-maintained constants in requirements(), not "
+    "measurements of the URLs, and they have been wrong by an order of "
+    "magnitude before: the Foldseek AFDB50 entry claimed ~1 TB until v0.5.0 "
+    "corrected it to ~123 GB, and that was the number a user read before "
+    "deciding whether to enable the structure stage at all. Treat both totals "
+    "as the magnitude to plan a volume around, never as a download's "
+    "denominator.")
+
+
+def enabled_stages(cfg):
+    """The stage names this config turns on, in engine order.
+
+    The two stages with `enabled: None` have no run: flag and always run.
+    """
+    R = cfg.get("run") or {}
+    return [st["name"] for st in STAGES
+            if st["enabled"] is None or R.get(st["enabled"])]
+
+
+def _claims(patterns, rid):
+    """Does a stage's requires/degraded_by tuple name this requirement id?
+
+    fnmatchcase, so the diamond stage can claim the whole `diamond:<tag>`
+    family with one entry: those ids are created per configured database and
+    cannot be listed statically.
+    """
+    return any(fnmatch.fnmatchcase(rid, pat) for pat in patterns)
+
+
+def requirement_effect(cfg, rid, join_reaches=None):
+    """(blocks, degrades) for one requirements() item: which ENABLED stages
+    die without it, and which run anyway and do less.
+
+    `join_reaches` overrides the quant-table contingency below, and exists so
+    that the one caller who needs to ask "would RESTORING the quant table put
+    join in blocks" can ask THIS function instead of reimplementing half of
+    it. It had reimplemented half of it: the old test beside the caller was
+    `join is on and the quant table is absent and join's requires tuple claims
+    this id`, which misses the other contingency entirely. With taxon_rank
+    empty, `ncbi_taxonomy` is not fatal for join whatever the quant table
+    does - collapse_taxon_rank returns the raw seed taxids untouched - so that
+    row was promising an operator a failure that restoring the table would
+    not produce.
+
+    This is the second scope sentence as a data structure. The attribution
+    lives on STAGES beside `inp`, `keys` and `deps` - the place a new stage is
+    added - because requirements() gates on run: flags with inline boolean
+    logic (`if R.get("pfam") or R.get("dbcan") or ...` for hmmer) and so knows
+    that SOMETHING wants hmmsearch but not which stage dies without it.
+
+    Two conditions cannot be static tuples and are applied here, each derived
+    from the stage function rather than from its inp lambda:
+
+    * db.ncbi_taxonomy is fatal for `join` only when taxon_rank asks for a
+      rank: collapse_taxon_rank dies on a missing nodes.dmp under
+      taxon_rank='genus' and returns the raw seed taxids untouched when
+      taxon_rank is empty.
+    * NOTHING join declares is fatal when the quant table is absent, because
+      join returns before it consults any of it. See
+      _join_reaches_its_requirements().
+    * a diamond DATABASE never blocks: stage_diamond logs "diamond database
+      missing, skipping" and searches the rest, and writes an empty .done
+      marker when none of them exist. Only the diamond BINARY is fatal, and
+      only a database that EXISTS and cannot answer is - which is a separate
+      check (db:diamond:<tag>:usable), not this one.
+    """
+    on = set(enabled_stages(cfg))
+    blocks, degrades = [], []
+    for st in STAGES:
+        if st["name"] not in on:
             continue
-        good = os.path.exists(path)
-        ok &= good or label == "gff"
-        print(f"  {'OK' if good else 'MISS':6s} {label:16s} {path}")
+        if _claims(st.get("requires", ()), rid):
+            blocks.append(st["name"])
+        elif _claims(st.get("degraded_by", ()), rid):
+            degrades.append(st["name"])
+    if rid == "ncbi_taxonomy" and not str(cfg.get("taxon_rank") or ""):
+        blocks = [s for s in blocks if s != "join"]
+    if join_reaches is None:
+        join_reaches = _join_reaches_its_requirements(cfg)
+    if not join_reaches:
+        blocks = [s for s in blocks if s != "join"]
+    return blocks, degrades
 
+
+def _join_reaches_its_requirements(cfg):
+    """False when stage_join returns before it touches anything it requires.
+
+    stage_join's first act is `if not os.path.exists(quant_table): log("quant
+    table not found, skipping join"); return` - before resolve_taxonomy, before
+    any reader, before anything in the stage's `requires` tuple is consulted.
+    So with the quant table absent, join dies on NOTHING it declares, and a
+    requirement row that names it is a false FAIL on the more common half of
+    the configs: run.taxonomy is off in DEFAULT_CONFIG, so `taxon_rank: genus`
+    with no taxdump and no quant table had doctor exiting 1 with
+    `req:ncbi_taxonomy` while `run` exited 0 on "done: 4 run, 0 adopted, 17
+    skipped".
+
+    doctor already held this contingency in two other places and applied it in
+    neither: `input:quant_table` reports `degrades: ["join"]` on exactly this
+    config, and _manifest_checks gates its whole verdict on the same
+    os.path.exists. It is one predicate now, and the rows that depend on it say
+    so with `depends_on: ["input:quant_table"]`.
+
+    ABSENT and not "unusable": an empty file or a directory both satisfy
+    os.path.exists(), so join does NOT take the skip branch for them - it goes
+    on to resolve_taxonomy and dies there exactly as the row claims.
+    """
+    return os.path.exists(cfg.get("quant_table") or "")
+
+
+def quant_consumers(cfg):
+    """The enabled stages that OPEN `quant_table`, in engine order.
+
+    join reads it through read_feature_table on a feature-level format and
+    reads it itself on a protein-level one - pd.read_csv plus column detection,
+    inline in stage_join; unipept and taxonomy read it through
+    peptide_features(). Nothing else opens it, which
+    is why a quant table missing from an annotate-only config is not a failure
+    of any kind: `run.join` is true in DEFAULT_CONFIG and stage_join logs a
+    WARN and returns.
+
+    unipept is here only when `unipept.result` is UNSET, and that clause is
+    the whole difference between "names the table" and "opens it".
+    stage_unipept returns after ingesting that export and never reaches
+    peptide_features(), so every row that asks "who reads this table" has to
+    ask it this way: the manifest block and the tmt block were asking the
+    coarser question and claiming a stage that returns first - a `blocks`
+    doctor cannot justify, on a config `run` completes.
+    """
+    on = set(enabled_stages(cfg))
+    u = cfg.get("unipept") or {}
+    return [s for s in ("unipept", "taxonomy", "join")
+            if s in on and not (s == "unipept" and u.get("result"))]
+
+
+def _peptide_readers(cfg):
+    """The enabled stages that would call peptide_features() on quant_table.
+
+    quant_consumers() without join, and empty on a protein-level format: both
+    stages refuse one before reaching the table at all - stage_unipept in its
+    own words, stage_taxonomy with "the taxonomy comparison needs
+    peptide-level input" - so neither dies on a missing quant table there, and
+    neither may be listed as blocked by it.
+    """
+    if cfg.get("quant_format") not in FEATURE_FORMATS:
+        return []
+    return [s for s in quant_consumers(cfg) if s != "join"]
+
+
+def _manifest_readers(cfg):
+    """The enabled stages that actually call read_manifest().
+
+    Opening the quant table is not the same as opening the manifest beside it,
+    and what separates them is the quant FORMAT. read_manifest is reached from
+    exactly two places: read_feature_table's fragpipe_peptide/fragpipe_ion
+    branch, which every quant consumer goes through, and stage_join's own
+    diann/fragpipe branch, where a manifest overrides column detection for a
+    wide protein table. The MSstats long formats carry their design in the
+    table itself and never look at it, and read_fragpipe_tmt logs "`manifest`
+    is ignored for quant_format 'fragpipe_tmt'" and takes its sample names
+    from each plex's annotation file instead - so on those four formats a
+    manifest that is not there kills nothing at all.
+    """
+    fmt = cfg.get("quant_format")
+    if fmt in ("fragpipe_peptide", "fragpipe_ion"):
+        # ...except under peptide_only_reader 'always', where
+        # peptide_features() goes straight to read_feature_peptides and the
+        # full reader - the only one that opens a manifest - is never called.
+        if str(cfg.get("peptide_only_reader", "auto")).lower() == "always":
+            return [s for s in quant_consumers(cfg) if s == "join"]
+        return quant_consumers(cfg)
+    if fmt in ("diann", "fragpipe"):
+        # The peptide stages die on a protein-level format before any reader
+        # opens anything, so join is the only one that gets as far as a
+        # manifest here.
+        return [s for s in quant_consumers(cfg) if s == "join"]
+    return []
+
+
+def _full_reader_refusal(cfg):
+    """(dies, survives) when the FULL quant reader REFUSES the table.
+
+    The third question, and the one the rows about a table's CONTENT ask: a
+    manifest run that matches no column, a TMT annotation that cannot be read,
+    two plexes claiming one sample name. join has no second reader -
+    read_feature_table, or its own inline read for a protein-level table, is
+    how it quantifies - so it dies.
+    The taxonomy stages go through peptide_features(), which CATCHES
+    StageError and re-reads with the peptide-only reader ("Quantification is
+    still unavailable - only the taxonomy work continues"), so the same
+    refusal costs them nothing: they want peptides and candidates, and the
+    fallback supplies both. peptide_only_reader is what decides that - 'never'
+    is the mode that says refuse rather than fall back, and under 'always' the
+    full reader is not called at all.
+
+    They are not in `degrades` either, and that is deliberate: the fallback
+    returns the same peptides, so the unipept and taxonomy OUTPUTS are
+    unchanged. What is lost is quantification, which is join's alone.
+    """
+    readers = _peptide_readers(cfg)
+    mode = str(cfg.get("peptide_only_reader", "auto")).lower()
+    dies = [s for s in quant_consumers(cfg)
+            if s == "join" or (mode == "never" and s in readers)]
+    return dies, [s for s in readers if s not in dies]
+
+
+def _no_manifest_reader(cfg):
+    """Why a manifest is inert on this config, in the reader's own words.
+
+    One sentence per format family, because "nothing opens it" is true for
+    two quite different reasons and the operator's next move differs: on a TMT
+    run the manifest is the wrong KIND of document, while on MSstats input the
+    design is already in the table.
+    """
+    fmt = cfg.get("quant_format")
+    if fmt == "fragpipe_tmt":
+        return ("quant_format is 'fragpipe_tmt', so the manifest is not used: "
+                "sample names come from each plex's annotation file, and a "
+                "TMT manifest's experiment column is the plex, not a "
+                "condition. read_fragpipe_tmt says so in the log and reads it "
+                "no further.")
+    return (f"quant_format '{fmt}' carries its own design (Run, Condition, "
+            "BioReplicate) in the table, and no reader for it opens a "
+            "manifest")
+
+
+def _refusal_status(dies):
+    """`fail` only where a full-reader refusal actually kills something.
+
+    A quant table the full reader refuses is fatal to join and survivable for
+    the taxonomy stages, so on a config with join off there can be nothing
+    left to die - and a row that said "fail" with an empty `blocks` would not
+    merely be wrong: it trips _check()'s own invariant and takes the whole
+    command down with an AssertionError.
+    """
+    return "fail" if dies else "warn"
+
+
+def _stage_error_clause(f, path=""):
+    """The half-sentence a state that ends in a StageError owes the reader.
+
+    WHERE the StageError comes from, because the two places it can come from
+    mean different things to somebody watching a run. A FIFO at a single-read
+    input raises one only after `fifo_wait_s` has gone by, so the operator has
+    a wait to plan around; a character device and an empty manifest raise at
+    the open, so there is nothing to wait for. That distinction used to be
+    baked into the sentence as "once the wait below is over" and printed over
+    every StageError state, which told an operator with a device node at an
+    input to expect a six-hour pause that was never going to happen.
+    """
+    waits = (f.get("other_kind") == "fifo"
+             and len(planned_reads(path) if path else ()) <= 1)
+    return ((": opener() raises a StageError once the wait is over"
+             if waits else
+             ": opener() raises a StageError at the open")
+            + ", and a StageError is a refusal that peptide_features() "
+            "catches.")
+
+
+def _survives_clause(survives):
+    """The half-sentence a full-reader refusal owes the stages it spares."""
+    if not survives:
+        return ""
+    return (" " + " and ".join(survives) + " read this table for peptides "
+            "only: peptide_features() re-reads with the peptide-only reader "
+            "when the full one refuses it (and skips the full reader "
+            "altogether under peptide_only_reader: always), so this does not "
+            "kill " + ("either of them" if len(survives) > 1 else "it")
+            + " - peptide_only_reader: never would.")
+
+
+def _found(path):
+    """What is actually at a path, named rather than left to arithmetic.
+
+    A consumer must read `kind` and never compute `bytes > 0` for itself: the
+    whole first scope sentence is about the states a bare os.path.exists()
+    cannot tell apart, and each of them has a name here. `symlink_broken` in
+    particular is why these checks used to "fail for the right reason by
+    accident": os.path.exists() follows the link and answers False, and nothing
+    could say why.
+
+    `present` is os.path.exists()'s answer and has to stay that, because that
+    is the guard every stage in this file puts in front of an input - so a
+    state where the two disagree is a state where a row's whole sentence is
+    wrong. That is what `other` is for: a FIFO, a socket or a device node is
+    neither a regular file nor a directory, and answering `absent` for it -
+    which is what the fall-through below used to do - told an operator that
+    `run` would refuse, on a path os.path.exists() is perfectly happy with.
+    """
+    blank = {"present": False, "kind": "unset", "other_kind": None,
+             "bytes": None, "entries": None, "symlink": False}
+    if not path:
+        return blank
+    try:
+        sym = os.path.islink(path)
+        if sym and not os.path.exists(path):
+            return {"present": False, "kind": "symlink_broken",
+                    "other_kind": None, "bytes": None,
+                    "entries": None, "symlink": True}
+        if os.path.isdir(path):
+            try:
+                n = len(os.listdir(path))
+            except OSError:
+                # There, and the OS will not describe it: a directory with no
+                # read bit, or one under a parent with no execute bit. The
+                # remedy is a permission and not a file, and "absent" sends an
+                # operator entirely the wrong way about it.
+                return {"present": True, "kind": "unreadable",
+                        "other_kind": None, "bytes": None,
+                        "entries": None, "symlink": sym}
+            return {"present": True, "kind": "dir" if n else "empty_dir",
+                    "other_kind": None, "bytes": None, "entries": n,
+                    "symlink": sym}
+        if os.path.isfile(path):
+            # os.access() as well as getsize(), and it is the half that was
+            # missing. getsize() is a STAT, and a stat needs only search
+            # permission on the DIRECTORY above the file - so a mode-000
+            # regular file answered its own size perfectly happily and came
+            # back `kind: "file"`, which made `unreadable` a state this
+            # function could reach for a directory and never for a file. Four
+            # rows branch on `kind == "file"` and said ok on exactly that
+            # state, each measured against a `run` that died on "Permission
+            # denied" in the stage that opened it: proteins_faa (emapper),
+            # quant_table (join), gff (context) and emapper_precomputed
+            # (emapper). Shared FragPipe or eggNOG output on a cluster is the
+            # ordinary way a file ends up here, and the remedy is a permission
+            # on it or on a directory above it, which is what `unreadable`
+            # exists to say.
+            #
+            # ADVISORY, on purpose: os.access() asks the real uid and cannot
+            # know about an ACL, a read-only mount or a file that changes mode
+            # between here and the read. It is the right test for a CLASSIFIER
+            # that every row reads. Anything about to actually OPEN the path
+            # goes through _deep_readable() below, which proves it instead.
+            if not os.access(path, os.R_OK):
+                return {"present": True, "kind": "unreadable",
+                        "other_kind": None, "bytes": None,
+                        "entries": None, "symlink": sym}
+            try:
+                n = os.path.getsize(path)
+            except OSError:
+                return {"present": True, "kind": "unreadable",
+                        "other_kind": None, "bytes": None,
+                        "entries": None, "symlink": sym}
+            return {"present": True, "kind": "file" if n else "empty_file",
+                    "other_kind": None, "bytes": n, "entries": None,
+                    "symlink": sym}
+        if os.path.lexists(path):
+            # Present, and neither a regular file nor a directory.
+            # os.path.exists() is TRUE here, so every `if not
+            # os.path.exists(...)` guard in this file passes and nothing
+            # refuses at the top.
+            return {"present": True, "kind": "other",
+                    "other_kind": _other_kind(path), "bytes": None,
+                    "entries": None, "symlink": sym}
+        return {"present": False, "kind": "absent", "other_kind": None,
+                "bytes": None, "entries": None, "symlink": sym}
+    except OSError:
+        # Nothing above should reach here - islink, isdir and isfile all
+        # swallow their own OSError - but an unanticipated path state must not
+        # take the document down, and it must not be reported as a MISSING
+        # file either.
+        return dict(blank, kind="unreadable")
+
+
+def _other_kind(path):
+    """Which of DOCTOR_OTHER_KINDS a present-but-not-regular path is.
+
+    A LSTAT and not a stat, for the same reason the rest of _found() reaches
+    for os.path.lexists(): a broken symlink has its own kind above this, and a
+    symlink to a FIFO is a FIFO. Never raises and never blocks - this is the
+    classifier every row reads, and it reads st_mode, which is already in
+    hand.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:                      # pragma: no cover - raced away
+            return None
+    for test, name in ((stat.S_ISFIFO, "fifo"),
+                       (stat.S_ISSOCK, "socket"),
+                       (stat.S_ISCHR, "char_device"),
+                       (stat.S_ISBLK, "block_device")):
+        if test(mode):
+            return name
+    return None
+
+
+def _stat_depth(f):
+    """The `depth` a row reached, given what _found() answered for it.
+
+    DERIVED, because every row that wrote this by hand wrote the depth its
+    author had in mind rather than the one the call had made - and `skip` rows
+    were wrong in BOTH directions at once. A row that stat'd a path to fill
+    `found` and then said "config" claims it consulted nothing outside the
+    config, which is false; a row that says "kind" over a path nobody
+    configured claims a stat that never happened. _found() consults the
+    filesystem for every path except an unset one, and answers the KIND and
+    the emptiness for everything it can describe, so the mapping has exactly
+    three arms.
+    """
+    if f["kind"] == "unset":
+        return "config"
+    if f["kind"] in ("absent", "symlink_broken", "unreadable"):
+        # It asked whether the path is there; for these three there is nothing
+        # further to learn about a thing that is not there or will not answer.
+        return "existence"
+    return "kind"
+
+
+def _fifo_clause(f, path=""):
+    """What a present-but-not-regular path really costs, per KIND and per RUN.
+
+    MEASURED three times, and the third measurement is why this sentence is
+    now two sentences that depend on the config.
+
+    The FIRST said "not one of them can get a FASTA out of this", which reads
+    as a failure; a read-only open of a FIFO with no writer BLOCKS, and `run`
+    was measured never returning on seven paths.
+
+    The SECOND said the read "waits `fifo_wait_s` for a writer and only then
+    dies naming the path", which was true of the open and false about the run:
+    a verifier drove `mkfifo p; zcat big.faa.gz > p &` end to end at all four
+    operator-supplied inputs and it worked at ONE. At the other three the run
+    opened the path AGAIN after the pipe had been drained, so what the wait
+    bought was a later failure - and at quant_table a hang that held the
+    results lock while the writer took EPIPE. A sentence promising a workflow
+    that cannot work at that path is worse than the hang it described.
+
+    So the honest clause depends on how many times THIS run opens THIS path,
+    which is what INPUT_READ_SITES answers and what set_read_plan() computes
+    from the config. More than once: refused at the first open, at once, with
+    the count in the message - there is no wait to plan around and saying
+    there is would send an operator to lengthen a timeout that changes
+    nothing. Exactly once: the live-writer workflow, which really does work
+    there, and the wait is the thing to plan around.
+
+    AND IT IS ONLY ABOUT FIFOs, which is the other half of what was wrong.
+    `other` is one bucket for a FIFO, a UNIX socket AND a device node, and
+    this clause was printed for all three: driven, a socket at proteins_faa
+    published "A FIFO in particular is not refused on sight ... waits
+    fifo_wait_s", while a socket cannot be opened as a file at all - os.open()
+    itself fails on it. It is keyed on `found.other_kind` now, which exists
+    for this.
+
+    `blocks` was always the honest machine-readable answer and still is: the
+    stage does not complete either way.
+
+    doctor is a separate case and stays one - every path it reads goes through
+    _deep_readable(), which opens with O_NONBLOCK and never waits at all,
+    because a command whose whole job is to answer before the run is worthless
+    if it blocks.
+    """
+    if f.get("other_kind") != "fifo":
+        return ""
+    reads = planned_reads(path) if path else ()
+    if len(reads) > 1:
+        return (" A FIFO here is refused AT ONCE, before any wait, because "
+                "this run "
+                + ("reads" if all(not _is_contingent(x) for x in reads)
+                   else "can read")
+                + f" this input {len(reads)} times ("
+                + "; ".join(reads) + ") and a FIFO can be drained exactly "
+                "once: the first reader consumes the whole stream and the "
+                "next finds an empty pipe. `fifo_wait_s` does not apply - "
+                "waiting longer, starting the writer earlier or making it "
+                "faster all change nothing - so write the stream to a real "
+                "file and point this input at that file.")
+    return (" A FIFO here is NOT refused on sight, because this run reads "
+            "this input exactly once and a FIFO with a live writer is then "
+            "read to completion - `mkfifo p; zcat big.faa.gz > p &` is a "
+            "supported way to feed this tool at a single-read input. The read "
+            "says on the log that it is waiting and then waits `fifo_wait_s` "
+            # The default is READ rather than written: a number in a published
+            # sentence that is also a number in the config is the drift this
+            # whole change set keeps finding, and this one would drift the day
+            # somebody decided six hours was too long.
+            f"({DEFAULT_CONFIG['fifo_wait_s']}s by default) for each next "
+            "byte, and dies naming the path when nothing comes - saying "
+            "whether anything is holding the write end at all. A stream that "
+            "stops early is a failure and not a short file.")
+
+
+def _open_outcome(f, path=""):
+    """What a stage that OPENS this path does next, read off what is there.
+
+    DERIVED, for the same reason `depth` is. Three published sentences said a
+    stage "dies" on a path where `run` was measured HANGING - the precomputed
+    emapper table, the TMT level file and the TUTORIAL's own paragraph about
+    wrong-kind paths - and all three outlived four verification rounds,
+    because the sweep that checks this document compares COUNTS and VERDICTS
+    and has nothing at all to say about a verb. A verb is a claim about a path
+    state exactly as `depth` and `_present_kind_phrase()` are, and a claim
+    about a path state that is written by hand is a claim that is true of the
+    state its author had in mind.
+
+    Every state dies. What separates them is WHEN, because a row that promises
+    a death at the open and delivers one six hours later has told an operator
+    something false about a run they are watching. The one state that is not
+    prompt is a FIFO at a path this run reads ONCE - that one waits, and
+    waiting is the point of it. A FIFO at a path read more than once is
+    refused at the first open and is prompt again; so is a socket, which
+    cannot be opened as a file at all - os.open() itself fails on it, and the
+    ERRNO is the OS's to choose rather than this file's to publish: it was
+    written here as ENXIO and measured as EOPNOTSUPP on the platform it was
+    measured on, so what is asserted anywhere now is that an OSError comes out
+    of the open, which is the half that decides who dies. A device node is
+    prompt too, and answers immediately and forever with bytes that are not a
+    table.
+
+    This is the VERB only. What the operator should plan around is
+    _fifo_clause(), which every caller of this pairs with, and which stays a
+    separate sentence because a row that is merely absent needs the verb and
+    not the paragraph.
+    """
+    return "dies" if _raises_promptly(f, path) else "dies, but not at once"
+
+
+def _raises_promptly(f, path=""):
+    """Does opening this path raise at once, or wait first?
+
+    THE predicate, written once, because a sentence that names the exception
+    it dies of is making the same claim the verb makes and must not be able to
+    disagree with it: the manifest row said "it raises an OSError" for every
+    state including the one where nothing was ever raised.
+
+    It was `kind != "other"`, and `other` is a BUCKET - see
+    DOCTOR_OTHER_KINDS for what is in it. Driven, that published "dies, but
+    not at once ... waits fifo_wait_s" over a UNIX socket and over a device
+    node, where it is false twice: a socket cannot be opened as a file at all
+    and os.open() itself fails on it, which is what the stage-side test
+    asserts, and a character device is readable the instant it is opened. The derivation that
+    existed to stop hand-written claims about path states had a hand-written
+    claim about path states inside it, and PATH_STATES had no socket and no
+    device node to catch it with.
+
+    So there are two questions now and both are answered from data: is this a
+    FIFO at all - `found.other_kind`, which exists for this - and does THIS
+    run read this path once, which is the only case where anything waits.
+    """
+    if f["kind"] != "other":
+        return True
+    if f.get("other_kind") != "fifo":
+        return True
+    return len(planned_reads(path)) > 1 if path else False
+
+
+def _dies_with_a_stage_error(f, path=""):
+    """Does opening this path end in a StageError, or in an OSError?
+
+    THE SECOND PREDICATE, and it is not the one beside it. _raises_promptly()
+    answers WHEN the open ends; this answers WHAT it ends with, and the two
+    part company on exactly one state - which is the state that was published
+    wrong. A CHARACTER DEVICE answers immediately, so _raises_promptly() is
+    true of it, and the manifest row read that as "it dies with an OSError ...
+    every stage that opens a quant table on this format goes with it" while
+    the same row's `blocks` said `['join']`. Driven, `blocks` was the right
+    half: _open_for_read() falls through to die() for a device node, die()
+    raises a StageError, peptide_features() catches a StageError and re-reads
+    with the peptide-only reader, and a taxonomy run over a char-device
+    manifest logged "falling back to the peptide-only reader" and returned 30
+    rows. Prose and machine-readable field disagreed on one row, and the prose
+    was the wrong half.
+
+    WHO IT COSTS follows from this and from nothing else, so `blocks` is
+    computed from it too. A StageError is a refusal peptide_features() falls
+    back from; an OSError is caught by nothing at all between read_manifest
+    and the stage, so it costs every reader. The old test - `empty or kind ==
+    "other"` - had the same bucket problem one field over: it treated a socket
+    and a block device as StageError states because they share the `other`
+    bucket with the FIFO, and so UNDER-claimed `blocks` for both.
+
+    Measured on this platform, one kind at a time, by driving
+    _open_for_read():
+
+        directory       IsADirectoryError (EISDIR)      OSError
+        socket          OSError (EOPNOTSUPP)            OSError
+        block device    PermissionError (EPERM)         OSError
+        unreadable file PermissionError (EACCES)        OSError
+        char device     StageError                      caught
+        FIFO            StageError                      caught
+        empty file      opens; read_manifest refuses    caught
+
+    A block device is the one entry that is a property of the MACHINE as well
+    as of the kind: the open fails with EPERM because a block device is not
+    open to an ordinary user, and on a machine where it succeeded the die()
+    fallthrough would make it a StageError like the char device. Classed as an
+    OSError because that is what was measured and because that is the
+    conservative direction - it claims MORE stages die, and a row that warns
+    about a stage which would have survived costs an operator a look, where
+    the other way round costs them the run.
+
+    test_the_exception_predicate_matches_what_the_open_really_raises drives
+    every state in PATH_STATES through _open_for_read() and holds this against
+    the exception that comes out, so neither half can be written by hand.
+    """
+    if f["kind"] == "empty_file":
+        # The open SUCCEEDS on a zero-byte file; what refuses is read_manifest
+        # itself, with "no rows; expected a FragPipe .fp-manifest", and that is
+        # a StageError like any other refusal in this file.
+        return True
+    if f["kind"] != "other":
+        return False
+    return f.get("other_kind") in ("fifo", "char_device")
+
+
+def _present_kind_phrase(f):
+    """What a path that IS there, and is not the file a check wanted, is.
+
+    One sentence fragment per `found.kind`, in one place, because the three
+    branches that used to write "is a directory" inline were each written for
+    the state their author had in mind and were false for the next one: a FIFO
+    at `proteins_faa` is neither absent nor a directory, and a row that called
+    it one told an operator to look for the wrong thing. Reading it off `kind`
+    is also what keeps the phrase honest the day DOCTOR_FOUND_KINDS grows: an
+    unknown kind falls through to a fragment that claims nothing.
+    """
+    return {
+        "dir": "a directory",
+        "empty_dir": "an empty directory",
+        "file": "a file",
+        "empty_file": "a zero-byte file",
+        # NAMED, not listed. This arm used to read "neither a regular file
+        # nor a directory - a FIFO, a socket or a device node", which is the
+        # three-things-in-one-bucket problem in prose: an operator with a
+        # socket at an input was told it might be a FIFO, and the paragraph
+        # that followed was written about the FIFO. `other_kind` knows which.
+        "other": {"fifo": "a FIFO (a named pipe)",
+                  "socket": "a UNIX socket",
+                  "char_device": "a character device",
+                  "block_device": "a block device"}.get(
+                      f.get("other_kind"),
+                      "neither a regular file nor a directory"),
+        # "refused to DESCRIBE it" was written for the one state that could
+        # reach this arm - a directory nobody may list - and became false the
+        # moment a regular file could: the OS describes a mode-000 file
+        # perfectly well, it will not let this process READ it. One phrase has
+        # to be true of both, and the remedy is the same either way.
+        "unreadable": ("there, and this process may not read it: check the "
+                       "permissions on it and on every directory above it"),
+    }.get(f["kind"], "not the kind of thing this check wants")
+
+
+# THE ONE GATE every check that is about to OPEN a path goes through, and the
+# reason it is a gate rather than a fourth branch. Three rounds of this change
+# set each found another site where doctor opened something it had not
+# established was a regular readable file, and each fix was local to the site
+# that had just been caught: a directory at `manifest` raised IsADirectoryError
+# past an `except StageError` and the command printed NO DOCUMENT AT ALL; the
+# `except` beside it was widened to OSError; and then the identical class
+# turned up again at the TMT annotations, where a chmod-000 file printed a
+# traceback and a FIFO made `doctor` HANG INDEFINITELY on a blocking open - no
+# document and no exit, which is worse than any traceback, because a caller
+# waiting on the process has nothing to time out against either.
+#
+# A local fix per site is a promise that nobody adds a fifth one. This is the
+# structural version of that promise: nothing below opens a path this function
+# has not handed back, and it hands back nothing it has not PROVED it can
+# open. os.open() with O_NONBLOCK is what makes the FIFO case return instead
+# of wait - a read-only open of a FIFO with no writer blocks forever without
+# it - and fstat() on the descriptor is the only "is this a regular file" test
+# that cannot be raced by the path changing under the stat. The stat beside it
+# is kept for the SENTENCE, never for the decision.
+#
+# It is a gate and not a guarantee, which is why every caller still keeps
+# `except OSError` around the read it goes on to make: the descriptor is
+# closed again before the reader opens its own, an NFS server can change its
+# mind in between, and the whole point of this class of defect is that the
+# next state was one nobody had thought of.
+def _deep_readable(path):
+    """(found, refusal) for a path a check is about to read INTO.
+
+    `refusal` is None only when `path` is a regular file this process really
+    opened and closed. Otherwise it is the half-sentence the row prints, in
+    the words of what is actually there - _present_kind_phrase()'s, so a FIFO
+    reads as a FIFO here and everywhere else.
+
+    An EMPTY regular file PASSES. Emptiness is not an opening failure, and
+    three of the readers behind this gate say something better about it than
+    this function could: read_manifest refuses "no rows; expected a FragPipe
+    .fp-manifest", read_tmt_annotation names the plex whose channels are
+    missing. A caller that needs the distinction earlier - the manifest block
+    does, because an empty manifest costs a different list of stages from an
+    unopenable one - takes it off `found.kind` before it gets here.
+    """
+    f = _found(path)
+    if f["kind"] not in ("file", "empty_file"):
+        return f, (_present_kind_phrase(f) if f["present"]
+                   else "a symlink with no target" if f["kind"] ==
+                   "symlink_broken"
+                   else "not set" if f["kind"] == "unset" else "not there")
+    if not regular_readable(path):
+        # _found() asked os.access(), which is ADVISORY - it answers for the
+        # real uid and knows nothing about an ACL, a read-only mount or a mode
+        # that changed since. regular_readable() opens the thing. A path that
+        # stats as a file and lands here has to be re-described, because every
+        # row downstream branches on `kind`.
+        return dict(f, kind="unreadable", bytes=None), \
+            _present_kind_phrase({"kind": "unreadable"})
+    return f, None
+
+
+def _dir_sample(path, n=8):
+    """A few entry names from a directory, for a sentence, and never a raise.
+
+    os.listdir() on a directory nobody may list raises PermissionError, and
+    the call this replaces sat INSIDE an f-string building a `detail` - so a
+    chmod-000 plex directory took the WHOLE DOCUMENT down from a row that was
+    only trying to be helpful about what was there instead. A sentence's
+    garnish may not be able to fail.
+    """
+    try:
+        return sorted(os.listdir(path))[:n]
+    except OSError as e:
+        return f"(not listable: {e.strerror})"
+
+
+def _expect(kind, because, nonempty=True, members=(), derived_from=()):
+    """The "right kind of thing" for one check, as data.
+
+    `derived_from` names the config keys whose VALUES decided the kind, so a
+    ninth quant_format changes this VALUE and not the schema, and a front end
+    renders "this wants a directory because fragpipe_tmt reads the per-plex run
+    directory" without carrying its own copy of the format table.
+    """
+    return {"kind": kind, "nonempty": bool(nonempty), "members": list(members),
+            "derived_from": list(derived_from), "because": because}
+
+
+def _remedy_for(r):
+    """Which affordance a requirement's row should offer.
+
+    requirements()[].manual is overloaded and doctor has been printing one mark
+    for two different situations: dbentry() sets it to "no path configured"
+    for an unfilled config key, while signalp6 and interproscan set it to a
+    licence or a version-specific distribution. The first needs an edit box,
+    the second a link-out and structurally no button. This is the split, and
+    requirements()[].manual itself is left exactly as it is.
+    """
+    if r["ok"]:
+        return "none", None
+    if r["manual"] == "no path configured":
+        return "config", r["manual"]
+    if r["manual"]:
+        return "manual", r["manual"]
+    return ("auto", None) if r["cmds"] else ("none", None)
+
+
+# The optional fields _check() accepts. Named, so a typo in a keyword is a loud
+# failure here rather than a field that silently never appears in the document -
+# which is exactly how a contract loses a key without anyone bumping a version.
+_CHECK_FIELDS = {"target", "expect", "found", "depth", "caveat", "config_keys",
+                 "requirement_id", "blocks", "blocks_commands", "degrades",
+                 "depends_on", "fails_reason", "remedy", "remedy_reason"}
+
+
+def _check(cid, section, label, status, finding, detail, **kw):
+    """One row of the document.
+
+    Every key is always present and absent is never a value: a consumer reading
+    an older build must be able to tell "this build did not compute it" from
+    "the answer is empty", and the only way to keep that promise is for the row
+    to be built in one place with a fixed field set.
+    """
+    unknown = sorted(set(kw) - _CHECK_FIELDS)
+    if unknown:
+        raise AssertionError(f"{cid}: unknown check field(s) {unknown}")
+    row = {
+        "id": cid, "section": section, "label": label,
+        "status": status, "finding": finding,
+        "target": kw.get("target"),
+        "expect": kw.get("expect"), "found": kw.get("found"),
+        "depth": kw.get("depth", "config"),
+        "caveat": kw.get("caveat"),
+        "config_keys": list(kw.get("config_keys", ())),
+        "requirement_id": kw.get("requirement_id"),
+        "blocks": list(kw.get("blocks", ())),
+        "blocks_commands": list(kw.get("blocks_commands", ())),
+        "degrades": list(kw.get("degrades", ())),
+        "depends_on": list(kw.get("depends_on", ())),
+        "fails_reason": kw.get("fails_reason"),
+        "remedy": kw.get("remedy", "none"),
+        "remedy_reason": kw.get("remedy_reason"),
+        "detail": detail,
+    }
+    # EVERY CLOSED VOCABULARY, enforced where the row is made rather than only
+    # in a test, and enforced FIRST so that nothing below reasons about a value
+    # that is not in its set. Two of these were guarded here and the rest were
+    # not, and the reason written for those two - a typo here should be a loud
+    # failure and not a value a consumer's switch falls through on - was never
+    # a reason that applied to only two of them. What the other five had
+    # instead was the eleven CONFIGS the tests walk: a misspelling in a branch
+    # those configs reach dies in a test, and a misspelling in a branch they do
+    # not reach ships. `status` is the one that costs something immediately -
+    # exit_status is `1 if fails else 0` counted over status == "fail", so a
+    # row that MEANS to fail and writes "faill" is a silent 0 with nothing
+    # anywhere objecting - but `remedy`, `depth` and `fails_reason` are each a
+    # field a consumer switches on, which is the whole reason they are closed.
+    #
+    # `blocks` and `blocks_commands` are checked AGAINST EACH OTHER and not
+    # merely each against its own tuple. The two sets are disjoint, so "is it a
+    # stage" already rejects a command - but the operator's mistake is putting
+    # a name in the wrong list, not inventing a name, and "run is a COMMAND,
+    # not a stage; it belongs in blocks_commands" is the sentence that ends
+    # that mistake, where "unknown stage 'run'" starts a hunt for a stage that
+    # was renamed. `degrades` is a stage list too and gets the same treatment;
+    # `depends_on` is NOT in here because it names other ROWS, and a row can
+    # name one that this call has not built yet.
+    for _f, _vocab in (("status", DOCTOR_STATUSES),
+                       ("remedy", DOCTOR_REMEDIES),
+                       ("depth", DOCTOR_DEPTHS),
+                       # The eighth, and the one that had no guard at all.
+                       # `section` decides the heading a row prints under, and
+                       # print_doctor() looks it up in dict(DOCTOR_SECTIONS)
+                       # with no `.get` - so a typo was a bare KeyError and NO
+                       # DOCUMENT from the text command, while --json dropped
+                       # the row from `sections` in silence. Derived from the
+                       # table that names the headings rather than typed
+                       # again, so a section cannot exist in one and not the
+                       # other.
+                       ("section", tuple(i for i, _t in DOCTOR_SECTIONS))):
+        if row[_f] not in _vocab:
+            raise AssertionError(
+                f"{cid}: {_f} {row[_f]!r} is not one of {list(_vocab)}")
+    if row["fails_reason"] is not None \
+            and row["fails_reason"] not in DOCTOR_FAIL_REASONS:
+        raise AssertionError(
+            f"{cid}: fails_reason {row['fails_reason']!r} is not one of "
+            f"{list(DOCTOR_FAIL_REASONS)}")
+    # `kind` is not optional on either of these, and its ABSENCE had to be
+    # said separately from its being wrong. `found` went through a `.get`, so a
+    # dict built without one read as `None` and passed the vocabulary check -
+    # the row then published a `found` that every consumer switches on and
+    # that answers nothing. `expect` was indexed directly, so the same mistake
+    # there was a bare KeyError with no row, no section and no document: the
+    # failure a malformed row can cause is the one this whole function exists
+    # to make impossible, so it is named here rather than raised by accident.
+    for _f, _vocab, _maker in (
+            # `found` alone may carry a null kind, and that is not sloppiness:
+            # it is the documented "this build did not compute it" of
+            # DOCTOR_NULL_KIND_ROWS. `expect` has no such value.
+            ("found", (None,) + DOCTOR_FOUND_KINDS, "_found()"),
+            ("expect", DOCTOR_EXPECT_KINDS, "_expect()")):
+        if row[_f] is None:
+            continue
+        if not isinstance(row[_f], dict) or "kind" not in row[_f]:
+            raise AssertionError(
+                f"{cid}: {_f} is {row[_f]!r}, which carries no 'kind'. Every "
+                f"{_f} has one - build it with {_maker} rather than by hand.")
+        if row[_f]["kind"] not in _vocab:
+            raise AssertionError(f"{cid}: {_f}.kind {row[_f]['kind']!r} is "
+                                 f"not in DOCTOR_{_f.upper()}_KINDS")
+    # `found.other_kind` is checked here as well, and it is checked BOTH ways:
+    # a value outside the vocabulary, and a value on a kind that may not carry
+    # one. It exists precisely because `other` was three things wearing one
+    # name, so a row that put "fifo" on a directory - or a fifth other-kind
+    # nobody added to the vocabulary - would put the bucketing problem back
+    # one level down, in the field added to remove it.
+    if isinstance(row["found"], dict):
+        _ok = row["found"].get("other_kind")
+        if _ok is not None and _ok not in DOCTOR_OTHER_KINDS:
+            raise AssertionError(
+                f"{cid}: found.other_kind {_ok!r} is not in "
+                f"DOCTOR_OTHER_KINDS")
+        if _ok is not None and row["found"]["kind"] != "other":
+            raise AssertionError(
+                f"{cid}: found.other_kind is {_ok!r} on kind "
+                f"{row['found']['kind']!r}; only `other` carries one")
+    for _f in ("blocks", "degrades"):
+        for _name in row[_f]:
+            if _name in DOCTOR_COMMANDS:
+                raise AssertionError(
+                    f"{cid}: {_f} names {_name!r}, which is a metaannot "
+                    "COMMAND and not a stage; a command belongs in "
+                    "blocks_commands")
+            if _name not in STAGE_NAMES:
+                raise AssertionError(
+                    f"{cid}: {_f} names {_name!r}, which is not a stage in "
+                    "STAGE_NAMES")
+    for _name in row["blocks_commands"]:
+        if _name in STAGE_NAMES:
+            raise AssertionError(
+                f"{cid}: blocks_commands names {_name!r}, which is a STAGE "
+                "and not a command; a stage belongs in blocks")
+        if _name not in DOCTOR_COMMANDS:
+            raise AssertionError(
+                f"{cid}: blocks_commands names {_name!r}, which is not one of "
+                f"{list(DOCTOR_COMMANDS)}")
+    # The invariant the whole contract rests on, asserted where the rows are
+    # made rather than only in a test: a failure names what it costs.
+    if status == "fail" and not row["fails_reason"]:
+        row["fails_reason"] = "stage_or_command_dies"
+    if (row["fails_reason"] == "stage_or_command_dies"
+            and not (row["blocks"] or row["blocks_commands"])):
+        raise AssertionError(
+            f"{cid}: fails as stage_or_command_dies but names neither a stage "
+            "nor a command")
+    # The other half of the scope, enforced the same way. A row that read INTO
+    # a file has to say what it read, on the row, or `depth` becomes a label
+    # rather than a fence and the next `parsed` check arrives without anyone
+    # noticing it was the fourth.
+    if row["depth"] in ("header", "parsed") and not row["caveat"]:
+        raise AssertionError(f"{cid}: depth {row['depth']} with no caveat")
+    # ...and the ratchet bites DOWNWARD too, which it did not: nothing stopped
+    # a row claiming it had looked deeper than it had, and the "no path
+    # configured" requirement rows were all claiming "kind" over a path nobody
+    # had named. "existence" and "kind" are claims that something outside the
+    # config was stat'd, so the row has to carry what that answered.
+    #
+    # SYMMETRIC, in both senses, because half a guard was catching half the
+    # rows. A `found` of kind "unset" is _found()'s answer for a path that was
+    # never configured: it is not evidence of a stat, so a row carrying one may
+    # not claim "existence" or "kind" either - which is where the `skip` rows
+    # were getting through, a TMT root row claiming depth "kind" over an empty
+    # `quant_table` among them. And the other direction: "config" is a positive
+    # claim that NOTHING outside the config was consulted, so a row carrying a
+    # real `found` may not make it - which is where the rest of the `skip` rows
+    # were getting through, each one having stat'd its path to fill `found` and
+    # then reported "config".
+    stat_evidence = (row["found"] is not None
+                     and row["found"]["kind"] != "unset")
+    if row["depth"] in ("existence", "kind") and not stat_evidence:
+        raise AssertionError(
+            f"{cid}: depth {row['depth']} with no `found` to show for it - "
+            "nothing outside the config was consulted, so the depth is "
+            "'config'")
+    if row["depth"] == "config" and stat_evidence:
+        raise AssertionError(
+            f"{cid}: depth 'config' with a `found` of kind "
+            f"{row['found']['kind']!r} - something outside the config WAS "
+            "consulted, so the depth is 'existence' or 'kind'")
+    # ...and the RATCHET in the remaining direction, which is what makes
+    # "_stat_depth() derives it, so no row writes its own" true rather than
+    # intended. A row carrying a real `found` may claim exactly the depth that
+    # `found` justifies - or one of the three that are past the ladder
+    # ("header", "parsed", "probe"), which already have to carry a caveat
+    # saying what was read. Anything else is a row writing its own depth, and
+    # it stayed invisible for a release because the one hard-coded
+    # `depth="kind"` sat in a branch where a DIRECTORY was the only reachable
+    # state and the two answers happened to agree. They stop agreeing the
+    # moment `unreadable` is reachable for a file.
+    if stat_evidence and row["depth"] in DOCTOR_DEPTH_ORDER:
+        floor = _stat_depth(row["found"])
+        deeper = (DOCTOR_DEPTH_ORDER.index(row["depth"])
+                  > DOCTOR_DEPTH_ORDER.index(floor))
+        if deeper and not row["caveat"]:
+            raise AssertionError(
+                f"{cid}: depth {row['depth']!r} over a found.kind of "
+                f"{row['found']['kind']!r}, which justifies no more than "
+                f"{floor!r}, and no caveat saying what was read. Use "
+                "_stat_depth(found).")
+    return row
+
+
+def doctor_checks(cfg, p, reqs, args=None):
+    """Every line doctor prints, as data, in print order.
+
+    One printed RECORD is one entry: the `manual:` line, the note and the
+    `$ cmd` lines under a requirement are that requirement's own, reachable
+    through `requirement_id`, and are not rows of their own - a table renderer
+    that made them rows would get orphans.
+    """
+    out = []
+    on = set(enabled_stages(cfg))
+    R = cfg.get("run") or {}
+
+    # ---- config ------------------------------------------------------
+    cfg_path = getattr(args, "config", None)
+    # The gate here too, in place of the os.path.exists() that used to stand
+    # in front of this open(). load_config() has already read this same path,
+    # so a state that gets past it and fails here should be impossible - and
+    # "should be impossible" is the sentence every one of these sites was
+    # written under. The backstop costs one skipped block; a traceback here
+    # costs the whole document, unknown-key rows and every other section with
+    # it.
+    raw, read_failed = {}, None
+    if cfg_path and yaml is not None and os.path.exists(cfg_path):
+        _cf, refusal = _deep_readable(cfg_path)
+        if refusal:
+            read_failed = f"it is {refusal}"
+        else:
+            try:
+                with open(cfg_path, encoding="utf-8") as fh:
+                    raw = yaml.safe_load(fh) or {}
+            except Exception as e:                          # noqa: BLE001
+                # Wider than OSError on purpose: yaml.YAMLError is not one,
+                # and a config whose second read raises a parse error must
+                # cost this block and not the document.
+                read_failed = e
+    if read_failed is not None:
+        out.append(_check(
+            "config:unreadable", "config", "config file", "warn",
+            "unreadable",
+            f"{cfg_path} could not be re-read to check it for unknown keys: "
+            f"{read_failed}. Every other check below is unaffected - they run "
+            "off the config that was already loaded.",
+            target=cfg_path, depth="kind", found=_found(cfg_path),
+            expect=_expect("file", "the config file named by --config",
+                           derived_from=[]),
+            remedy="input"))
+    else:
+        bad = unknown_keys(raw, DEFAULT_CONFIG) if isinstance(raw, dict) else []
+        for b in bad:
+            if b in RETIRED_KEYS:
+                # A retired key is not a failure: the config predates a
+                # removal, the setting is inert, and doctor exiting non-zero
+                # over it would block a run that is otherwise correct.
+                out.append(_check(
+                    f"config:retired:{b}", "config", b, "warn", "retired_key",
+                    f"'{b}' is no longer a setting - {RETIRED_KEYS[b]}",
+                    config_keys=[b], remedy="config",
+                    expect=_expect("setting", "listed in RETIRED_KEYS",
+                                   nonempty=False)))
+                continue
+            # THE ONE DECLARED EXCEPTION to "fails exactly when a stage dies".
+            # report_unknown_keys() only logs and load_config carries on, so an
+            # unrecognised key kills nothing - and yet the setting the operator
+            # believes is in effect is not, and the run answers a different
+            # question than the config asked. doctor has always exited 1 on
+            # it, and demoting it to a warning would change that for a real
+            # class of config - not a call to make inside a contract change.
+            # `fails_reason` names the exception rather than hiding it.
+            out.append(_check(
+                f"config:unknown:{b}", "config", b, "fail", "unknown_key",
+                f"unrecognised key '{b}'" + (nearest_config_key(b) or ".")
+                + " It is being ignored, so this setting is NOT in effect.",
+                config_keys=[b], remedy="config",
+                fails_reason="setting_ignored",
+                expect=_expect("setting", "not a key of DEFAULT_CONFIG",
+                               nonempty=False)))
+
+    # ---- inputs ------------------------------------------------------
+    out.extend(_input_checks(cfg, p, on))
+
+    # ---- precomputed emapper ----------------------------------------
     pre = cfg.get("emapper_precomputed") or ""
     pre = [pre] if isinstance(pre, str) and pre else list(pre or [])
-    if pre:
-        print("== precomputed emapper ==")
-        for path in pre:
-            good = os.path.exists(path)
-            ok &= good
-            print(f"  {'OK' if good else 'MISS':6s} {path}")
-
-    reqs = requirements(cfg, p)     # evaluated once; every view below uses it
-    tools = [r for r in reqs if r["kind"] == "tool"]
-    dbs = [r for r in reqs if r["kind"] == "db"]
-    for title, group in (("tools", tools), ("databases", dbs)):
-        if not group:
+    for i, path in enumerate(pre):
+        f = _found(path)
+        # This used to be folded into `ok` with no run.eggnog guard, so a
+        # stale path failed doctor even when nothing read it. stage_emapper
+        # takes
+        # the prepare_emapper() branch only when the stage runs at all.
+        if "emapper" not in on:
+            out.append(_check(
+                f"precomputed_emapper:{i}", "precomputed_emapper",
+                f"emapper_precomputed[{i}]", "skip", "not_enabled", path,
+                target=path, depth=_stat_depth(f),
+                config_keys=["emapper_precomputed", "run.eggnog"],
+                expect=_expect("file", "prepare_emapper() reads each entry as "
+                                       "one .emapper.annotations table",
+                               derived_from=["emapper_precomputed"]),
+                found=f))
             continue
-        print(f"== {title} ==")
-        for r in group:
-            if r["ok"]:
-                mark = "OK"
-            elif r["manual"]:
-                mark = "MANUAL"
-            else:
-                mark = "MISS"
-            # A MANUAL item used to count as satisfied, so doctor said "all
-            # checks passed" with no InterProScan and no SignalP 6 and the run
-            # died at that stage hours later. `manual` says doctor will not
-            # fetch it, not that the stage can do without it.
-            ok &= r["ok"]
-            size = ""
-            if not r["ok"] and r["size_gb"] >= 0.05:
-                size = f"  ~{_gb(r['size_gb'])} GB"
-                if r["disk_gb"] > r["size_gb"]:
-                    size += f" ({_gb(r['disk_gb'])} GB on disk)"
-            print(f"  {mark:6s} {r['label']}{size}")
-            if not r["ok"]:
-                if r["manual"]:
-                    print(f"         manual: {r['manual']}")
-                if r["note"]:
-                    print(f"         {r['note']}")
-                for c in r["cmds"]:
-                    print(f"         $ {c}")
+        if f["kind"] in ("file",):
+            out.append(_check(
+                f"precomputed_emapper:{i}", "precomputed_emapper",
+                f"emapper_precomputed[{i}]", "ok", "ok", path,
+                target=path, depth=_stat_depth(f),
+                config_keys=["emapper_precomputed"],
+                expect=_expect("file", "prepare_emapper() reads each entry as "
+                                       "one .emapper.annotations table",
+                               derived_from=["emapper_precomputed"]),
+                found=f, blocks=[]))
+            continue
+        out.append(_check(
+            f"precomputed_emapper:{i}", "precomputed_emapper",
+            f"emapper_precomputed[{i}]", "fail", _finding(f),
+            # This row printed the path and then a verdict, and never said
+            # WHAT was at the path: it was the one fail row in the document
+            # with no _present_kind_phrase() on it, so a FIFO here was not
+            # even named as one, let alone reported as the hang it is.
+            ((f"{path} is {_present_kind_phrase(f)}. " if f["present"]
+              else _gone(f"emapper_precomputed[{i}]", path, f) + ". ")
+             + "emapper_precomputed is set, so stage_emapper takes the reuse "
+               "branch and never shells out to emapper.py; prepare_emapper() "
+               "opens this path and " + _open_outcome(f, path) + "."
+             + _fifo_clause(f, path)
+             + " (Because this list is set, requirements() carries neither "
+               "the eggnog-mapper tool nor the eggNOG data directory, which "
+               "is why this row is the only eggNOG evidence in the "
+               "document.)"),
+            target=path, depth=_stat_depth(f),
+            config_keys=["emapper_precomputed"],
+            expect=_expect("file", "prepare_emapper() reads each entry as one "
+                                   ".emapper.annotations table",
+                           derived_from=["emapper_precomputed"]),
+            found=f, blocks=["emapper"], remedy="input"))
 
-    if cfg["run"].get("diamond"):
-        unweighted = set((cfg["db"].get("diamond") or {})) - set(cfg.get("diamond_weights") or {})
-        if unweighted:
-            print(f"  {'WARN':6s} diamond_weights missing for "
-                  f"{sorted(unweighted)}; those hits still count as annotation "
-                  "but score 0 in the effector ranking")
-        # Existence is not usability. A failed `diamond makedb` leaves a
-        # zero-byte .dmnd that passes every check above, and a database of
-        # 15-residue peptides passes them all while being unable to reach the
-        # configured e-value. Both return 0 hits, and 0 hits is also what a
-        # real absence looks like, so doctor is the last place either can be
-        # caught before hours of searching say nothing.
-        for tag, path in sorted((cfg["db"].get("diamond") or {}).items()):
-            if not path or not os.path.exists(path):
-                continue          # already reported as MISS above
-            try:
-                bad, warn = diamond_db_check(cfg, tag, path)
-            except StageError as e:      # a non-numeric diamond_evalues entry
-                ok, bad, warn = False, f"{tag}: {e}", None
-            if bad:
-                ok = False
-                print(f"  {'MISS':6s} {bad}")
-            elif warn:
-                print(f"  {'WARN':6s} {warn}")
+    # ---- tools and databases ----------------------------------------
+    out.extend(_requirement_checks(cfg, reqs))
 
-    if cfg["run"].get("structure") or cfg["run"].get("topology"):
-        # Without this, a machine with no usable GPU passed every check and the
-        # user learned the truth hours later, when esmfold finally ran and
-        # died. The GPU is the one requirement doctor could not see.
-        print("== gpu ==")
-        usable, why = cuda_probe()
-        print(f"  {'OK' if usable else 'WARN':6s} {why}")
-        if not usable:
-            if cfg["run"].get("structure"):
-                print(f"  {'MISS':6s} run.structure needs CUDA: stage_esmfold "
-                      "exits rather than fold on CPU, which is impractical at "
-                      "any real scale. Set run.structure: false, or fold on a "
-                      "GPU host and copy results/structures/ back - foldseek "
-                      "itself is CPU-only and will search whatever models are "
-                      "there.")
-                ok = False
-            if cfg["run"].get("topology"):
-                # Not a MISS: signalp is CPU-only and useful on its own, and
-                # tmbed does run without a GPU - just not at this size.
-                print(f"  {'WARN':6s} run.topology: SignalP 6 is CPU-only and "
-                      "unaffected. tmbed will fall back to CPU, where it is "
-                      "one to two orders of magnitude slower - fine for a few "
-                      "thousand proteins, not for a few hundred thousand. Set "
-                      "tmbed_use_gpu: false to say so deliberately, or true to "
-                      "make a missing GPU fatal instead of slow.")
-        elif cfg["run"].get("structure") and cfg["run"].get("topology"):
-            print(f"  {'OK':6s} esmfold and tmbed share gpu_device "
-                  f"{cfg['gpu_device']}, so at most "
-                  f"{cfg.get('gpu_workers', 1)} of them runs at a time")
+    # ---- databases: the two checks that go past existence ------------
+    out.extend(_diamond_checks(cfg, on))
 
+    # ---- gpu ---------------------------------------------------------
+    out.extend(_gpu_checks(cfg, on))
+
+    # ---- tmt ---------------------------------------------------------
     if cfg["quant_format"] == "fragpipe_tmt":
-        # Without this block doctor says nothing at all about a TMT run: the
-        # only TMT line it printed lived inside `== manifest ==`, and a TMT
-        # config normally sets no manifest. So the one layout this format is
-        # most particular about - a run directory of per-plex folders, each
-        # with its own annotation file - went unchecked until the run itself
-        # died on it.
-        print("== tmt ==")
-        root = cfg.get("quant_table") or ""
-        t = cfg.get("tmt") or {}
-        lvl = str(t.get("level") or "ion").lower()
-        fname = TMT_LEVEL_FILES.get(lvl, "ion.tsv")
-        ref_name = str(t.get("reference_name") or "")
-        ref_chan = str(t.get("reference_channel") or "")
-        if ref_name and ref_chan:
-            ok = False
-            print(f"  {'MISS':6s} tmt.reference_name ('{ref_name}') and "
-                  f"tmt.reference_channel ('{ref_chan}') are both set and can "
-                  "disagree per plex; set one")
-        if os.path.isfile(root):
-            ok = False
-            print(f"  {'MISS':6s} quant_table is a file: {root}. This format "
-                  "reads the run DIRECTORY holding the per-plex folders, "
-                  "because a tmt-report matrix has already collapsed the "
-                  "peptides this tool needs")
-        elif not os.path.isdir(root):
-            ok = False
-            print(f"  {'MISS':6s} quant_table not found: {root}")
-        else:
-            try:
-                plexes = tmt_plex_dirs(root, cfg)
-            except StageError as e:
-                ok, plexes = False, []
-                print(f"  {'MISS':6s} {e}")
-            if plexes:
-                print(f"  {'OK':6s} {len(plexes)} plex(es): "
-                      f"{[n for n, _ in plexes]}")
-            # Every rule below is read_fragpipe_tmt's own - which channels it
-            # keeps, how it resolves the reference, which names it refuses -
-            # because a verdict that disagrees with the reader is worse than
-            # no verdict: the run doctor blessed still dies, on the same
-            # config, hours later.
-            drop_empty = bool(t.get("drop_empty_channels", True))
-            sizes, seen_names, ref_hits = {}, {}, {}
-            for plex, pdir in plexes:
-                lvl_path = os.path.join(pdir, fname)
-                if not os.path.exists(lvl_path):
-                    ok = False
-                    print(f"  {'MISS':6s} {plex}: no {fname} (tmt.level "
-                          f"'{lvl}'); {pdir} holds "
-                          f"{sorted(os.listdir(pdir))[:8]}")
-                try:
-                    apath = tmt_annotation_path(plex, pdir, cfg)
-                    rows = read_tmt_annotation(apath, plex)
-                except StageError as e:
-                    ok = False
-                    print(f"  {'MISS':6s} {plex}: {e}")
-                    continue
-                sizes[plex] = len(rows)
-                # The reader's keep_samples: an unassigned <PLEX>_<CHANNEL>
-                # placeholder is not a sample when drop_empty_channels is on.
-                keep = [(c, s) for c, s in rows
-                        if not (drop_empty and s == f"{plex}_{c}")]
-                if ref_name:
-                    hits = [s for _c, s in keep
-                            if fnmatch.fnmatchcase(s, ref_name)]
-                elif ref_chan:
-                    # fnmatchcase on the CHANNEL, because the reader and the
-                    # README both make reference_channel a glob ('131*'),
-                    # while this compared it to the channel as a literal and
-                    # so failed a config the run accepts. fnmatchcase, not
-                    # fnmatch, because it is what the reader uses: fnmatch
-                    # normalises through os.path.normcase, which lowercases on
-                    # Windows only, so fnmatch would make doctor's verdict
-                    # differ from the run's by platform. '131c' would pass
-                    # here and be refused by the reader.
-                    hits = [s for c, s in keep
-                            if fnmatch.fnmatchcase(c, ref_chan)]
-                else:
-                    hits = []
-                if ref_name or ref_chan:
-                    ref_hits[plex] = hits
-                    if len(hits) == 1:
-                        # Under both treatments the reference stops being a
-                        # sample column before the reader's collision check,
-                        # so a bridge carrying one name in every plex is the
-                        # design and must not be reported as a duplicate.
-                        keep = [(c, s) for c, s in keep if s != hits[0]]
-                for _c, s in keep:
-                    seen_names.setdefault(s, []).append(plex)
-            # "every plex" can only mean the ones doctor got as far as
-            # reading: a plex whose annotation failed above is in none of
-            # these counts and must not be summarised as though it had passed.
-            scope = ("every plex" if len(sizes) == len(plexes)
-                     else f"each of the {len(sizes)} plex(es) read")
-            if sizes:
-                dist = sorted(set(sizes.values()))
-                if len(dist) > 1:
-                    # Not fatal - the reader handles ragged plexes - but it is
-                    # the kind of thing that is a typo far more often than it
-                    # is the design.
-                    print(f"  {'WARN':6s} plexes differ in channel count "
-                          f"{dist}: "
-                          f"{ {k: v for k, v in sorted(sizes.items())} }")
-                else:
-                    print(f"  {'OK':6s} {dist[0]} channels in {scope}, "
-                          f"{sum(sizes.values())} in total")
-            dupes = {n: pl for n, pl in seen_names.items() if len(pl) > 1}
-            if dupes:
-                # This was a WARN promising the plexes would be "treated as
-                # one sample measured in each". They are not: the reader dies
-                # on the second plex to claim a name, so doctor was exiting 0
-                # on a config the run refuses outright.
-                ok = False
-                shown = dict(sorted(dupes.items())[:4])
-                print(f"  {'MISS':6s} {len(dupes)} sample name(s) appear in "
-                      f"more than one plex: {shown}. Sample names are the "
-                      "columns of the joined matrix, so the reader refuses "
-                      "two plexes that claim one; rename them per plex, or, "
-                      "if this is a bridge, name it with tmt.reference_name "
-                      "so it stops being a sample")
-            if ref_name or ref_chan:
-                which = f"reference_name '{ref_name}'" if ref_name                     else f"reference_channel '{ref_chan}'"
-                missing = sorted(p for p, h in ref_hits.items() if not h)
-                ambig = {p: h for p, h in sorted(ref_hits.items())
-                         if len(h) > 1}
-                if missing:
-                    ok = False
-                    print(f"  {'MISS':6s} tmt.{which} matches nothing in "
-                          f"{len(missing)} plex(es): {missing[:6]}. A "
-                          "reference absent from a plex leaves that plex "
-                          "without a denominator")
-                if ambig:
-                    # The reader takes exactly one reference per plex and
-                    # dies on anything else, so a pattern matching two
-                    # channels is a failure to report, not a resolution.
-                    ok = False
-                    print(f"  {'MISS':6s} tmt.{which} matches more than one "
-                          f"channel in {len(ambig)} plex(es): "
-                          f"{dict(list(ambig.items())[:4])}. The reference is "
-                          "one channel per plex; narrow the pattern until it "
-                          "names it")
-                if ref_hits and not missing and not ambig:
-                    # Guarded on ref_hits: with no plex read there is nothing
-                    # the pattern resolved in, and this line was printed
-                    # anyway - an OK about a run doctor never opened.
-                    print(f"  {'OK':6s} tmt.{which} resolves in {scope}")
-            elif bool(t.get("use_reference_ratios", False)):
-                ok = False
-                print(f"  {'MISS':6s} tmt.use_reference_ratios is on but "
-                      "neither tmt.reference_name nor tmt.reference_channel "
-                      "is set")
-            else:
-                print(f"  {'WARN':6s} no reference channel named, so plexes "
-                      "are compared on within-plex normalised intensity "
-                      "alone; set tmt.reference_name if this design has a "
-                      "bridge")
+        out.extend(_tmt_checks(cfg))
 
+    # ---- manifest ----------------------------------------------------
     if cfg.get("manifest"):
-        print("== manifest ==")
-        if not os.path.exists(cfg["manifest"]):
-            ok = False
-            print(f"  {'MISS':6s} {cfg['manifest']} (config key `manifest`)")
-        else:
-            # doctor is the one command that has to survive every other
-            # failure: a manifest read_manifest rejects must not take the
-            # tools, databases, resources and R blocks down with it.
-            try:
-                m = read_manifest(cfg["manifest"])
-            except StageError as e:                         # noqa: PERF203
-                ok, m = False, None
-                print(f"  {'MISS':6s} {e}")
-            if m is not None:
-                print(f"  {'OK':6s} {len(m)} runs, groups: "
-                      f"{sorted(m['experiment'].unique())}")
-            if m is not None and cfg["quant_format"] == "fragpipe_tmt":
-                print(f"  {'WARN':6s} quant_format is 'fragpipe_tmt', so the "
-                      "manifest is not used: sample names come from each "
-                      "plex's annotation file, and a TMT manifest's "
-                      "experiment column is the plex, not a condition")
-            elif m is not None and os.path.isfile(cfg["quant_table"]):
-                try:
-                    head = pd.read_csv(cfg["quant_table"], sep=None,
-                                       engine="python", nrows=0, encoding="utf-8", encoding_errors="replace")
-                    sfx = (" Intensity" if cfg["quant_format"].startswith("fragpipe")
-                           else "")
-                    cand = [c for c in head.columns
-                            if (c.endswith(sfx) if sfx else True)
-                            and not c.endswith(("MaxLFQ Intensity",
-                                                "Spectral Count"))]
-                    _, miss_rows, miss_cols = map_manifest_to_columns(
-                        m, cand, sfx)
-                    if miss_rows:
-                        ok = False
-                        print(f"  {'MISS':6s} {len(miss_rows)} manifest "
-                              "run(s) match no column in "
-                              f"{cfg['quant_table']}: {miss_rows[:5]}. Fix the "
-                              "run names in the manifest, or unset `manifest:`")
-                    else:
-                        print(f"  {'OK':6s} every run maps to a quant column")
-                    if miss_cols:
-                        print(f"  {'WARN':6s} {len(miss_cols)} quant column(s) "
-                              "absent from the manifest and will be dropped: "
-                              f"{miss_cols[:4]}")
-                except Exception as e:                      # noqa: BLE001
-                    print(f"  {'WARN':6s} could not pre-check the mapping: {e}")
+        out.extend(_manifest_checks(cfg))
 
-    if cfg["run"].get("unipept") or cfg["run"].get("taxonomy"):
-        print("== taxonomy ==")
-        u = cfg.get("unipept") or {}
-        # The taxonomy stage consumes the unipept stage's output, so with
-        # run.unipept off the honest answer is "turn it on", not "MISS unipept
-        # cache".
-        if cfg["run"].get("taxonomy") and not cfg["run"].get("unipept"):
-            ok = False
-            print(f"  {'MISS':6s} run.taxonomy needs run.unipept (it "
-                  "compares the eggNOG lineage against Unipept's); set "
-                  "run.unipept: true, or run.taxonomy: false")
-        if u.get("result"):
-            good = os.path.exists(u["result"])
-            ok &= good
-            print(f"  {'OK' if good else 'MISS':6s} unipept.result   "
-                  f"{u['result']}")
-        elif u.get("allow_http"):
-            print(f"  {'WARN':6s} unipept.allow_http is on; the API version, "
-                  "field names and rate limits are outside this tool's control")
-        else:
-            cached = os.path.exists(p.unipept_cache)
-            ok &= cached
-            print(f"  {'OK' if cached else 'MISS':6s} unipept cache    "
-                  f"{p.unipept_cache}  (set unipept.result to an existing "
-                  "pept2lca export, or unipept.allow_http: true)")
-        if cfg["quant_format"] not in FEATURE_FORMATS and not u.get("result"):
-            ok = False
-            print(f"  {'MISS':6s} quant_format is '{cfg['quant_format']}', "
-                  "which is protein level; Unipept needs peptides. Use a "
-                  "peptide-level quant_format "
-                  f"({', '.join(sorted(FEATURE_FORMATS))}), or point "
-                  "unipept.result at an existing pept2lca export")
-        src = cfg.get("taxonomy_source", "eggnog")
-        if src != "eggnog" and not cfg["run"].get("taxonomy"):
-            ok = False
-            print(f"  {'MISS':6s} taxonomy_source is '{src}' but "
-                  "run.taxonomy is off; set run.taxonomy: true, or "
-                  "taxonomy_source: eggnog")
+    # ---- taxonomy ----------------------------------------------------
+    if R.get("unipept") or R.get("taxonomy"):
+        out.extend(_taxonomy_checks(cfg, p, on))
 
+    # ---- resources ---------------------------------------------------
+    out.extend(_resource_checks(cfg, args))
+
+    # ---- R -----------------------------------------------------------
+    out.extend(_r_checks(cfg))
+    return out
+
+
+def _gone(label, path, f):
+    """How to say that a path is not usable, in the words of what is there.
+
+    A dangling symlink is the case this exists for. os.path.exists() follows
+    the link and answers False, so every check in doctor has always rejected
+    one "for the right reason by accident" and could not say why - and a
+    symlink into a volume that is not mounted is the single most common way a
+    path on this project's shared server stops resolving.
+    """
+    if f["kind"] == "symlink_broken":
+        return f"{label} is a symlink with no target: {path}"
+    if f["kind"] == "unset":
+        return f"{label} is not set"
+    return f"{label} not found: {path}"
+
+
+def _finding(f, want="file"):
+    """The machine-readable reason a path check did not pass.
+
+    `want` because two of these answers are not properties of the path alone.
+    An EMPTY DIRECTORY where a file is expected came out as `empty`,
+    indistinguishable in the document from a zero-byte file - while what is
+    wrong with it is that it is a directory, and the two carry different
+    remedies (fill the file, against fix the path). The kind that was EXPECTED
+    decides which half of the answer leads, so an empty directory is
+    `wrong_kind` where a file was wanted and `empty` where quant_format
+    'fragpipe_tmt' wanted the run directory.
+    """
+    kind = f["kind"]
+    if kind in ("unset", "absent", "symlink_broken"):
+        return {"unset": "unset", "absent": "missing",
+                "symlink_broken": "dangling_symlink"}[kind]
+    if kind == "unreadable":
+        # Neither `missing` nor `wrong_kind`: the thing may well be exactly
+        # what was asked for, and the remedy is a permission on it or on a
+        # directory above it.
+        return "unreadable"
+    if kind == "other":
+        return "wrong_kind"
+    if (kind in ("dir", "empty_dir")) != (want == "dir"):
+        return "wrong_kind"
+    return "empty" if kind in ("empty_file", "empty_dir") else "ok"
+
+
+def _faa_readers(cfg, p, on):
+    """The enabled stages that OPEN proteins_faa.
+
+    Read off `inp`, which the note at the top of _input_checks() warns against
+    - and the warning is about inputs a stage SKIPS when they are not there.
+    Nothing skips proteins_faa: every stage that digests it opens it, either
+    through read_fasta() or by handing the path to the search tool as the
+    query, and a path that cannot be read as a FASTA kills all of them. So for
+    this one key `inp` IS the readers list, and reading it here is what keeps
+    the list from going stale the day a stage is added.
+    """
+    return [st["name"] for st in STAGES
+            if st["name"] in on and cfg["proteins_faa"] in st["inp"](cfg, p)]
+
+
+def _input_checks(cfg, p, on):
+    """The `== inputs ==` block, one check per configured input path.
+
+    Every verdict here is read off the stage function that consumes the file,
+    not off the stage's `inp` lambda, because the two disagree: `inp` lists
+    what the signature digests, and a stage that SKIPS a missing input still
+    digests it.
+    """
+    out = []
+
+    # -- proteins_faa, and THREE verdicts on one key, because cmd_run's guard
+    #    is `os.path.exists(cfg["proteins_faa"])` and that is true of more
+    #    states than it looks. ABSENT (or a dangling symlink, or unset): the
+    #    guard is false, cmd_run refuses before it schedules anything, and the
+    #    honest answer is the COMMAND rather than a list of the stages that
+    #    never start. ZERO BYTES: the guard passes, every hmmsearch runs
+    #    happily against nothing, and build_annotation dies on "no sequences
+    #    in ..." hours in. A DIRECTORY: the guard passes too - `run` does not
+    #    refuse, it schedules everything and each stage dies as it opens the
+    #    path - so blocks_commands ["run"] was a machine-readable claim about
+    #    the one command a preflight screen gates on, and it was false.
+    path = cfg["proteins_faa"]
+    f = _found(path)
+    exp = _expect("file", "read as FASTA by read_fasta(), and passed to every "
+                          "search tool as the query")
+    if f["kind"] == "file":
+        out.append(_check("input:proteins_faa", "inputs", "proteins_faa", "ok",
+                          "ok", f"{'proteins_faa':16s} {path}", target=path,
+                          expect=exp, found=f, depth="kind",
+                          config_keys=["proteins_faa"]))
+    elif f["kind"] == "empty_file":
+        blocks = [s for s in ("emapper", "integrate") if s in on]
+        out.append(_check(
+            "input:proteins_faa", "inputs", "proteins_faa", "fail", "empty",
+            f"proteins_faa is 0 bytes: {path}. `run` only tests that it "
+            "exists, so every search stage runs against nothing and "
+            "build_annotation dies on 'no sequences' hours later.",
+            target=path, expect=exp, found=f, depth="kind",
+            config_keys=["proteins_faa"], blocks=blocks, remedy="input"))
+    elif f["present"]:
+        # A directory. Every stage that opens it dies, and doctor stat'd the
+        # path to know which of the two present states this is, so `depth` is
+        # `kind` and not the `existence` the old shared branch reported.
+        out.append(_check(
+            "input:proteins_faa", "inputs", "proteins_faa", "fail",
+            _finding(f),
+            f"proteins_faa is {_present_kind_phrase(f)}: {path}. `run`'s "
+            "only test is os.path.exists(), which this passes, so it does NOT "
+            "refuse - it schedules every stage, and each one that OPENS it "
+            + _open_outcome(f, path) + " on this, in read_fasta(). The search "
+            "stages are a different answer and a worse one: hmmsearch, DIAMOND "
+            "and the rest are handed this path as a FILENAME and do their own "
+            "open, so what they do with it is the tool's answer and not this "
+            "file's - measured, a FIFO here leaves hmmsearch blocked in its "
+            "own open() and `run` waiting for a stage it says it cannot "
+            "interrupt, with the results directory still locked."
+            + _fifo_clause(f, path),
+            target=path, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=["proteins_faa"], blocks=_faa_readers(cfg, p, on),
+            remedy="input"))
+    else:
+        out.append(_check(
+            "input:proteins_faa", "inputs", "proteins_faa", "fail", _finding(f),
+            _gone("proteins_faa", path, f)
+            + ". `run` refuses before any stage starts.",
+            target=path or None, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=["proteins_faa"], blocks_commands=["run"],
+            remedy="config" if f["kind"] == "unset" else "input"))
+
+    # -- quant_table. THE headline row, and the reason this contract exists.
+    out.append(_quant_table_check(cfg, on))
+
+    # -- gff. Three behaviours on one key, all in stage_context: off -> nobody
+    #    reads it; on with gff "" -> a WARN, an EMPTY context table and a run
+    #    that finishes with the evidence silently gone; on with a path that is
+    #    not there -> die(). The old `ok &= good or label == "gff"` could not
+    #    express the third and exited 0 on a config the run kills.
+    gff = cfg.get("gff") or ""
+    f = _found(gff)
+    exp = _expect("file", "parsed by parse_gff() as a single GFF",
+                  derived_from=["gff"])
+    keys = ["gff", "run.context"]
+    if "context" not in on:
+        out.append(_check(
+            "input:gff", "inputs", "gff", "skip", "not_enabled",
+            f"{'gff':16s} " + (gff or "(not set)"), target=gff or None,
+            expect=exp, found=f, depth=_stat_depth(f), config_keys=keys))
+    elif not gff:
+        out.append(_check(
+            "input:gff", "inputs", "gff", "warn", "unset",
+            "run.context is on but `gff` is empty; stage_context logs a WARN, "
+            "writes an empty context table and returns, so the run finishes "
+            "with no context evidence at all.",
+            target=None, expect=exp, found=f, depth="config", config_keys=keys,
+            degrades=["context"], remedy="config"))
+    elif f["kind"] in ("file", "empty_file"):
+        # An empty GFF is not a death: parse_gff finds no contigs and the
+        # stage writes a table with no rows, exactly as the unset case does.
+        #
+        # "Exactly as the unset case does" was a claim about the ENGINE, and
+        # for one release it was false: the unset branch wrote
+        # pd.DataFrame(columns=["protein_id"]), while a gff that parsed to
+        # nothing fell through to pd.DataFrame([]).to_csv(), which writes one
+        # newline and NO COLUMNS - and parse_context's pd.read_csv then died
+        # with "No columns to parse from file", in `integrate`, which always
+        # runs. doctor said warn and exited 0; the run exited 1. The engine is
+        # the half that was wrong and stage_context now writes the column in
+        # both branches, which is what makes this sentence true rather than
+        # merely intended. A HEADER-ONLY gff took the same path and is outside
+        # this check's scope entirely - the file is neither missing nor empty,
+        # so doctor reports `ok` for it and must - which is why the fix had to
+        # be the engine's.
+        st = "ok" if f["kind"] == "file" else "warn"
+        out.append(_check(
+            "input:gff", "inputs", "gff", st,
+            "ok" if st == "ok" else "empty",
+            f"{'gff':16s} {gff}" if st == "ok" else
+            f"gff is 0 bytes: {gff}. parse_gff finds no features in it, so "
+            "stage_context writes an empty context table and the run finishes "
+            "without context evidence.",
+            target=gff, expect=exp, found=f, depth="kind", config_keys=keys,
+            degrades=[] if st == "ok" else ["context"],
+            remedy="none" if st == "ok" else "input"))
+    elif f["present"]:
+        # A directory, and stage_context's guard is os.path.exists() as well,
+        # so it does not exit THERE - parse_gff opens the path and dies. Same
+        # verdict, different sentence and a `depth` that says doctor stat'd
+        # the path rather than merely asking whether it was there.
+        out.append(_check(
+            "input:gff", "inputs", "gff", "fail", _finding(f),
+            f"gff is {_present_kind_phrase(f)}: {gff}. stage_context's guard "
+            "is os.path.exists(), which this passes, so it does not exit "
+            "there - parse_gff opens the path and "
+            + _open_outcome(f, gff) + "." + _fifo_clause(f, gff),
+            target=gff, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=keys, blocks=["context"], remedy="input"))
+    else:
+        out.append(_check(
+            "input:gff", "inputs", "gff", "fail", _finding(f),
+            _gone("gff", gff, f)
+            + ". run.context is on and stage_context exits when `gff` names a "
+            "path that is not there (an EMPTY gff is not a failure; a missing "
+            "one is).",
+            target=gff, expect=exp, found=f, depth="existence",
+            config_keys=keys, blocks=["context"], remedy="input"))
+
+    # -- contigs_fna. Not checked by doctor at all until now, though
+    #    stage_smorf dies without it: "run.smorf needs contigs_fna pointing at
+    #    the assembly". Note the inversion against its own tools - an ABSENT
+    #    input is fatal while a missing smorf/macrel BINARY only warns and
+    #    writes an empty file, because "every other stage is independent of
+    #    this one". That inversion holds only at the TOP of stage_smorf, which
+    #    is where the absent case dies; past that guard the binary is what
+    #    decides, and the verdict on a path that EXISTS and is unusable has to
+    #    be read off the probe rather than copied from the branch above it.
+    fna = cfg.get("contigs_fna") or ""
+    f = _found(fna)
+    exp = _expect("file", "the assembly smorf/macrel call ORFs on",
+                  derived_from=["contigs_fna"])
+    keys = ["contigs_fna", "run.smorf"]
+    if "smorf" not in on:
+        out.append(_check("input:contigs_fna", "inputs", "contigs_fna", "skip",
+                          "not_enabled",
+                          f"{'contigs_fna':16s} " + (fna or "(not set)"),
+                          target=fna or None, expect=exp, found=f,
+                          depth=_stat_depth(f), config_keys=keys))
+    elif f["kind"] == "file":
+        out.append(_check("input:contigs_fna", "inputs", "contigs_fna", "ok",
+                          "ok", f"{'contigs_fna':16s} {fna}", target=fna,
+                          expect=exp, found=f, depth="kind", config_keys=keys))
+    elif f["kind"] == "empty_file":
+        # The SAME probe the wrong-kind branch below reads, for the same
+        # reason. "it hands the empty assembly to whichever ORF finder is
+        # installed and writes an empty candidate list" is two claims welded
+        # together, and which of them happens is decided by the HOST: with a
+        # finder on PATH the path really is handed to it and what comes back
+        # is that tool's business, not this row's; with none installed the
+        # assembly is never opened at all and the empty candidate list is
+        # stage_smorf's own doing. This row was asserting the second mechanism
+        # unconditionally - the exact fault the directory branch below was
+        # corrected for, left standing one state over.
+        tools = smorf_tools()
+        out.append(_check(
+            "input:contigs_fna", "inputs", "contigs_fna", "warn", "empty",
+            f"contigs_fna is 0 bytes: {fna}. stage_smorf's own test is "
+            "os.path.exists, so it does not die here - "
+            + (f"it hands the empty assembly to {'/'.join(tools)} and takes "
+               "whatever comes back; no ORF can be called out of nothing, so "
+               "at best the candidate list is empty."
+               if tools else
+               "and no ORF finder is installed here, so the assembly is "
+               "never opened at all: the stage logs 'neither smorf(inder) "
+               "nor macrel is installed', writes an empty smorf_proteins.faa "
+               "and returns."),
+            target=fna, expect=exp, found=f, depth="kind", config_keys=keys,
+            degrades=["smorf"], depends_on=["req:smorf"], remedy="input"))
+    elif f["present"]:
+        # A directory, or anything else that is not the assembly. stage_smorf's
+        # test is `not fna or not os.path.exists(fna)`, which a directory
+        # passes, so it does not exit there either - and what happens next is
+        # decided by the HOST rather than by the path. With an ORF finder on
+        # PATH the path is handed to it and the stage dies; with NONE of them
+        # installed the stage never opens the assembly at all - it logs
+        # "neither smorf(inder) nor macrel is installed", writes an empty
+        # smorf_proteins.faa and returns, and `run` exits 0. The unconditional
+        # blocks: ["smorf"] here was measured failing doctor on a host where
+        # the run completes.
+        tools = smorf_tools()
+        out.append(_check(
+            "input:contigs_fna", "inputs", "contigs_fna",
+            "fail" if tools else "warn", _finding(f),
+            f"contigs_fna is {_present_kind_phrase(f)}: {fna}. stage_smorf's "
+            "test is os.path.exists(), which this passes, so it does not exit "
+            "there - "
+            + (f"it hands the path to {'/'.join(tools)} as a FILENAME and "
+               "never opens it here, so what that tool does with this is that "
+               "tool's answer and not this file's: metaannot cannot promise "
+               "it refuses, cannot bound how long it takes about it, and on a "
+               "FIFO in particular the tool can sit blocked in its own open "
+               "while this run holds the results directory. The verdict is "
+               "that an ORF finder takes an assembly FILE and this is not "
+               "one - not a measurement of how the tool fails."
+               if tools else
+               "but no ORF finder is installed here, so the path is never "
+               "opened: the stage logs 'neither smorf(inder) nor macrel is "
+               "installed', writes an empty smorf_proteins.faa and returns. "
+               "Install "
+               "smorf, smorfinder or macrel and this becomes fatal for "
+               "smorf."),
+            target=fna, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=keys, blocks=["smorf"] if tools else [],
+            depends_on=["req:smorf"], remedy="input"))
+    else:
+        out.append(_check(
+            "input:contigs_fna", "inputs", "contigs_fna", "fail", _finding(f),
+            ("run.smorf is on but contigs_fna is not set; stage_smorf exits "
+             "with 'run.smorf needs contigs_fna pointing at the assembly'."
+             if not fna else
+             _gone("contigs_fna", fna, f)
+             + ". run.smorf is on and stage_smorf exits when it cannot open "
+             "the assembly."),
+            target=fna or None, expect=exp, found=f,
+            depth=_stat_depth(f), config_keys=keys,
+            blocks=["smorf"], remedy="input" if fna else "config"))
+    return out
+
+
+def _quant_table_check(cfg, on):
+    """quant_table: the row that made this contract necessary.
+
+    Under DEFAULT_CONFIG run.join is true and run.unipept / run.taxonomy are
+    false. stage_join logs "quant table not found, skipping join" and RETURNS,
+    so an ordinary annotate-without-MS-quant run completes and exits 0 - while
+    the old `ok &= good` exited 1 on it. The verdict here is a property of the
+    CONFIG, not of the file: turn run.unipept on and the same
+    absent table becomes fatal, because stage_unipept calls peptide_features(),
+    which reads it and has no skip branch.
+
+    The other half is the scope's first sentence. A MISSING quant table is
+    survivable; a ZERO-BYTE one is not, because os.path.exists() is true so
+    stage_join never takes its skip branch and dies in the reader instead.
+    Only a per-state check can tell those two apart.
+    """
+    path = cfg["quant_table"]
+    fmt = cfg["quant_format"]
+    tmt = fmt == "fragpipe_tmt"
+    f = _found(path)
+    consumers = quant_consumers(cfg)
+    readers = _peptide_readers(cfg)
+    keys = ["quant_table", "quant_format"]
+    exp = _expect(
+        "dir" if tmt else "file",
+        ("quant_format 'fragpipe_tmt' reads the run DIRECTORY holding the "
+         "per-plex TMTn/ folders, because a tmt-report matrix has already "
+         "collapsed the peptides this tool needs"
+         if tmt else
+         f"quant_format '{fmt}' reads one table file; of the quant formats "
+         "only 'fragpipe_tmt' makes quant_table a directory"),
+        derived_from=["quant_format"])
+    if not consumers:
+        return _check("input:quant_table", "inputs", "quant_table", "skip",
+                      "not_enabled",
+                      f"{'quant_table':16s} " + (path or "(not set)"),
+                      target=path or None, expect=exp, found=f,
+                      depth=_stat_depth(f),
+                      config_keys=keys + ["run.join", "run.unipept",
+                                          "run.taxonomy"])
+    want = "dir" if tmt else "file"
+    if f["kind"] == want:
+        return _check("input:quant_table", "inputs", "quant_table", "ok", "ok",
+                      f"{'quant_table':16s} {path}", target=path, expect=exp,
+                      found=f, depth="kind", config_keys=keys)
+    # Present, and the wrong kind of thing. stage_join's os.path.exists() is
+    # satisfied either way, so the reader is reached and refuses.
+    if f["present"]:
+        if f["kind"] in ("empty_file", "empty_dir"):
+            return _check(
+                "input:quant_table", "inputs", "quant_table", "fail", "empty",
+                f"quant_table is empty: {path}. os.path.exists() is true, so "
+                "stage_join does NOT take its skip branch - it reads the table "
+                "and dies there. An absent quant table is survivable; an empty "
+                "one is not.",
+                target=path, expect=exp, found=f, depth="kind",
+                config_keys=keys, blocks=consumers, remedy="input")
+        # `unreadable` splits off from the rest of "present and wrong", and
+        # the REMEDY is why. Every other state here is a path pointing at the
+        # wrong THING, and the fix is in the config; a table that is exactly
+        # what quant_format asked for and cannot be opened is a permission on
+        # the file or on a directory above it, and telling that operator to
+        # edit `quant_format` sends them to change a setting that is already
+        # right. This is the state os.path.getsize() could not see: it is a
+        # stat, it answers for a mode-000 file, and this row said `ok` about
+        # one while `run` died in the join with "Permission denied".
+        unread = f["kind"] == "unreadable"
+        return _check(
+            "input:quant_table", "inputs", "quant_table", "fail",
+            _finding(f, want),
+            f"quant_table is {_present_kind_phrase(f)}: {path}. "
+            + ("os.path.exists() is true, so stage_join does not take its "
+               "skip branch - it goes on to open the table, as every reader "
+               "that touches it does, and the OSError that comes back is not "
+               "a refusal anything falls back from."
+               if unread else
+               # No _fifo_clause() on this arm, and that is the mirror of
+               # the defect the other arms had: `fragpipe_tmt` never OPENS
+               # this path. tmt_plex_dirs() globs under it and die()s with
+               # "no plex directory matches", promptly, on every state -
+               # so a FIFO here is the one FIFO in the document that does
+               # not hang anything, and claiming it would send an operator
+               # looking for a hang that is not there.
+               "This format reads the run DIRECTORY holding the per-plex "
+               "folders, because a tmt-report matrix has already collapsed "
+               "the peptides this tool needs. tmt_plex_dirs() globs under "
+               "the path rather than opening it, so the stage refuses with "
+               "'no plex directory matches' whatever is really here."
+               if tmt else
+               f"quant_format '{fmt}' reads a single table file; only "
+               "'fragpipe_tmt' takes a directory. Every reader that opens "
+               "it " + _open_outcome(f, path) + ".")
+            + ("" if tmt else _fifo_clause(f, path)),
+            target=path, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=keys, blocks=consumers,
+            remedy="input" if unread else "config")
+    # Absent. join skips; the peptide readers die.
+    if readers:
+        return _check(
+            "input:quant_table", "inputs", "quant_table", "fail",
+            _finding(f, want),
+            _gone("quant_table", path, f) + ". "
+            + ", ".join(readers) + " read it through peptide_features(), which "
+            "has no skip branch."
+            + (" run.join is on too, but stage_join logs a WARN and returns, "
+               "so join alone would not have failed this."
+               if "join" in consumers else ""),
+            target=path or None, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=keys,
+            blocks=readers, degrades=["join"] if "join" in consumers else [],
+            remedy="input")
+    return _check(
+        "input:quant_table", "inputs", "quant_table", "warn",
+        _finding(f, want),
+        _gone("quant_table", path, f)
+        + ". run.join is on, but stage_join logs a "
+        "WARN and returns when the table is absent, so the run still exits 0 - "
+        "with no results/quant/annotated_quant.tsv, which is the file most of "
+        "this pipeline exists to produce. No enabled stage dies on this.",
+        target=path or None, expect=exp, found=f, depth=_stat_depth(f),
+        config_keys=keys, degrades=["join"], remedy="input")
+
+
+def _requirement_checks(cfg, reqs):
+    """The `== tools ==` and `== databases ==` blocks.
+
+    Thin on purpose: label, cmds, note and both sizes live in `requirements`
+    and are reached through `requirement_id`. What a check adds is expect/found,
+    which stages die, and the affordance to offer.
+    """
+    out = []
+    sections = {"tool": "tools", "db": "databases"}
+    for r in reqs:
+        section = sections[r["kind"]]
+        blocks, degrades = requirement_effect(cfg, r["id"])
+        exp, depth, keys = _requirement_expect(r, blocks, degrades)
+        # A row whose verdict the quant table decided says which row decided
+        # it. Without this the warning reads as "nothing on this config needs
+        # a taxdump", when what it means is "join would die on this the moment
+        # the quant table is back" - the same sentence input:manifest already
+        # owes its own contingency.
+        # DERIVED, and the question it derives is the one the sentence
+        # promises: "would restoring the quant table put join in `blocks`".
+        # Asking it as three separate conditions got a different answer -
+        # `taxon_rank: ""` leaves ncbi_taxonomy non-fatal for join however the
+        # quant table stands, so a row claiming this dependency was telling an
+        # operator that restoring the table would make it fatal, which it
+        # would not. One call to requirement_effect() with the contingency
+        # lifted, compared against the real one, cannot drift from it.
+        restored, _ = requirement_effect(cfg, r["id"], join_reaches=True)
+        depends = (["input:quant_table"]
+                   if "join" in restored and "join" not in blocks else [])
+        remedy, reason = _remedy_for(r)
+        size = ""
+        if not r["ok"] and r["size_gb"] >= 0.05:
+            size = f"  ~{_gb(r['size_gb'])} GB"
+            if r["disk_gb"] > r["size_gb"]:
+                size += f" ({_gb(r['disk_gb'])} GB on disk)"
+        if r["ok"]:
+            status, finding = "ok", "ok"
+        elif blocks:
+            # MANUAL is a property of the REMEDY, never of the severity: a
+            # missing licence-gated tool still kills its stage. The comment in
+            # cmd_doctor's tools loop records what happened the last time the
+            # two were fused - doctor said "all checks passed" with no
+            # InterProScan and no SignalP 6, and the run died hours later.
+            status, finding = "fail", "missing"
+        else:
+            # Nothing enabled dies without it. The only requirements that
+            # reach here are the per-database diamond entries, which
+            # stage_diamond skips one by one, and smorf/macrel, which
+            # stage_smorf warns about and writes an empty file instead.
+            status, finding = "warn", "missing"
+        out.append(_check(
+            f"req:{r['id']}", section, r["label"], status, finding,
+            f"{r['label']}{size}",
+            target=None, depth=depth, expect=exp, config_keys=keys,
+            # `kind` is null here on purpose, and it means "this build did not
+            # compute it" rather than "nothing is there": requirements()
+            # answers with one boolean per item - _exists, _pressed,
+            # _prefix_exists or have() - and never says whether a database that
+            # failed is absent, a directory, or an unpressed library. A row
+            # under `== inputs ==` does say, because doctor stats those paths
+            # itself. `found` goes to null altogether where the path was never
+            # configured, because there `present: false` would be a fact about
+            # a path nobody named - and a null `found` is what lets _check()
+            # enforce that such a row claims no depth past "config".
+            found=None if depth == "config" else
+            {"present": bool(r["ok"]), "kind": None, "bytes": None,
+             "entries": None, "symlink": False},
+            requirement_id=r["id"], blocks=blocks, degrades=degrades,
+            depends_on=depends, remedy=remedy, remedy_reason=reason))
+    return out
+
+
+# What requirements() ACTUALLY probes for each tool, in the executable names it
+# passes to have(). A table rather than one blanket sentence, because the
+# blanket sentence - "found on PATH by have(); every stage that uses it dies
+# first" - was false for four of these twelve and false in two different ways:
+# InterProScan and ESMFold are not probed on PATH at all, and kofamscan and
+# smorf are probed under MORE THAN ONE name, either of which satisfies the
+# stage. A test drives every entry here against requirements() itself, one name
+# on PATH at a time, and asserts the table's key set is the set of tool ids
+# requirements() can produce - so neither a drifted name nor a new tool can
+# leave this describing a probe that is not the one being made.
+REQUIREMENT_TOOL_PROBES = {
+    "hmmer": ("hmmsearch",),
+    "diamond": ("diamond",),
+    "mmseqs2": ("mmseqs",),
+    "foldseek": ("foldseek",),
+    "tmbed": ("tmbed",),
+    "signalp6": ("signalp6",),
+    "kofamscan": ("exec_annotation", "kofamscan"),
+    "hhsuite": ("hhblits",),
+    "smorf": ("smorf", "smorfinder", "macrel"),
+    "eggnog-mapper": ("emapper.py",),
+}
+# The two that are not probed on PATH at all have their own sentences, at the
+# branches in _requirement_expect() that produce them.
+REQUIREMENT_OFF_PATH_PROBES = ("interproscan", "esmfold")
+
+
+def _requirement_consequence(blocks, degrades):
+    """What going without one requirement costs, read off requirement_effect().
+
+    DERIVED, because the blanket half-sentence this replaces was attached to
+    every tool row whatever the row said elsewhere, and `req:smorf` is the row
+    that shows the price: it carried "every stage that uses it dies first" with
+    `blocks` EMPTY and `degrades: ["smorf"]`, so one object contradicted itself
+    - stage_smorf logs "smorf/smorfinder not found; skipping that half",
+    writes an empty candidate list and returns. Read off the same call that
+    fills `blocks` and `degrades`, there is nothing left to contradict.
+    """
+    if blocks:
+        return ("without it every enabled stage that uses it dies first: "
+                + ", ".join(blocks))
+    if degrades:
+        return ("nothing dies without it on this config: "
+                + ", ".join(degrades) + " runs anyway and produces less")
+    return "no enabled stage on this config dies or does less without it"
+
+
+def _requirement_expect(r, blocks=(), degrades=()):
+    """(expect, depth, config_keys) for one requirements() item.
+
+    Three claims, and each of them was hard-coded per KIND and so wrong for
+    every item whose test is not its kind's usual one.
+
+    * `expect.because` said "found on PATH by have(); every stage that uses it
+      dies first" for EVERY tool - but InterProScan is tested with
+      _exists(db.interproscan_sh) and ESMFold with _pyhas(), so a preflight
+      screen told an operator to put InterProScan on PATH when the fix is a
+      config key.
+    * `depth` said "kind" for every database, including dbentry()'s "no path
+      configured" rows, where nothing outside the config was consulted. The
+      ratchet was enforced upward only - header and parsed must carry a
+      caveat - and nothing stopped a row claiming it had looked deeper than it
+      had. It is now derived from the same marker _remedy_for() switches on.
+    * `expect.members` was never passed a value anywhere in the file, though
+      the cases it was written for are right here: the four hmmpress siblings,
+      foldseek's .dbtype and .index, the nodes.dmp inside a taxdump. It is
+      populated from the engine's OWN test and left empty where that test
+      names no sibling, which is a fact about the test and is said out loud.
+    """
+    rid = r["id"]
+    cost = _requirement_consequence(list(blocks), list(degrades))
+    # dbentry()'s exact marker, and InterProScan's too since it started going
+    # through the same split: nothing outside the config was consulted.
+    unset = r["manual"] == "no path configured"
+    if rid == "interproscan":
+        return (_expect("file",
+                        "the interproscan.sh named by db.interproscan_sh: "
+                        "requirements() tests _exists() on THAT PATH and "
+                        "never looks at PATH, so a copy on PATH does not "
+                        "satisfy it and putting one there is not the fix; "
+                        + cost,
+                        derived_from=["db.interproscan_sh"]),
+                "config" if unset else "kind", ["db.interproscan_sh"])
+    if rid == "esmfold":
+        return (_expect("probe",
+                        "an importable Python module on THIS interpreter: "
+                        "_pyhas('esm') or _pyhas('transformers'), the two "
+                        "backends stage_esmfold accepts, in that order; "
+                        + cost,
+                        nonempty=False), "probe", [])
+    if r["kind"] == "tool":
+        names = REQUIREMENT_TOOL_PROBES.get(rid)
+        if not names:
+            # A tool id nobody put in the table. Say only what is certainly
+            # true rather than guess a command name - a guessed one sends an
+            # operator to install something the probe does not look at, which
+            # is the whole defect this table exists to close.
+            probe = ("probed on PATH by requirements(); the executable name it "
+                     "looks for is not recorded here")
+        elif len(names) == 1:
+            probe = f"`{names[0]}` on PATH, found by have()"
+        else:
+            probe = ("ANY ONE of " + ", ".join(f"`{n}`" for n in names)
+                     + " on PATH, found by have(); the stage accepts whichever "
+                       "is there")
+        return (_expect("on_path", probe + "; " + cost, nonempty=False),
+                "probe", [])
+    keys = [f"db.{rid}"]
+    kind, members = "file", ()
+    because = "a file with content, or a directory that is not empty (_exists)"
+    if rid in ("pfam_hmm", "dbcan_hmm", "ncbifam_hmm"):
+        members = (".h3f", ".h3i", ".h3m", ".h3p")
+        because = ("an hmmpress'd HMM library: _pressed() requires the four "
+                   "binary siblings hmmsearch needs, which also rejects an "
+                   "HTML landing page and a truncated download - neither of "
+                   "which existence alone can tell from the real file")
+    elif rid == "foldseek_target":
+        members = (".dbtype", ".index")
+        because = ("a set of sibling files addressed by one stem, of which "
+                   "requirements() tests for these two by name")
+    elif rid == "hhblits_db":
+        because = ("a set of sibling files addressed by one stem: "
+                   "_prefix_exists() accepts ANY non-empty file whose name "
+                   "starts with it, which is why `members` is empty here - no "
+                   "particular sibling was tested for")
+    elif rid == "ncbi_taxonomy":
+        kind, members = "dir", ("nodes.dmp",)
+        because = ("the directory a taxdump unpacks into; requirements() "
+                   "tests for the nodes.dmp inside it")
+    elif rid == "eggnog_data":
+        kind, members = "dir", ("eggnog.db",)
+        because = ("the --data_dir download_eggnog_data.py fills; "
+                   "requirements() tests for the eggnog.db inside it")
+    elif rid == "kofam_db":
+        keys = ["db.kofam_profiles", "db.kofam_ko_list"]
+        because = ("two configured paths, both tested with _exists(): the "
+                   "profile directory and the ko_list file. `members` is "
+                   "empty because neither is a sibling of the other - they "
+                   "are two keys, and derived_from names both")
+    elif rid == "jackhmmer_db":
+        because = ("the UNPACKED UniRef50 fasta: requirements() refuses a "
+                   "path still ending in .gz, because a gunzip that ran out "
+                   "of disk leaves one that _exists() is perfectly happy with")
+    elif rid.startswith("diamond:"):
+        keys = ["db.diamond." + rid.split(":", 1)[1]]
+        because = "a .dmnd built by `diamond makedb` (_exists)"
+    return (_expect(kind, because + "; " + cost, members=members,
+                    derived_from=keys),
+            "config" if unset else "kind", keys)
+
+
+# What each thing diamond_db_check() opens costs in `depth`, and the sentence
+# it owes the row for having opened it. The pair is here rather than at the
+# check because `depth` is doctor's vocabulary and the tokens are the engine's:
+# diamond_db_check reports what it read, and this decides what that means.
+DMND_READS = {
+    "size": ("kind", "only the file's size was read (os.path.getsize); "
+                     "nothing inside it was opened"),
+    "dbinfo": ("header", "read from the DIAMOND header: `diamond dbinfo` "
+                         "reports Sequences and Letters, and parses no "
+                         "sequence"),
+    "fasta_lengths": ("parsed", "diamond is not on PATH, so the length "
+                                "profile was taken from the source FASTA "
+                                "beside the database - up to "
+                                f"{DMND_FASTA_RECORD_CAP:,} records read, "
+                                "sequence lines included"),
+    "fasta_headers": ("parsed", f"up to {DMND_DEFLINE_CAP} deflines of the "
+                                "source FASTA were read, to tell a motif "
+                                "seed set from a database of proteins; no "
+                                "sequence was used"),
+}
+
+
+def _diamond_depth(reads):
+    """(depth, caveat) for what diamond_db_check() actually opened.
+
+    The deepest of them wins, and every one of them is named: a row that read
+    two files owes a sentence about both, because the caveat is what the
+    scope statement's "it does not parse" is qualified BY.
+    """
+    depth, notes = "kind", []
+    for tok in reads:
+        d, note = DMND_READS[tok]
+        if DOCTOR_DEPTH_ORDER.index(d) > DOCTOR_DEPTH_ORDER.index(depth):
+            depth = d
+        notes.append(note)
+    return depth, "; ".join(notes) or None
+
+
+def _diamond_checks(cfg, on):
+    """The DIAMOND checks that look past existence - `db:diamond:weights` and
+    one `db:diamond:<tag>:usable` per configured database - printed under
+    `== databases ==` with no heading of their own.
+
+    The asymmetry here is the opposite of the intuitive reading and is worth
+    stating plainly: an ABSENT diamond database is a warning, because
+    stage_diamond logs "diamond database missing, skipping" and searches the
+    rest; a database that is PRESENT and cannot answer is fatal, because
+    diamond_db_check refuses it and the stage dies with "refusing to search a
+    DIAMOND database that cannot answer". A zero-byte .dmnd left by a failed
+    `diamond makedb` is exactly the second case, and searching it reports 0
+    hits, which reads like a real absence of virulence factors.
+    """
+    out = []
+    if not cfg["run"].get("diamond"):
+        return out
+    blocks = ["diamond"] if "diamond" in on else []
+    unweighted = set((cfg["db"].get("diamond") or {})) \
+        - set(cfg.get("diamond_weights") or {})
+    if unweighted:
+        out.append(_check(
+            "db:diamond:weights", "databases", "diamond_weights", "warn",
+            "unweighted",
+            f"diamond_weights missing for {sorted(unweighted)}; those hits "
+            "still count as annotation but score 0 in the effector ranking",
+            config_keys=["diamond_weights", "db.diamond"], depth="config",
+            degrades=blocks, remedy="config"))
+    for tag, path in sorted((cfg["db"].get("diamond") or {}).items()):
+        if not path or not os.path.exists(path):
+            continue          # already reported by its requirement row
+        cid = f"db:diamond:{tag}:usable"
+        exp = _expect("file", "a DIAMOND database `diamond blastp` can answer "
+                              "from, at the configured --evalue",
+                      derived_from=["db.diamond", "diamond_evalues",
+                                    "thresholds.diamond_evalue"])
+        # The gate, because diamond_db_check() getsize()s the database and
+        # then hands it to `diamond dbinfo` or reads a FASTA beside it: every
+        # one of those is an open on a path whose kind nothing had established.
+        f, refusal = _deep_readable(path)
+        if refusal:
+            out.append(_check(
+                cid, "databases",
+                f"DIAMOND {tag} - usability", "fail", _finding(f),
+                f"{tag}: {path} is {refusal}, so nothing here could look at "
+                "it. stage_diamond's own test is os.path.exists(), which this "
+                "passes - so it does NOT log 'diamond database missing, "
+                "skipping' and search the rest: it puts this database in the "
+                "job list and hands the path to `diamond blastp`, which runs "
+                "as the same user and cannot open it either.",
+                target=path, expect=exp,
+                found=f, depth=_stat_depth(f), config_keys=["db.diamond"],
+                requirement_id=f"diamond:{tag}",
+                depends_on=[f"req:diamond:{tag}"], blocks=blocks,
+                remedy="input"))
+            continue
+        try:
+            bad, warn, reads = diamond_db_check(cfg, tag, path)
+        except StageError as e:      # a non-numeric diamond_evalues entry
+            bad, warn, reads = f"{tag}: {e}", None, ()
+        except OSError as e:                                # noqa: BLE001
+            # The backstop the gate above is meant to make unreachable. A
+            # .dmnd that passes the open and a source FASTA beside it that
+            # does not are two different paths, and only one of them has been
+            # proved; this is what keeps the second from costing the document.
+            bad, warn, reads = (f"{tag}: {path} could not be examined: {e}",
+                                None, ())
+        # DERIVED, never declared. What this check opens depends on whether
+        # diamond is on PATH and whether a source FASTA is beside the
+        # database, and the hard-coded pair here said "read from the DIAMOND
+        # header ... the sequences themselves were not parsed" in both cases -
+        # so on the ordinary first run, where diamond is not installed yet and
+        # the check reads up to 200,000 FASTA records instead, the row
+        # asserted the opposite of what it had just done. That also defeated
+        # the guard in _check(), which is the structural fence here: it can
+        # only check that a deep row says SOMETHING, not that what it says is
+        # true.
+        depth, caveat = _diamond_depth(reads)
+        if bad:
+            out.append(_check(
+                cid, "databases", f"DIAMOND {tag} - usability", "fail",
+                "unusable", bad, target=path, expect=exp, found=f,
+                depth=depth, caveat=caveat,
+                config_keys=["db.diamond"], requirement_id=f"diamond:{tag}",
+                depends_on=[f"req:diamond:{tag}"], blocks=blocks,
+                remedy="input"))
+        elif warn:
+            out.append(_check(
+                cid, "databases", f"DIAMOND {tag} - usability", "warn",
+                "indicative", warn, target=path, expect=exp, found=f,
+                depth=depth, caveat=caveat,
+                config_keys=["db.diamond"], requirement_id=f"diamond:{tag}",
+                depends_on=[f"req:diamond:{tag}"], degrades=blocks,
+                remedy="input"))
+    return out
+
+
+def _tmbed_no_gpu_check(cfg, on):
+    """`gpu:topology`: what run.topology costs on a host with no CUDA.
+
+    BRANCHED on tmbed_use_gpu, which is the key the row names, because the
+    answer is different for each of its three values and the row was giving
+    one answer for all of them: warn / blocks [] / degrades ["tmbed"] under
+    `auto`, under `true` AND under `false`. Two of those were wrong in
+    opposite directions.
+
+    * `true` maps to `--use-gpu --no-cpu-fallback`. TMbed tolerates a missing
+      or failing GPU only when --cpu-fallback is given, so every chunk fails,
+      every protein lands in tmbed_failed.tsv, and stage_tmbed die()s on
+      "finished 0 of N prediction(s)" - unless tmbed_allow_partial is on, in
+      which case it logs the shortfall and returns with an EMPTY prediction
+      file. So the verdict is fatal, and which of the two it is depends on a
+      SECOND key the row never mentioned. doctor exited 0 on this.
+    * `false` maps to `--no-use-gpu`. The operator has already answered the
+      question this row asks, and it still told them to "Set tmbed_use_gpu:
+      false" - advice to make a change they have made. Nothing is fatal here,
+      but the slowness is not a fallback either: it is the configuration.
+
+    The flags come from TMBED_GPU_MODES, which is stage_tmbed's own map, so a
+    fourth value cannot be described here without being handled there.
+    """
+    want = str(cfg.get("tmbed_use_gpu", "auto")).strip().lower()
+    hits = ["tmbed"] if "tmbed" in on else []
+    flags, fatal = TMBED_GPU_MODES.get(want, ((), False))
+    partial = bool(cfg.get("tmbed_allow_partial"))
+    keys = ["run.topology", "tmbed_use_gpu"]
+    lead = ("run.topology: SignalP 6 is CPU-only and unaffected, so all of "
+            "this is about tmbed. ")
+    if want not in TMBED_GPU_MODES:
+        # stage_tmbed die()s on the value before it looks at a device at all,
+        # so this is not a GPU verdict and does not pretend to be one.
+        return _check(
+            "gpu:topology", "gpu", "run.topology without a GPU", "fail",
+            "config_missing",
+            lead + f"tmbed_use_gpu is '{cfg.get('tmbed_use_gpu')}', which "
+            "stage_tmbed does not recognise: it exits on 'unknown "
+            "tmbed_use_gpu' before it looks at a device at all. Choose "
+            + _and_list(sorted(TMBED_GPU_MODES), "or") + ".",
+            depth="config", config_keys=keys,
+            expect=_expect("setting", "one of "
+                           + _and_list(sorted(TMBED_GPU_MODES), "or"),
+                           nonempty=False, members=sorted(TMBED_GPU_MODES)),
+            blocks=hits, remedy="config")
+    if fatal and not partial:
+        return _check(
+            "gpu:topology", "gpu", "run.topology without a GPU",
+            "fail" if hits else "warn", "no_device",
+            lead + f"tmbed_use_gpu is '{want}', so tmbed is run with "
+            + " ".join(flags) + " - and TMbed tolerates a missing or failing "
+            "GPU only under --cpu-fallback. Every chunk fails, every protein "
+            "is listed in tmbed_failed.tsv, and the stage exits on 'tmbed "
+            "finished 0 of N prediction(s)'. That is what 'true' is FOR - "
+            "slow is worse than absent - but this host has no device. Set "
+            "tmbed_use_gpu: auto to fall back to CPU, tmbed_allow_partial: "
+            "true to accept an empty topology set, or run.topology: false.",
+            depth="config", config_keys=keys + ["tmbed_allow_partial"],
+            blocks=hits, remedy="config")
+    if fatal:
+        return _check(
+            "gpu:topology", "gpu", "run.topology without a GPU", "warn",
+            "no_device",
+            lead + f"tmbed_use_gpu is '{want}' ({' '.join(flags)}), so every "
+            "chunk fails on this host - but tmbed_allow_partial is on, so the "
+            "stage logs the shortfall instead of dying and writes an EMPTY "
+            "prediction file. Nothing dies; no protein gets topology "
+            "evidence, and an absent helix or strand count then means 'not "
+            "attempted' rather than 'absent'.",
+            depth="config", config_keys=keys + ["tmbed_allow_partial"],
+            degrades=hits, remedy="config")
+    if want == "false":
+        return _check(
+            "gpu:topology", "gpu", "run.topology without a GPU", "warn",
+            "cpu_only",
+            lead + "tmbed_use_gpu is 'false' (--no-use-gpu), so this is the "
+            "configured behaviour and not a fallback: tmbed runs on CPU, "
+            "where it is one to two orders of magnitude slower - fine for a "
+            "few thousand proteins, not for a few hundred thousand. There is "
+            "nothing to change here that this config has not already said; "
+            "the remedies are a GPU host or run.topology: false.",
+            depth="config", config_keys=keys, degrades=hits, remedy="config")
+    return _check(
+        "gpu:topology", "gpu", "run.topology without a GPU", "warn",
+        "cpu_fallback",
+        lead + f"tmbed_use_gpu is '{want}' ({' '.join(flags)}), so tmbed asks "
+        "for the GPU and falls back to CPU, where it is one to two orders of "
+        "magnitude slower - fine for a few thousand proteins, not for a few "
+        "hundred thousand. Set tmbed_use_gpu: false to say so deliberately, "
+        "or true to make a missing GPU fatal instead of slow.",
+        depth="config", config_keys=keys, degrades=hits, remedy="config")
+
+
+def _gpu_checks(cfg, on):
+    """The `== gpu ==` block.
+
+    Two stages reach opposite verdicts from ONE probe, which is why they are
+    two checks: stage_esmfold exits rather than fold on CPU, while what tmbed
+    does is decided by tmbed_use_gpu - see _tmbed_no_gpu_check().
+    """
+    out = []
+    if not (cfg["run"].get("structure") or cfg["run"].get("topology")):
+        return out
+    usable, why = cuda_probe()
+    out.append(_check(
+        "gpu:probe", "gpu", "CUDA", "ok" if usable else "warn",
+        "ok" if usable else "no_device", why, depth="probe",
+        expect=_expect("probe", "torch.cuda, probed on this host",
+                       nonempty=False),
+        found={"present": bool(usable), "kind": None, "bytes": None,
+               "entries": None, "symlink": False},
+        caveat="a fact about this host at `generated`, not about metaannot"))
+    if not usable:
+        if cfg["run"].get("structure"):
+            out.append(_check(
+                "gpu:structure", "gpu", "run.structure without a GPU", "fail",
+                "no_device",
+                "run.structure needs CUDA: stage_esmfold exits rather than "
+                "fold on CPU, which is impractical at any real scale. Set "
+                "run.structure: false, or fold on a GPU host and copy "
+                "results/structures/ back - foldseek itself is CPU-only and "
+                "will search whatever models are there.",
+                config_keys=["run.structure", "gpu_device"],
+                blocks=["esmfold"] if "esmfold" in on else [],
+                remedy="config"))
+        if cfg["run"].get("topology"):
+            out.append(_tmbed_no_gpu_check(cfg, on))
+    elif cfg["run"].get("structure") and cfg["run"].get("topology"):
+        out.append(_check(
+            "gpu:share", "gpu", "gpu_device sharing", "ok", "ok",
+            f"esmfold and tmbed share gpu_device {cfg['gpu_device']}, so at "
+            f"most {cfg.get('gpu_workers', 1)} of them runs at a time",
+            config_keys=["gpu_device", "gpu_workers"]))
+    return out
+
+
+# What the `== tmt ==` rows below actually opened. They are `depth: "parsed"` -
+# read_tmt_annotation reads every plex's annotation file in full - and that is
+# one of the checks at DOCTOR_DEEP_CHECKS, so it is named on every row rather
+# than asserted once.
+TMT_CAVEAT = ("counted from the annotation files doctor could read; the quant "
+              "tables themselves were not opened")
+
+
+def _tmt_checks(cfg):
+    """The `== tmt ==` block.
+
+    Every rule below is read_fragpipe_tmt's own - which channels it keeps, how
+    it resolves the reference, which names it refuses - because a verdict that
+    disagrees with the reader is worse than no verdict: the run doctor blessed
+    still dies, on the same config, hours later.
+
+    The gate at the top fixes a live false-fail. Until now this whole block ran
+    on `quant_format == "fragpipe_tmt"` alone and every MISS inside it set
+    ok=False, so a TMT config with run.join, run.unipept and run.taxonomy all
+    off exited 1 - on a config where no enabled stage opens the quant tree at
+    all.
+
+    Three different lists come out of that, and using one for all three was
+    the second false-fail here. `consumers` opens the tree at all, and is what
+    a plex directory or a level file that is not there costs, because the
+    peptide-only reader needs both as much as the full one does. `dies` is
+    what a refusal by the FULL reader costs - an annotation that cannot be
+    read, a duplicated sample name, a reference that does not resolve - which
+    peptide_features() catches and re-reads around, so it is join's loss and
+    not unipept's. `quality` is who a tree that reads perfectly but describes
+    a ragged design costs: the taxonomy stages take peptides out of it and
+    never touch an intensity, so that too is join alone.
+    """
+    consumers = quant_consumers(cfg)
+    dies, survives = _full_reader_refusal(cfg)
+    quality = [s for s in consumers if s == "join"]
+    root = cfg.get("quant_table") or ""
+    t = cfg.get("tmt") or {}
+    if not consumers:
+        return [_check(
+            "tmt:applies", "tmt", "quant tree", "skip", "not_enabled",
+            "quant_format is 'fragpipe_tmt', but no enabled stage reads the "
+            "quant tree (run.join, run.unipept and run.taxonomy are all off), "
+            "so nothing under it was checked",
+            target=root or None, depth=_stat_depth(_found(root)),
+            config_keys=["quant_format", "run.join", "run.unipept",
+                         "run.taxonomy"],
+            expect=_expect("dir", "the FragPipe run directory holding the "
+                                  "per-plex folders",
+                           derived_from=["quant_format"]),
+            found=_found(root))]
+    out = []
+    lvl = str(t.get("level") or "ion").lower()
+    fname = TMT_LEVEL_FILES.get(lvl, "ion.tsv")
+    ref_name = str(t.get("reference_name") or "")
+    ref_chan = str(t.get("reference_channel") or "")
+    if ref_name and ref_chan:
+        # read_fragpipe_tmt dies on this outright, so it is a failure and not
+        # the advisory it looks like.
+        out.append(_check(
+            "tmt:reference_conflict", "tmt", "tmt.reference",
+            _refusal_status(dies), "ambiguous",
+            f"tmt.reference_name ('{ref_name}') and tmt.reference_channel "
+            f"('{ref_chan}') are both set and can disagree per plex; set one."
+            + _survives_clause(survives),
+            depth="config",
+            config_keys=["tmt.reference_name", "tmt.reference_channel"],
+            blocks=dies, remedy="config"))
+    f = _found(root)
+    exp = _expect("dir", "quant_format 'fragpipe_tmt' reads the run DIRECTORY "
+                         "holding the per-plex TMTn/ folders",
+                  derived_from=["quant_format", "tmt.plex_glob"])
+    if not os.path.isdir(root):
+        # The quant_table row in `== inputs ==` already carries this verdict
+        # and its blocks; this line is the one a TMT operator is looking at, so
+        # it stays, and points back rather than double-counting.
+        out.append(_check(
+            "tmt:root", "tmt", "quant_table", "skip", "upstream_unresolved",
+            f"quant_table is not a directory: {root or '(not set)'}; see "
+            "input:quant_table for what that costs. Nothing under it could be "
+            "checked.",
+            target=root or None, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=["quant_table", "quant_format"],
+            depends_on=["input:quant_table"]))
+        return out
+    try:
+        plexes = tmt_plex_dirs(root, cfg)
+    except StageError as e:
+        out.append(_check(
+            "tmt:plex_dirs", "tmt", "plexes", "fail", "missing", str(e),
+            target=root, expect=exp, found=f, depth="kind",
+            config_keys=["quant_table", "tmt.plex_glob"], blocks=consumers,
+            remedy="config"))
+        return out
+    if plexes:
+        out.append(_check(
+            "tmt:plex_dirs", "tmt", "plexes", "ok", "ok",
+            f"{len(plexes)} plex(es): {[n for n, _ in plexes]}",
+            target=root, expect=exp, found=f, depth="kind",
+            config_keys=["quant_table", "tmt.plex_glob"]))
+    drop_empty = bool(t.get("drop_empty_channels", True))
+    sizes, seen_names, ref_hits = {}, {}, {}
+    for plex, pdir in plexes:
+        lvl_path = os.path.join(pdir, fname)
+        lf = _found(lvl_path)
+        lvl_exp = _expect("file", f"tmt.level '{lvl}' names {fname} inside "
+                                  "every plex folder",
+                          derived_from=["tmt.level"])
+        if lf["kind"] != "file":
+            # THREE-WAY, for the reason every other input in this file is:
+            # read_fragpipe_tmt's own guard is `if not os.path.exists(path)`,
+            # which is true of exactly one of these states. Driven, on this
+            # reader, one state at a time: a DIRECTORY raises IsADirectoryError
+            # out of header_columns(), a chmod-000 file raises PermissionError
+            # there, an EMPTY one gets past header_columns() and dies in
+            # read_delim_table with pandas' EmptyDataError ("No columns to
+            # parse from file"), and a FIFO with no writer does not raise at
+            # all - it blocks. None of them is a StageError and none of them
+            # is caught anywhere downstream, so all of them cost the whole
+            # list of consumers, and the row said nothing about any of them:
+            # `os.path.exists` was its only test too.
+            out.append(_check(
+                f"tmt:{plex}:level_file", "tmt", f"{plex} {fname}", "fail",
+                _finding(lf),
+                (f"{plex}: no {fname} (tmt.level '{lvl}'); {pdir} holds "
+                 f"{_dir_sample(pdir)}"
+                 if not lf["present"] else
+                 # The correction that reached this row's SIBLING - the
+                 # annotation row below, which says "or, on a FIFO with no
+                 # writer, never returns at all" - and not this one, in the
+                 # same function, in the same loop. It is derived here so
+                 # that the two cannot part company again.
+                 f"{plex}: {fname} is {_present_kind_phrase(lf)}: {lvl_path}. "
+                 "read_fragpipe_tmt's own test is os.path.exists(), which "
+                 "this passes, so it does not die there - header_columns() "
+                 "opens the path and " + _open_outcome(lf, lvl_path) + "."
+                 + _fifo_clause(lf, lvl_path)),
+                target=lvl_path, depth=_stat_depth(lf), expect=lvl_exp,
+                found=lf, config_keys=["tmt.level"],
+                blocks=consumers, remedy="input"))
+        # The annotation, and the gate in front of it. This is the site that
+        # made _deep_readable() necessary: tmt_annotation_path() guards only
+        # os.path.exists(), read_tmt_annotation() goes straight to opener() -
+        # which is open() - and the `except` here was StageError alone. A
+        # DIRECTORY and a chmod-000 file each printed a traceback and NO
+        # DOCUMENT; a FIFO made the whole command hang on the open, forever.
+        ann_exp = _expect("file", "an annotation file naming this plex's "
+                                  "channels",
+                          derived_from=["tmt.annotation"])
+        apath, af, why, rows = None, None, None, None
+        try:
+            apath = tmt_annotation_path(plex, pdir, cfg)
+            af, refusal = _deep_readable(apath)
+            if refusal:
+                # The gate said no, so NOTHING was read and the row may not
+                # say it was. Three of the four states that brought this
+                # command down land here, in one branch, with the kind they
+                # really are.
+                # The VERB is derived here too, and this row is why the
+                # derivation exists: it was the one that said "it raises, or,
+                # on a FIFO with no writer, never returns at all" - a verb
+                # written by hand, correct when it was written and wrong the
+                # moment opener() grew a bounded wait. Its sibling twenty
+                # lines up was already derived; a hand-written verb beside a
+                # derived one is the two of them waiting to disagree.
+                why = (_stat_depth(af), _finding(af), None,
+                       f"{plex}: the annotation file {apath} is {refusal}. "
+                       "read_tmt_annotation opens the path directly through "
+                       "opener(), so it does not refuse here - the open is "
+                       "where it ends, and on this state it "
+                       + _open_outcome(af, apath) + "."
+                       + _fifo_clause(af, apath))
+            else:
+                rows = read_tmt_annotation(apath, plex)
+        except StageError as e:
+            # The reader REFUSING, which is what this row was always for. The
+            # `no annotation file` refusal comes out of tmt_annotation_path()
+            # before anything is opened, so the depth is what was really
+            # reached and not a flat "parsed".
+            opened = apath is not None and af is not None
+            why = (("parsed" if opened else "existence"), "unreadable",
+                   ("the plex's annotation file was read in full; this is "
+                    + DOCTOR_DEEP_CLAUSE) if opened else None,
+                   f"{plex}: {e}")
+        except OSError as e:                                # noqa: BLE001
+            # The backstop, not the branch: _deep_readable() above is what is
+            # meant to catch these, and this is what catches the state it did
+            # not anticipate. An unreachable backstop costs one row in a
+            # document that survives; a missing one costs the document.
+            why = (None, "unreadable",
+                   None, f"{plex}: the annotation file could not be read: "
+                         f"{e}")
+        if why is not None:
+            depth, finding, caveat, detail = why
+            f_row = af if af is not None else _found(pdir)
+            out.append(_check(
+                f"tmt:{plex}:annotation", "tmt", f"{plex} annotation",
+                _refusal_status(dies), finding,
+                detail + _survives_clause(survives),
+                target=apath or pdir, depth=depth or _stat_depth(f_row),
+                caveat=caveat, expect=ann_exp, found=f_row,
+                config_keys=["tmt"], blocks=dies, remedy="input"))
+            continue
+        sizes[plex] = len(rows)
+        keep = [(c, s) for c, s in rows
+                if not (drop_empty and s == f"{plex}_{c}")]
+        if ref_name:
+            hits = [s for _c, s in keep if fnmatch.fnmatchcase(s, ref_name)]
+        elif ref_chan:
+            hits = [s for c, s in keep if fnmatch.fnmatchcase(c, ref_chan)]
+        else:
+            hits = []
+        if ref_name or ref_chan:
+            ref_hits[plex] = hits
+            if len(hits) == 1:
+                keep = [(c, s) for c, s in keep if s != hits[0]]
+        for _c, s in keep:
+            seen_names.setdefault(s, []).append(plex)
+    # "every plex" can only mean the ones doctor got as far as reading: a plex
+    # whose annotation failed above is in none of these counts and must not be
+    # summarised as though it had passed.
+    scope = ("every plex" if len(sizes) == len(plexes)
+             else f"each of the {len(sizes)} plex(es) read")
+    if sizes:
+        dist = sorted(set(sizes.values()))
+        if len(dist) > 1:
+            out.append(_check(
+                "tmt:channel_counts", "tmt", "channels per plex", "warn",
+                "ragged",
+                f"plexes differ in channel count {dist}: "
+                f"{ {k: v for k, v in sorted(sizes.items())} }",
+                depth="parsed", caveat=TMT_CAVEAT,
+                config_keys=["tmt"], degrades=quality))
+        else:
+            out.append(_check(
+                "tmt:channel_counts", "tmt", "channels per plex", "ok", "ok",
+                f"{dist[0]} channels in {scope}, {sum(sizes.values())} in "
+                "total", depth="parsed", caveat=TMT_CAVEAT,
+                config_keys=["tmt"]))
+    dupes = {n: pl for n, pl in seen_names.items() if len(pl) > 1}
+    if dupes:
+        shown = dict(sorted(dupes.items())[:4])
+        out.append(_check(
+            "tmt:sample_names", "tmt", "sample names", _refusal_status(dies),
+            "duplicate",
+            f"{len(dupes)} sample name(s) appear in more than one plex: "
+            f"{shown}. Sample names are the columns of the joined matrix, so "
+            "the reader refuses two plexes that claim one; rename them per "
+            "plex, or, if this is a bridge, name it with tmt.reference_name so "
+            "it stops being a sample." + _survives_clause(survives),
+            depth="parsed", caveat=TMT_CAVEAT,
+            config_keys=["tmt.reference_name"],
+            blocks=dies, remedy="input"))
+    if ref_name or ref_chan:
+        which = (f"reference_name '{ref_name}'" if ref_name
+                 else f"reference_channel '{ref_chan}'")
+        missing = sorted(pl for pl, h in ref_hits.items() if not h)
+        ambig = {pl: h for pl, h in sorted(ref_hits.items()) if len(h) > 1}
+        if missing:
+            out.append(_check(
+                "tmt:reference_missing", "tmt", "tmt.reference",
+                _refusal_status(dies), "unmatched",
+                f"tmt.{which} matches nothing in {len(missing)} plex(es): "
+                f"{missing[:6]}. A reference absent from a plex leaves that "
+                "plex without a denominator." + _survives_clause(survives),
+                depth="parsed", caveat=TMT_CAVEAT,
+                config_keys=["tmt.reference_name", "tmt.reference_channel"],
+                blocks=dies, remedy="config"))
+        if ambig:
+            out.append(_check(
+                "tmt:reference_ambiguous", "tmt", "tmt.reference",
+                _refusal_status(dies), "ambiguous",
+                f"tmt.{which} matches more than one channel in {len(ambig)} "
+                f"plex(es): {dict(list(ambig.items())[:4])}. The reference is "
+                "one channel per plex; narrow the pattern until it names it."
+                + _survives_clause(survives),
+                depth="parsed", caveat=TMT_CAVEAT,
+                config_keys=["tmt.reference_name", "tmt.reference_channel"],
+                blocks=dies, remedy="config"))
+        if ref_hits and not missing and not ambig:
+            out.append(_check(
+                "tmt:reference", "tmt", "tmt.reference", "ok", "ok",
+                f"tmt.{which} resolves in {scope}", depth="parsed",
+                caveat=TMT_CAVEAT,
+                config_keys=["tmt.reference_name", "tmt.reference_channel"]))
+    elif bool(t.get("use_reference_ratios", False)):
+        out.append(_check(
+            "tmt:reference", "tmt", "tmt.reference", _refusal_status(dies),
+            "unset",
+            "tmt.use_reference_ratios is on but neither tmt.reference_name nor "
+            "tmt.reference_channel is set." + _survives_clause(survives),
+            depth="config",
+            config_keys=["tmt.use_reference_ratios"], blocks=dies,
+            remedy="config"))
+    else:
+        out.append(_check(
+            "tmt:reference", "tmt", "tmt.reference", "warn", "unset",
+            "no reference channel named, so plexes are compared on within-plex "
+            "normalised intensity alone; set tmt.reference_name if this design "
+            "has a bridge", depth="config",
+            config_keys=["tmt.reference_name"], degrades=quality,
+            remedy="config"))
+    return out
+
+
+def _mapping_unresolved(why):
+    """The `manifest:mapping` row for every state that stops it being asked.
+
+    Four callers now - the manifest is absent, it is the wrong kind, it was
+    refused, it could not be opened - and one row rather than four copies,
+    because `depends_on` and `config_keys` are the contract and a copy is
+    where a key goes missing.
+    """
+    return _check(
+        "manifest:mapping", "manifest", "manifest -> quant columns",
+        "skip", "upstream_unresolved", f"not checked: {why}",
+        depth="config", config_keys=["manifest", "quant_table",
+                                     "quant_format"],
+        depends_on=["input:manifest"])
+
+
+def _manifest_checks(cfg):
+    """The `== manifest ==` block.
+
+    The verdict on a manifest that is set and absent is CONTINGENT, which is
+    why `depends_on` exists. read_manifest is reached from read_feature_table
+    and directly from stage_join, and both are downstream of stage_join's
+    `if not os.path.exists(quant_table): return`. With the quant table gone,
+    nothing ever opens the manifest, so the old unconditional `ok = False`
+    here was the same family of false-fail as the quant_table one.
+
+    Who "whoever" is comes from _manifest_readers(), not from
+    quant_consumers(), and the difference is two false verdicts. A
+    stage_unipept with unipept.result set returns before any reader runs, and
+    four of the eight quant formats have no reader that opens a manifest at
+    all - so this block was failing configs on which `run` completes, and
+    claiming stages that never look at the file.
+    """
+    out = []
+    path = cfg["manifest"]
+    f = _found(path)
+    readers = _manifest_readers(cfg)
+    dies, survives = _full_reader_refusal(cfg)
+    quant_there = os.path.exists(cfg["quant_table"] or "")
+    exp = _expect("file", "a tab-separated FragPipe .fp-manifest",
+                  derived_from=["manifest"])
+    if not readers:
+        return [_check("input:manifest", "manifest", "manifest", "skip",
+                       "not_used" if quant_consumers(cfg) else "not_enabled",
+                       f"{path} (config key `manifest`) - "
+                       + (_no_manifest_reader(cfg) if quant_consumers(cfg)
+                          else "no enabled stage reads a quant table, so "
+                               "nothing opens it"),
+                       target=path, expect=exp, found=f,
+                       depth=_stat_depth(f),
+                       config_keys=["manifest", "quant_format"])]
+    if not f["present"]:
+        # Whoever reads it reads the quant table FIRST - join returns on a
+        # missing one and the peptide readers die on it - so with the quant
+        # table gone NOTHING reaches read_manifest and this file kills nobody.
+        #
+        # WHO IT COSTS when the quant table IS there is asked the way the
+        # wrong-kind branch below asks it, off _dies_with_a_stage_error(), and
+        # not asserted here. The answer is the same one the hand-written
+        # sentence gave - read_manifest goes straight to opener(), os.open()
+        # raises FileNotFoundError on an absent path, an OSError is caught by
+        # nothing between read_manifest and the stage, so every reader goes
+        # with it, and a driven `run` with the taxonomy stage on and the
+        # manifest removed dies with "[Errno 2] No such file or directory" and
+        # no fallback. Derived rather than written down because the two
+        # branches were answering one question two ways, which is how the
+        # wrong-kind branch came to contradict its own `blocks` field.
+        refused = _dies_with_a_stage_error(f, path)
+        would_block = dies if refused else readers
+        blocked = would_block if quant_there else []
+        if blocked:
+            out.append(_check(
+                "input:manifest", "manifest", "manifest", "fail", _finding(f),
+                f"{path} (config key `manifest`) is not there, and "
+                + ", ".join(blocked) + " open it while reading the quant "
+                "table"
+                + (_survives_clause(survives) if refused else
+                   " (read_manifest opens the path directly through opener(), "
+                   "so the open ends in an OSError - peptide_features() falls "
+                   "back from a StageError and from nothing else, so this one "
+                   "is not caught)."),
+                target=path, expect=exp, found=f, depth=_stat_depth(f),
+                config_keys=["manifest"], blocks=blocked,
+                depends_on=["input:quant_table"], remedy="input"))
+        else:
+            out.append(_check(
+                "input:manifest", "manifest", "manifest", "warn", _finding(f),
+                f"{path} (config key `manifest`) is not there. Nothing reads "
+                "it on this config: the quant table it maps onto is absent, so "
+                "every reader returns or dies before read_manifest is called. "
+                "Restore the quant table and this becomes fatal for "
+                + ", ".join(would_block) + ".",
+                target=path, expect=exp, found=f, depth=_stat_depth(f),
+                config_keys=["manifest"],
+                degrades=["join"] if "join" in would_block else [],
+                depends_on=["input:quant_table"], remedy="input"))
+        out.append(_mapping_unresolved(
+            "the manifest is not there, so there is nothing to map onto"))
+        return out
+    # The gate, before the split below, so that the split branches on what is
+    # PROVABLY there rather than on a stat. A manifest an ACL refuses comes
+    # back kind "file" from os.access()'s advisory answer and `unreadable`
+    # from here, and lands in the branch that costs every reader - which is
+    # what read_manifest's OSError really costs.
+    f, why_not = _deep_readable(path)
+    if f["kind"] != "file":
+        # PRESENT, and not a file read_manifest can open. This branch is the
+        # three-way split every other input already had, and it has to happen
+        # HERE, before read_manifest: that function goes straight to opener(),
+        # which is open(), so a DIRECTORY raises IsADirectoryError - an
+        # OSError, not a StageError, and so not caught below. doctor then
+        # emitted no document at all, which is the worst failure this file can
+        # have: a command that prints nothing has no contract, and every other
+        # row - the tools, the databases, the resources, the R block - went
+        # down with the one that could not be read.
+        #
+        # The CONTINGENCY is the absent branch's, for the absent branch's
+        # reason: nothing opens the manifest until something has opened the
+        # quant table, so with the quant table gone this file still kills
+        # nobody.
+        #
+        # Who it kills when the quant table IS there depends on which
+        # EXCEPTION the state ends in, and the two are not the same list. A
+        # StageError is caught by peptide_features(), which re-reads around it
+        # with the peptide-only reader - so it costs `dies` and spares
+        # `survives`. An OSError is caught by nothing at all downstream, so it
+        # costs every reader.
+        #
+        # WHICH EXCEPTION IS ASKED FOR ONCE, by _dies_with_a_stage_error(),
+        # and both the sentence below and `blocks` are computed from that one
+        # answer. They were computed from two different tests before and duly
+        # contradicted each other on the row where the two tests differ: the
+        # sentence keyed on _raises_promptly(), which is true of a character
+        # device because a character device answers at once, and published "it
+        # dies with an OSError ... every stage that opens a quant table on this
+        # format goes with it" - while `blocks` on the same row said
+        # `['join']`. Driven, `blocks` was right: a char-device manifest raises
+        # a StageError from die(), peptide_features() catches it, and the
+        # taxonomy stage came back with 30 rows.
+        #
+        # THREE states end in a StageError, not two. An EMPTY manifest reaches
+        # read_manifest and dies inside it with "no rows; expected a FragPipe
+        # .fp-manifest". A FIFO ends in one from opener() itself, once
+        # `fifo_wait_s` has passed with no writer - that used to be the state
+        # that ended in NOTHING, and moving it out of "hangs" and into "raises"
+        # moved it into this list. A CHARACTER DEVICE ends in one too, from the
+        # die() at the bottom of _open_for_read(). A socket, a block device and
+        # a directory end in an OSError and cost every reader, and `other` is
+        # no longer read as one thing: `found.other_kind` tells the four apart
+        # and exists for exactly this.
+        empty = f["kind"] == "empty_file"
+        refused = _dies_with_a_stage_error(f, path)
+        # What it WOULD cost with the quant table in place, which is not the
+        # same as what it costs. On an empty manifest with join off, `dies` is
+        # empty and there is nothing for the quant table to make fatal - the
+        # peptide readers fall back either way - so the contingent sentence
+        # below has to be guarded on the list and not on the quant table.
+        would_block = dies if refused else readers
+        blocked = would_block if quant_there else []
+        if empty:
+            detail = (
+                f"the manifest is 0 bytes: {path}. read_manifest refuses an "
+                "empty one - 'no rows; expected a FragPipe .fp-manifest' - "
+                "rather than treating it as a design with no samples."
+                + _survives_clause(survives))
+        else:
+            detail = (
+                f"the manifest is {why_not}: {path}. "
+                "read_manifest opens the path directly through opener(), so "
+                "it does not refuse here - the open is where it ends, and on "
+                "this state it " + _open_outcome(f, path)
+                + (_stage_error_clause(f, path) + _survives_clause(survives)
+                   if refused else
+                   " with an OSError, which nothing between read_manifest and "
+                   "the stage turns into a refusal anything falls back from - "
+                   "peptide_features() catches the reader's StageError and "
+                   "nothing else - so every stage that opens a quant table on "
+                   "this format goes with it.")
+                + _fifo_clause(f, path))
+        if not blocked and would_block:
+            detail += (" Nothing reads it on this config: the quant table it "
+                       "maps onto is absent, so every reader returns or dies "
+                       "before read_manifest is called. Restore the quant "
+                       "table and this becomes fatal for "
+                       + ", ".join(would_block) + ".")
+        out.append(_check(
+            "input:manifest", "manifest", "manifest",
+            "fail" if blocked else "warn", _finding(f), detail,
+            target=path, expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=["manifest"], blocks=blocked,
+            degrades=[] if blocked else
+            (["join"] if "join" in would_block else []),
+            depends_on=["input:quant_table"], remedy="input"))
+        out.append(_mapping_unresolved(
+            "the manifest is not a file read_manifest can open"))
+        return out
+    # doctor is the one command that has to survive every other failure: a
+    # manifest read_manifest rejects must not take the tools, databases,
+    # resources and R blocks down with it. The `except` is deliberately wider
+    # than the refusal it was written for. StageError is what read_manifest
+    # RAISES ON PURPOSE; OSError is every path state nobody anticipated, and
+    # one of those - a directory - is exactly how this command came to emit no
+    # document at all. The branch above means a caught OSError should now be
+    # unreachable, and that is the point: an unreachable backstop costs one
+    # row in a document that survives, and a missing one costs the document.
+    try:
+        m = read_manifest(path)
+    except StageError as e:
+        out.append(_check(
+            "input:manifest", "manifest", "manifest", _refusal_status(dies),
+            "unreadable",
+            str(e) + _survives_clause(survives), target=path, expect=exp,
+            found=f, depth="parsed",
+            caveat="the manifest was read in full; the quant table it names "
+                   "was not",
+            config_keys=["manifest"], blocks=dies, remedy="input"))
+        out.append(_mapping_unresolved("the manifest could not be read"))
+        return out
+    except OSError as e:                                    # noqa: BLE001
+        # Not `dies`: an OSError is not the full reader REFUSING, so
+        # peptide_features() does not catch it and nothing falls back.
+        out.append(_check(
+            "input:manifest", "manifest", "manifest",
+            "fail" if readers else "warn", "unreadable",
+            f"the manifest could not be opened: {e}. Nothing catches this - "
+            "it is not the full reader's refusal, so there is no fall back "
+            "to the peptide-only reader.",
+            target=path, expect=exp, found=f, depth="kind",
+            config_keys=["manifest"], blocks=readers, remedy="input"))
+        out.append(_mapping_unresolved("the manifest could not be opened"))
+        return out
+    out.append(_check(
+        "input:manifest", "manifest", "manifest", "ok", "ok",
+        f"{len(m)} runs, groups: {sorted(m['experiment'].unique())}",
+        target=path, expect=exp, found=f, depth="parsed",
+        caveat="the manifest was read in full; the quant table it names was "
+               "not",
+        config_keys=["manifest"]))
+    # The gate again, in place of the os.path.isfile() that used to stand
+    # here. The sentence already said "not a READABLE file" and isfile() does
+    # not ask that: a chmod-000 quant table passed it, pd.read_csv then raised
+    # PermissionError, and the row that came out said "could not pre-check the
+    # mapping" - a warning about doctor's own failure, where the answer is
+    # that the quant table itself is unreadable and input:quant_table says so.
+    _qf, q_why_not = _deep_readable(cfg["quant_table"])
+    if q_why_not:
+        out.append(_check(
+            "manifest:mapping", "manifest", "manifest -> quant columns",
+            "skip", "upstream_unresolved",
+            f"not checked: the quant table is {q_why_not}, so there is "
+            "nothing to map onto",
+            depth="config", config_keys=["manifest", "quant_table"],
+            depends_on=["input:quant_table", "input:manifest"]))
+        return out
+    try:
+        # header_columns() is `run`'s reader and waits on a FIFO, so doctor may
+        # not call it; _open_regular_text() is the same shape as _open_for_read
+        # with the waiting arm removed - it opens non-blocking, fstats the
+        # DESCRIPTOR and refuses anything that is not a regular file. This was
+        # a bare pd.read_csv() on the path, which is two things wrong at once.
+        # It reopened a path _deep_readable() had already proved, so the proof
+        # was a stat taken some instructions before the open - the exact race
+        # every other check here was rewritten to remove - and it split the
+        # header line with pandas' own sniffer while the run splits it with
+        # _sniff_sep(), so doctor could pre-check a mapping against a different
+        # set of columns from the one the run would see. One descriptor, and
+        # the header is split by the shared _header_cells().
+        with _open_regular_text(cfg["quant_table"]) as fh:
+            cols = _header_cells(fh.readline(), cfg["quant_table"])
+        sfx = (" Intensity" if cfg["quant_format"].startswith("fragpipe")
+               else "")
+        cand = [c for c in cols
+                if (c.endswith(sfx) if sfx else True)
+                and not c.endswith(("MaxLFQ Intensity", "Spectral Count"))]
+        _, miss_rows, miss_cols = map_manifest_to_columns(m, cand, sfx)
+    except Exception as e:                                  # noqa: BLE001
+        out.append(_check(
+            "manifest:mapping", "manifest", "manifest -> quant columns",
+            "warn", "unreadable", f"could not pre-check the mapping: {e}",
+            depth="header", caveat="only the quant table's HEADER LINE is read "
+                                   "for this; the body is not",
+            config_keys=["manifest", "quant_table"],
+            depends_on=["input:quant_table", "input:manifest"]))
+        return out
+    caveat = ("only the quant table's HEADER LINE is read for this "
+              "(pd.read_csv nrows=0); the body is not")
+    if miss_rows:
+        out.append(_check(
+            "manifest:mapping", "manifest", "manifest -> quant columns",
+            _refusal_status(dies), "unmatched",
+            f"{len(miss_rows)} manifest run(s) match no column in "
+            f"{cfg['quant_table']}: {miss_rows[:5]}. Fix the run names in the "
+            "manifest, or unset `manifest:`." + _survives_clause(survives),
+            depth="header", caveat=caveat,
+            config_keys=["manifest", "quant_table"],
+            depends_on=["input:quant_table", "input:manifest"],
+            blocks=dies, remedy="input"))
+    else:
+        out.append(_check(
+            "manifest:mapping", "manifest", "manifest -> quant columns", "ok",
+            "ok", "every run maps to a quant column", depth="header",
+            caveat=caveat, config_keys=["manifest", "quant_table"],
+            depends_on=["input:quant_table", "input:manifest"]))
+    if miss_cols:
+        out.append(_check(
+            "manifest:unused_columns", "manifest", "unused quant columns",
+            "warn", "dropped",
+            f"{len(miss_cols)} quant column(s) absent from the manifest and "
+            f"will be dropped: {miss_cols[:4]}",
+            depth="header", caveat=caveat,
+            config_keys=["manifest", "quant_table"], degrades=dies))
+    return out
+
+
+def _taxonomy_checks(cfg, p, on):
+    """The `== taxonomy ==` block.
+
+    One verdict here is a straight correction. `taxonomy_source` set to
+    unipept or concordant with run.taxonomy OFF is not a failure:
+    resolve_taxonomy() logs "falling back to eggnog" and carries on, so
+    nothing dies and the run exits 0, and doctor used to set ok=False on it.
+    """
+    out = []
+    u = cfg.get("unipept") or {}
+    R = cfg["run"]
+    if R.get("taxonomy") and not R.get("unipept"):
+        # stage_taxonomy's first act is to die on a missing unipept_lca, and
+        # with run.unipept off nothing ever writes one.
+        out.append(_check(
+            "taxonomy:needs_unipept", "taxonomy", "run.taxonomy", "fail",
+            "config_missing",
+            "run.taxonomy needs run.unipept (it compares the eggNOG lineage "
+            "against Unipept's); set run.unipept: true, or run.taxonomy: false",
+            depth="config", config_keys=["run.taxonomy", "run.unipept"],
+            blocks=["taxonomy"] if "taxonomy" in on else [], remedy="config"))
+    blocks_u = ["unipept"] if "unipept" in on else []
+    if not blocks_u:
+        # run.taxonomy on with run.unipept off. Everything below is about the
+        # unipept stage's own inputs, and that stage does not run: the honest
+        # answer is "turn it on", which the check above already gives, not a
+        # second failure about a cache nothing would read.
+        out.append(_check(
+            "taxonomy:unipept_source", "taxonomy", "unipept input", "skip",
+            "not_enabled",
+            "run.unipept is off, so nothing reads unipept.result or the "
+            "pept2lca cache", depth="config",
+            config_keys=["run.unipept", "unipept.result"]))
+    elif u.get("result"):
+        f = _found(u["result"])
+        exp = _expect("file", "an existing pept2lca export stage_unipept "
+                              "ingests instead of querying the API",
+                      derived_from=["unipept.result"])
+        # `kind`, not `present`, and this row asserting depth "kind" while
+        # branching on `present` was the first scope sentence broken by
+        # doctor's own data: it asked what kind of thing is there, computed
+        # the answer, and then threw it away. stage_unipept's own test is
+        # os.path.exists(), which a zero-byte file and a directory both pass -
+        # and read_unipept_result() then dies on both, with EMPTY_PEPT2LCA on
+        # the one and IsADirectoryError on the other.
+        good = f["kind"] == "file"
+        if good:
+            detail = f"{'unipept.result':16s} {u['result']}"
+        elif f["kind"] == "empty_file":
+            detail = (f"unipept.result is 0 bytes: {u['result']}. "
+                      "stage_unipept's test is os.path.exists(), which a "
+                      "zero-byte file passes, so it ingests rather than "
+                      "queries and read_unipept_result dies on it "
+                      f"('{EMPTY_PEPT2LCA}').")
+        elif f["present"]:
+            detail = (f"unipept.result is {_present_kind_phrase(f)}: "
+                      f"{u['result']}. os.path.exists() passes, so "
+                      "stage_unipept takes the ingest branch and "
+                      "read_unipept_result cannot open it.")
+        else:
+            detail = (_gone("unipept.result", u["result"], f)
+                      + "; stage_unipept dies on a result file it cannot open")
+        out.append(_check(
+            "taxonomy:unipept_result", "taxonomy", "unipept.result",
+            "ok" if good else "fail", _finding(f), detail,
+            target=u["result"], expect=exp, found=f, depth=_stat_depth(f),
+            config_keys=["unipept.result"], blocks=[] if good else blocks_u,
+            remedy="none" if good else "input"))
+    elif u.get("allow_http"):
+        out.append(_check(
+            "taxonomy:unipept_source", "taxonomy", "unipept.allow_http",
+            "warn", "network",
+            "unipept.allow_http is on; the API version, field names and rate "
+            "limits are outside this tool's control",
+            depth="config", config_keys=["unipept.allow_http"],
+            degrades=blocks_u))
+    else:
+        f = _found(p.unipept_cache)
+        # The same correction as unipept.result, one step further into the
+        # stage. stage_unipept adopts the cache only when getsize() > 0, so a
+        # ZERO-BYTE cache leaves `cache` empty, every peptide lands in `todo`,
+        # and with allow_http false the stage dies on "unipept.allow_http is
+        # false and the cache is incomplete" - the very message this row
+        # exists to pre-empt. A DIRECTORY at the path gets past both
+        # os.path.exists and getsize, and pd.read_csv then raises
+        # IsADirectoryError, which the EmptyDataError guard beside it does not
+        # catch.
+        good = f["kind"] == "file"
+        if good:
+            detail = f"{'unipept cache':16s} {p.unipept_cache}"
+        elif f["present"]:
+            detail = (
+                f"the unipept cache at {p.unipept_cache} is "
+                + _present_kind_phrase(f)
+                + ", and unipept.allow_http is false. stage_unipept cannot "
+                "read a peptide out of it and has no way to resolve one it "
+                "has not seen, so it dies on 'the cache is incomplete' (set "
+                "unipept.result to an existing pept2lca export, or "
+                "unipept.allow_http: true)")
+        else:
+            detail = (
+                f"no unipept cache at {p.unipept_cache}, and "
+                "unipept.allow_http is false, so stage_unipept has no way to "
+                "resolve a peptide it has not seen (set unipept.result to an "
+                "existing pept2lca export, or unipept.allow_http: true)")
+        out.append(_check(
+            "taxonomy:unipept_cache", "taxonomy", "unipept cache",
+            "ok" if good else "fail", _finding(f), detail,
+            target=p.unipept_cache, expect=_expect(
+                "file", "a peptide-keyed pept2lca cache from an earlier run",
+                derived_from=["unipept.allow_http", "unipept.result"]),
+            found=f, depth=_stat_depth(f),
+            config_keys=["unipept.allow_http", "unipept.result"],
+            blocks=[] if good else blocks_u,
+            remedy="none" if good else "config"))
+    # The guard here used to be `and not u.get("result")`, which is right for
+    # unipept and wrong for taxonomy. stage_unipept returns after ingesting
+    # unipept.result and never reaches its own format check; stage_taxonomy's
+    # `die("the taxonomy comparison needs peptide-level input")` is guarded on
+    # nothing at all - it reads p.unipept_lca whoever wrote it, and then calls
+    # peptide_features() on the quant table. So a protein-level quant_format
+    # with unipept.result set and run.taxonomy on was a false PASS on a stage
+    # that dies in its first seconds.
+    if cfg["quant_format"] not in FEATURE_FORMATS:
+        blocked = [s for s in ("unipept", "taxonomy") if s in on
+                   and not (s == "unipept" and u.get("result"))]
+        if blocked:
+            out.append(_check(
+                "taxonomy:format", "taxonomy", "quant_format", "fail",
+                "wrong_kind",
+                f"quant_format is '{cfg['quant_format']}', which is protein "
+                "level; Unipept needs peptides. Use a peptide-level "
+                f"quant_format ({', '.join(sorted(FEATURE_FORMATS))})"
+                + (", or point unipept.result at an existing pept2lca export"
+                   if blocked == ["unipept"] else
+                   ". unipept.result does not answer this one: stage_taxonomy "
+                   "reads the quant table for peptides itself, and its format "
+                   "check is not guarded on it."),
+                depth="config", config_keys=["quant_format", "unipept.result"],
+                blocks=blocked, remedy="config"))
+    src = cfg.get("taxonomy_source", "eggnog")
+    if src != "eggnog" and not R.get("taxonomy"):
+        out.append(_check(
+            "taxonomy:source", "taxonomy", "taxonomy_source", "warn",
+            "falls_back",
+            f"taxonomy_source is '{src}' but run.taxonomy is off, so the "
+            "comparison it reads is never written: resolve_taxonomy logs "
+            "'falling back to eggnog' and the run finishes with eggNOG "
+            "taxids. Nothing "
+            "dies on this. Set run.taxonomy: true, or taxonomy_source: eggnog.",
+            depth="config", config_keys=["taxonomy_source", "run.taxonomy"],
+            degrades=["join"] if "join" in on else [], remedy="config"))
+    return out
+
+
+def _resource_checks(cfg, args):
+    """The `== resources ==` block.
+
+    A budget doctor cannot read is a problem, but not one worth losing the R
+    block over - so parse_ram's message is a check rather than a traceback. It
+    is fatal for the `run` COMMAND, not for one stage: cmd_run calls parse_ram
+    on cfg["ram_gb"] before it schedules anything.
+    """
+    out = []
     w = max(1, int(cfg.get("stage_workers", 4)))
-    # parse_ram, not int(): `ram_gb: 64G` is the form the --ram help text
-    # advertises, and int() turned it into an unhandled ValueError traceback
-    # halfway through doctor's output. A budget doctor cannot read is a
-    # problem, but not one worth losing the R block over.
     ram, ram_err = 0, ""
     try:
         ram = parse_ram(getattr(args, "ram", None) or cfg.get("ram_gb"))
     except StageError as e:
-        ok, ram_err = False, str(e)
-    ram = ram or int(detect_ram_gb() * 0.8)
-    print("== resources ==")
+        ram_err = str(e)
     if ram_err:
-        print(f"  {'MISS':6s} ram_gb: {ram_err}")
-    print(f"  {'OK':6s} {cfg['threads']} cpu, {ram or 'unknown'} GB budget, "
-          f"up to {w} stage(s) at once")
-    print(f"  {'OK' if ram else 'WARN':6s} per stage: "
-          f"{max(1, int(cfg['threads']) // w)} cpu"
-          + (f", {max(1, ram // w)} GB" if ram else ", memory budget unknown"))
+        out.append(_check(
+            "resources:ram_gb", "resources", "ram_gb", "fail", "unreadable",
+            f"ram_gb: {ram_err}", depth="config", config_keys=["ram_gb"],
+            blocks_commands=["run"], remedy="config"))
+    detected = not ram
+    ram = ram or int(detect_ram_gb() * 0.8)
+    out.append(_check(
+        "resources:budget", "resources", "budget", "ok", "ok",
+        f"{cfg['threads']} cpu, {ram or 'unknown'} GB budget, up to {w} "
+        "stage(s) at once", depth="probe",
+        config_keys=["threads", "ram_gb", "stage_workers"],
+        caveat=None if not detected else
+        "the memory budget was detected from this host (80% of physical RAM), "
+        "not read from the config"))
+    out.append(_check(
+        "resources:per_stage", "resources", "per stage",
+        "ok" if ram else "warn", "ok" if ram else "unknown",
+        f"per stage: {max(1, int(cfg['threads']) // w)} cpu"
+        + (f", {max(1, ram // w)} GB" if ram else ", memory budget unknown"),
+        depth="probe", config_keys=["threads", "ram_gb", "stage_workers"]))
     if ram:
         per = max(1, ram // w)
         need = int(cfg.get("emapper_dbmem_min_gb", 64))
-        if cfg["run"].get("eggnog") and not (cfg.get("emapper_precomputed") or ""):
-            print(f"  {'OK' if per >= need else 'WARN':6s} eggNOG --dbmem "
-                  f"{'enabled' if per >= need else f'off ({per} < {need} GB)'}"
-                  + ("" if per >= need else "; raise ram_gb or lower "
-                     "stage_workers, or set emapper_dbmem_min_gb"))
-        per = max(1, per)
+        pre = cfg.get("emapper_precomputed") or ""
+        if cfg["run"].get("eggnog") and not pre:
+            out.append(_check(
+                "resources:emapper_dbmem", "resources", "eggNOG --dbmem",
+                "ok" if per >= need else "warn",
+                "ok" if per >= need else "below_threshold",
+                f"eggNOG --dbmem "
+                f"{'enabled' if per >= need else f'off ({per} < {need} GB)'}"
+                + ("" if per >= need else "; raise ram_gb or lower "
+                   "stage_workers, or set emapper_dbmem_min_gb"),
+                depth="config", config_keys=["ram_gb", "stage_workers",
+                                             "emapper_dbmem_min_gb"],
+                degrades=[] if per >= need else
+                (["emapper"] if "emapper" in set(enabled_stages(cfg)) else [])))
         if per < 4:
-            print(f"  {'WARN':6s} {per} GB per stage is tight; lower "
-                  "stage_workers or raise ram_gb")
+            out.append(_check(
+                "resources:per_stage_tight", "resources", "per stage", "warn",
+                "tight",
+                f"{per} GB per stage is tight; lower stage_workers or raise "
+                "ram_gb", depth="config",
+                config_keys=["ram_gb", "stage_workers"]))
     else:
-        # doctor has no --ram flag, so telling the user to pass one was advice
-        # they could not follow; ram_gb in the config is what run reads too.
-        print(f"  {'WARN':6s} set ram_gb: in the config (e.g. 64G) so "
-              "memory-sensitive flags can be set (diamond -b, mmseqs/foldseek "
-              "--split-memory-limit, hhblits -maxmem, InterProScan heap)")
+        out.append(_check(
+            "resources:ram_unset", "resources", "ram_gb", "warn", "unset",
+            "set ram_gb: in the config (e.g. 64G) so memory-sensitive flags "
+            "can be set (diamond -b, mmseqs/foldseek --split-memory-limit, "
+            "hhblits -maxmem, InterProScan heap)",
+            depth="config", config_keys=["ram_gb"], remedy="config"))
+    return out
 
-    if have("Rscript"):
-        # Ask for exactly what the generated Rmd and build_object.R load. The
-        # old four-package probe let an environment pass doctor and then die
-        # at the report's first `library(readr)`, after the whole pipeline had
-        # run. Keep this list in step with RMD_TEMPLATE's setup chunk.
-        RNEED = ["readr", "dplyr", "tidyr", "tibble", "stringr", "ggplot2",
-                 "purrr", "limma", "knitr", "rmarkdown", "SummarizedExperiment"]
-        ROPT = ["QFeatures", "patchwork", "clusterProfiler"]
-        # Bioconductor packages need BiocManager; everything else is CRAN.
-        BIOC = {"limma", "SummarizedExperiment", "QFeatures", "clusterProfiler"}
-        want = RNEED + ROPT
-        chk = ('cat(paste(vapply(c(%s), function(p) paste0(p, "=", '
-               'requireNamespace(p, quietly=TRUE)), character(1)), collapse=" "))'
-               % ",".join(f'"{n}"' for n in want))
-        print("== R ==")
-        try:
-            r = subprocess.run([resolve_tool("Rscript"), "-e", chk], capture_output=True,
-                               text=True, timeout=180)
-            seen = {}
-            for tok in (r.stdout or "").split():
-                name, _, val = tok.partition("=")
-                seen[name] = val == "TRUE"
-            if not seen:
-                # An Rscript that answers nothing is not a green R stack.
-                ok = False
-                print(f"  {'MISS':6s} the R package query returned nothing "
-                      f"(rc={r.returncode}): {(r.stderr or '').strip()[:200]}")
-            for name in want:
-                if name not in seen:
-                    continue
-                good, need = seen[name], name in RNEED
-                how = (f'BiocManager::install("{name}")' if name in BIOC
-                       else f'install.packages("{name}")')
-                # A missing required package is a problem, not a note: the
-                # verdict and the exit code used to ignore this whole block.
-                if need and not good:
-                    ok = False
-                print(f"  {'OK' if good else ('MISS' if need else 'WARN'):6s} "
-                      f"{name}" + ("" if good else "  " + how))
-        except Exception as e:                              # noqa: BLE001
-            ok = False
-            print(f"  {'MISS':6s} could not query R packages: {str(e)[:160]}")
-        if not have("pandoc"):
-            # rmarkdown shells out to pandoc; RStudio bundles one, a bare
-            # R install does not.
-            print(f"  {'WARN':6s} pandoc not on PATH; rmarkdown::render "
-                  "will fail unless R finds its own copy (RSTUDIO_PANDOC)")
-    else:
-        print("== R ==\n" + f"  {'WARN':6s} Rscript not found; the report "
-              "and the R object cannot be built here (run.report/run.object "
-              "still write the scripts, so they can be knitted elsewhere)")
+
+# What the generated Rmd's setup chunk and build_object.R load. Kept in step
+# with RMD_TEMPLATE: the old four-package probe let an environment pass doctor
+# and then die at the report's first `library(readr)`, after the whole pipeline
+# had run.
+RNEED = ("readr", "dplyr", "tidyr", "tibble", "stringr", "ggplot2", "purrr",
+         "limma", "knitr", "rmarkdown", "SummarizedExperiment")
+ROPT = ("QFeatures", "patchwork", "clusterProfiler")
+# Bioconductor packages need BiocManager; everything else is CRAN.
+RBIOC = {"limma", "SummarizedExperiment", "QFeatures", "clusterProfiler"}
+
+
+def _r_checks(cfg):
+    """The `== R ==` block, one check per package.
+
+    One row per package rather than one row for the set: the remedy differs per
+    package (BiocManager::install against install.packages, decided by
+    Bioconductor membership) and a preflight checklist offers its affordance
+    per row.
+
+    `report` and `object` are metaannot SUBCOMMANDS, not stages, so a missing
+    required package goes in `blocks_commands` and never in `blocks`.
+    """
+    out = []
+    if not have("Rscript"):
+        return [_check(
+            "r:rscript", "R", "Rscript", "warn", "missing",
+            "Rscript not found; the report and the R object cannot be built "
+            "here (run.report/run.object still write the scripts, so they can "
+            "be knitted elsewhere)",
+            depth="probe", expect=_expect("on_path", "shutil.which('Rscript')",
+                                          nonempty=False),
+            found={"present": False, "kind": None, "bytes": None,
+                   "entries": None, "symlink": False},
+            remedy="manual",
+            remedy_reason="install R, or knit the report on another machine")]
+    want = list(RNEED) + list(ROPT)
+    chk = ('cat(paste(vapply(c(%s), function(p) paste0(p, "=", '
+           'requireNamespace(p, quietly=TRUE)), character(1)), collapse=" "))'
+           % ",".join(f'"{n}"' for n in want))
+    try:
+        r = subprocess.run([resolve_tool("Rscript"), "-e", chk],
+                           capture_output=True, text=True, timeout=180)
+        seen = {}
+        for tok in (r.stdout or "").split():
+            name, _, val = tok.partition("=")
+            seen[name] = val == "TRUE"
+    except Exception as e:                                  # noqa: BLE001
+        return [_check(
+            "r:query", "R", "R packages", "fail", "unreadable",
+            f"could not query R packages: {str(e)[:160]}", depth="probe",
+            blocks_commands=["report", "object"], remedy="manual",
+            remedy_reason="Rscript is on PATH but could not be run")]
+    if not seen:
+        # An Rscript that answers nothing is not a green R stack.
+        return [_check(
+            "r:query", "R", "R packages", "fail", "unreadable",
+            f"the R package query returned nothing (rc={r.returncode}): "
+            f"{(r.stderr or '').strip()[:200]}", depth="probe",
+            blocks_commands=["report", "object"], remedy="manual",
+            remedy_reason="Rscript answered nothing")]
+    for name in want:
+        if name not in seen:
+            continue
+        good, need = seen[name], name in RNEED
+        how = (f'BiocManager::install("{name}")' if name in RBIOC
+               else f'install.packages("{name}")')
+        out.append(_check(
+            f"r:package:{name}", "R", name,
+            "ok" if good else ("fail" if need else "warn"),
+            "ok" if good else "missing",
+            f"{name}" + ("" if good else "  " + how), depth="probe",
+            caveat="answered by requireNamespace() in Rscript; the package was "
+                   "not loaded",
+            expect=_expect("r_package",
+                           "loaded by the generated Rmd or build_object.R"
+                           if need else "used when present", nonempty=False),
+            found={"present": good, "kind": None, "bytes": None,
+                   "entries": None, "symlink": False},
+            blocks_commands=["report", "object"] if (need and not good) else [],
+            remedy="none" if good else "manual",
+            remedy_reason=None if good else how))
+    if not have("pandoc"):
+        # rmarkdown shells out to pandoc; RStudio bundles one, a bare R
+        # install does not.
+        out.append(_check(
+            "r:pandoc", "R", "pandoc", "warn", "missing",
+            "pandoc not on PATH; rmarkdown::render will fail unless R finds "
+            "its own copy (RSTUDIO_PANDOC)", depth="probe",
+            expect=_expect("on_path", "rmarkdown::render shells out to it",
+                           nonempty=False),
+            found={"present": False, "kind": None, "bytes": None,
+                   "entries": None, "symlink": False},
+            remedy="manual",
+            remedy_reason="install pandoc, or set RSTUDIO_PANDOC"))
+    return out
+
+
+def doctor(cfg, p, reqs, checks, config_path=None, install_plan=None):
+    """`doctor --json`: what THIS MACHINE can currently do with THIS config.
+
+    The sibling of describe(), and deliberately shaped like it. The header is
+    describe()'s header key for key, and `requirements` is describe()'s
+    `requirements` array element for element - the same requirements(cfg, p)
+    call, not a re-shaping of it - so a front end that already parses one needs
+    almost no new code for the other, and `cmds`, `size_gb`, `disk_gb` and
+    `note` have exactly one home. A check points back into that array through
+    `requirement_id` rather than restating any of it.
+
+    What doctor ADDS is `checks`: one entry per line the human report prints,
+    each naming which ENABLED stages die without it (`blocks`) and which run
+    anyway and do less (`degrades`). That is the scope's second sentence as a
+    data structure rather than a claim, and it is what makes the exit status
+    derivable: a check fails exactly when `blocks`/`blocks_commands` is
+    non-empty, with one declared exception that names itself in `fails_reason`.
+
+    What doctor does NOT carry is describe()'s static half - no `config`, no
+    `default_config`, no `stages`, no `path_keys` - because a second copy of
+    the config vocabulary is a second place for it to go stale, and a console
+    holding both documents has describe's already.
+    """
+    fails = [c["id"] for c in checks if c["status"] == "fail"]
+    counts = {s: sum(1 for c in checks if c["status"] == s)
+              for s in DOCTOR_STATUSES}
+    present = {c["section"] for c in checks}
+    missing = [r for r in reqs if not r["ok"] and not r["manual"]]
+    return {
+        "doctor_version": DOCTOR_VERSION,
+        # Carried so ONE call tells a consumer the level of both contracts on
+        # this build: a console that meets a doctor_version it does not know
+        # must refuse to render a verdict, and it should not need a second
+        # subprocess to find that out.
+        "describe_version": DESCRIBE_VERSION,
+        "metaannot_version": __version__,
+        "signature_version": SIGNATURE_VERSION,
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "host": socket.gethostname(),
+        "config_path": config_path,
+        # The verdict, three ways that cannot disagree because they are one
+        # expression: `ok` is what main() returns on, `exit_status` is that
+        # number, and `verdict.fails` is the id list behind it.
+        "ok": not fails,
+        "exit_status": 1 if fails else 0,
+        "counts": counts,
+        "verdict": {"rule": DOCTOR_VERDICT_RULE, "fails": fails},
+        # A literal string the console renders under its table verbatim. The
+        # console must not author this sentence; saying it here is what "and
+        # doctor says so" means.
+        "scope": {"statement": DOCTOR_SCOPE_STATEMENT,
+                  "checks": ["exists", "kind", "non-empty"],
+                  "does_not_check": ["contents"]},
+        "sections": [{"id": i, "title": t} for i, t in DOCTOR_SECTIONS
+                     if i in present],
+        "requirements": reqs,
+        "checks": checks,
+        "totals": {
+            # Raw numbers, not _gb()'s strings: 0.08, never "0.1", and doctor's
+            # own >= 0.05 display threshold is presentation and is not applied
+            # here. Rounded only to two places, which is not formatting - it is
+            # dropping the binary-float noise a sum leaves behind, because
+            # publishing 11.450000000000001 on a figure labelled "indicative"
+            # claims a precision nobody has.
+            "download_gb": round(sum(r["size_gb"] for r in missing), 2),
+            "disk_gb": round(sum(max(r["disk_gb"], r["size_gb"])
+                                 for r in missing), 2),
+            "items": len(missing),
+            # An enum to branch on rather than a sentence to read, so a future
+            # measured figure needs no consumer change. Anything that does not
+            # recognise a value must treat it as "indicative".
+            "accuracy": "indicative",
+            "basis": "hand-maintained",
+            "counted": [r["id"] for r in missing],
+            # The systematic bias, named rather than merely counted. `missing`
+            # is `not ok and not manual`, so both totals silently omit
+            # InterProScan - a large Java distribution - and every licence-gated
+            # tool and un-URLed database. A total that quietly leaves out the
+            # biggest item is worse than no total.
+            "not_counted": [r["id"] for r in reqs
+                            if not r["ok"] and r["manual"]],
+            "not_counted_reason":
+                "MANUAL items are never fetched by doctor, so they are in "
+                "neither total. They still have to be installed: the totals "
+                "are a floor, not the whole job.",
+            # requirements() defaults both sizes to 0.0 and uses that for
+            # "negligible" AND for "not estimated", and doctor's human report
+            # hides anything under 0.05 GB - so a consumer reading 0.0 as
+            # "free" reads a large Java distribution as free. These are the
+            # ids where the 0.0 means "nobody wrote a number down".
+            "unsized": [r["id"] for r in reqs
+                        if not r["ok"] and r["size_gb"] == 0.0
+                        and r["disk_gb"] == 0.0
+                        and (r["manual"] or not r["cmds"])],
+            "unsized_means":
+                "for these ids the 0.0 in requirements[] means 'not "
+                "estimated', never 'free'.",
+            "detail": DOCTOR_SIZE_DETAIL,
+        },
+        # null unless --install-plan was passed. --json does not suppress the
+        # side effect the operator asked for, only the prose about it.
+        "install_plan": install_plan,
+    }
+
+
+def _requirement_lines(r):
+    """The continuation lines printed under one requirement row.
+
+    They are that requirement's own - reachable in the document through
+    `requirement_id` - and not rows: a table renderer that made them rows would
+    get orphans.
+    """
+    if r["ok"]:
+        return []
+    out = []
+    if r["manual"]:
+        out.append(f"         manual: {r['manual']}")
+    if r["note"]:
+        out.append(f"         {r['note']}")
+    out += [f"         $ {c}" for c in r["cmds"]]
+    return out
+
+
+def doctor_mark(check, manual=False):
+    """The six-character mark the human report prints for one check.
+
+    MANUAL is the one place status and remedy are fused, and only for the
+    printed line: `manual` says doctor will not FETCH the thing, not that the
+    stage can do without it, so a MANUAL row is an ordinary failure everywhere
+    else in the document. A front end decides whether to offer an install
+    button from `remedy`, never from this mark.
+
+    `manual` is the requirement's own flag rather than the check's `remedy`,
+    because the two no longer answer the same question. The document splits
+    requirements()[].manual into "manual" (a licence, a version-specific
+    distribution) and "config" (a path nobody has filled in yet), which is the
+    split a preflight UI needs - an edit box against a link-out. The PRINTED
+    vocabulary is older than that split and an operator reads it as "doctor
+    will not fetch this", which is true of both, so the printed report is left
+    saying exactly what it has always said.
+    """
+    if check["status"] == "fail":
+        return "MANUAL" if manual or check["remedy"] == "manual" else "MISS"
+    return {"ok": "OK", "warn": "WARN", "skip": "-"}[check["status"]]
+
+
+def print_doctor(checks, reqs):
+    """The human report, rendered from the same rows the document carries.
+
+    One vocabulary, two renderings: `detail` is the sentence, `section` decides
+    the heading, and the only thing this function adds is the mark and the
+    indentation. It is what makes `detail` honest - the printed report cannot
+    say something the document does not, because there is nowhere else for it
+    to say it from - and a test asserts every sentence in the document turns up
+    in this output.
+    """
+    by_id = {r["id"]: r for r in reqs}
+    titles = dict(DOCTOR_SECTIONS)
+    seen = None
+    for c in checks:
+        if c["section"] != seen:
+            seen = c["section"]
+            print(f"== {titles[seen]} ==")
+        r = (by_id.get(c["requirement_id"])
+             if c["id"].startswith("req:") else None)
+        print(f"  {doctor_mark(c, bool(r and r['manual'])):6s} {c['detail']}")
+        if r is not None:
+            for line in _requirement_lines(r):
+                print(line)
+
+
+def cmd_doctor(args):
+    cfg = load_config(args.config)
+    # The same read plan `run` computes, for the same config, because half the
+    # sentences in this document are about what a FIFO at an input costs and
+    # the answer is "it depends how many times this run reads it". Computed
+    # here rather than hard-coded in the rows: a row that said "waits
+    # fifo_wait_s" over a path the run opens three times would be the exact
+    # defect this whole change set is about, one surface over. doctor itself
+    # still never opens a FIFO - every path it reads goes through
+    # _deep_readable() or _open_regular_text(), neither of which waits.
+    #
+    # AND THE SAME WAIT, which it was not setting. _fifo_clause() quotes a
+    # number of seconds into the sentence an operator plans around, and with
+    # set_fifo_wait() never called it quoted the module default while the run
+    # beside it would have used `fifo_wait_s` from this very config. Nothing
+    # published that number today - the clause reaches for
+    # DEFAULT_CONFIG['fifo_wait_s'] explicitly - so this is latent rather than
+    # wrong, and it is set anyway, because "doctor reasons about the run's
+    # settings" has to be true of all of them or it is not a rule. Not fatal
+    # here, unlike in `run`: doctor's job is to report what it finds, and a
+    # mistyped wait is reported by config:fifo_wait_s rather than by killing
+    # the command that was asked to look for exactly that kind of mistake.
+    set_read_plan(cfg)
+    try:
+        set_fifo_wait(cfg["fifo_wait_s"])
+    except (TypeError, ValueError, KeyError):
+        set_fifo_wait(DEFAULT_CONFIG["fifo_wait_s"])
+    p = Paths(cfg)
+    reqs = requirements(cfg, p)     # evaluated once; every view below uses it
+    checks = doctor_checks(cfg, p, reqs, args)
+    ok = not any(c["status"] == "fail" for c in checks)
+    as_json = bool(getattr(args, "json", False))
+    if not as_json:
+        print_doctor(checks, reqs)
 
     missing = [r for r in reqs if not r["ok"] and not r["manual"]]
     manual = [r for r in reqs if not r["ok"] and r["manual"]]
     total = sum(r["size_gb"] for r in missing)
     total_disk = sum(max(r["disk_gb"], r["size_gb"]) for r in missing)
 
+    plan = None
     if args.install_plan or (args.fix and missing):
         # ASCII only: this file is read by a shell, and on a non-UTF-8 console
         # the em dash arrived as a replacement glyph inside the comment.
@@ -13792,13 +18661,40 @@ def cmd_doctor(args):
             # Always write the file that was asked for, even when it is empty:
             # `doctor --install-plan i.sh && bash i.sh` used to fail with "No
             # such file" on a machine that had everything.
-            with open(args.install_plan, "w", encoding="utf-8", newline="\n") as fh:
+            with open(args.install_plan, "w", encoding="utf-8",
+                      newline="\n") as fh:
                 fh.write(script)
             os.chmod(args.install_plan, 0o755)
-            print(f"\ninstall plan -> {args.install_plan}  "
-                  f"({len(missing)} item(s), ~{_gb(total)} GB)")
-            print("review it, then run it, or rerun doctor with --fix"
-                  if missing else "nothing to install")
+            plan = {
+                "path": os.path.abspath(args.install_plan), "written": True,
+                "items": len(missing),
+                "covers": [r["id"] for r in missing],
+                "omits": [r["id"] for r in manual],
+                "download_gb": round(total, 2),
+                "disk_gb": round(total_disk, 2),
+            }
+            # Under --json this line would land in stdout beside the document
+            # and nothing would parse. The file is still written: it is a side
+            # effect the operator asked for, and `install_plan` records it.
+            if not as_json:
+                print(f"\ninstall plan -> {args.install_plan}  "
+                      f"({len(missing)} item(s), ~{_gb(total)} GB)")
+                print("review it, then run it, or rerun doctor with --fix"
+                      if missing else "nothing to install")
+
+    if as_json:
+        # --json REPLACES the printed report on stdout, exactly as
+        # `describe --json` does, and log() already writes to stderr so the
+        # stream is clean. The exit status is unchanged, so a consumer reading
+        # the document and a supervisor reading $? get the same verdict twice
+        # and cannot disagree. --fix is refused alongside --json by argparse,
+        # which is why nothing below this point can run under it.
+        json.dump(doctor(cfg, p, reqs, checks,
+                         os.path.abspath(args.config) if args.config else None,
+                         plan),
+                  sys.stdout, indent=1, sort_keys=True, default=str)
+        print()
+        return 0 if ok else 1
 
     if args.fix and os.name == "nt":
         # The commands come out of `requirements()` as POSIX shell -- mkdir
@@ -13893,7 +18789,21 @@ def cmd_subset(args):
         with opener(args.quant) as fh:
             want = {l.strip() for l in fh if l.strip()}
     else:
-        q = pd.read_csv(args.quant, sep="\t", low_memory=False, encoding="utf-8", encoding_errors="replace")
+        # Through opener(), like every other reader of an operator-supplied
+        # path, and it was a bare pd.read_csv(args.quant) - the LAST one, and
+        # the one that was in neither the report nor the read plan, because
+        # every sweep so far had driven `run` and nothing else. `subset` takes
+        # --quant from the command line, which is an operator-supplied path by
+        # any definition, and a FIFO there hung the command with no exit
+        # status exactly as the others did.
+        #
+        # NO PLAN IS SET FOR `subset`, and that is right rather than an
+        # oversight: this command opens --quant once and --db once, and a path
+        # with no plan is treated as single-read, which is the case where
+        # waiting for a writer can pay off. set_read_plan() is for the command
+        # that reads one input from several stages.
+        with opener(args.quant) as fh:
+            q = pd.read_csv(fh, sep="\t", low_memory=False)
         if args.format == "diann":
             cands = ["Protein.Group", "Protein.Ids", "Protein.Names"]
         else:
@@ -13953,6 +18863,23 @@ def cmd_run(args):
     except (TypeError, ValueError):
         die(f"progress_interval_s must be a number of seconds (0 disables), "
             f"not {cfg['progress_interval_s']!r}")
+    # Fatal for the same reason its two siblings are, and read HERE rather
+    # than inside opener(): a mistyped wait must be a config error at the top
+    # of the run, not a TypeError three hours in on the one input that
+    # happened to be a pipe.
+    try:
+        set_fifo_wait(cfg["fifo_wait_s"])
+    except (TypeError, ValueError):
+        die(f"fifo_wait_s must be a number of seconds (0 refuses a FIFO "
+            f"outright), not {cfg['fifo_wait_s']!r}")
+    # How many times THIS run will open each of its inputs. Worked out here,
+    # from this config, because it is the fact every FIFO decision rests on
+    # and because it is a property of the run rather than of the program - a
+    # project with run.unipept on reads its quant table once more than one
+    # without, so a pipe that works in the first config does not work in the
+    # second. Set before any stage starts, so the refusal happens at the first
+    # open rather than after the whole `fifo_wait_s` has been spent.
+    set_read_plan(cfg)
     heartbeat_s = cfg.get("heartbeat_s", DEFAULT_CONFIG["heartbeat_s"])
     # Fatal, exactly like its sibling above. A mistyped interval is the same
     # config error in either key, and warning about one while dying on the
@@ -14648,7 +19575,20 @@ def main():
     s.add_argument("--config", default=None)
     s.add_argument("--install-plan", metavar="FILE",
                    help="write a reviewable shell script that installs what is missing")
-    s.add_argument("--fix", action="store_true",
+    # --json and --fix are mutually exclusive, and the refusal is here rather
+    # than a die() inside cmd_doctor for a reason a caller can feel: argparse
+    # exits 2, while die() exits 1 - which is also what "problems found" exits
+    # with, so a script could not tell a refused invocation from a failed
+    # check. --fix reads stdin for its confirmation and prints progress to
+    # stdout, either of which corrupts a JSON stream, and a document written
+    # while a 123 GB download is half done describes nothing. --json reports;
+    # --fix acts. The honest loop is `doctor --json`, decide,
+    # `doctor --install-plan`, run it, `doctor --json` again.
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--json", action="store_true",
+                   help="emit the machine-readable report instead of the "
+                        "printed one (not with --fix)")
+    g.add_argument("--fix", action="store_true",
                    help="download and install what is missing, after confirmation")
     s.add_argument("--yes", "-y", action="store_true",
                    help="skip the confirmation prompt for --fix")

@@ -1103,8 +1103,17 @@ DESCRIBE_TOP_LEVEL = {
 # changes, and a consumer reading the seven fields it knew about is unaffected
 # by an eighth appearing. It is pinned here so the next addition is a decision
 # rather than an accident.
+#
+# `requires` and `degraded_by` joined in v0.6.0 with `doctor --json`: the
+# requirements() ids each stage dies without, and the ones it merely does less
+# without. They are on STAGES because that is where a new stage is added, and
+# they are emitted here because a field STAGES carries and describe does not is
+# invisible to the console - which test_console_contract.py's
+# test_describe_emits_every_field_a_stage_dict_carries exists to catch, and did
+# catch. This is the decision that tripwire asks for, taken deliberately:
+# DESCRIBE_VERSION does NOT move, because nothing was removed or redefined.
 DESCRIBE_PER_STAGE = {"name", "enabled", "deps", "keys", "gpu", "empty_ok",
-                      "outputs", "cost"}
+                      "outputs", "cost", "requires", "degraded_by"}
 
 
 def test_describe_version_pins_the_shape_it_versions(ma, project):
