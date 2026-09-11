@@ -7524,43 +7524,58 @@ def _tmt_add_condition(design, cfg):
         design recovered from the input carries what the input knows, and the
         metadata is merged later, at report time. Saying so is the difference
         between a warning and a false alarm.
+
+        Returns (note, recovered). `recovered` is True only when the metadata
+        on disk names every sample in this design, which is the one case where
+        nothing is wrong and the caller should log INFO rather than WARN.
         """
         a = cfg.get("analysis") or {}
         path = a.get("metadata") or ""
         if not path:
-            return ("supply it in analysis.metadata, keyed on sample")
+            return ("supply it in analysis.metadata, keyed on sample",
+                    False)
         if not os.path.exists(path):
             return (f"analysis.metadata is set to {path}, which does not "
-                    "exist; the report will have no condition either")
+                    "exist; the report will have no condition either", False)
         col = a.get("sample_col") or "sample"
         try:
             md = read_delim_table(path)
         except Exception:                                   # noqa: BLE001
             return (f"analysis.metadata ({path}) could not be read here, so "
-                    "whether it supplies the condition is unknown")
+                    "whether it supplies the condition is unknown", False)
         if col not in md.columns:
             return (f"analysis.metadata ({path}) has no '{col}' column "
-                    f"(analysis.sample_col), only {list(md.columns)[:6]}")
+                    f"(analysis.sample_col), only {list(md.columns)[:6]}",
+                    False)
         have = set(md[col].astype(str))
         miss = [s for s in samples if s not in have]
         if miss:
             return (f"analysis.metadata ({path}) is keyed on '{col}' but "
                     f"does not name {len(miss)} of these samples "
-                    f"({miss[:4]}), so the report will drop them")
+                    f"({miss[:4]}), so the report will drop them", False)
         return (f"analysis.metadata ({path}) does name every sample, so the "
                 "report supplies the condition; this affects only "
-                "design_from_input.tsv, which records what the INPUT knew")
+                "design_from_input.tsv, which records what the INPUT knew",
+                True)
     if not spec:
+        # INFO when the metadata covers every sample, WARN when it does not.
+        # The note already said which case this was; the LEVEL did not, and on
+        # a 60-hour run a WARN is a thing you stop and investigate. A warning
+        # that ends "this affects only design_from_input.tsv" is a false alarm
+        # by its own admission.
+        note, recovered = _metadata_note()
         log("tmt: tmt.condition_from_name is empty, so no condition is "
-            f"derived from the sample names; {_metadata_note()}", "WARN")
+            f"derived from the sample names; {note}",
+            "INFO" if recovered else "WARN")
         return design, "not derived (tmt.condition_from_name is empty)"
     if spec == "auto":
         mapping, how = _tmt_split_condition(samples)
         if mapping is None:
+            note, recovered = _metadata_note()
             log(f"tmt: the condition could not be derived from the sample "
                 f"names ({how}), so the design has no group column. It is NOT "
-                f"taken from the plex, which is a batch: {_metadata_note()}",
-                "WARN")
+                f"taken from the plex, which is a batch: {note}",
+                "INFO" if recovered else "WARN")
             return design, f"not derived ({how})"
     else:
         try:

@@ -1809,3 +1809,112 @@ def test_a_tmt_run_writes_the_same_peptide_evidence_file_as_a_label_free_one(
     # protein of the fixture is there
     assert len(b) == 8
     assert set(b["n_features_used"]) == {2}
+
+
+# --- the log level has to follow the content -------------------------
+# symptom: on a 60-hour TMT run the design recovery logged
+#   WARN tmt: the condition could not be derived from the sample names ...
+#        analysis.metadata (...) does name every sample, so the report
+#        supplies the condition; this affects only design_from_input.tsv
+# A warning that ends by saying nothing is affected is a false alarm by its own
+# admission, and a WARN on a run that long is a thing you stop and
+# investigate. _metadata_note already got the PROSE right -- its own docstring
+# calls this case a false alarm -- but every caller logged WARN regardless.
+def _no_separator_design(ma):
+    """Sample names carrying no condition, as the real cohort's do not:
+    MF0030, MF0071, MF001A3A817."""
+    return pd.DataFrame({"sample": [f"MF{i:04d}" for i in range(6)],
+                         "plex": ["TMT1"] * 3 + ["TMT2"] * 3})
+
+
+def _levels_for(ma, capsys, cfg):
+    capsys.readouterr()
+    design, note = ma._tmt_add_condition(_no_separator_design(ma), cfg)
+    lines = [l for l in capsys.readouterr().err.splitlines()
+             if "condition could not be derived" in l
+             or "no condition is" in l]
+    assert len(lines) == 1, lines
+    return lines[0], note
+
+
+def test_a_condition_the_metadata_supplies_is_information_not_a_warning(
+        ma, tmp_path, capsys):
+    md = tmp_path / "metadata.tsv"
+    md.write_text("sample\tgroup\n"
+                  + "".join(f"MF{i:04d}\tresponder\n" for i in range(6)),
+                  encoding="utf-8")
+    line, note = _levels_for(ma, capsys, {
+        "tmt": {"condition_from_name": "auto"},
+        "analysis": {"metadata": str(md)}})
+    assert "INFO" in line, line
+    assert "WARN" not in line
+    assert "does name every sample" in line
+    # the note still records that it was NOT derived, which is the claim
+    # design_record.txt has to carry
+    assert "not derived" in note
+
+
+def test_no_metadata_at_all_is_still_a_warning(ma, capsys):
+    line, _ = _levels_for(ma, capsys, {"tmt": {"condition_from_name": "auto"}})
+    assert "WARN" in line, line
+    assert "supply it in analysis.metadata" in line
+
+
+def test_metadata_that_misses_samples_is_still_a_warning(ma, tmp_path,
+                                                        capsys):
+    md = tmp_path / "metadata.tsv"
+    md.write_text("sample\tgroup\nMF0000\tresponder\nMF0001\tresponder\n",
+                  encoding="utf-8")
+    line, _ = _levels_for(ma, capsys, {
+        "tmt": {"condition_from_name": "auto"},
+        "analysis": {"metadata": str(md)}})
+    assert "WARN" in line, line
+    assert "does not name 4 of these samples" in line
+
+
+def test_metadata_pointing_at_nothing_is_still_a_warning(ma, tmp_path,
+                                                         capsys):
+    line, _ = _levels_for(ma, capsys, {
+        "tmt": {"condition_from_name": "auto"},
+        "analysis": {"metadata": str(tmp_path / "absent.tsv")}})
+    assert "WARN" in line, line
+    assert "which does not exist" in line
+
+
+def test_metadata_without_the_sample_column_is_still_a_warning(ma, tmp_path,
+                                                               capsys):
+    md = tmp_path / "metadata.tsv"
+    md.write_text("subject\tgroup\nMF0000\tresponder\n", encoding="utf-8")
+    line, _ = _levels_for(ma, capsys, {
+        "tmt": {"condition_from_name": "auto"},
+        "analysis": {"metadata": str(md)}})
+    assert "WARN" in line, line
+    assert "has no 'sample' column" in line
+
+
+def test_an_empty_condition_spec_follows_the_same_rule(ma, tmp_path, capsys):
+    # the other caller of _metadata_note: tmt.condition_from_name left empty
+    md = tmp_path / "metadata.tsv"
+    md.write_text("sample\tgroup\n"
+                  + "".join(f"MF{i:04d}\tresponder\n" for i in range(6)),
+                  encoding="utf-8")
+    line, _ = _levels_for(ma, capsys, {
+        "tmt": {"condition_from_name": ""},
+        "analysis": {"metadata": str(md)}})
+    assert "INFO" in line, line
+    line, _ = _levels_for(ma, capsys, {"tmt": {"condition_from_name": ""}})
+    assert "WARN" in line, line
+
+
+def test_the_note_is_a_pair_so_the_level_cannot_drift_from_the_prose(ma):
+    # the defect was that the prose and the level were decided separately.
+    # _metadata_note returns both now, so a new branch cannot add a message
+    # without also saying whether it is recoverable.
+    import inspect
+    src = inspect.getsource(ma._tmt_add_condition)
+    body = src[src.index("def _metadata_note"):src.index("if not spec:")]
+    for ret in [l for l in body.splitlines() if "return" in l]:
+        pass                      # returns span lines; check the pairing below
+    assert body.count("return") == 6, body.count("return")
+    assert "False)" in body and "True)" in body
+    assert '"WARN"' not in body, "the note must not choose its own level"
