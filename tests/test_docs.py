@@ -1329,3 +1329,28 @@ def _named_test(name):
             if isinstance(fn, ast.FunctionDef) and fn.name == name:
                 out.append((base, fn))
     return out
+
+
+def test_the_uc_dark_rescue_numbers_reconcile_with_each_other():
+    """README quoted two incompatible eggNOG-only dark figures for the same run.
+
+    One section said 9,731 dark on eggNOG alone falling to 1,462, "8,686
+    rescued" -- which does not even self-reconcile, since 9,731 - 1,462 =
+    8,269. Another section said 17,377 proteins had no eggNOG KO and 6,271 of
+    them carried an eggNOG PFAMs entry, which implies 11,106. Measured off the
+    UC run's own outputs, 11,106 is right: 38,204 proteins, 29,084 in the
+    emapper table, and 11,106 with no KO, no PFAMs and no CAZy. 1,462 is right
+    too, from bin_summary.tsv and annotation_final.tsv independently.
+    """
+    import re
+    txt = _norm(_text(README))
+    m = re.search(r"took ([\d,]+) proteins dark on eggNOG alone down to "
+                  r"([\d,]+) — ([\d,]+) rescued", txt)
+    assert m, "the dark-rescue sentence moved; re-measure before rewording it"
+    before, after, rescued = (int(g.replace(",", "")) for g in m.groups())
+    assert before - after == rescued, (before, after, rescued)
+    # and it has to agree with the KO/PFAMs join quoted elsewhere
+    j = re.search(r"([\d,]+) of ([\d,]+) dark proteins", txt)
+    assert j, "the eggNOG-PFAMs join sentence moved"
+    with_pfam, no_ko = (int(g.replace(",", "")) for g in j.groups())
+    assert no_ko - with_pfam == before, (no_ko, with_pfam, before)
