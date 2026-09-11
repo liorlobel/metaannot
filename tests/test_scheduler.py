@@ -1749,3 +1749,91 @@ def test_a_dry_run_writes_neither_artefact(tmp_path, stub_bin):
     proj.run("--dry-run")
     assert not os.path.exists(proj.rpath(".metaannot_state.json"))
     assert not os.path.exists(proj.rpath("config.effective.yaml"))
+
+
+# --- the shape of the division, not just its size ---------------------
+# symptom: share() divided what was FREE, which fixed the serial tail sitting
+# on a quarter of an idle box. It divided it EVENLY, though, and the stages in
+# one round are not equal. An external tool's thread count is fixed when it is
+# launched -- `interproscan.sh -cpu 7` cannot grow, nor can hmmsearch's --cpu
+# or InterProScan's -Xmx -- so an hours-class stage that hands half the box to
+# a seconds-class one has given it away for its whole life.
+#
+# On the 455,571-protein run InterProScan was launched with -cpu 7 while
+# signalp and tmbed held the other 15. Those two finished at 57 h; InterProScan
+# spent its remaining hours on 7 of 22 cores with 14 idle.
+def _round_of(ma, total, weights):
+    """The cuts share() would make across one dispatch round."""
+    free, cuts = total, []
+    for i in range(len(weights)):
+        c = ma.weighted_share(free, weights[i:])
+        cuts.append(c)
+        free -= c
+    return cuts, free
+
+
+def test_equal_cost_stages_split_the_machine_exactly_as_before(ma):
+    # the common case must not move: a round of same-rank stages is the old
+    # even split, arithmetically identical.
+    assert _round_of(ma, 22, [3, 3, 3]) == ([7, 7, 8], 0)
+    assert _round_of(ma, 32, [2, 2, 2, 2]) == ([8, 8, 8, 8], 0)
+    assert _round_of(ma, 22, [1, 1]) == ([11, 11], 0)
+
+
+def test_an_hours_class_stage_is_not_halved_by_a_seconds_class_one(ma):
+    # 13 rather than 7, and the two short stages still get enough to run.
+    cuts, left = _round_of(ma, 22, [3, 1, 1])
+    assert cuts[0] == 13, cuts
+    assert min(cuts) >= 1
+    assert left == 0
+
+
+def test_a_round_of_cuts_never_oversubscribes(ma):
+    # the invariant that matters: the machine cannot be promised twice.
+    for total in (1, 2, 7, 22, 64, 128):
+        for weights in ([3], [3, 3], [3, 1], [1, 3], [3, 2, 1], [1, 1, 1, 1],
+                        [3, 3, 3, 3, 3], [2, 1, 1, 1, 1, 1]):
+            cuts, left = _round_of(ma, total, weights)
+            assert sum(cuts) <= max(total, len(weights)), (total, weights, cuts)
+            assert left >= 0 or total < len(weights), (total, weights, cuts)
+            assert all(c >= 1 for c in cuts), (total, weights, cuts)
+
+
+def test_a_lone_stage_gets_the_whole_machine(ma):
+    assert ma.weighted_share(22, [3]) == 22
+    assert ma.weighted_share(22, [1]) == 22
+
+
+def test_the_split_never_divides_by_zero_or_returns_nothing(ma):
+    # an empty weight list, a zero weight and a zero budget all reach this.
+    assert ma.weighted_share(22, []) == 22
+    assert ma.weighted_share(0, [3, 1]) == 1      # floored, never 0
+    assert ma.weighted_share(22, [0, 0]) == 11    # zeros clamp to 1
+
+
+def test_the_weight_is_the_cost_rank_so_the_two_cannot_drift(ma):
+    # share() must weight by stage_priority and nothing else, or the ranks and
+    # the allocation tell different stories about which stage is long.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    body = src[src.index("    def share(starting):"):
+               src.index("    def worker(st, cpu, ram):")]
+    assert "stage_priority(n)" in body
+    assert "weighted_share(" in body
+    assert "// slots" not in body, "the even split is gone"
+
+
+def test_a_stage_that_cannot_grow_into_freed_cpu_is_told_about(ma):
+    # Structural, deliberately. The condition needs three hours-class stages
+    # running concurrently and one finishing first; with instant stubs that is
+    # a race, and a racy test here would be worse than none -- see the signal
+    # handler, where CI caught on 1 job of 7 what every local run missed. So
+    # this pins the guards instead: once per stage, hours-class only, and only
+    # when the freed CPU would at least double what the survivor holds.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("# CPU freed here cannot be handed to a stage that is")
+    body = src[i:src.index("break", i)]
+    assert "other in starved" in body, "must be said once per stage"
+    assert "stage_priority(other) < 3" in body, "minutes-class stages finish first"
+    assert "free_cpu < held" in body, "only when it could at least double"
+    assert "--only" in body, "the message has to say what to do"
+    assert "starved = set()" in src, "the once-per-stage set must exist"

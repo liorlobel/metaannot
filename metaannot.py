@@ -9269,6 +9269,30 @@ def stage_priority(name):
     return STAGE_COSTS[name]
 
 
+def weighted_share(free, weights):
+    """The first weight's cut of `free`, divided in proportion to `weights`.
+
+    Not an even split. An external tool's thread count is fixed when it is
+    launched -- `interproscan.sh -cpu 7` cannot grow later, and neither can
+    hmmsearch's --cpu or InterProScan's -Xmx -- so a stage measured in HOURS
+    that hands half the box to one measured in SECONDS has given it away for
+    its entire life and gets nothing back when the short stage finishes eight
+    seconds later.
+
+    That is not hypothetical. On the 455,571-protein run InterProScan was
+    launched with `-cpu 7` while signalp and tmbed held the other 15, and when
+    those two finished at 57 h it spent its remaining hours on 7 of 22 cores
+    with 14 idle, because there is no way to tell a running JVM to take more.
+
+    Equal weights give exactly the old even split, so the common case -- a
+    round of stages that are all the same cost rank -- is unchanged. Callers
+    recompute `free` between calls, so a round's cuts sum to `free` rather
+    than over-subscribing it.
+    """
+    ws = [max(1, int(w)) for w in weights] or [1]
+    return max(1, free * ws[0] // sum(ws))
+
+
 def gpu_lease(ready, running, slots, needs_gpu):
     """Which of one round's ready stages may start, given what is running.
 
@@ -14315,19 +14339,28 @@ def cmd_run(args):
                            "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
             save_state(p.state, state)
 
-    def share(pending):
-        """CPU and RAM for one stage about to start, out of what is free.
+    def share(starting):
+        """CPU and RAM for the FIRST of `starting`, out of what is free.
 
         Splitting the machine statically by stage_workers left the serial tail
         — InterProScan, jackhmmer, foldseek, and the emapper --dbmem decision —
-        on a quarter of the box even when nothing else was running.
+        on a quarter of the box even when nothing else was running. Dividing
+        what is FREE fixed that much.
+
+        What it did not fix is the shape of the division. It was even, and the
+        stages in one round are not equal: see weighted_share. The cut is now
+        proportional to the cost rank, which for a round of equally-ranked
+        stages is arithmetically the same even split as before.
         """
-        slots = max(1, min(workers - len(futures), pending))
-        cpu = max(1, (total_cpu - sum(a[0] for a in alloc.values())) // slots)
+        room = max(1, workers - len(futures))
+        take = list(starting)[:room] or [None]
+        ws = [stage_priority(n) if n else 1 for n in take]
+        free_cpu = total_cpu - sum(a[0] for a in alloc.values())
+        cpu = weighted_share(free_cpu, ws)
         ram = 0
         if total_ram:
-            ram = max(1, (total_ram - sum(a[1] for a in alloc.values()))
-                      // slots)
+            free_ram = total_ram - sum(a[1] for a in alloc.values())
+            ram = weighted_share(free_ram, ws)
         return cpu, ram
 
     def worker(st, cpu, ram):
@@ -14349,6 +14382,7 @@ def cmd_run(args):
     remaining = [st["name"] for st in STAGES]
     alloc = {}                    # future -> (cpu, ram) committed to a stage
     gpu_waiting = set()           # said once per stage, not once per round
+    starved = set()               # said once per stage, not once per finish
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {}
         while (remaining or futures) and not failure:
@@ -14422,7 +14456,7 @@ def cmd_run(args):
                 if len(futures) >= workers:
                     break
                 st = by_name[name]
-                cpu, ram = share(len(run_now) - i)
+                cpu, ram = share(run_now[i:])
                 remaining.remove(name)
                 progressed = True
                 log(f"=== {name}: running ({cpu} cpu"
@@ -14450,6 +14484,27 @@ def cmd_run(args):
                 alloc.pop(fut, None)
                 set_log_context(None)
                 finish(name, "RUN", sig=sig, err=err, secs=secs)
+                # CPU freed here cannot be handed to a stage that is already
+                # running: its tool's thread count was fixed at launch. Only
+                # the hours-class stages are worth saying it about — a stage
+                # measured in minutes finishes before the waste matters — and
+                # only once each, because this runs on every completion.
+                free_cpu = total_cpu - sum(a[0] for a in alloc.values())
+                for other in list(futures.values()):
+                    held = next((a[0] for f, a in alloc.items()
+                                 if futures.get(f) == other), 0)
+                    if (other in starved or not held or free_cpu < held
+                            or stage_priority(other) < 3):
+                        continue
+                    starved.add(other)
+                    log(f"{other} holds {held} of {total_cpu} cpu and "
+                        f"{free_cpu} are now free, but a tool's thread count "
+                        "is fixed when it is launched, so this stage cannot "
+                        "grow into them — it will finish at the share it was "
+                        f"given. At this scale run it on its own "
+                        f"(--only {other}) to give it the whole machine, or "
+                        "lower stage_workers so fewer stages divide it.",
+                        "WARN")
                 break
 
     # Drain anything still running so every failure is reported, not just the
