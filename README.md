@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1612 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1636 passed, 1 skipped, 6 xfailed, 37
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 37
 deselected are the `slow` marker, and they are the second command above.
-`pytest -q -m R` selects the 35 R tests, which the default run **already
+`pytest -q -m R` selects the 57 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1577 passed and 36
+absent, so on a machine with no R the same run reports 1579 passed and 58
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1106,6 +1106,39 @@ LPxTG motif and an anchor domain — so with `topology` off it narrows to the
 last two rather than closing, and an empty shortlist is as likely to mean
 nothing was significant as it is to mean the tool was missing. Check the
 differential-abundance table before concluding either. See `docs/signalp-6.md`.
+
+The report also says when the statistics do not reach the bins this tool exists
+for, rather than leaving it in a table. `retention by bin` prints each bin's
+quantified count beside the count that survives `min_valid_per_group` and
+`min_plexes` and is actually fitted; a bin that arrives with proteins and
+leaves with none raises a GATE naming it and saying that nothing below — no
+table, no enrichment, no shortlist — is about it. The KO-less bins raise a
+second GATE stating what fraction of that whole population the statistics
+cover, and it is conditional in both directions: only when the run quantified
+at least `COVERAGE_MIN_N` KO-less groups, so that the fraction has something
+behind it, and only when the fraction is under `COVERAGE_MIN_PCT` — one per
+cent — because above that the coverage is a number the reader can work with
+and not a failure. The percentage is of the KO-less groups the run QUANTIFIED,
+and the model it is set against is the whole model, the unbinned groups
+included, since those are fitted too. A NOTE names the knobs behind it:
+`analysis.min_valid_per_group` with its value, `analysis.min_plexes` where an
+isobaric run applies it as well, and `min_features_per_protein` — a top-level
+key, not part of any stage block — which decided which proteins were written
+to `annotated_quant.tsv` before the report saw anything. The escalation
+is by DENOMINATOR, so a bin that is empty because nothing was ever put in it
+stays silent — `3p_profile_only` is fed only by `hhblits` and `jackhmmer` and
+no run has put a protein in it, and a gate that fires on that every time is how
+a reader learns to skip the line that matters. Under `COVERAGE_MIN_N`
+quantified groups the same zero is a NOTE rather than a GATE, because "none of
+them" over a handful of proteins is an anecdote. The ratio model and the
+effector shortlist repeat it where it changes how they are read, under the same
+floor and distinguishing the same two causes: a ratio model whose usable set
+holds no KO-less protein says whether none reached the model at all — the
+coverage failure above, and nothing to do with taxonomy — or whether the ones
+that did have no usable taxon, which is a limit of the taxonomy and gated only
+over a population; and an empty shortlist prints the population it was drawn
+from, so "nothing was significant" and "there was nobody to rank" stop looking
+the same on the page.
 
 ## Parallelism
 

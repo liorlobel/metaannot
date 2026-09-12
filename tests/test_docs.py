@@ -1913,7 +1913,7 @@ def _phrase_re(key):
                       + r"[ \-]+(?:(?!(?:" + "|".join(sorted(_UNITS))
                       # {1,14}, not {2,14}: `_count_head` steps over a
                       # one-letter adjective and this has to reach the same
-                      # phrase, or "the 35 R tests" is a count the scan finds
+                      # phrase, or "the 57 R tests" is a count the scan finds
                       # and the table cannot locate.
                       + r")[ \-])[a-z]{1,14}[ \-]+)?"
                       + re.escape(noun).replace("\\ ", r"[ \-]+") + r"\b",
@@ -2573,7 +2573,7 @@ COUNT_PROSE = {
     "eight functions": ("MEASURED", "the Windows-skipped signal tests"),
     "eight items": ("MEASURED", "what those eight functions collect as"),
     "five tests": ("MEASURED", "the tests the open xfail markers sit on"),
-    "35 tests": ("MEASURED", "the R selection, counted exactly by "
+    "57 tests": ("MEASURED", "the R selection, counted exactly by "
                              "test_the_readme_test_counts_are_the_counts_"
                              "this_suite_really_has"),
     "seven strings": ("MEASURED", "the class names three outputs share"),

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -14,6 +15,8 @@ import sys
 
 import pandas as pd
 import pytest
+
+from html import unescape
 
 import fixtures as F
 from conftest import METAANNOT_PY, ROOT, build_project, needs_r, r_has, \
@@ -1452,3 +1455,568 @@ def test_the_tmt_object_links_its_peptide_assay_to_the_proteins(tmt_object):
     assert int(npep) == 2 * len(tmt_object.truth.null
                                 | tmt_object.truth.regulated)
     assert int(ncol) == len(tmt_object.truth.samples)
+
+
+# ----------------------------------------------------------------------
+# issue #5: a bin that contributes nothing to the model has to say so
+# ----------------------------------------------------------------------
+def _coverage_source(ma):
+    """The report's coverage block, with the constants it is written against.
+
+    Returned as (constants, block): the preamble between them builds its
+    fixture out of BIN_LEVELS, so the two cannot simply be concatenated here.
+    Lifted out of the document rather than retyped, so a threshold or a
+    sentence that changes there changes here too. The constants come from the
+    setup chunk because the rule is meaningless without them: BIN_KOLESS
+    decides which bins the headline is about, and the two COVERAGE_ values are
+    the whole of when it is raised.
+
+    Only BIN_LEVELS has to be there, and it is older than this feature. The
+    coverage constants and the block come back EMPTY when they are absent,
+    deliberately: a case whose whole assertion is that a line was not printed
+    has to fail on the report going silent, and with an assertion here it
+    would instead fail on a regex in the test file - which is a statement
+    about this harness and not about the report. Empty, the script still runs,
+    prints nothing, and every case fails on the retention table it did not
+    find.
+    """
+    setup = _chunk(ma, "setup")
+    levels = re.search(r"^BIN_LEVELS <- c\(.*?\)$", setup, re.S | re.M)
+    assert levels, "the setup chunk no longer defines BIN_LEVELS"
+    # `\d+(?:\.\d+)?`, not `\d+`: a threshold edited to 0.5 made this regex
+    # miss, which returned EMPTY constants, which failed 17 of the cases below
+    # with `object 'BIN_KOLESS' not found` and told the reader the escalation
+    # was not in the document. A harness that blames the report for a change to
+    # a number is worse than no harness.
+    consts = re.search(r"^BIN_KOLESS <- .*?^COVERAGE_MIN_PCT <- \d+(?:\.\d+)?$",
+                       setup, re.S | re.M)
+    block = re.search(r"^TESTED <- aq\$group_id .*", _chunk(ma, "prep"),
+                      re.S | re.M)
+    return (levels.group(0) + "\n" + (consts.group(0) if consts else ""),
+            block.group(0) if block else "")
+
+
+# aq, keep and X as the document has them by the time the block runs: one row
+# per quantified group, `keep` the two retention filters, and X already cut
+# down to the rows the model is fitted on. The first two arguments are the
+# per-bin quantified and tested counts in BIN_LEVELS order, which is exactly
+# the shape of the `retention by bin` table the issue quotes. The third is the
+# same pair for the quantified groups with NO annotation row - no bin, so
+# dropped from every per-bin number and still fitted - and the fourth is
+# min_plexes and the number of plexes, off unless a case asks for them.
+COVERAGE_PREAMBLE = """
+suppressPackageStartupMessages({library(dplyr); library(tibble)})
+gate <- function(fmt, ...) cat("GATE:", sprintf(fmt, ...), "\\n")
+note <- function(fmt, ...) cat("NOTE:", sprintf(fmt, ...), "\\n")
+a <- commandArgs(TRUE)
+nq <- as.integer(strsplit(a[1], ",")[[1]])
+nt <- as.integer(strsplit(a[2], ",")[[1]])
+nna <- if (length(a) >= 3) as.integer(strsplit(a[3], ",")[[1]]) else c(0L, 0L)
+px <- if (length(a) >= 4) as.integer(strsplit(a[4], ",")[[1]]) else c(1L, 0L)
+stopifnot(length(nq) == length(BIN_LEVELS), all(nt <= nq), nna[2] <= nna[1])
+params <- list(min_valid_per_group = 3L, min_features = 0L,
+               min_plexes = px[1], group_col_for_filtering = "group")
+fgrp <- factor(rep(c("a", "b"), each = 18))
+pbatch <- if (px[2] > 0) rep(paste0("P", seq_len(px[2])), length.out = 36) else
+          NULL
+ntot <- sum(nq) + nna[1]
+aq <- tibble(group_id = if (ntot) paste0("g", seq_len(ntot)) else character(0),
+             bin = factor(c(rep(BIN_LEVELS, nq), rep(NA_character_, nna[1])),
+                          levels = BIN_LEVELS))
+keep <- c(unlist(Map(function(q, t) c(rep(TRUE, t), rep(FALSE, q - t)), nq, nt),
+                 use.names = FALSE),
+          rep(TRUE, nna[2]), rep(FALSE, nna[1] - nna[2]))
+X <- matrix(0, nrow = sum(keep), ncol = 36,
+            dimnames = list(aq$group_id[keep], paste0("s", seq_len(36))))
+"""
+
+# The issue's own run, bin by bin: 16,070 quantified protein groups, 212 in
+# the model, and not one of them from 3d_duf_only or 4_dark.
+ISSUE_5_QUANTIFIED = "7023,5153,2914,170,0,0,810"
+ISSUE_5_TESTED = "26,175,11,0,0,0,0"
+
+
+def _loose(n):
+    """`n` as the printed table may break it up, thin space, comma or not."""
+    return r"[\s,]*".join(str(n))
+
+
+@needs_r("dplyr", "tibble")
+@pytest.mark.parametrize("quantified,tested,unbinned,plex,expect,forbid", [
+    # The run in the issue. Two bins quantified in the thousands contribute
+    # nothing, and the KO-less fraction as a whole is in the model only just.
+    (ISSUE_5_QUANTIFIED, ISSUE_5_TESTED, "0,0", "1,0",
+     ["GATE: 0/170 3d_duf_only and 0/810 4_dark quantified group(s) reach "
+      "the model",
+      "not the effector shortlist - is about them",
+      "GATE: the statistics below cover 0.28% of the KO-less groups this run "
+      "quantified: 11 of 3894 are tested, and they are 11 of the 212 "
+      "group(s) in the model",
+      "Two knobs decide it",
+      "analysis.min_valid_per_group is 3",
+      "min_features_per_protein"],
+     # the two bins that held nothing are not named anywhere: a gate that
+     # fires on an empty bin every run is the noise this rule exists to avoid
+     ["3s_structure_only", "3p_profile_only",
+      # and the knob is named where the config really keeps it: `join` is a
+      # stage name, so a reader who writes the block this implies is told
+      # "unrecognised key 'join'" and their setting is silently ignored
+      "join.min_features_per_protein"]),
+    # The same run with the quantified groups that have no annotation row at
+    # all put back, every one of them in the model, because an unbinned group
+    # is a well-covered one and passes the filter the sparse dark ones fail.
+    # They are not a bin and are rightly absent from every per-bin number -
+    # but the model they are fitted in is 48 and not 34, and the fraction is
+    # read against the model.
+    (ISSUE_5_QUANTIFIED, "20,13,1,0,0,0,0", "14,14", "1,0",
+     ["they are 1 of the 48 group(s) in the model"],
+     ["1 of the 34 group(s)"]),
+    # A healthy run: every bin keeps most of what it brought, and the block
+    # says nothing at all.
+    ("31,12,14,11,10,0,15", "30,12,13,10,9,0,14", "0,0", "1,0",
+     [], ["GATE:", "NOTE:"]),
+    # 3p_profile_only as it is on every run ever made - fed only by hhblits
+    # and jackhmmer, so quantified-nothing, tested-nothing. Silence.
+    ("31,12,14,11,10,0,15", "30,12,13,10,9,0,14", "0,0", "1,0",
+     [], ["3p_profile_only"]),
+    # Below the denominator floor the same zero is a NOTE, not a GATE: "none
+    # of 7" is an anecdote about a handful of proteins.
+    ("400,300,200,0,0,0,7", "380,290,190,0,0,0,0", "0,0", "1,0",
+     ["NOTE: 0/7 4_dark reach the model", "fewer than 10 quantified group(s)"],
+     ["GATE:"]),
+    # Every KO-less bin at zero, with enough behind it to be a population:
+    # the headline sentence the issue asked for, and it names only the bins
+    # that actually held proteins.
+    ("400,300,0,0,0,0,60", "380,290,0,0,0,0,0", "0,0", "1,0",
+     ["GATE: 0/60 4_dark quantified group(s) reach the model",
+      "is about it.",
+      "GATE: no KO-less protein is tested in any contrast: 0 of 60 "
+      "quantified KO-less group(s), in 4_dark"],
+     ["3_annotated_no_ko"]),
+    # The same run isobaric, with min_plexes in force. `keep` is keep_valid &
+    # keep_plex, so a third filter is behind the counts the NOTE explains, and
+    # min_valid_per_group is not on its own what they measure.
+    ("400,300,0,0,0,0,60", "380,290,0,0,0,0,0", "0,0", "2,3",
+     ["Three knobs decide it",
+      "analysis.min_plexes is 2, over 3 plex(es); the counts above measure "
+      "both"],
+     ["Two knobs", "and it is what the counts above measure"]),
+    # A bin that goes to zero is gated whether or not it is KO-less: nothing
+    # is tested at all here, and that is not a KO-less-only problem.
+    ("120,300,200,0,0,0,190", "0,290,190,0,0,0,180", "0,0", "1,0",
+     ["GATE: 0/120 1_ko_pathway quantified group(s) reach the model"], []),
+])
+def test_a_bin_filtered_out_is_escalated_but_an_empty_one_is_not(
+        ma, tmp_path, quantified, tested, unbinned, plex, expect, forbid):
+    # symptom: the report printed `retention by bin` with a 0 in it and
+    # nothing escalated it, while a GATE was raised for findings orders of
+    # magnitude smaller. The zeros of a bin that HELD nothing and of a bin
+    # that lost everything looked identical.
+    consts, block = _coverage_source(ma)
+    # the constants first, because the preamble builds its bins out of
+    # BIN_LEVELS, and the block last, exactly as the document orders them
+    r = _rscript_file(tmp_path, consts + COVERAGE_PREAMBLE + block,
+                      quantified, tested, unbinned, plex)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    # First, that the block RAN. Every case below asserts some line was not
+    # printed, and a block that printed nothing at all satisfies all of them
+    # - so the table it always prints is checked before anything else, with
+    # the counts each row is supposed to carry.
+    for col in ("bin", "n_kept", "n_tested", "pct_tested"):
+        assert col in out, f"the retention table has no {col} column:\n{out}"
+    for b, q, t in zip(_BIN_LEVELS, quantified.split(","), tested.split(",")):
+        if int(q) == 0:      # dropped by group_by(); its absence is the rule
+            continue
+        row = rf"^\s*\d+\s+{b}\s+{_loose(q)}\s+{_loose(t)}\s+{_loose(t)}\s"
+        assert re.search(row, out, re.M), f"no {b} row of {q}/{t}:\n{out}"
+    nq_na, nt_na = unbinned.split(",")
+    if int(nq_na):
+        row = (rf"^\s*\d+\s+(?:NA|<NA>)\s+{_loose(nq_na)}\s+{_loose(nt_na)}"
+               rf"\s+{_loose(nt_na)}\s")
+        assert re.search(row, out, re.M), f"no unbinned row:\n{out}"
+    for want in expect:
+        assert want in out, out
+    for no in forbid:
+        assert no not in out, out
+
+
+# The bins in the order the document lists them, for the row check above.
+_BIN_LEVELS = ("1_ko_pathway", "2_ko_orphan", "3_annotated_no_ko",
+               "3d_duf_only", "3s_structure_only", "3p_profile_only", "4_dark")
+
+
+def test_the_bin_levels_this_file_checks_rows_against_are_the_documents(ma):
+    # a literal list here would go stale the first time a bin is added, and
+    # the row check above would then silently stop checking that bin.
+    consts, _ = _coverage_source(ma)
+    assert re.findall(r'"([0-9a-z_]+)"', consts.split("BIN_KOLESS")[0]) \
+        == list(_BIN_LEVELS)
+
+
+def test_the_report_names_config_keys_where_the_config_keeps_them(ma):
+    # symptom: the coverage NOTE told the reader to set
+    # `join.min_features_per_protein`. The key is TOP-LEVEL; `join` is a stage
+    # name and `run.join` is a boolean, so the config that line describes is
+    # refused with "unrecognised key 'join' - did you mean 'join'?" and the
+    # setting is silently not in effect. Every dotted config path the report
+    # prints is checked against DEFAULT_CONFIG, in both directions.
+    tpl = ma.RMD_TEMPLATE
+    top = {k for k, v in ma.DEFAULT_CONFIG.items() if not isinstance(v, dict)}
+    sections = {k: v for k, v in ma.DEFAULT_CONFIG.items()
+                if isinstance(v, dict)}
+    for m in re.finditer(r"(?<![\w.$])([a-z_]{2,})\.([a-z_]{4,})\b", tpl):
+        prefix, key = m.groups()
+        if key in top:
+            raise AssertionError(
+                f"the report writes {prefix}.{key}, but {key} is a top-level "
+                f"config key: a reader who writes that block is told the "
+                f"'{prefix}' key is unrecognised and their setting is "
+                f"silently ignored")
+        if prefix in sections:
+            assert key in sections[prefix], \
+                f"the report names {prefix}.{key}, which {prefix} has no key for"
+    # and the one this was found on, named in full rather than left to the
+    # scan: it is in the document, and it is in the config, unprefixed
+    assert "min_features_per_protein decided which proteins" in tpl
+    assert "min_features_per_protein" in top
+
+
+def _ratio_koless_source(ma):
+    """The ratio model's KO-less escalation, lifted whole.
+
+    Empty when it is absent, for the reason _coverage_source is: the cases
+    that assert silence must fail on a silent report rather than on a regex.
+    """
+    block = re.search(r"^    if \(sum\(usable\) > 0 .*?^    \}$",
+                      _chunk(ma, "taxon-adjusted"), re.S | re.M)
+    return block.group(0) if block else ""
+
+
+RATIO_PREAMBLE = """
+suppressPackageStartupMessages({library(dplyr); library(tibble)})
+gate <- function(fmt, ...) cat("GATE:", sprintf(fmt, ...), "\\n")
+note <- function(fmt, ...) cat("NOTE:", sprintf(fmt, ...), "\\n")
+a <- as.integer(commandArgs(TRUE))
+# a[1] KO-less groups in the model, a[2] of them with a usable taxon, a[3]
+# mapped groups with one. aqk is the retained set, `usable` its taxon filter.
+aqk <- tibble(bin = factor(c(rep("4_dark", a[1]), rep("1_ko_pathway", a[3])),
+                           levels = BIN_LEVELS))
+usable <- c(rep(TRUE, a[2]), rep(FALSE, a[1] - a[2]), rep(TRUE, a[3]))
+KOLESS_TESTED <- a[1]
+"""
+
+# The input the escalation is loudest on, used to prove the block is there
+# when a case's whole assertion is that it said nothing: a report that CANNOT
+# speak satisfies every such case, and nothing else in a silent run would tell
+# the two apart.
+RATIO_LOUD = (30, 0, 30)
+RATIO_LOUD_SAYS = "GATE: and none of them is KO-less: all 30 KO-less group(s)"
+
+
+@needs_r("dplyr", "tibble")
+@pytest.mark.parametrize("koless,koless_usable,mapped,expect,forbid", [
+    # The healthy shape, and the one this was found on: KO-less proteins ARE
+    # in the model, their taxa are too small for a size factor, and there are
+    # seven of them. A GATE on that is a GATE on a document with nothing
+    # wrong with it.
+    (7, 0, 30, ["NOTE: and none of them is KO-less: the 7 KO-less group(s) in "
+                "the model are without a usable taxon",
+                "fewer than 10 group(s)"], ["GATE:"]),
+    # The same zero over a population: now it is the model's whole argument
+    # that has nothing to stand on, and it is loud.
+    (30, 0, 30, ["GATE: and none of them is KO-less: all 30 KO-less group(s) "
+                 "in the model are without a usable taxon",
+                 "the population it exists for"], ["NOTE:"]),
+    # A different cause with the same symptom: nothing KO-less reached the
+    # model at all. That is the coverage failure the retention block reports,
+    # it is not a taxonomy limit, and sending the reader to
+    # taxon_min_proteins would send them to the wrong knob.
+    (0, 0, 30, ["NOTE: and none of them is KO-less, because no KO-less group "
+                "reached the model at all",
+                "not a limit of the taxonomy"],
+     ["GATE:", "without a usable taxon"]),
+    # KO-less proteins in the usable set: nothing to say.
+    (30, 3, 30, [], ["GATE:", "NOTE:"]),
+    # No usable taxon for anything. The count above it already says so, and
+    # the block does not speak.
+    (0, 0, 0, [], ["GATE:", "NOTE:"]),
+])
+def test_the_ratio_model_escalates_only_over_a_koless_population(
+        ma, tmp_path, koless, koless_usable, mapped, expect, forbid):
+    # symptom: the GATE fired whenever no KO-less protein had a usable taxon,
+    # with no floor under the population and no way to tell "none reached the
+    # model" from "their taxa are too small" - so it fired on a knit with
+    # every bin fully retained, which is the noise the rule above it exists
+    # to keep out of the report.
+    consts, _ = _coverage_source(ma)
+    code = consts + RATIO_PREAMBLE + _ratio_koless_source(ma)
+    r = _rscript_file(tmp_path, code, koless, koless_usable, mapped)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    if not expect:
+        # this case says only that nothing was printed, which a document with
+        # no escalation in it also satisfies. So the same block is run on the
+        # input it is loudest on, and the silence counts only once it has
+        # been shown to be a choice.
+        loud = _rscript_file(tmp_path, code, *RATIO_LOUD)
+        assert RATIO_LOUD_SAYS in loud.stdout + loud.stderr, \
+            "the escalation is not in the document, so silence proves nothing"
+    for want in expect:
+        assert want in out, out
+    for no in forbid:
+        assert no not in out, out
+
+
+def _shortlist_source(ma):
+    """The empty-shortlist branch, lifted whole. Empty when it is absent."""
+    block = re.search(r"^if \(nrow\(short\) == 0 && KOLESS_N > 0\) \{.*?^\}$",
+                      _chunk(ma, "shortlist"), re.S | re.M)
+    return block.group(0) if block else ""
+
+
+# KOLESS_N, KOLESS_TESTED and a shortlist of the given length: base R only,
+# because the branch is arithmetic and three sentences.
+SHORTLIST_PREAMBLE = """
+gate <- function(fmt, ...) cat("GATE:", sprintf(fmt, ...), "\\n")
+note <- function(fmt, ...) cat("NOTE:", sprintf(fmt, ...), "\\n")
+a <- as.integer(commandArgs(TRUE))
+KOLESS_N <- a[1]
+KOLESS_TESTED <- a[2]
+short <- data.frame(group_id = seq_len(a[3]))
+"""
+
+SHORTLIST_LOUD = (19, 0, 0)
+SHORTLIST_LOUD_SAYS = "GATE: and none was possible: no KO-less group reached"
+
+
+@needs_r()
+@pytest.mark.parametrize("koless_n,koless_tested,candidates,expect,forbid", [
+    # Nothing KO-less reached the model, over a population: the coverage
+    # failure, and the empty list is not a result at all.
+    (19, 0, 0, [SHORTLIST_LOUD_SAYS, "(0 of 19 quantified)"], ["NOTE:"]),
+    # The same zero under the floor. The tier drops to a NOTE - "none of 7"
+    # is an anecdote - but the CLAIM does not change with it: there was still
+    # nothing to rank, and the list is still not a negative result. Saying it
+    # was "a statement about those 0" is the reading this block exists to
+    # prevent, printed by the block itself.
+    (7, 0, 0, ["NOTE: and nothing was rankable: no KO-less group reached the "
+               "model, of 7 quantified",
+               "not a negative result either"],
+     ["GATE:", "statement about those 0", "drawn from the 0"]),
+    # KO-less proteins WERE tested and none was significant. That is a
+    # result, and it says what it was drawn from.
+    (7, 7, 0, ["NOTE: the list was drawn from the 7 KO-less group(s) that "
+               "reached the model, of 7 quantified",
+               "a statement about those 7"], ["GATE:"]),
+    # A list with candidates on it explains nothing: there is nothing to
+    # explain.
+    (7, 7, 3, [], ["GATE:", "NOTE:"]),
+    # No KO-less group quantified at all - 3p_profile_only on every run there
+    # has been. Silent, like the bin rule above it.
+    (0, 0, 0, [], ["GATE:", "NOTE:"]),
+])
+def test_an_empty_shortlist_never_reads_as_a_result_it_is_not(
+        ma, tmp_path, koless_n, koless_tested, candidates, expect, forbid):
+    # symptom: under the denominator floor the branch printed "the list was
+    # drawn from the 0 KO-less group(s) that reached the model ... an empty
+    # list is a statement about those 0" - no population, presented as a weak
+    # negative result, which is the exact confusion the block was added to
+    # remove. Reachable on any small run.
+    consts, _ = _coverage_source(ma)
+    code = consts + SHORTLIST_PREAMBLE + _shortlist_source(ma)
+    r = _rscript_file(tmp_path, code, koless_n, koless_tested, candidates)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    if not expect:
+        loud = _rscript_file(tmp_path, code, *SHORTLIST_LOUD)
+        assert SHORTLIST_LOUD_SAYS in loud.stdout + loud.stderr, \
+            "the branch is not in the document, so silence proves nothing"
+    for want in expect:
+        assert want in out, out
+    for no in forbid:
+        assert no not in out, out
+
+
+def _rendered_output(path):
+    """Only what the report PRINTED, never its own source.
+
+    `code_folding: hide` echoes every chunk into the page, so a sentence that
+    lives in a format string or a comment is in the HTML whether or not the
+    line it belongs to ever fired - which makes a raw search on the file
+    useless for asserting that something was NOT said. knitr prefixes each
+    line of a chunk's output with `## `, and that prefix is the only thing
+    that tells the two apart.
+    """
+    txt = _text_of(path)
+    out = []
+    for m in re.finditer(r"<pre><code>(.*?)</code></pre>", txt, re.S):
+        for line in unescape(m.group(1)).splitlines():
+            if line.startswith("## "):
+                out.append(line[3:])
+    return "\n".join(out)
+
+
+def _text_of(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+@pytest.fixture(scope="module")
+def sparse_koless(tmp_path_factory):
+    """A finished run shaped like the run issue #5 was found on, knitted once.
+
+    Rendering is the expensive step, so the assertions about what it says are
+    spread over several tests reading one rendered document.
+
+    Twelve extra dark proteins so `4_dark` clears the denominator floor, and
+    every KO-less protein quantified in too few samples per group to pass
+    `min_valid_per_group`. They are QUANTIFIED - a real intensity in half of
+    the samples - so they are in annotated_quant.tsv and in the retention
+    table, and then the filter takes all of them. That is the shape the issue
+    is about: not absent, filtered out.
+    """
+    rng = random.Random(11)
+    proteins = F.protein_set(n_extra=30)
+    proteins += [F.Protein(f"P_darkx{i:02d}",
+                           "".join(rng.choice(F.AA) for _ in range(110)),
+                           in_emapper=False, expect_bin="4_dark")
+                 for i in range(12)]
+    samples = ["A_1", "A_2", "A_3", "A_4", "B_1", "B_2", "B_3", "B_4"]
+    proj = build_project(tmp_path_factory.mktemp("sparse") / "p",
+                         proteins=proteins, samples=samples)
+    koless = [p.pid for p in proteins
+              if p.expect_bin not in ("1_ko_pathway", "2_ko_orphan")]
+    q = proj.path("input", "combined_peptide.tsv")
+    d = pd.read_csv(q, sep="\t")
+    sparse = d["Protein"].isin(koless)
+    # 0 is what FragPipe writes for "not quantified", and metaannot reads it
+    # as missing: two valid values in each group of four, against a
+    # min_valid_per_group of three.
+    for c in [f"{s} Intensity" for s in ("A_3", "A_4", "B_3", "B_4")]:
+        d.loc[sparse, c] = 0
+    d.to_csv(q, sep="\t", index=False)
+    proj.run()
+    proj.rendered = False
+    if shutil.which("Rscript") and shutil.which("pandoc") and r_has(*R_CORE):
+        run_metaannot("report", "--config", proj.config_path, cwd=proj.root,
+                      timeout=1800)
+        proj.rendered = True
+    proj.koless = koless
+    return proj
+
+
+@needs_r(*R_CORE, *R_BIOC)
+def test_a_knitted_report_escalates_the_bins_that_reach_the_model_with_nothing(
+        sparse_koless):
+    # symptom: issue #5. Every number was already in the report - the
+    # retention table printed 0 for two whole bins, and the join stage had
+    # warned about the proteins it dropped - but nothing escalated any of it,
+    # so "your statistics cover none of the fraction this tool exists for"
+    # was left for the reader to work out from a cell in a tibble.
+    if not sparse_koless.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    html = _rendered_output(sparse_koless.rpath("analysis",
+                                                "analyse_metaannot.html"))
+    # the bin that is big enough for its zero to be a claim about a population
+    assert "GATE  0/15 4_dark quantified group(s) reach the model" in html
+    # the headline: the KO-less fraction as a whole is in no statistic below
+    assert ("GATE  no KO-less protein is tested in any contrast: 0 of 19 "
+            "quantified KO-less group(s)") in html
+    # and the knobs that decided it, named where the consequence is - and
+    # named as the config really keeps them: min_features_per_protein is
+    # top-level, and this run is not isobaric, so there are two of them
+    assert "Two knobs decide it" in html
+    assert "analysis.min_valid_per_group is 3" in html
+    assert "min_features_per_protein decided which proteins" in html
+    assert "join.min_features_per_protein" not in html
+    # the small bins are reported without being escalated
+    assert ("NOTE  0/2 3_annotated_no_ko and 0/2 3d_duf_only reach the model"
+            in html)
+
+
+@needs_r(*R_CORE, *R_BIOC)
+def test_the_ratio_model_and_the_shortlist_say_it_too_rather_than_ranking_nothing(
+        sparse_koless):
+    # symptom: with no KO-less protein in the model the ratio model still runs
+    # - on the enzymes it was never the argument for - and the effector
+    # shortlist prints "0 candidates", which reads as "nothing was
+    # significant" when the truth is that it had nobody to rank.
+    if not sparse_koless.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    html = _rendered_output(sparse_koless.rpath("analysis",
+                                                "analyse_metaannot.html"))
+    # the ratio model says WHICH of the two things happened: nothing KO-less
+    # reached the model at all, which is the coverage failure gated above and
+    # not a limit of the taxonomy, so it is not escalated a second time here
+    assert ("NOTE  and none of them is KO-less, because no KO-less group "
+            "reached the model at all") in html
+    assert "GATE  and none of them is KO-less" not in html
+    assert "0 candidates (significant, no KO, secreted or surface-exposed)" in html
+    assert ("GATE  and none was possible: no KO-less group reached the model "
+            "at all (0 of 19 quantified)") in html
+
+
+@needs_r(*R_CORE, *R_BIOC)
+def test_a_bin_with_nothing_to_lose_raises_nothing_on_a_healthy_knit(knitted):
+    # the other half of the rule, and the half that keeps the gate readable:
+    # 3p_profile_only is fed only by hhblits and jackhmmer, so no run has ever
+    # put a protein in it. A gate that fired on its 0 every time would teach
+    # the reader to skip the line they most need to read.
+    #
+    # The absences below are only worth something against a document that
+    # really has the feature, which is what the first half of this test is
+    # for: asserting that nothing was said is also satisfied by a report that
+    # cannot say it. So the table's new columns are checked, and the one line
+    # this run DOES earn - the ratio model's sub-floor NOTE, its KO-less
+    # population being too small to gate over - is required to be there. That
+    # NOTE was a GATE once, on this very knit, which is the bug the absence
+    # list below could not see.
+    if not knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    html = _rendered_output(knitted.rpath("analysis",
+                                          "analyse_metaannot.html"))
+    assert "retention by bin" in html, "the retention table is gone"
+    for col in ("n_kept", "n_tested", "pct_tested"):
+        assert col in html, f"the retention table has no {col} column"
+    assert ("NOTE  and none of them is KO-less: the 7 KO-less group(s) in the "
+            "model are without a usable taxon") in html
+    for absent in ("quantified group(s) reach the model",
+                   "no KO-less protein is tested in any contrast",
+                   "the statistics below cover",
+                   # the ratio model's version of the same rule: its floor is
+                   # the KO-less population in the model, and seven is under
+                   # it. Without one, this GATE fired on a healthy document.
+                   "GATE  and none of them is KO-less",
+                   # every knob-naming NOTE belongs to a line that fired
+                   "knobs decide it"):
+        assert absent not in html, \
+            f"a coverage line fired on a healthy run: {absent}"
+    # and no GATE anywhere in the document is one of this rule's, however it
+    # was worded. Scoped to the rule's own vocabulary rather than to the word
+    # KO-less, which a legitimate gate two sections up uses for the
+    # identification-rate odds ratio.
+    for line in html.splitlines():
+        if not line.startswith("GATE"):
+            continue
+        for phrase in ("KO-less group", "KO-less protein", "reach the model",
+                       "statistics below cover"):
+            assert phrase not in line, \
+                f"a coverage GATE on a healthy run: {line}"
+
+
+@needs_r(*R_CORE, *R_BIOC)
+def test_an_empty_shortlist_says_what_population_it_was_drawn_from(knitted):
+    # symptom: "0 candidates" is a negative RESULT when the KO-less proteins
+    # were tested and none was significant, and a COVERAGE failure when none
+    # was tested at all. The printed line was the same either way. This is the
+    # first of those two, and it must not read as the second - the tool has
+    # been wrong in that direction before (see the v0.2.0 CHANGELOG entry).
+    if not knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    html = _rendered_output(knitted.rpath("analysis",
+                                          "analyse_metaannot.html"))
+    assert "0 candidates (significant, no KO, secreted or surface-exposed)" in html
+    assert "NOTE  the list was drawn from the 7 KO-less group(s) that reached" \
+        in html
+    assert "none was possible" not in html

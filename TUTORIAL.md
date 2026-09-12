@@ -955,10 +955,25 @@ evaluates a document with the working directory set to its own folder.
 2. **Feature support by bin.** KO-less proteins carry fewer peptides. If the
    median for `4_dark` is 1, those quantifications are not evidence.
 3. **`% invisible to KEGG enrichment`.** This is the headline number.
-4. **Taxonomy agreement by bin.**
-5. **Normalisation risk.** Any taxon marked `AT RISK` needs both models
+4. **`retention by bin`, and any `GATE` under it.** The headline number says
+   how large the KO-less fraction is; this says how much of it the statistics
+   below are actually about. A gate there means a bin arrived with proteins
+   and reached the model with none, or that the KO-less bins together are in
+   the model barely at all — and then the differential abundance tables, the
+   enrichment and the shortlist are not about the population you ran this for,
+   whatever the headline number says. The line names every knob behind those
+   counts — `min_valid_per_group`, `min_plexes` where an isobaric run applies
+   it too, and `min_features_per_protein`; changing any of them is a decision
+   about power and not a formality. A bin that was never populated says nothing, so a line
+   that IS there is about proteins that were quantified and then filtered out.
+5. **Taxonomy agreement by bin.**
+6. **Normalisation risk.** Any taxon marked `AT RISK` needs both models
    reported, not just the ratio model.
-6. **Effector shortlist** — significant, no KO, predicted secreted or surface.
+7. **Effector shortlist** — significant, no KO, predicted secreted or surface.
+   `0 candidates` now prints what it was drawn from: an empty list over a
+   KO-less set that WAS tested is a result, and an empty list over one that
+   was not is the gate above, not a finding — and never "a statement about
+   those 0", which is a missing population dressed as a weak negative.
 
 ---
 

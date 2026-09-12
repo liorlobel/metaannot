@@ -278,6 +278,24 @@ it names; do not force the file through another format.
   at a multi-read input would sell six hours for a failure it could have
   reported in the first second, and a `doctor` that waited would remove the
   only thing that can tell you about the pipe first.
+- **The report's coverage gate is silent on a bin that quantified nothing.**
+  A bin at 0/0 lost nothing at that step, and `3p_profile_only` is 0/0 on every
+  run there has ever been (rule 8), so a GATE firing on it each time is exactly
+  the noise that teaches a reader to skip the line the report most needs them
+  to read. Under `COVERAGE_MIN_N` quantified groups the same zero is a NOTE
+  instead of a GATE. Do not "complete" the rule by gating every bin, and do not
+  add a per-bin percentage floor: the percentage is computed over the KO-less
+  bins TOGETHER on purpose, because that is the population the claim is about,
+  and a floor per bin would either fire on every sparse rare bin or never fire.
+  Neither `min_valid_per_group` nor `min_features_per_protein` is changed by
+  any of it — the point is that the consequence of the choice is impossible to
+  miss, not that the choice is prevented. The floor applies wherever the rule
+  is repeated, the ratio model included: a GATE that fires on a document with
+  nothing wrong with it spends the attention the loud line needs. And the
+  denominator a coverage fraction is set against is the WHOLE model —
+  `sum(cov_tab$n_tested)`, unbinned groups included, because they are fitted —
+  while every per-bin number rightly drops them; getting that backwards makes
+  coverage look better than it is in the report's loudest sentence.
 - A repeated sample name in an `.fp-manifest` is a **fraction**, not a
   duplicate. Fraction rows are collapsed to one sample; the manifest is only
   refused when the rows genuinely disagree about the design.
