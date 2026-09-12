@@ -13387,6 +13387,52 @@ BIN_COLS <- c("1_ko_pathway" = "#4C72B0", "2_ko_orphan" = "#55A868",
               "3s_structure_only" = "#CCB974", "3p_profile_only" = "#DD8452",
               "4_dark" = "#64676B")
 
+# The bins with no KO at all: the fraction KEGG-based analysis cannot see even
+# in principle, which is the fraction this tool exists to rescue.
+# 2_ko_orphan is NOT in it - it carries a KO and is merely off the specific
+# maps - and the set is defined by SUBTRACTION rather than by listing, so a
+# bin added to BIN_ORDER later joins the KO-less side by default. That is the
+# safe direction for a document whose headline claim is about how much of that
+# side the statistics cover: a new bin wrongly included makes the claim more
+# conservative, a new bin wrongly left out makes it silently untrue.
+BIN_KOLESS <- setdiff(BIN_LEVELS, c("1_ko_pathway", "2_ko_orphan"))
+
+# When a bin's absence from the model is escalated, and when it is not.
+#
+# The retention table further down prints every bin's quantified count beside
+# the count that survives the filters, and a zero in it can mean two opposite
+# things. A bin that retained nothing because it HELD nothing is not a
+# finding: 3p_profile_only is fed only by hhblits and jackhmmer, so on a
+# default run it is quantified-nothing, tested-nothing, for ever, and a gate
+# that fires on it every time trains the reader to skip the one line the
+# report most needs them to read. A bin that held hundreds of proteins and
+# retained none of them is the entire point of the run. So the escalation is
+# by DENOMINATOR, and it has a silent tier, a quiet one and a loud one: a bin
+# with no quantified group at all is silent, because it lost nothing here and
+# its zero is already visible in the bin composition table; a bin below
+# COVERAGE_MIN_N gets a NOTE, because
+# "none of them" over a handful of proteins is an anecdote rather than a
+# statement about a population; a bin at or above it gets a GATE.
+#
+# The floor is a COUNT and the fraction below is applied only to the KO-less
+# bins TOGETHER, because the two are not the same kind of number. Whether one
+# small bin kept a tenth or a fiftieth of itself is noise; what fraction of
+# the whole KO-less proteome the statistics cover is the claim this report is
+# for. A per-bin percentage floor would have to be set either high enough to
+# fire on every sparse rare bin or low enough to never fire at all.
+#
+# COVERAGE_MIN_PCT is deliberately not a test of whether a bin is depleted
+# RELATIVE to the others. On the run this was written for the whole proteome
+# kept about one group in eighty, and against that baseline a bin of several
+# hundred coming out at zero is not even statistically surprising. Surprise is
+# the wrong question: the question is COVERAGE - whether any sentence below
+# this point is about these proteins - and its answer is a count, not a
+# p-value. The threshold is therefore set where a reader would stop being able
+# to build any claim at all on what survived, not where a test would call the
+# depletion significant.
+COVERAGE_MIN_N <- 10
+COVERAGE_MIN_PCT <- 1
+
 RD  <- params$results_dir
 OUT <- file.path(RD, params$out_subdir)
 dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
@@ -14380,9 +14426,134 @@ if (any(gv)) {
 }
 
 cat("\nretention by bin:\n")
-print(tibble(bin = aq$bin, kept = keep) %>% group_by(bin) %>%
-        summarise(n = n(), n_kept = sum(kept),
-                  pct = round(100 * mean(kept), 1), .groups = "drop"))
+# TESTED, and not `keep`, is what every sentence below this table is about.
+# The two are the same set on a default run, but drop_zero_variance removes
+# the constant rows from the model a few lines above, and a bin whose only
+# survivors were constants is retained-some, tested-none. Both columns are
+# printed so that the table and the gates below quote one number rather than
+# two that a reader has to reconcile.
+TESTED <- aq$group_id %in% rownames(X)
+cov_tab <- tibble(bin = aq$bin, kept = keep, tested = TESTED) %>%
+  group_by(bin) %>%
+  summarise(n = n(), n_kept = sum(kept), n_tested = sum(tested),
+            # pct_tested, not pct: the two counts differ whenever
+            # drop_zero_variance removed a row, and a percentage named after
+            # neither of them leaves the reader to work out which it is of.
+            pct_tested = round(100 * mean(tested), 1), .groups = "drop")
+print(cov_tab)
+
+# The table above is a table, and a table cannot say which of its rows is the
+# finding. Everything the reader needs is in it - so was the 0 that produced
+# this code - but a zero in a printed tibble looks exactly like every other
+# cell, while the report raises a GATE for things an order of magnitude
+# smaller. What follows draws the conclusion instead of leaving it to be
+# noticed: which bins the statistics below do not cover at all, and how much
+# of the KO-less proteome they cover in total. See COVERAGE_MIN_N and
+# COVERAGE_MIN_PCT at the top of this document for why a zero is escalated
+# only above a denominator, and why the fraction is applied to the KO-less
+# bins together rather than to each bin on its own.
+#
+# NA is dropped rather than counted: a quantified group with no annotation row
+# has no bin, it is already reported as its own NOTE further up, and it is not
+# a population this tool claims to be about.
+cov_bins <- filter(cov_tab, !is.na(bin))
+lost  <- filter(cov_bins, n_tested == 0, n >= COVERAGE_MIN_N)
+tiny  <- filter(cov_bins, n_tested == 0, n < COVERAGE_MIN_N)
+# "0/810 4_dark and 0/170 3d_duf_only", joined so the sentence around it
+# reads as English however many bins are in it.
+as_bins <- function(d) {
+  x <- sprintf("%d/%d %s", d$n_tested, d$n, d$bin)
+  if (length(x) < 2) x else
+    paste(paste(head(x, -1), collapse = ", "), "and", tail(x, 1))
+}
+
+KOLESS_N      <- sum(cov_bins$n[cov_bins$bin %in% BIN_KOLESS])
+KOLESS_TESTED <- sum(cov_bins$n_tested[cov_bins$bin %in% BIN_KOLESS])
+KOLESS_PCT    <- if (KOLESS_N > 0) 100 * KOLESS_TESTED / KOLESS_N else NA_real_
+# Gated on the same denominator floor as a single bin: a run that quantified
+# almost no KO-less protein in the first place has a coverage number with
+# nothing behind it, and that is a fact about the search database, not about
+# the filters this line names.
+KOLESS_GATED  <- KOLESS_N >= COVERAGE_MIN_N && KOLESS_PCT < COVERAGE_MIN_PCT
+
+if (nrow(lost))
+  gate(paste("%s quantified group(s) reach the model. No protein of %s is",
+             "tested in any contrast, so nothing below - not the differential",
+             "abundance tables, not the enrichment, not the effector",
+             "shortlist - is about %s."),
+       as_bins(lost),
+       if (nrow(lost) > 1) "those bins" else "that bin",
+       if (nrow(lost) > 1) "them" else "it")
+
+# The bins NAMED here are the ones that contributed to the denominator, not
+# BIN_KOLESS itself: listing a bin that quantified nothing would put
+# 3p_profile_only in the report's loudest sentence on every run, which is the
+# noise this whole block is built to avoid.
+KOLESS_HELD <- cov_bins$bin[cov_bins$bin %in% BIN_KOLESS]
+if (KOLESS_GATED && KOLESS_TESTED == 0)
+  gate(paste("no KO-less protein is tested in any contrast: 0 of %d",
+             "quantified KO-less group(s), in %s. The fraction this tool",
+             "exists to rescue contributes nothing to the statistics below."),
+       KOLESS_N, paste(KOLESS_HELD, collapse = ", "))
+# sum(cov_tab$n_tested), and NOT cov_bins: this one denominator is the SIZE
+# OF THE MODEL, which is every row of X. Dropping the unbinned groups from the
+# per-bin analysis, from `lost` and from the KO-less numerator and denominator
+# is right - a quantified group with no annotation row is not a bin, and not a
+# population this tool claims to be about - but those groups ARE fitted, and
+# being the well-covered ones they pass min_valid_per_group far more often
+# than the sparse dark ones do. Leaving them out here shrinks the number this
+# fraction is read against, and it shrinks it the FLATTERING way: on the run
+# this was found on the sentence read "1 of the 34 group(s) in the model" over
+# a model of 48, twenty lines after the report had printed both numbers.
+if (KOLESS_GATED && KOLESS_TESTED > 0)
+  gate(paste("the statistics below cover %.2f%% of the KO-less groups this",
+             "run quantified: %d of %d are tested, and they are %d of the %d",
+             "group(s) in the model. The fraction this tool exists to rescue",
+             "is barely in it."),
+       KOLESS_PCT, KOLESS_TESTED, KOLESS_N, KOLESS_TESTED,
+       sum(cov_tab$n_tested))
+
+# min_features_per_protein is a TOP-LEVEL key, and prefixing it with the name
+# of the stage that reads it is not a harmless flourish: `join` is a stage
+# name, `run.join` is a boolean, and a reader who writes the `join:` block
+# such a prefix implies gets "unrecognised key 'join'" and a setting that is
+# silently not in effect. Every dotted path this document prints is pinned
+# against DEFAULT_CONFIG by the suite, so the prefix cannot come back.
+#
+# Two knobs or three. `keep` is keep_valid & keep_plex, so on an isobaric run
+# with min_plexes set there is a third filter behind these counts - on the
+# suite's own TMT fixture it removes 10 of 50 against min_valid_per_group's 0
+# of 50 - and "min_valid_per_group is what the counts above measure" is then
+# untrue. Named when it is in force, and not named when it is not.
+KNOBS_PLEX <- !is.null(pbatch) && params$min_plexes > 1
+if (nrow(lost) || KOLESS_GATED)
+  note(paste("those proteins were quantified and then filtered out; they are",
+             "not missing from the input. %s decide it, and none of them is",
+             "wrong to have set - the point here is only that the consequence",
+             "is this.\n      analysis.min_valid_per_group is %d, over %d",
+             "sample(s) in %d group(s) of the '%s' column%s.\n     ",
+             "min_features_per_protein decided which proteins were written to",
+             "annotated_quant.tsv at all, so the quantified totals above are",
+             "already after it.%s"),
+       if (KNOBS_PLEX) "Three knobs" else "Two knobs",
+       params$min_valid_per_group, ncol(X), nlevels(fgrp),
+       params$group_col_for_filtering,
+       if (KNOBS_PLEX)
+         sprintf(paste(", and analysis.min_plexes is %d, over %d plex(es);",
+                       "the counts above measure both"),
+                 params$min_plexes, length(unique(pbatch)))
+       else ", and it is what the counts above measure",
+       if (params$min_features > 0)
+         sprintf(" analysis.min_features (%d) removed more again, in this document.",
+                 params$min_features) else "")
+
+# Not silence, and not a GATE either. These bins really did lose everything
+# they had, and saying so costs a line; escalating it would spend the reader's
+# attention on a handful of proteins and make the GATE above cheaper.
+if (nrow(tiny))
+  note(paste("%s reach the model. That is a zero on fewer than %d quantified",
+             "group(s), too few to be a statement about a bin rather than",
+             "about a handful of proteins."), as_bins(tiny), COVERAGE_MIN_N)
 ```
 
 No imputation. Missing values in DIA data are largely not missing at random,
@@ -14548,6 +14719,47 @@ if (file.exists(sf_path)) {
       tax_of %in% sf[[id_col]]
     gate("%d/%d groups sit in a taxon with >= %d proteins and a size factor",
          sum(usable), nrow(aqk), params$taxon_min_proteins)
+    # The same fact the retention gates above report, said where it decides
+    # what this model is worth. This model exists because a KO-less protein is
+    # likelier than a mapped enzyme to be riding its organism's abundance; run
+    # over a usable set with no KO-less protein in it, it answers that
+    # question for the proteins it was never the argument for, and the
+    # "attenuated by adjustment" verdicts below are all about them.
+    #
+    # Two different things produce that zero and they are not one sentence.
+    # Either no KO-less group reached the model at all, which is the coverage
+    # failure already reported above, upstream of this model and fixed by the
+    # filters named there; or KO-less groups ARE in the model and not one of
+    # them has a usable taxon, which is a limit of the taxonomy and fixed, if
+    # at all, by taxon_min_proteins_for_factor or a better assignment. A line
+    # that blames the taxon filter for the first sends the reader to the wrong
+    # knob.
+    #
+    # And the same denominator discipline as the coverage rule above, for the
+    # same reason: KOLESS_TESTED is the KO-less population in the model - the
+    # rows of X, so the number the retention gates quote - and a zero over a
+    # handful of it is an anecdote about those few rather than a statement
+    # about this model. Without the floor this GATE fired on a knit with every
+    # bin fully retained and nothing wrong with it, which is exactly the noise
+    # the escalation rule exists to keep out of the report.
+    if (sum(usable) > 0 && !any(usable & aqk$bin %in% BIN_KOLESS)) {
+      if (KOLESS_TESTED == 0)
+        note(paste("and none of them is KO-less, because no KO-less group",
+                   "reached the model at all - see the retention table above.",
+                   "That is upstream of this model and not a limit of the",
+                   "taxonomy."))
+      else if (KOLESS_TESTED >= COVERAGE_MIN_N)
+        gate(paste("and none of them is KO-less: all %d KO-less group(s) in",
+                   "the model are without a usable taxon. The ratio model has",
+                   "no KO-less protein to test, which is the population it",
+                   "exists for."), KOLESS_TESTED)
+      else
+        note(paste("and none of them is KO-less: the %d KO-less group(s) in",
+                   "the model are without a usable taxon. That is a zero on",
+                   "fewer than %d group(s), too few to be a statement about",
+                   "this model rather than about a handful of proteins."),
+             KOLESS_TESTED, COVERAGE_MIN_N)
+    }
     fb <- sf$method[match(tax_of[usable], sf[[id_col]])] == "sum_fallback"
     if (any(fb, na.rm = TRUE))
       note(paste("%d group(s) belong to a taxon too small for a robust median,",
@@ -15001,6 +15213,36 @@ if (length(pred_cols)) {
        paste(pred_cols, collapse = ", "))
 }
 cat(sprintf("%d candidates (significant, no KO, secreted or surface-exposed)\n", nrow(short)))
+# An empty shortlist reads as a negative RESULT - nothing was significant -
+# and that is often exactly what it is. It is indistinguishable, on the page,
+# from a shortlist that had no population to draw from, and the difference is
+# the whole question: one is an answer about the KO-less proteome, the other
+# is the report having nothing to say about it. So the population is printed
+# beside the zero rather than left to be reconstructed from a table several
+# sections up. Never claimed the other way round: with candidates on the list
+# there is nothing to explain, and an empty list on a KO-less set that WAS
+# tested is a result, which is why only the no-population case is a GATE.
+if (nrow(short) == 0 && KOLESS_N > 0) {
+  if (KOLESS_TESTED == 0 && KOLESS_N >= COVERAGE_MIN_N)
+    gate(paste("and none was possible: no KO-less group reached the model at",
+               "all (0 of %d quantified), so this is the coverage failure",
+               "reported above and not a negative result"), KOLESS_N)
+  # Under the floor the zero is still not a result. "A statement about those
+  # 0" is precisely the reading this block exists to prevent - no population,
+  # printed as a weak negative - so what the denominator changes is the TIER,
+  # never the claim: too few quantified KO-less groups for the coverage gate
+  # above to fire, and still nothing that could have been ranked.
+  else if (KOLESS_TESTED == 0)
+    note(paste("and nothing was rankable: no KO-less group reached the model,",
+               "of %d quantified. That is too few for the coverage gate above",
+               "to fire on it, and it is not a negative result either - the",
+               "list had no population to be drawn from"), KOLESS_N)
+  else
+    note(paste("the list was drawn from the %d KO-less group(s) that reached",
+               "the model, of %d quantified. An empty list is a statement",
+               "about those %d, not about the KO-less proteome"),
+         KOLESS_TESTED, KOLESS_N, KOLESS_TESTED)
+}
 if (adj_attempted && nrow(short))
   note(paste("%d of them were called by the abundance model because they have",
              "no usable taxon (model_used says which).\n      They were never",

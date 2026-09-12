@@ -70,6 +70,110 @@ state the row claims.
 
 ### Added
 
+**The report now says out loud when a bin reaches the statistics with nothing
+in it (#5).** Every number was already there. `retention by bin` printed the
+zeros, the join stage already warned that the proteins `min_features_per_protein`
+dropped are absent from `annotated_quant.tsv` and from every report table, and
+`DEFAULT_CONFIG` already said what a default of two costs the population this
+tool exists to study. Nothing escalated any of it, while the same document
+raised a GATE over findings orders of magnitude smaller, so the reader had to
+notice a cell in a printed tibble and work out what it implied. The retention
+chunk now draws the conclusion instead. A bin that was quantified and then
+filtered out entirely gets a GATE naming it and the count behind it, and saying
+that no table, no enrichment and no shortlist below is about it. The KO-less
+bins get a second GATE of their own, stating how much of that whole population
+the statistics cover — the sentence the issue asked for, and the one this tool
+exists to be able to make. A NOTE then names the knobs that decided it:
+`analysis.min_valid_per_group` with its value and the design it was applied
+over, `analysis.min_plexes` where an isobaric run applies that as well — the
+retained set is `keep_valid & keep_plex`, so on the suite's own TMT fixture the
+plex filter removes ten of fifty against `min_valid_per_group`'s none, and a
+line calling `min_valid_per_group` "what the counts above measure" would be
+untrue there — and `min_features_per_protein`, which chose the denominators
+before the report saw anything. That key is TOP-LEVEL and is named without a
+prefix: `join` is a stage name and `run.join` is a boolean, so a reader who
+wrote the `join:` block an earlier draft of this NOTE implied was told
+`unrecognised key 'join'` and had the setting silently ignored. Every dotted
+config path the document prints is now checked against `DEFAULT_CONFIG` by the
+suite, in both directions. On the run this was found on it reads
+`0/170 3d_duf_only and 0/810 4_dark quantified group(s) reach the model`,
+followed by the KO-less coverage, which was eleven of 3,894 quantified groups.
+
+**The model the fraction is read against is the WHOLE model.** The per-bin
+analysis drops the quantified groups with no annotation row — they are not a
+bin, and they are reported by their own NOTE further up — but they ARE fitted,
+and being the well-covered ones they pass `min_valid_per_group` where the
+sparse dark ones fail. So the KO-less GATE counts them, `sum(cov_tab$n_tested)`
+rather than the binned subtotal, and the retention table's percentage column is
+`pct_tested` rather than `pct`, since with `drop_zero_variance` set `n_kept` and
+`n_tested` differ and a name after neither leaves the reader to guess. Read
+against the binned subtotal the sentence said `1 of the 34 group(s) in the
+model` on a page that had already printed both the unbinned groups it left
+out and a model of 48 — an error the flattering way, in the loudest sentence
+the report has.
+
+**Neither default moved**, and that is deliberate rather than unfinished.
+`min_features_per_protein` is already 1, already carries the warning, and the
+run that produced this issue overrode it knowingly. Making the consequence
+impossible to miss is a different thing from preventing the choice.
+
+**The escalation is by DENOMINATOR**, which is the only part of this that
+needed deciding. A bin that retained nothing because it HELD nothing is not a
+finding: `3p_profile_only` is fed only by `hhblits` and `jackhmmer`, so on a
+default run it is quantified-nothing, tested-nothing, for ever, and a gate that
+fires on it every time teaches the reader to skip the one line the report most
+needs them to read. So a bin with no quantified group is silent — its zero is
+already in the bin composition table — a bin under `COVERAGE_MIN_N` gets a NOTE
+rather than a GATE, because "none of them" over a handful of proteins is an
+anecdote and not a statement about a population, and a bin at or above it gets
+the GATE. The percentage floor, `COVERAGE_MIN_PCT`, is applied to the KO-less
+bins TOGETHER and to no single bin: whether one small bin kept a tenth or a
+fiftieth of itself is noise, while what fraction of the KO-less proteome the
+statistics cover is the claim the document is for. It is deliberately not a
+test of whether a bin is depleted RELATIVE to the others — with that run's
+missingness the whole proteome kept about one group in eighty, and against that
+baseline a bin of several hundred coming out at zero is not even surprising.
+Surprise is the wrong question; coverage is the question, and its answer is a
+count rather than a p-value.
+
+**The ratio model and the effector shortlist say it too**, rather than
+silently having nothing to rank. A ratio model whose usable set contains no
+KO-less protein now says so beside the count it already printed, because that
+model exists on the argument that a KO-less protein is likelier than a mapped
+enzyme to be riding its organism's abundance — run without one, it is answering
+that question for the proteins it was never the argument for. It says WHICH of
+two different things happened, because they have different causes and
+different fixes: either no KO-less group reached the model at all, which is the
+coverage failure gated above, upstream of this model and nothing to do with
+taxonomy, or the KO-less groups that did reach it have no usable taxon, which
+is a limit of the taxonomy and is where `taxon_min_proteins_for_factor` or a
+better assignment would help. And it is under the same floor as everything
+else here: the second case is a GATE only over `COVERAGE_MIN_N` KO-less groups
+in the model and a NOTE under it. Without that floor it fired on a knit with
+every bin fully retained and nothing wrong with it, which is the exact noise
+the denominator rule exists to keep out.
+
+An empty shortlist now prints the population it was drawn from: `0 candidates`
+reads as a negative result, which is exactly what it was on the first real run,
+and is indistinguishable on the page from a shortlist that had nobody to rank.
+Only the second is a GATE. Where the KO-less population was tested, the NOTE
+names how many groups it was drawn from; where nothing KO-less reached the
+model but too few were quantified for the GATE, the NOTE says that nothing was
+rankable. It never says the list is "a statement about those 0", which is the
+missing population dressed as a weak negative result and the reading this whole
+change exists to prevent. What the denominator changes is the TIER, never the
+claim — which is the same defect, one report section over, as the one the
+v0.2.0 entry corrected about what an empty shortlist means.
+
+The rule is pinned by a real knit over a run reproducing the issue's shape and
+by a knit of a healthy run that must stay quiet, not by a string match on the
+template, and by the report's own coverage block, its ratio-model escalation
+and its empty-shortlist branch, each lifted out of the document and run
+against the counts that reach it — the issue's per-bin ones included. The
+healthy-knit test asserts what the report DOES say as well as what it does
+not, because a report that cannot raise a line satisfies every assertion that
+it was not raised.
+
 **`--force-unlock-live`, and a `--force-unlock` that refuses a holder it can
 see running.** Registered on `run` and on `all`, because `all` is the command
 the tutorial leads with and a flag the refusal names has to exist wherever the
