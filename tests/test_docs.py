@@ -474,6 +474,10 @@ def test_the_troubleshooting_table_quotes_messages_the_code_can_emit():
         "this looks like isobaric (TMT/iTRAQ) output",
         "cannot run:",
         "deadlock:",
+        "--force-unlock refused",
+        "another run holds this results directory",
+        "NOT renamed into place",
+        "is no longer there, so ",
         # split across two source lines in the die() call, so only the first
         # half is a contiguous literal
         "have rows with different ",
@@ -799,14 +803,14 @@ def test_the_docs_say_what_a_superseded_run_stops_doing(ma):
     asserted the literal `if self.is_still_ours():`, which broke the moment the
     gate grew its third answer and said nothing about whether the two callers
     still asked it. What matters is that both writes consult the one gate and
-    that the three answers stay distinguishable, because collapsing "vacant"
-    into "somebody else's" cost an unsuperseded run its own final verdict."""
+    that the three answers stay distinguishable, because the two callers want
+    OPPOSITE things out of "vacant": there is nothing for __exit__ to remove,
+    while for the state write a vacant path is a directory this run can no
+    longer prove is its own."""
     src = _text(os.path.join(ROOT, "metaannot.py"))
     assert "def is_still_ours(self):" in src, "the ownership gate is gone"
     assert "self.is_still_ours() is True" in src, \
         "the lock release must remove only on a definite yes"
-    assert "self.owner.is_still_ours() is False" in src, \
-        "the state write must refuse only on a definite no, not on a vacancy"
     assert "this run no longer holds" in src
 
     # The three answers, exercised rather than grepped.
@@ -820,6 +824,50 @@ def test_the_docs_say_what_a_superseded_run_stops_doing(ma):
         assert lk.is_still_ours() is False, "another run's lock must read False"
         os.remove(lk.path)
         assert lk.is_still_ours() is None, "a vacant path must be its own answer"
+
+    # ...and what the state write does with each of them, exercised rather
+    # than grepped, because the grep that stood here (`self.owner
+    # .is_still_ours() is False`) said only that a literal had not moved. The
+    # rule it defends is that `_run` is an OWNERSHIP CLAIM and goes in on
+    # positive proof only: our own lock, or one we could not read. A vacancy is
+    # not that proof - it is what a replacement that took the directory and
+    # then exited leaves behind - so `_run` stops, and the STAGE keys, which
+    # claim nothing about the directory, carry on.
+    #
+    # The version of this rule that stood here declined only a `_run` that
+    # would CREATE the document, and pinned it by removing the document first.
+    # That is why the sequence below no longer does: a real run's stage record
+    # creates the document one call earlier, so a gate that only guarded
+    # creation never fired for any run that recorded anything.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, ".metaannot_state.json")
+        lk = ma.ResultsLock(os.path.join(d, "y.lock"))
+        lk.__enter__()
+        st = {}
+        rec = ma.RunRecord(state, st, ["metaannot", "run"], None, 0, owner=lk)
+        assert rec._save() is True, "a run holding its own lock must write"
+        before = open(state, "rb").read()
+        os.remove(lk.path)                        # vacant, no replacement
+        assert rec._save() is False, \
+            "a vacant lock was read as proof this run still owns the directory"
+        assert open(state, "rb").read() == before, "`_run` was written anyway"
+        st["pfam"] = {"status": "ok", "signature": "a"}
+        assert ma.update_state(state, st, ("pfam",), claim=rec.claim) is True, \
+            "the stage keys were gated like `_run`; only `_run` is a claim"
+
+    # The vacant answer's own line, quoted in both guides and written in one
+    # place. An operator greps for what they saw on stderr, so a paraphrase in
+    # either file is a dead end - and this is the message that tells the two
+    # readings of a gone lock apart, which is the whole of what it is for.
+    vacant = "cannot prove it still owns this directory"
+    assert vacant in src, "the vacant-lock refusal no longer says this"
+    assert "handed to another run" not in src[src.index(vacant):
+                                              src.index(vacant) + 1200], \
+        "the vacant-lock refusal claims a handover nothing here proves"
+    for name, doc in (("README", README), ("TUTORIAL", TUTORIAL)):
+        assert vacant in _norm(_text(doc)), \
+            f"the {name} does not quote the line an operator will actually see"
 
     txt = _norm(_text(README))
     assert "A run that is unwinding stops writing when it is superseded" in txt
@@ -1577,8 +1625,14 @@ def test_the_changelog_does_not_name_functions_that_do_not_exist(ma):
     `read_protein_table` that has never existed in this tool, and two named a
     `taxon_map()` where the function is `resolve_taxonomy()`. A changelog is
     read by someone going to the code next, so a name it invents costs a grep.
+
+    The console is in the search set as well as the engine, because an entry
+    about the engine can legitimately name the console function that reads what
+    the engine writes - `_run.heartbeat_s` and `beat_of()` are one such pair -
+    and the rule this defends is "greppable in this repository", not "defined
+    in metaannot.py". Both files, so a typo in either is still caught.
     """
-    src = _text(METAANNOT_PY) + "".join(
+    src = _text(METAANNOT_PY) + _text(CONSOLE_PY) + "".join(
         _text(os.path.join(ROOT, "tests", f))
         for f in sorted(os.listdir(os.path.join(ROOT, "tests")))
         if f.endswith(".py"))
@@ -2409,6 +2463,9 @@ COUNT_PROSE = {
         "DERIVED", "the entries under the false-verdict groups",
         lambda ma: sum(n for h, n in _unreleased_fixed_groups()
                        if "false verdict" in h.lower())),
+    "three revisions": ("PROSE", "the rounds of the issue-23 fix that kept "
+                                 "the whole-document rebuild and guarded it "
+                                 "- history, not a set that exists now"),
     "four states": ("MEASURED", "the four path states measured taking the "
                                 "whole document down"),
     "four packages": ("PROSE", "a quotation of what the TUTORIAL used to say"),

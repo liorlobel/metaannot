@@ -514,6 +514,17 @@ deciding that; it does not decide for you. The exception is a zero-byte lock,
 which is what a power loss or a hard crash leaves behind: those are removed on
 sight once they are more than a minute old.
 
+If the lock names a pid on **this** host and this host can see that process
+running, `--force-unlock` refuses instead of taking the directory:
+`--force-unlock refused: pid ... is still running`. The message prints the
+pid, the host, when the run started, when it last stamped `_run`, which stages
+it has recorded running, its command line and the `ps -p` to run — which is the
+check rule 4 of `CLAUDE.md` calls for, made for you. Do that check. If the pid is not a
+metaannot (a pid gets recycled once its owner is gone), or if you have decided
+the run has to be taken over anyway, add `--force-unlock-live`. A lock from
+another node of the array is unprovable from here and is not refused: that is
+the case `--force-unlock` exists for, and the single flag still takes it.
+
 `SIGTERM` no longer strands a lock, but it is not Ctrl-C with a different
 number. `kill` and `systemctl stop` release the lock, print one `WARN` line to
 stderr naming the signal and the lock file, and exit **immediately** — exit
@@ -534,11 +545,107 @@ though — the signal stops metaannot, not the InterProScan or DIAMOND it
 launched, and those keep writing into the same scratch paths with no lock left
 to keep a second writer out.
 
-Ctrl-C's slow unwind is also why `--force-unlock` on a directory whose holder is
-still unwinding is safe: from the moment the lock is no longer the one that run
-took, it stops writing to `.metaannot_state.json` and stops trying to remove the
-lock. It says `this run no longer holds ...` once and exits, and the `_run`
-record you then watch is the replacement's.
+`--force-unlock` on a directory whose holder is still unwinding is the case
+the refusal above exists for, and what it costs is worth stating exactly. Once
+that run READS a lock holding somebody else's token it says `this run no longer
+holds ...` once, stops writing to `.metaannot_state.json` and stops trying to
+remove the lock, and the `_run` you then watch is the replacement's. Two things
+are outside that. A run whose lock is simply GONE has read no such proof: it
+declines to write `_run`, says so once, and goes on recording the stages it
+finishes. And a stage ALREADY RUNNING at the handover keeps its own output path
+until the handover is noticed — see the parking note below, which is a clock
+and not a guarantee.
+
+The records of the stages the replacement has already finished are better
+protected than its outputs, but **not** — as an earlier version of this section
+said — in a way that does not depend on timing at all. Three things are true,
+and they are different kinds of thing:
+
+* **A guarantee.** A write names the stage it changes and writes only that, so
+  an unwinding run never replaces the document with its own older view of it,
+  and it never rebuilds the rest of a document out of its own snapshot. If it
+  notices the handover a second way — the `_run` in the file names a run it has
+  never seen — it says `another run holds this results directory` and stops
+  writing entirely, for good. A `--force` run's discard is held to the same
+  rule: it deletes a stage record only while that record is still the one the
+  run read at the start, so the discard cannot take a record the replacement
+  wrote afterwards.
+* **A clock, and not the thirty-second one below.** The write re-reads the
+  file, merges its key in, and renames a complete document into place. Anything
+  another process writes **in the gap between that read and that rename** is
+  not in what we merged, and the rename puts a complete document over it.
+  Nothing notices: the read-back afterwards catches only a writer that lands
+  *after* the rename. The gap is one read-modify-rename rather than a
+  configurable interval, and nobody has managed to lose a record to it at
+  shipped speeds — so read its width as unmeasured, not as small. It is a
+  window either way, and calling it none was the error this paragraph corrects.
+* **Not covered.** Whatever removed the file. If someone `rm`s
+  `.metaannot_state.json`, or a remount or a power loss leaves NULs in it, the
+  records that were in it are gone, and the run logs `is no longer there` once,
+  naming the path, and carries on writing a document holding only what it
+  writes from then on. That costs a recomputation and not a wrong answer: the
+  outputs are still on disk and only their provenance is missing, so the next
+  run recomputes or re-adopts those stages and says so. Do not restore that
+  file from a copy while a run is using it.
+
+`_run` is held to a stricter rule than the stage records, because it is the
+claim about who owns the directory: a run writes it only on positive proof that
+it still holds the lock — its own lock, or one it could not read at all. A run
+whose lock has gone **vacant**, removed by an operator or by a replacement that
+took the directory and then finished, writes **no more `_run`** from that
+moment: no `last_seen`, no `final_status`, no `finished`. If it did, the next
+run would read that `_run`, take the dead run as its predecessor, and never be
+able to refuse its writes.
+
+**That really does cost a dying run its own last word, and it is the case to
+recognise on a console.** A run in that state goes on recording the stages it
+finishes and exits normally, but its `_run` stops where the last heartbeat left
+it — `"final_status": "running"` — so the page shows a run that never ended,
+and its heartbeat age keeps growing. If the state file went at the same time as
+the lock, the document the run recreates has stage records and **no `_run` at
+all**. A console buckets that as **done** and says there is no run record —
+offering "nothing has run here" or "an older metaannot wrote it", neither of
+which is what happened — so the lock panel ("Nothing holds this directory") and
+the log line below are what tell you which case it really is. The log says which it is, once:
+`the results lock ... is no longer there, so this run cannot prove it still
+owns this directory`. No ordinary run reaches this: the lock is released after
+the final stamp, not before, and a `kill` releases it and exits without
+stamping. It is the signature of a lock removed under a live run — an operator,
+a tmp-reaper, a remount — or of a directory that really was handed away.
+
+Its **outputs** are a weaker claim and this section used to overstate it.
+Three different things are true, and which one applies depends on when the
+handover happened relative to the stage:
+
+* A stage that **starts** after the handover cannot rename its result over the
+  live run's at all. `mark_running` is a merged write, so the run reads the
+  document and is stood down before the stage begins. (If the state file
+  happens to be missing or unreadable at that instant, there is nothing to
+  read and this falls through to the next case.)
+* A stage that was **already running** when the directory changed hands is
+  only *noticed*, on a clock: whichever comes first of the next heartbeat tick
+  and the fallback probe, so `min(heartbeat_s, STATE_PROBE_S)` — thirty
+  seconds with the shipped defaults. **Inside that window nothing detects the
+  handover**, and the stage renames its output over the live run's exactly as
+  it would have before any of this existed; a takeover that completes in under
+  a second is caught by nothing. Lower `heartbeat_s` to narrow the window.
+  Once it *is* noticed, a **declared** output is parked beside its target as
+  `.superseded.<stem>.<run_id><ext>`, the log names the path, and nothing is
+  deleted. Anything a stage writes outside `atomic_out` is not parked and not
+  covered — `diamond/vfdb.tsv`, `diamond/merops.tsv` and the per-protein
+  `structures/*.pdb` are the ones to know, because for those stages the
+  declared entry is the `.done` sentinel and not the file you care about. Expect a later stage of that dying run to fail on the missing
+  input; the run that holds the directory is unaffected.
+* Some files are **not covered at all**, because the check lives in
+  `atomic_out` and these do not go through it: `hhblits`' per-query
+  `<id>.hhr`, `esmfold`'s `plddt.tsv` and `esmfold_failed.tsv`, and the
+  `.done` sentinel each of `diamond`, `hhblits` and `esmfold` writes at the
+  end. A superseded run still puts those into the live run's directory,
+  silently.
+
+Which is the reason rule 4 of `CLAUDE.md` is a rule and not a preference: none
+of this is exclusion, and `--force-unlock-live` on a run that is still alive
+stays unsupported.
 
 Monitor from another shell:
 
@@ -551,7 +658,9 @@ The state file shows which stages finished, how long each took, and any that
 failed with the reason. Its `_run` block, first in the file, says what produced
 the directory — version, host, pid, config path, command line — and whether the
 run is still alive: `final_status` plus a `last_seen` stamped every
-`heartbeat_s` seconds. `results/config.effective.yaml` beside it is the merged
+`heartbeat_s` seconds for as long as the run can still prove it holds the lock
+(see the `--force-unlock` section: a run whose lock is gone stops stamping and
+says so, and `final_status` then stays `running` whatever became of the run). `results/config.effective.yaml` beside it is the merged
 configuration the run actually used, defaults included.
 
 Or watch it in a browser. `console/console.py` renders the same three files —
@@ -881,6 +990,11 @@ evaluates a document with the working directory set to its own folder.
 | report: `factor(s) with only one level` | the manifest does not distinguish conditions | check the `experiment` column of the manifest |
 | report: `N protein(s) have zero variance within every group` | identical in every replicate | listed in `zero_variance.tsv`; usually one shared peptide or an imputed constant. `drop_zero_variance: true` removes them |
 | `another metaannot is already running here` | a second run on the same results directory | wait for it; `--force-unlock` only if you are certain the other is gone |
+| `--force-unlock refused` | the lock names a pid on this host that the process table says is still running | do what the message says and run the `ps -p` it prints. If that process is not a metaannot its pid was recycled and `--force-unlock-live` is the answer; if it is, stop it or wait. A lock from another node is never refused, because this host cannot see that process table |
+| `another run holds this results directory` | the `_run` record in the state file names a run this one has never seen — the directory was handed to a replacement while this run was still going | nothing to do about the message: that run stops writing to the state file and exits. From this message on its **records** cannot reach the live run's at all — the refusal is latched and is asked before anything is read, so no later write of any key is attempted. What it wrote BEFORE it saw this message went in as an ordinary merge, naming its own keys. Its **outputs** are a clock and not a guarantee: a stage already running at the handover renames over the live run's until the handover is noticed, within `min(heartbeat_s, STATE_PROBE_S)`. Normal after a `--force-unlock-live`; look for `.superseded.*` files afterwards, and note that the search comes back EMPTY for a run superseded inside `diamond` or `esmfold`, whose real outputs are not declared and so are never parked — there you will find a leftover `.<stem>.<pid>.<tid>.part<ext>` instead |
+| `is no longer there, so it is being recreated` | the state file was removed or emptied while a run was using it | the records written before it vanished are gone with the file, and this run writes only what it records from here on. Nothing is corrupt and nothing you produced is lost — the outputs are on disk — but the next run has no record of those stages and will recompute or re-adopt them, saying so. Do not restore the file from a copy underneath a live run |
+| `is no longer there, so this run cannot prove it still owns this directory` | the **lock** was removed while this run was still alive — an operator, a tmp-reaper, a remount, or a replacement that took the directory with `--force-unlock-live` and has since exited | the run keeps recording the stages it finishes and exits normally, but writes no more `_run`: its `final_status` stays `running` and its heartbeat age keeps growing, so a console shows it as a run that never ended. `_run` says who owns the directory, and a vacant lock is not proof of that — from inside the process a lock removed by accident and one removed by a finished replacement are the same absence. Read the stage records, not `_run`, for what that run actually did |
+| `NOT renamed into place` | a stage finished inside a run that had already been superseded | its result is parked beside its target as `.superseded....` and nothing was deleted. This line is emitted only for a DECLARED output; a stage whose real file is written outside `atomic_out` is superseded silently. Expect a later stage of THAT run to fail on the missing input; the run holding the directory is unaffected |
 | `cannot run: [...] produced nothing and were not selected` | `--only`/`--from` skipped a stage this one needs | rerun without the selection, or add the named stages to it |
 | `deadlock: [...] can never become ready` | the scheduler has stages left but none whose dependencies are all satisfied, and nothing is still running | the message names the stuck stages and, per stage, which dependencies are unsatisfied. Normally that means those deps were excluded by `--only`/`--from`: add them to the selection, or drop the selection. If they *were* selected this is a bug in the stage graph, not a config error — keep the message |
 | a stage has said nothing for hours | it is working, or it is hung — you cannot tell from silence alone | every `progress_interval_s` seconds (60 by default) the newest line the tool wrote to stderr is echoed with its elapsed time; `no output yet on stderr` is the heartbeat from a tool that prints nothing. Set `progress_interval_s: 0` to switch it off |

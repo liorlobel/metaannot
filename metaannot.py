@@ -366,9 +366,37 @@ DEFAULT_CONFIG = {
     # 4h ago" about a run whose process table this machine cannot read - a job
     # on another node of the array, or any job at all on Windows.
     #
-    # ADVISORY ONLY. Nothing in this file reads it back, and in particular it
-    # never authorises reclaiming a lock. A heartbeat that stopped is not
-    # evidence the process died: it is equally the signature of one failed
+    # ADVISORY, and two earlier claims about it were too strong. "Nothing in
+    # this file reads it back" is no longer true: `_run` IS read back now, by
+    # the succession check before every state write and by --force-unlock's
+    # refusal, which prints `last_seen` and how long ago it was so an operator
+    # has the facts. And "nothing BRANCHES on this number" is true only of the
+    # VALUE COPIED INTO THE DOCUMENT, which is what it was written about: the
+    # succession check branches on run_id, host, pid and started, which say
+    # who wrote the record and which this timer does not touch, and the
+    # refusal branches on the process table. Nothing IN THIS FILE reads
+    # `_run.heartbeat_s` and decides something on it.
+    #
+    # The scope of that sentence is the file, not the world, and a wider
+    # version of it stood here and was false. console/console.py DOES read
+    # `_run.heartbeat_s` and decide on it: beat_of() takes it as the cadence
+    # its fresh/late/long bands are arithmetic on - 3x and 20x it - and a
+    # record carrying 0, the documented way to turn the heartbeat off, falls
+    # into a band of its own with a different sentence. So the number written
+    # here is a fact a READER interprets. Changing what is written into the
+    # document is a console-visible change; only the config key is private to
+    # this file.
+    #
+    # THE CONFIG KEY IT SITS ON IS A DIFFERENT MATTER, and does branch.
+    # `RunRecord.watch()` returns without starting the thread at all when it
+    # is 0, `_beat()` waits on it, and it is half of
+    # `min(heartbeat_s, STATE_PROBE_S)` - the bound on how long a superseded
+    # run can go on renaming its outputs over a live run's, because every tick
+    # is a merged write and so a fresh read of the document. So 0 does not
+    # merely stop a display updating: it leaves the fallback probe as the only
+    # detector. Neither the key nor the value ever authorises reclaiming a
+    # lock. A heartbeat that stopped is not evidence the process
+    # died: it is equally the signature of one failed
     # write, a thread that died, or a filesystem that went away, and from
     # another host those are indistinguishable from a corpse. Reclaiming a
     # lock on that reading puts two runs in one results directory, which is
@@ -2747,6 +2775,16 @@ def atomic_out(path):
         die(f"nothing was written to {tmp}, so {path} was left alone. "
             "The tool exited successfully but produced no output — check the "
             "log above for what it was asked to do.")
+    # The one ownership check on a stage output, and it declines rather than
+    # aborts: the work is finished and kept, it is simply not renamed over a
+    # file that now belongs to somebody else. _directory_still_ours() answers
+    # True on every doubt and does no I/O at all in the ordinary case, so a
+    # run that still owns its directory renames exactly as it always did -
+    # which is the property that matters most here, since every normal run
+    # takes this path for every output it writes.
+    if not _directory_still_ours():
+        _park_superseded(tmp, path)
+        return
     os.replace(tmp, path)
 
 
@@ -11222,20 +11260,42 @@ def signature(stage, cfg, p):
         json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def _windows_pid_alive(pid):
-    """Whether a pid names a live process on Windows, without signalling it.
+# The three answers the process table can give about a pid, and the only
+# vocabulary anything here reasons in. PROVEN_ALIVE and PROVEN_DEAD are
+# evidence; UNPROVABLE is the absence of it, and the two callers of that
+# evidence want OPPOSITE defaults from it, which is why it is three answers
+# and not a boolean:
+#
+#   _holder_is_alive() refuses to reclaim a lock unless it is PROVEN_DEAD, so
+#   unprovable reads as alive and a live run is never trampled.
+#
+#   --force-unlock's refusal fires only on PROVEN_ALIVE, so an unprovable
+#   holder is taken over exactly as it always was. That asymmetry is the whole
+#   care of it: a lock written on another node of the array is unprovable BY
+#   CONSTRUCTION - we cannot see that node's process table - and a refusal
+#   keyed on "not proven dead" would refuse there, which is the one case
+#   --force-unlock exists for. It would also refuse every lock on Windows.
+#
+# The same shape, and for the same stated reason, as is_still_ours()'s three
+# answers: callers that agree about the evidence and differ about its absence.
+PROVEN_ALIVE = "alive"
+PROVEN_DEAD = "dead"
+UNPROVABLE = "unknown"
 
-    Unprovable means alive, as everywhere else in the lock: a missing API, a
-    refused handle or an ambiguous exit code all answer True, and
-    --force-unlock is the escape. Only ERROR_INVALID_PARAMETER -- the answer
-    Windows gives for a pid that does not exist at all -- is taken as proof of
-    death.
+
+def _windows_pid_proof(pid):
+    """What Windows can prove about a pid, without signalling it.
+
+    Only ERROR_INVALID_PARAMETER -- the answer Windows gives for a pid that
+    does not exist at all -- and a real exit code are proof of death. A
+    missing API, a refused handle or a failed query prove nothing either way
+    and answer UNPROVABLE, which _holder_is_alive() reads as alive.
     """
     try:
         import ctypes
         from ctypes import wintypes
     except Exception:                                   # pragma: no cover
-        return True
+        return UNPROVABLE
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     ERROR_INVALID_PARAMETER = 87
     STILL_ACTIVE = 259
@@ -11247,18 +11307,87 @@ def _windows_pid_alive(pid):
         h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
                             int(pid))
         if not h:
-            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+            return (PROVEN_DEAD
+                    if ctypes.get_last_error() == ERROR_INVALID_PARAMETER
+                    else UNPROVABLE)
         try:
             code = wintypes.DWORD()
             if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-                return True
+                return UNPROVABLE
             # STILL_ACTIVE is ambiguous with a process that exited WITH code
-            # 259, which is why it errs towards alive rather than away.
-            return code.value == STILL_ACTIVE
+            # 259, which is why it errs towards alive rather than away. What
+            # that costs the refusal is one extra flag for a run that really
+            # did exit with that code, which is the cheap direction.
+            return PROVEN_ALIVE if code.value == STILL_ACTIVE else PROVEN_DEAD
         finally:
             k32.CloseHandle(h)
     except Exception:                                   # pragma: no cover
-        return True
+        return UNPROVABLE
+
+
+def _windows_pid_alive(pid):
+    """Whether a pid names a live process on Windows, without signalling it.
+
+    Unprovable means alive, as everywhere else in the lock: a missing API, a
+    refused handle or an ambiguous exit code all answer True, and
+    --force-unlock is the escape.
+    """
+    return _windows_pid_proof(pid) != PROVEN_DEAD
+
+
+def _lock_holder_note(state_path):
+    """What the state file beside a lock says about its holder, as TEXT.
+
+    For the --force-unlock refusal message and for nothing else. The decision
+    is already made by then - it was made on the process table - and this only
+    tells the operator what they would otherwise open the file to find out:
+    when the holder was last seen, what it is in the middle of, and what it
+    was invoked as. `_run` stays advisory exactly as its own comment says; no
+    branch here reads it back, and no lock is reclaimed on the strength of it.
+
+    Returns "" for anything it cannot read. A refusal must not turn into a
+    traceback because the state file is missing or garbled.
+    """
+    if not state_path:
+        return ""
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        rec = doc.get(RUN_KEY) if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(rec, dict):
+        return ""
+    bits = []
+    if rec.get("last_seen"):
+        ago = ""
+        if isinstance(rec.get("last_seen_epoch"), (int, float)):
+            ago = (" (%ds ago)"
+                   % int(max(0, time.time() - rec["last_seen_epoch"])))
+        bits.append(f"It last stamped {rec['last_seen']}{ago}")
+    # THIS run's running stages, not every running record in the document. A
+    # state file routinely holds `running` records left by an EARLIER run that
+    # was killed - that is the ordinary trace of a SIGTERM, which does not
+    # unwind and so never stamps - and attributing them to the pid in the lock
+    # tells an operator the live process is doing work it has never touched.
+    # Measured: SIGTERM a run mid-pfam, start a second with `--only dbcan`, and
+    # the refusal said "It has dbcan, pfam recorded running" of a process whose
+    # own command line, printed on the next line, says `--only dbcan`.
+    #
+    # `run_id` is what separates them, and it is in every record. A record with
+    # no run_id predates the field, so it is not this holder's either.
+    holder = rec.get("run_id")
+    running = sorted(k for k, v in doc.items()
+                     if k != RUN_KEY and isinstance(v, dict)
+                     and v.get("status") == "running"
+                     and v.get("run_id") == holder and holder is not None)
+    if running:
+        bits.append("It has " + ", ".join(running) + " recorded running")
+    argv = rec.get("argv")
+    if isinstance(argv, list) and argv:
+        bits.append("Its command line was `"
+                    + " ".join(str(a) for a in argv) + "`")
+    return (" " + ". ".join(bits) + ".") if bits else ""
 
 
 class ResultsLock:
@@ -11268,9 +11397,21 @@ class ResultsLock:
     damage is silent: both report success and the outputs are interleaved.
     """
 
-    def __init__(self, path, force=False, empty_grace=60.0):
+    def __init__(self, path, force=False, empty_grace=60.0, force_live=False,
+                 state_path=None):
         self.path = path
         self.force = force
+        # --force-unlock-live: the second flag that gets past the refusal
+        # below. It is a separate flag and not a wider --force-unlock because
+        # taking over a run this host can SEE running is a different claim
+        # from removing a lock whose writer is gone, and the docs have always
+        # told people to make only the second one.
+        self.force_live = force_live
+        # The state file beside this lock, for the refusal message alone.
+        # Nothing decides anything on it: `_run` is advisory, and it is read
+        # here to give the operator the facts they would otherwise go and
+        # assemble by hand.
+        self.state_path = state_path
         self.empty_grace = float(empty_grace)
         self.held = False
         # What __enter__ wrote into the file, and whether it got as far as
@@ -11296,9 +11437,22 @@ class ResultsLock:
         heartbeat is there for a person to read; the decision it informs is
         --force-unlock, and it is theirs.
         """
+        return self._holder_proof(info) != PROVEN_DEAD
+
+    def _holder_proof(self, info):
+        """What this host can PROVE about the process named in a lock file.
+
+        The process-table reading, in one place, answering with evidence
+        rather than with a verdict - see PROVEN_ALIVE above for why the two
+        callers need opposite defaults out of the same three answers.
+
+        Not a pid, or a lock written on another host, is UNPROVABLE and
+        nothing else: we cannot see that node's process table, and inventing
+        an answer for it is what would break --force-unlock on the cluster.
+        """
         pid, host = info.get("pid"), info.get("host", "")
         if not isinstance(pid, int) or host != socket.gethostname():
-            return True
+            return UNPROVABLE
         if os.name == "nt":
             # os.kill(pid, 0) on Windows calls TerminateProcess: asking
             # whether a process is alive that way would KILL it. OpenProcess
@@ -11306,14 +11460,22 @@ class ResultsLock:
             # this did, meant a lock left by a crashed run on Windows could
             # never be reclaimed and every resume needed --force-unlock -- and
             # a crash is exactly when reclaiming has to work.
-            return _windows_pid_alive(pid)
+            return _windows_pid_proof(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return False
+            return PROVEN_DEAD
+        except PermissionError:
+            # It exists. Another user owns it, which on a shared box is the
+            # normal shape of the thing the refusal is for, so this is proof
+            # and not a shrug.
+            return PROVEN_ALIVE
         except OSError:
-            return True                   # PermissionError: it exists
-        return True
+            # Anything else - an ESRCH-shaped EPERM from a container, an
+            # errno this platform invents - proves nothing, and an answer we
+            # cannot stand behind must not refuse the escape hatch.
+            return UNPROVABLE
+        return PROVEN_ALIVE
 
     def _empty_and_settled(self):
         """A zero-byte lock old enough that no live writer could still owe it.
@@ -11376,6 +11538,34 @@ class ResultsLock:
                         "Two runs sharing a results directory corrupt each "
                         "other. Wait for it, or use --force-unlock if you are "
                         "certain it is gone.")
+                if (self.force and not self.force_live
+                        and self._holder_proof(info) == PROVEN_ALIVE):
+                    # The refusal, and it fires on the PROVEN arm alone. It
+                    # takes nothing away: a holder on another node, a garbled
+                    # lock, a pid this host cannot ask about and every Windows
+                    # ambiguity are all UNPROVABLE, and --force-unlock reclaims
+                    # them exactly as it did before. What it adds is a message
+                    # in the one case the docs already tell an operator to
+                    # avoid - the other run is HERE, and running - where what
+                    # used to follow was silent: the superseded run's tail
+                    # rewriting the state file and renaming its outputs into
+                    # the live run's directory.
+                    #
+                    # It is also the only part of this fix that PREVENTS
+                    # rather than detects, which is why it is a refusal and
+                    # not a warning.
+                    die(f"--force-unlock refused: pid {pid} on {host or '?'} "
+                        f"holds {self.path} (started "
+                        f"{info.get('started', '?')}), and this host can see "
+                        f"that process is still running."
+                        f"{_lock_holder_note(self.state_path)}\n"
+                        "Two runs sharing a results directory corrupt each "
+                        "other silently, so find out what that process is "
+                        f"first (CLAUDE.md rule 4): `ps -p {pid}`. If it is "
+                        "NOT a metaannot -- a pid can be recycled by anything "
+                        "once its owner is gone -- or if you are certain it "
+                        "has to be taken over anyway, pass "
+                        "--force-unlock-live as well.")
                 log(f"removing a stale lock from pid {pid} on {host or '?'}",
                     "WARN")
                 try:
@@ -11403,10 +11593,20 @@ class ResultsLock:
     def is_still_ours(self):
         """Whether this run still owns the results directory.
 
-        THE ownership gate, and the only one: every write a superseded run can
-        still make asks this one question. It exists because a killed run now
-        UNWINDS - SIGTERM raises KeyboardInterrupt instead of terminating the
-        process where it stands - and unwinding WRITES. The sequence those
+        The ownership gate on the LOCK, and one of two. The other is
+        _judge_ownership(), which asks the same question of the `_run` record
+        in the state FILE, and the two are not interchangeable: this one is
+        authoritative about the directory - the lock is what a takeover
+        actually rewrites - and that one is authoritative about the document,
+        which is the thing a superseded run's write would damage. They read
+        different bytes, they can be readable at different moments, and they
+        share one latch, so a run learns it was superseded from whichever
+        notices first and stops for good either way. Neither authorises
+        anything; both only ever decline.
+
+        This one exists because a killed run now UNWINDS - SIGTERM raises
+        KeyboardInterrupt instead of terminating the process where it stands -
+        and unwinding WRITES. The sequence those
         writes have to survive is an operator's: run A is killed, A unwinds
         slowly, the operator sees it hang and --force-unlocks the directory,
         run B starts, and A's tail then lands on top of B. Both callers are
@@ -11414,10 +11614,14 @@ class ResultsLock:
         RunRecord must not write over B's `_run`.
 
         Three answers, not two, because the callers agree on "ours" and on
-        "B's" and genuinely differ on "no lock at all": there is nothing for
-        __exit__ to remove, while for RunRecord a vacant path means nobody was
-        superseded and its own verdict is still worth writing. True is ours
-        (or unreadable, see below), False is somebody else's, None is vacant.
+        "B's" and genuinely differ on "no lock at all". For __exit__ a vacancy
+        means there is nothing to remove, which is not a failure. For RunRecord
+        it means the opposite of what this comment used to say: a vacancy is not
+        proof that nobody was superseded, because it is exactly what a
+        replacement that took the directory and then EXITED leaves behind, so
+        `_run` - which is an ownership claim - is not written on it. Neither
+        caller may collapse it into "somebody else's". True is ours (or
+        unreadable, see below), False is somebody else's, None is vacant.
 
         Keyed on the CONTENT of the lock file, because the way a lock changes
         hands is remove-then-create: pid, host and the second it started
@@ -11428,21 +11632,53 @@ class ResultsLock:
         What it does NOT cover is a stage's own output file. A worker still
         inside st["fn"] when the interrupt lands runs to completion - the
         executor's __exit__ waits for it - and atomic_out renames its result
-        into place at the end. That rename is not gated here on purpose: a
+        into place at the end. That rename is not gated on THIS, on purpose: a
         transient read error on the lock would abort a stage that is
         legitimately finishing, which is a worse failure than the one being
         prevented.
 
-        That leaves a real hole, and it is not bounded the way it looks. This
-        run's own record is indeed never written - finish() is past by then -
-        but the record in the file by then is the REPLACEMENT's, and if the
-        replacement has already finished that stage and marked it "ok", our
-        rename drops our output under its valid signature and the run after
-        that reports "cached" and reads it. Nothing detects that. It is the
-        reason --force-unlock on a run that is still alive is unsupported
-        (CLAUDE.md rule 4), rather than something this gate can fix: closing
-        it needs the stage write itself to be ownership-checked, which is the
-        abort-a-finishing-stage trade above.
+        That left a real hole: this run's own record is indeed never written -
+        finish() is past by then - but the record in the file by then is the
+        REPLACEMENT's, and if the replacement has already finished that stage
+        and marked it "ok", our rename dropped our output under its valid
+        signature and the run after that reported "cached" and read it.
+
+        What covers PART of it is not this gate and is not a lock read. The
+        rename asks _directory_still_ours(), which is an in-memory flag plus,
+        at most, one rate-limited read of the state file, and which renames on
+        every doubt - so the abort-a-finishing-stage trade above is not taken.
+        Part, and the split has to be stated rather than rounded up, because
+        the two halves are different KINDS of thing:
+
+        A GUARANTEE. A stage that starts after the handover, with a state
+        document that is readable and whose `_run` names the replacement,
+        cannot rename at all: mark_running() is a merged write, so it reads
+        the document before the stage begins, the succession check refuses,
+        and the same latch then stops the rename. No timing is involved.
+
+        A CLOCK. Everything else. A stage already inside st["fn"] when the
+        directory changed hands, and a stage that started while the document
+        was missing or garbled, are noticed by whichever comes first of the
+        next heartbeat tick and the next fallback probe - so at worst
+        min(heartbeat_s, STATE_PROBE_S), which is 30 s on a default run - and
+        NOT BEFORE. Inside that window nothing detects the handover: a
+        takeover that completes in under a second is caught by nothing at all,
+        and that stage's output is renamed over the live run's exactly as it
+        was before this check existed. _directory_still_ours() says which
+        mechanism does the noticing and why the probe is usually not it.
+
+        NOT COVERED AT ALL: an output a stage writes without going through
+        atomic_out. This gate is atomic_out's, so it reaches nothing else, and
+        three stages write files outside it - see _park_superseded().
+
+        Also not covered, and unreachable by any ownership check: a run
+        SIGKILLed between its rename and its record, which writes nothing and
+        can prove nothing, so the next run reports `cached` over an output it
+        was not told about.
+
+        None of this makes --force-unlock on a run that is still alive
+        supported (CLAUDE.md rule 4) - that is what --force-unlock's refusal
+        is for, one screen up.
         """
         if self.token is None:
             # Never entered, so there is nothing of ours anywhere: not a lock
@@ -11455,11 +11691,13 @@ class ResultsLock:
             # No lock at all, which is NOT the same answer as somebody else's
             # and must not be collapsed into it: the two callers want opposite
             # things here. There is nothing to release, so __exit__ treats
-            # this as "not ours"; but nothing has taken the directory either,
-            # so refusing the state write costs a run nobody superseded its
-            # own final verdict - _run stranded at "running" with a WARN
-            # announcing a handover that never happened. None says "vacant",
-            # and each caller reads it for itself.
+            # this as "not ours" and removes nothing. RunRecord treats it as
+            # "cannot prove this is ours", which costs a run nobody superseded
+            # its own final verdict - see _save(), where that price and who
+            # pays it are set out. What it must NOT do is say a handover
+            # happened, because nothing here shows one: the WARN on that branch
+            # names both readings. None says "vacant", and each caller reads it
+            # for itself.
             return None
         except OSError:
             # Unreadable is NOT the same answer as somebody else's, and
@@ -11583,7 +11821,18 @@ def _stamp_epoch(s):
         return None
 
 
-_STATELOCK = threading.Lock()
+# Threads of THIS process, and nothing else. It never implied anything about
+# other processes and does not now; what changed is that update_state() holds
+# it across a read, a write and a read-back rather than around the write
+# alone, so two of our own stages finishing at the same instant cannot
+# reintroduce the lost update locally that the merge exists to prevent
+# globally.
+#
+# RLock, because save_state() still takes it on its own account - it is called
+# directly by callers that are not update_state(), and by tests that
+# monkeypatch it and then call the real one - and the nested acquire is one
+# thread taking a lock it already holds.
+_STATELOCK = threading.RLock()
 
 
 def _rmd_bin_vocabulary(text):
@@ -11610,13 +11859,40 @@ def _check_bin_vocabulary():
 
 
 def save_state(path, state):
-    # Locked and written via a temp file: stages finish concurrently, and a
-    # torn state file would silently invalidate every cached stage.
+    """Write the whole document, atomically. THE WRITE STEP, not the writer.
+
+    Name, signature and whole-document semantics are unchanged, and that is
+    deliberate: it is what the failure-injection tests patch, and a caller
+    holding a plain dict can still call it. What changed is that no caller in
+    the engine calls it directly any more. Every one of them goes through
+    update_state(), which merges the keys it actually changed into the
+    document as it is on disk right now, so this function is handed a document
+    that already carries whatever another writer put there.
+
+    Returns the payload it wrote, so update_state can compare the file against
+    it afterwards without parsing anything. A patched save_state that returns
+    None simply skips that comparison.
+
+    Locked and written via a temp file: stages finish concurrently, and a torn
+    state file would silently invalidate every cached stage. The temp is named
+    the way atomic_out names its own - a leading dot and the fixed .part
+    suffix - so a leftover from a writer killed mid-update is found by the one
+    sweep that finds every other leftover in the tree,
+    `find results -name '.*.part.*'`. The old `<path>.<pid>.<tid>.tmp` was in
+    the results ROOT, which is the directory an operator opens cold, and was
+    the one leftover that sweep could not see.
+    """
     with _STATELOCK:
-        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        payload = json.dumps(dict(state), indent=1, sort_keys=True)
+        d = os.path.dirname(path) or "."
+        stem, ext = os.path.splitext(os.path.basename(path))
+        tmp = os.path.join(
+            d, f".{stem.lstrip('.')}.{os.getpid()}."
+               f"{threading.get_ident()}{ATOMIC_SUFFIX}{ext}")
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(dict(state), fh, indent=1, sort_keys=True)
+            fh.write(payload)
         os.replace(tmp, path)
+        return payload
 
 
 # The key the run record lives under. A leading underscore because the rest of
@@ -11631,6 +11907,682 @@ RUN_KEY = "_run"
 # the next tick usually succeeds. Not unbounded: a thread retrying a write that
 # can never succeed would repeat itself for the length of the run.
 HEARTBEAT_GIVE_UP = 5
+
+
+# How many times one update_state() write may find the file changed under it
+# and redo its merge. Not 1: the whole point of the read-back is that a writer
+# which loses a race redoes the merge against the document as it now stands,
+# so the record it would have clobbered comes back. Not unbounded: two
+# processes writing in lockstep would keep each other going round for ever.
+# After this many attempts the last write stands and says so in the log.
+STATE_WRITE_TRIES = 3
+
+# A floor on how often the RENAME path may read the state file to ask whether
+# this run still owns the directory. atomic_out() is called once per declared
+# output for most stages and once per ITEM for several - one PDB per dark
+# protein, one file per DIAMOND database, one per hhblits query - so an
+# unthrottled read there is an open() per protein on a shared array. The
+# console met the same shape in the same directory and answered it the same
+# way, with PART_RESCAN_S and its own argument: a probe is evidence, not a
+# control, so noticing a handover half a minute late costs at most one rename,
+# while reading a file once per protein costs the box the run is on. On a run
+# with a heartbeat this probe never fires at all: every tick is a merged write
+# and so a fresh read, which refreshes the same timestamp for free.
+STATE_PROBE_S = 30.0
+
+# What this process knows about whether it still owns the results directory it
+# writes into. One dict rather than a scatter of globals because it is all one
+# fact and because it is reset as a unit, by _watch_state(), at the start of a
+# run.
+#
+# `lost` is set from exactly one place: a `_run` block that was READ, PARSED,
+# and found to name a run outside this one's claim. Every failure - an OSError,
+# a garbled file, a missing one, a `_run` that is not a dict - leaves it None,
+# which means "carry on exactly as before this check existed".
+#
+# It is therefore NOT on its own the answer to "was this run superseded": it
+# cannot be raised at all when the document is the thing that is missing or
+# garbled. `record.superseded` is the other half - the lock gate's, raised
+# from bytes that are not in this file - and _superseded() is the two of them
+# together. Ask that, not this, wherever a write or a rename is being refused.
+#
+# And neither half, nor both, is ever asked as PERMISSION. Three revisions
+# tried to make a write that rebuilds a whole document safe by first proving
+# the run had not been superseded, and no reading of these two latches can do
+# it: the sequence that defeats them needs no race at all - a replacement that
+# has FINISHED leaves a vacant lock and no `_run` to read - so the rebuild was
+# deleted instead. See the missing/unparseable arm of update_state().
+_STATE_WATCH = {
+    "path": None,           # the state file this run writes
+    "record": None,         # the RunRecord, so one latch serves both gates
+    "claim": frozenset(),   # the `_run` identities this run may write over
+    "lost": None,           # the identity that took the directory, once proven
+    "seen": 0.0,            # when a read of the document last succeeded
+    "parsed": False,        # whether ANY read of it has ever parsed
+    "tried": 0.0,           # when the rename path last probed; its rate limit
+    "said": set(),          # what has already been said once
+}
+
+# The declared outputs of the stages of this run, for the parking rule in
+# atomic_out(). Filled in by cmd_run once Paths exists; empty everywhere else,
+# which means "park nothing, leave the .part", the conservative answer.
+_DECLARED_OUTPUTS = set()
+
+# Fixed, like ATOMIC_SUFFIX and for the same reason: a human looking at a
+# results directory has to be able to tell what a file is at a glance, and
+# `find results -name '.superseded.*'` has to find every one of them.
+SUPERSEDED_SUFFIX = ".superseded"
+
+
+def _run_identity(rec):
+    """Who wrote a `_run` block: run_id, host, pid, and the second it started.
+
+    The host, the pid and the start as well as run_id, because run_id on its
+    own is `%Y%m%dT%H%M%S-<pid>` with no host in it, so two nodes of a shared
+    array starting in the same second can be handed the same pid and mint the
+    same id. ResultsLock's own token identifies its writer by host, pid and
+    start for exactly that reason.
+
+    None for anything that is not a `_run` a metaannot wrote, and every caller
+    reads None as "no evidence", never as "somebody else".
+    """
+    if not isinstance(rec, dict) or not rec.get("run_id"):
+        return None
+    return (rec.get("run_id"), rec.get("host"), rec.get("pid"),
+            rec.get("started"))
+
+
+def _watch_state(path, record, claim):
+    """Arm the ownership checks for this run, and reset anything a previous
+    one left behind. Called once, from RunRecord, which is the object that
+    exists exactly once per run.
+
+    It took an `interval` for three revisions and never read it. The heartbeat
+    period belongs to the RunRecord that owns the timer, and a reader gets it
+    out of `_run.heartbeat_s`; a copy here was a second place for it to be
+    wrong and nothing at all for it to be right about. `seen` is the only
+    clock this dict keeps, and it is a moment rather than a period.
+    """
+    _STATE_WATCH.update(path=path, record=record,
+                        claim=frozenset(x for x in claim if x),
+                        lost=None, seen=time.time(), parsed=False,
+                        tried=0.0, said=set())
+
+
+def _said_once(key, message, level="WARN"):
+    """Say something the first time only. A run whose filesystem is refusing
+    reads would otherwise repeat one line per write for the length of it."""
+    if key in _STATE_WATCH["said"]:
+        return
+    _STATE_WATCH["said"].add(key)
+    log(message, level)
+
+
+def _own_run_id():
+    """This run's id, or "" where there is no run record (a test, describe)."""
+    rec = _STATE_WATCH["record"]
+    return (rec.rec.get("run_id") or "") if rec is not None else ""
+
+
+def _read_state_for_merge(path):
+    """The document as it is on disk right now, and how well that went.
+
+    NOT load_state(), and keeping the two apart is the most important line in
+    this file. load_state() is the run's ONE start-of-run read: it WARNs that
+    every stage will be recomputed and returns an empty _State whose
+    `unreadable` flag then stops adoption for the whole run. Routed through
+    here - once per write, several times per stage - that warning would fire
+    on every write, and the empty dict it returns would make the merge below
+    write a document holding only this run's keys, silently deleting every
+    other stage's record because the filesystem hiccuped for one instant. That
+    is the worst failure this design could have.
+
+    Parsed, missing, unparseable, unreadable - because the callers do
+    genuinely different things with them:
+
+      parsed       the document, to merge into and to check ownership against.
+      missing      there is nothing to merge into, so the write CREATES a
+                   document holding only the keys it names.
+      unparseable  bytes that are not a document are damage, not a rival's
+                   payload - the same judgement is_still_ours() makes one
+                   layer down - so the write replaces them, and again with
+                   only the keys it names.
+      unreadable   we know NOTHING, so the write is declined rather than made.
+
+    The difference between the middle two and the last one is the difference
+    between a document that DEMONSTRABLY holds nothing we can use and a
+    document we simply failed to look at. Neither of the middle two licenses
+    writing anything a caller did not name: see update_state().
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return {}, "missing"
+    except UnicodeDecodeError as e:
+        # A ValueError, not an OSError, so it needs its own arm exactly as it
+        # does in is_still_ours(): a torn write cutting a multi-byte
+        # character, or a page of nulls where a payload should be.
+        _said_once("decode", f"the state file {path} holds bytes that are not "
+                             f"text ({e}); the next write replaces it with a "
+                             "document holding only the keys that write "
+                             "names, and any record another run put there is "
+                             "not in it")
+        return {}, "unparseable"
+    except OSError as e:
+        _said_once("read", f"the state file {path} could not be read ({e}), "
+                           "so nothing is written to it until a read "
+                           "succeeds: writing without knowing what is already "
+                           "in it would delete every record this run has no "
+                           "view of. The run itself is not affected; the "
+                           "worst this costs is a finished stage recomputed "
+                           "by the next run.")
+        return {}, "unreadable"
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        _said_once("parse", f"the state file {path} does not parse ({e}); the "
+                            "next write replaces it with a document holding "
+                            "only the keys that write names, and any record "
+                            "another run put there is not in it")
+        return {}, "unparseable"
+    if not isinstance(doc, dict):
+        _said_once("shape", f"the state file {path} holds "
+                            f"{type(doc).__name__}, not an object; the next "
+                            "write replaces it with a document holding only "
+                            "the keys that write names, and any record "
+                            "another run put there is not in it")
+        return {}, "unparseable"
+    _STATE_WATCH["parsed"] = True
+    return doc, "parsed"
+
+
+def _judge_ownership(doc, path):
+    """Whether the `_run` in a document we have just read is one we may write
+    over. The succession check.
+
+    It is a REFUSAL and never an authorisation, which is the same shape
+    _holder_is_alive() and is_still_ours() have: one successfully parsed,
+    foreign identity is the ONLY thing that can stop a write, and every kind
+    of doubt - no `_run`, a `_run` with no run_id, one that is not a dict, a
+    document we could not read at all - answers "still ours" and writes.
+
+    A foreign `_run` on disk is the NORMAL state at the start of every resume:
+    it is the previous run's record. That is what the CLAIM is for. It holds
+    this run's own identity and the identity of the run it took the directory
+    over from, captured before `_run` was overwritten, so a legitimate resume
+    writes over its predecessor for the whole of its life, and only a THIRD
+    identity - a run that took the directory after us - stands this one down.
+
+    It shares one latch with ResultsLock's gate, deliberately. The lock is
+    authoritative about the DIRECTORY and this is authoritative about the
+    FILE; they answer from different evidence and can be readable at different
+    moments, so a run learns it was superseded from whichever notices first
+    and stops for good either way.
+    """
+    _STATE_WATCH["seen"] = time.time()
+    claim = _STATE_WATCH["claim"]
+    if not claim:
+        # Nothing has claimed this document, so there is nobody to supersede
+        # and nothing to refuse. This is the describe()/test path.
+        return True
+    ident = _run_identity(doc.get(RUN_KEY))
+    if ident is None or ident in claim:
+        return True
+    if _STATE_WATCH["lost"] is None:
+        _STATE_WATCH["lost"] = ident
+        rec = _STATE_WATCH["record"]
+        if rec is not None:
+            rec.supersede()
+        log("another run holds this results directory: the state file "
+            f"{path} records run {ident[0]} (pid {ident[2]} on {ident[1]}), "
+            "which is neither this run nor the run it took over from. "
+            "Nothing further is written to the state file from here, and any "
+            "output this run still finishes is left beside its target "
+            "instead of being renamed over the live run's. That happens when "
+            "a run is killed, takes a while to unwind, and the directory is "
+            "--force-unlocked meanwhile.", "WARN")
+    return False
+
+
+def _superseded():
+    """Whether EITHER ownership gate has already stood this run down.
+
+    The two gates read different bytes: ResultsLock.is_still_ours() asks the
+    LOCK, which is what a takeover actually rewrites, and _judge_ownership()
+    asks the `_run` record in the state FILE. They share one latch so that a
+    run learns it was superseded from whichever notices first - and this is
+    the function that makes that sentence true, because the latch has two
+    halves and only one of them lives in _STATE_WATCH.
+
+    `_STATE_WATCH["lost"]` is raised by _judge_ownership() and by nothing
+    else, and _judge_ownership() runs only on a read that SUCCEEDED and
+    PARSED. So when the document is the thing that is missing or garbled -
+    an operator's `rm`, a remount, a page of nulls where a crashed writer's
+    payload should be - that half CANNOT be raised, however long ago the
+    directory changed hands. Asking it alone is how _directory_still_ours()
+    came to be silently inoperative on the ordinary local takeover, where
+    RunRecord._save() latches from the LOCK and the succession check is never
+    reached at all: `lost` stayed None for the whole unwind and the rename
+    gate went on answering "ours".
+
+    What this is not, in any combination, is PERMISSION. Three revisions used
+    it to try to make a write that rebuilt a whole document safe, and no
+    reading of the two halves can be: the losing ordering needs no race,
+    because a replacement that has FINISHED leaves a vacant lock and no `_run`
+    to read. That write was deleted rather than gated - see update_state() -
+    and nothing here licenses another one.
+
+    RunRecord.superseded is the other half. It is raised from the lock, whose
+    bytes are a different file on a different path, and it is monotone - a run
+    told once that it lost the directory has lost it, and nothing it observes
+    afterwards gives it back.
+
+    None of this authorises anything; like both gates it only ever declines.
+    """
+    if _STATE_WATCH["lost"] is not None:
+        return True
+    rec = _STATE_WATCH["record"]
+    return rec is not None and bool(rec.superseded)
+
+
+def update_state(path, state, keys, claim=None, drop=()):
+    """Write the keys this caller changed INTO the document that is on disk.
+
+    The replacement for handing save_state() one process's whole in-memory
+    snapshot. Every mutation site in this file changes exactly ONE key - three
+    in finish(), one in mark_running(), one in RunRecord - so the whole
+    document was never what any caller meant; it was an accident of the
+    signature save_state() happened to have. Naming the keys is what lets a
+    run that no longer knows the truth about the other stages leave them
+    alone.
+
+    What this buys, in the sequence it exists for: run A hangs, the operator
+    --force-unlocks, run B completes four stages, and A's tail then records
+    the one stage it really did finish. A writes its own key into B's
+    document; B's other records are read, kept and written back. Before this,
+    A's snapshot replaced the file and B's work was gone with no warning.
+
+    What it does NOT buy, and no sentence here may say otherwise: this is not
+    atomic, not a compare-and-swap and not mutual exclusion. `os.replace` is
+    atomic, so no reader ever sees a spliced document, but between our read
+    and our rename another process can write, and on NFS attribute caching can
+    hand this read a document older than the last write and let the read-back
+    compare against a cached copy and report a success it did not earn. What
+    it does is shrink the lost-update window from the whole run - read at the
+    start, write at the end, everything in between gone - to the gap between
+    one read and one rename. What is left inside that gap is NOT caught, and
+    the published docs said for a while that it was. The read-back compares the
+    file against the payload we just renamed, so it sees a writer that landed
+    AFTER our rename and redoes the merge against the document as it now stands
+    - which brings that record back. A writer that landed BEFORE our rename is
+    simply not in what we merged, our own complete document goes over it, the
+    read-back matches, and nothing says a word. Read that as a CLOCK whose
+    window is one read-modify-rename and not as an exclusion: the mechanism has
+    been demonstrated by injecting a write into the gap, and the race has not
+    been won at shipped speeds, so the width is unmeasured rather than small.
+
+    `keys` are the keys to take from `state`; a key that is not in `state` is
+    deleted from the document, which is how a record is removed without the
+    caller having to hold a whole document to remove it from.
+
+    `drop` is the --force discard, and it is a MAPPING of stage name to the
+    record that stage had when --force popped it, not a set of names. That is
+    the difference between deleting a key and deleting a key this caller knows
+    the truth about. --force decides its discards from ONE read at the start of
+    the run and each merged write then carries them until the stage is recorded
+    again, so a blind `merged.pop(k)` deletes whatever is under that name at
+    the moment of the write - including a record another run wrote after the
+    discard was decided. Driven: a live run's `dbcan` record disappeared,
+    silently, from a document a superseded --force run was writing `pfam` into,
+    with no race and no window to be inside. So the pop is conditional on the
+    record still being the one that was read, and where it is not, the
+    document's record is left exactly where it is and the reason is said once.
+    Applied before the keys, so that a stage being re-recorded in the same
+    write keeps its new record.
+
+    `claim` is NOT read as a set here, and the sentence that said it was the
+    identity set the succession check allows described a parameter this
+    function does not have. The succession check reads the claim from
+    _STATE_WATCH, where _watch_state() put it once, because the identities are
+    a property of the RUN and not of any one write. All this function asks the
+    argument is whether it is empty: a non-empty claim marks a caller that is
+    a real run, and so a caller the ownership gate below applies to, while an
+    empty one is describe(), or a test writing a document nobody has claimed,
+    where there is no run to supersede and nothing to refuse.
+
+    Nothing here gates `_run`. A gate that declined only the write which
+    would CREATE the document stood in this function and was deleted: a run's
+    own stage record creates the document one call earlier, so for every run
+    that records anything the gate was never reached. Ownership of the
+    DIRECTORY is decided where the lock is read, in RunRecord._save(), which is
+    the only caller that writes `_run` at all.
+
+    Returns whether the document was written.
+    """
+    keys = tuple(keys)
+    if drop and not isinstance(drop, dict):
+        # Loud, and at the call site. This parameter WAS a set of names, and
+        # popping a name without looking at what is under it is exactly the
+        # defect it was changed to prevent - so a caller still passing names
+        # has to be told that rather than handed a dict() ValueError from
+        # inside a state write.
+        raise TypeError(
+            "update_state(drop=...) takes a mapping of stage name to the "
+            "record the discard was decided about, not a collection of "
+            "names; a name alone does not say whether the record on disk is "
+            "still the one this run read.")
+    drop = dict(drop or {})
+    if claim and _superseded():
+        # LATCHED, and asked before anything is read: a run that has been told
+        # once by EITHER gate that it lost the directory has lost it, and from
+        # there on writes nothing into this file at all - not a stage record,
+        # not `_run`, not into a document it could read and not into one it
+        # could not. Both halves, not just `lost` - see _superseded(). This is
+        # rule 4 of CLAUDE.md as a mechanism rather than as advice, and it is
+        # the whole of what the check is for.
+        #
+        # It is NOT what keeps a superseded run from rebuilding a whole
+        # document. Nothing rebuilds a whole document any more, and the
+        # missing/unparseable arm below sets out why no reading of these
+        # latches could ever have been trusted with that job.
+        return False
+    with _STATELOCK:
+        for _attempt in range(STATE_WRITE_TRIES):
+            base, how = _read_state_for_merge(path)
+            if how == "unreadable":
+                # Not written BLIND, which is the only thing this branch is
+                # for. We know nothing about what the document holds, so
+                # merging into the empty dict the read returned would write a
+                # file holding this run's keys and nothing else - deleting
+                # every other stage's record because the filesystem hiccuped
+                # once, the worst failure this design could have. Declining
+                # costs at most one record that never reaches the file, which
+                # decide() then reads as an output with no record: adopt or
+                # recompute, never corruption. _read_state_for_merge has
+                # already said so once in the log.
+                return False
+            if how == "parsed":
+                if not _judge_ownership(base, path):
+                    return False
+                merged = dict(base)
+                for k, was in drop.items():
+                    if k not in merged:
+                        continue
+                    if merged[k] != was:
+                        # Somebody else has recorded this stage since --force
+                        # decided to discard it. Their record is newer than the
+                        # decision and is not this run's to delete.
+                        _said_once(
+                            f"drop:{k}",
+                            f"--force wanted the '{k}' record in {path} "
+                            "discarded, but the record there now is not the "
+                            "one this run read at the start: another run has "
+                            "recorded that stage since. It is left alone - a "
+                            "run only deletes a record it knows the truth "
+                            "about - so if this run reruns that stage it will "
+                            "write over it then, and if it does not, the "
+                            "other run's record stands.")
+                        continue
+                    merged.pop(k, None)
+            else:
+                # MISSING or UNPARSEABLE: there is nothing to merge into, so
+                # this write creates a document holding the keys it NAMES and
+                # nothing else. Every other record stays gone.
+                #
+                # DO NOT PUT THE REBUILD BACK. What stood here rebuilt the
+                # whole document out of `state` - one run's in-memory snapshot
+                # - on the reasoning that a document which is not there has
+                # nothing in it to lose. It has: the records of whatever run
+                # holds the directory now. Three revisions kept the rebuild
+                # and tried to gate it, and each gate was broken in turn.
+                #
+                #   1. On `_STATE_WATCH["lost"]`. That latch is raised only by
+                #      _judge_ownership(), i.e. only by a read that SUCCEEDED
+                #      and PARSED - so on the exact failure that reaches this
+                #      arm it is guaranteed silent.
+                #   2. On that plus the lock latch. Nothing in finish(),
+                #      mark_running() or record() reads the lock, so in the
+                #      real ordering neither half is up; the test that passed
+                #      did so only because its fixture had called
+                #      RunRecord._save() first.
+                #   3. And NO LOCK READ CAN FIX IT, which is the finding that
+                #      settles it. A parks; B takes the directory with
+                #      --force-unlock-live, records dbcan and diamond, and
+                #      EXITS, removing its lock; the document is removed; A's
+                #      tail - or A's heartbeat alone, before any stage of A
+                #      has finished - rebuilds `{_run: A, pfam: A}`.
+                #      is_still_ours() answers None on a vacant path and the
+                #      lock half can never come up. Reproduced at heartbeat_s
+                #      0, 1 and 30. A VACANT LOCK IS EXACTLY WHAT A FINISHED
+                #      REPLACEMENT LEAVES BEHIND, so vacancy can never license
+                #      rebuilding a document - which is why _save() now
+                #      declines `_run` on it outright.
+                #
+                # It is the right trade even where no other run exists at all,
+                # which is the case the rebuild was written for: a SOLO run
+                # whose document is removed mid-run loses the records of the
+                # stages it had already finished. That costs a RECOMPUTATION
+                # and nothing else - the outputs are still on disk and only
+                # their provenance is gone - and over-invalidating rather than
+                # under-invalidating is the standing trade in this file (see
+                # signature()). Rebuilding costs a live run's records, which
+                # is a results table that looks fine and is not.
+                #
+                # `seen` is deliberately not refreshed here either. It records
+                # when a read of the document last SUCCEEDED, and the rename
+                # gate skips its fallback probe on the strength of it; a read
+                # that came back missing or unparseable proves nothing about
+                # who owns the directory and must not buy the gate another
+                # STATE_PROBE_S of silence.
+                if how == "missing" and _STATE_WATCH["parsed"]:
+                    # Said out loud, and only where the document was there and
+                    # is not any more. A fresh results directory reaches this
+                    # arm on its first write every single time, so warning on
+                    # `missing` alone would put a line about lost records into
+                    # every clean run; `parsed` is what tells the two apart.
+                    _said_once("gone",
+                               f"the state file {path} is no longer there, so "
+                               "it is being recreated holding only the keys "
+                               "this run writes from here on: the stages "
+                               "recorded before it disappeared are not in it. "
+                               "Nothing this run produced is lost - those "
+                               "outputs are on disk - but the next run has no "
+                               "record of them and will recompute or re-adopt "
+                               "them. Nothing belonging to another run is "
+                               "rebuilt from this run's snapshot either; one "
+                               "writer per results directory is the rule "
+                               "(CLAUDE.md rule 4).")
+                merged = {}
+            for k in keys:
+                if k in state:
+                    merged[k] = state[k]
+                else:
+                    merged.pop(k, None)
+            # Resolved through the module global on purpose, so that a test
+            # which replaces save_state to inject ENOSPC or EIO still injects
+            # into the write this function makes.
+            payload = save_state(path, merged)
+            if payload is None:
+                # A patched save_state with nothing to compare against.
+                return True
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    back = fh.read()
+            except (OSError, ValueError):
+                # Rewriting on a read we could not perform is how a doubt
+                # turns into a clobber. Assume our write stood.
+                _said_once("readback", f"the state file {path} could not be "
+                                       "read back after writing it, so "
+                                       "whether another run wrote over it in "
+                                       "that instant is not known here. The "
+                                       "write itself succeeded.")
+                return True
+            if back == payload:
+                return True
+            # Somebody replaced the file between our read and our read-back.
+            # Round again: the merge is redone against the document as it now
+            # stands, so whatever we just clobbered comes back with it.
+        _said_once("races", f"the state file {path} changed underneath this "
+                            "run's write "
+                            f"{STATE_WRITE_TRIES} times running, so "
+                            "the merge stopped retrying and the last write "
+                            "stands. Another process is writing this file; "
+                            "one writer per results directory is the rule "
+                            "(CLAUDE.md rule 4).")
+        return True
+
+
+def _directory_still_ours():
+    """Whether this run may still rename an output into place.
+
+    True unless there is POSITIVE, PARSED proof otherwise, and that polarity
+    is the whole design of it. Both latches count as that proof and both are
+    asked - see _superseded(). Asking only `lost`, as this did, asked only the
+    half that a successful read of the DOCUMENT can raise, and on the ordinary
+    local takeover that is the half that never fires: RunRecord._save() tests
+    the LOCK before it writes, so the tick after a handover latches from the
+    lock and returns without ever reaching the succession check. `lost` stayed
+    None for the rest of the unwind, this function went on answering True, and
+    the in-flight stage renamed over the live run's output - the whole clock
+    below, silently inoperative on the path it was written for. The lock read
+    is proof of exactly the same quality: is_still_ours() answers False only
+    on a lock file it READ and found to hold somebody else's token, and
+    answers True on every unreadable one. The objection to gating a rename on ownership
+    is that a transient read error would then abort a stage that is
+    legitimately finishing, which is worse than what it prevents - and that
+    objection is about the FAILURE DIRECTION, not about reading. Here there is
+    exactly one path to not renaming and it needs a read that SUCCEEDED and
+    returned a foreign, parsed identity. An OSError, a missing file, a garbled
+    one, a `_run` that is not a dict, no run record at all: every one of them
+    renames, exactly as this did before the check existed. Nothing is ever
+    aborted; a stage that cannot prove it lost the directory finishes.
+
+    The usual answer costs no I/O at all: the flag is already set, or the
+    document was read within STATE_PROBE_S by the write path - every heartbeat
+    tick and every stage record is a merge read. Only a run with its heartbeat
+    off, or one whose heartbeat is slower than STATE_PROBE_S, or one inside a
+    stage longer than that, reaches the file, and then at most once per
+    STATE_PROBE_S however many times it is asked.
+
+    WHICH MEANS THE PROBE IS NOT THE DETECTOR ON A DEFAULT RUN, and saying
+    "caught within one probe interval" hid that. `seen` is refreshed by EVERY
+    merge read, a heartbeat tick IS a merge read, and heartbeat_s is 30 s
+    while STATE_PROBE_S is 30 s - so on a default run `now - seen` is
+    essentially never over the limit and this function essentially never opens
+    the file. ESSENTIALLY, in both halves of that sentence, because the two
+    intervals are EQUAL: the margin is tick jitter, and a tick that lands a
+    few milliseconds late really does let one probe through. It costs one read
+    and cannot change an answer - the probe only ever declines, and on a
+    document that still names this run it declines nothing - so the equality
+    is not a defect to remove. The two sentences just have to say the same
+    thing, and an earlier "never opens the file at all" did not. What notices
+    a handover here is the heartbeat's own write, whose merge read runs the
+    succession check and latches the flag this function reads first. The probe
+    is the fallback for the runs the heartbeat does not cover: heartbeat_s 0,
+    or an interval longer than STATE_PROBE_S.
+
+    So the real bound on noticing is min(heartbeat_s, STATE_PROBE_S), with a
+    heartbeat_s of 0 meaning "the probe alone" - 30 s either way as shipped.
+    It is A CLOCK AND NOT AN EXCLUSION, and nothing here may be written as
+    though it were one. Inside that window there is no detection whatsoever: a
+    takeover that completes in 0.7 s is caught by nothing, and a stage that
+    was already inside st["fn"] renames its output over the live run's exactly
+    as it did before this check existed. Shortening the window is a matter of
+    lowering heartbeat_s, which costs one small file rewrite per interval.
+
+    The one part of this that is NOT a clock is the other half of the split
+    is_still_ours() sets out: a stage that STARTS after the replacement
+    claimed the directory cannot rename at all, because mark_running() is a
+    merged write and the succession check refuses it first - provided the
+    document was readable and named the replacement. A stage that starts while
+    the document is missing or garbled is back on the clock with the rest.
+    """
+    if _superseded():
+        return False
+    path = _STATE_WATCH["path"]
+    if path is None:
+        return True
+    now = time.time()
+    if now - _STATE_WATCH["seen"] <= STATE_PROBE_S:
+        return True
+    if now - _STATE_WATCH["tried"] < STATE_PROBE_S:
+        return True
+    _STATE_WATCH["tried"] = now
+    doc, how = _read_state_for_merge(path)
+    if how == "parsed":
+        _judge_ownership(doc, path)
+    return not _superseded()
+
+
+def _park_superseded(tmp, path):
+    """Leave a superseded run's finished work where it cannot be inherited.
+
+    Not deleted: CLAUDE.md rule 5, and the stage's work is real work a human
+    may want. Not renamed onto its target either, which is the point - the run
+    that holds the directory now may already have recorded that stage under
+    its own valid signature, and this file would land underneath it, after
+    which the next run reports `cached` and reads it.
+
+    A DECLARED output is parked under a name with the marker in FRONT of the
+    stem. That matters: a console looks for work in progress by matching
+    `.<stem>.` in the output's own directory, so a parked file named after the
+    stem would be offered to an operator as the live run's stage writing
+    bytes right now - and, being older, would eventually be reported as stalled
+    against a run that is perfectly healthy.
+
+    A PER-ITEM output - one PDB per dark protein, one file per DIAMOND
+    database - is not parked at all; its .part is simply left. Parking those
+    would put one undeletable file per protein into a results directory
+    nothing is allowed to clean up, and the .part convention already names
+    them for the sweep that finds every other leftover.
+
+    WHAT THIS FUNCTION NEVER SEES, because it is atomic_out's and reaches
+    nothing else. Three stages write files without going through atomic_out,
+    so a superseded run still puts those into the live run's directory with
+    no check and no warning:
+
+      diamond   `diamond/.done` - plain open().close(), like every stage
+                sentinel. Its per-database <tag>.tsv DOES go through
+                atomic_out and is covered.
+      hhblits   the per-query `<id>.hhr`, which does its own `.part` write and
+                its own os.replace - so every query this stage finishes after
+                the handover lands in the live run's directory. Its end-of-
+                stage sweep also removes `*.hhr.part` and `_q_*.fasta` from
+                that directory. And `hhblits/.done`.
+      esmfold   `structures/plddt.tsv`, appended in place; `esmfold_failed
+                .tsv`; and `structures/.done`. Its per-protein PDB DOES go
+                through atomic_out and is covered.
+
+    Stated rather than fixed, deliberately: routing those through atomic_out
+    changes the temp names the `.part` sweep and the console both match on,
+    which is a change of its own rather than a correction to this one. It is
+    in the NOT-DONE list.
+    """
+    if path not in _DECLARED_OUTPUTS:
+        log(f"{path} was written by a run that no longer holds this results "
+            f"directory, so it was NOT renamed into place; the work is left "
+            f"at {tmp} and nothing was deleted. Renaming it would drop this "
+            "run's output under the record of the run that holds the "
+            "directory now.", "WARN")
+        return
+    d = os.path.dirname(path) or "."
+    stem, ext = os.path.splitext(os.path.basename(path))
+    parked = os.path.join(
+        d, f"{SUPERSEDED_SUFFIX}.{stem}.{_own_run_id() or os.getpid()}{ext}")
+    try:
+        os.replace(tmp, parked)
+    except OSError:
+        parked = tmp
+    log(f"{path} was written by a run that no longer holds this results "
+        f"directory, so it was NOT renamed into place: the run holding the "
+        f"directory now may already have recorded that stage under its own "
+        f"signature, and this file would land underneath it. The work is "
+        f"parked at {parked} and nothing was deleted. This stage now returns "
+        "as if it had succeeded and its record will be refused as well, so "
+        "any later stage of THIS run that reads that output will fail on a "
+        "missing input; the run that holds the directory is unaffected.",
+        "WARN")
 
 
 class RunRecord:
@@ -11709,7 +12661,31 @@ class RunRecord:
             # last_seen is what then tells a reader it is looking at a corpse.
             "final_status": "running",
         }
+        # The run this one takes the directory over from, captured BEFORE its
+        # record is overwritten. It is half the claim: a foreign `_run` on
+        # disk is the normal state at the start of every resume, and a
+        # succession check that did not know the predecessor would stand a
+        # perfectly legitimate resume down at its first write. The other half
+        # is our own identity. Any THIRD identity is a run that took the
+        # directory after us. See _judge_ownership().
+        predecessor = _run_identity(state.get(RUN_KEY)
+                                    if isinstance(state, dict) else None)
         state[RUN_KEY] = self.rec
+        self.claim = frozenset(x for x in (_run_identity(self.rec),
+                                           predecessor) if x)
+        # The stage records this run still owes the document a deletion of,
+        # each mapped to the record it had when --force popped it: a merged
+        # write carries the pops along until the stage is recorded again, and
+        # deletes one only where the document still holds the record the
+        # discard was decided about. Shared with cmd_run's finish(), which is
+        # the other writer of stage keys.
+        self.drop = {}
+        # Arms the two checks that read this run's identity out of the state
+        # file: the succession check on every write, and the rename guard in
+        # atomic_out. Here, because a RunRecord exists exactly once per run
+        # and a dry run - which holds no lock and writes nothing - never
+        # builds one.
+        _watch_state(path, self, self.claim)
         # The last stamp that actually reached the FILE, which is not the same
         # thing as rec["last_seen"]: a tick advances that in memory and only
         # then attempts the write that carries it. Quoting the in-memory value
@@ -11717,6 +12693,19 @@ class RunRecord:
         # state file - see the give-up warning in _beat(). cmd_run writes the
         # record immediately after building it, so this one is true from here.
         self._written = now
+
+    def supersede(self):
+        """Latch this run as superseded, without a word.
+
+        For the succession check, which has already said what happened and in
+        more detail than _save() could: it can name the run that holds the
+        directory now. The latch itself is the same one _save() raises from
+        the lock, on purpose - a run told once by either gate that it lost the
+        directory has lost it, and nothing it observes afterwards gives it
+        back.
+        """
+        self.superseded = True
+        self._stop.set()
 
     def _save(self, required=False):
         """One state write: a tick may skip it, the final verdict may not, and
@@ -11728,6 +12717,13 @@ class RunRecord:
         "interrupted" over a live run's `_run` corrupts a running directory to
         preserve a dead run's last word. Losing the word is the cheaper of the
         two, so a superseded run says so once, in the log, and stops.
+
+        `_run` IS AN OWNERSHIP CLAIM, which is what makes it different from
+        every other key this file holds, and it is written only on POSITIVE
+        proof of ownership: `is_still_ours() is True`, which is our own lock or
+        one we could not read. A VACANT lock is refused - see the comment at
+        that branch for what that costs and who pays it. A stage record is not
+        an ownership claim and is not gated that way.
 
         Returns whether the state file was actually written.
 
@@ -11745,7 +12741,13 @@ class RunRecord:
         the next tick repairs it, while writing anyway is precisely the
         unsynchronised write the lock was being taken to avoid. The final stamp
         is not skippable - it is the only record of how the run ended - so it
-        writes whether the lock comes or not.
+        writes whether the lock comes or not. `required` is about the
+        SCHEDULER's lock and nothing else: it does not override the ownership
+        gate above, and on a vacant results lock there is no final stamp to
+        write. A run that still holds its own lock, or one whose lock is
+        unreadable, is the case that reasoning was written for, and there it is
+        unchanged - which, measured, is every ordinary run: the lock comes off
+        in an atexit hook that runs after the stamp.
         """
         # LATCHED, and asked before the lock is: a run that has been told once
         # that it lost the directory has lost it for good, and nothing it can
@@ -11754,12 +12756,12 @@ class RunRecord:
         # at that instant, and the losing sequence needs no race at all: A is
         # --force-unlocked and logs "no longer holds", B finishes and removes
         # its own lock on the way out, and A's final stamp then finds the path
-        # VACANT - None, not False - takes the branch below, and writes A's
-        # whole stale in-memory state dict over B's completed results. That
-        # branch's reasoning holds only for a replacement that has not STARTED
-        # yet; it cannot tell that one from a replacement that has FINISHED,
-        # and this flag is the only thing that can. A run that was never
-        # superseded is unaffected, which is the case the None branch is for.
+        # VACANT - None, not False - and writes as though nobody had ever
+        # taken the directory. A vacant lock reads exactly the same whether
+        # the replacement has not STARTED yet or has already FINISHED, and
+        # this flag is the only thing in this process that can tell the two
+        # apart. A run that was never superseded is unaffected, which is the
+        # case the None answer below is for.
         if self.superseded:
             # Set here too, not only where the flag is raised: a tick already
             # past its wait() when the flag went up must not be left waking
@@ -11767,12 +12769,21 @@ class RunRecord:
             # already set costs nothing to set again.
             self._stop.set()
             return False
-        # `is False`, not falsiness: only a lock somebody else now holds
-        # stops the write. A vacant path (None) means no replacement exists to
-        # be corrupted, and this run's own verdict is worth more than the
-        # theoretical race with a run that has not created its lock yet - and
-        # would overwrite us anyway when it did.
-        if self.owner is not None and self.owner.is_still_ours() is False:
+        # ONE read of the lock, and all three of its answers used. True is
+        # our own lock - or one we could not read, which is no evidence that
+        # anything changed hands - False is somebody else's, None is a vacant
+        # path. Read once and not once per question, so that the two decisions
+        # below cannot be taken against two different states of the file.
+        proof = self.owner.is_still_ours() if self.owner is not None else True
+        # `is False`, not falsiness, and this branch is the LATCH rather than
+        # the refusal: only a lock somebody else now holds is proof that the
+        # directory changed hands, so only this answer supersedes the run and
+        # says so. A vacancy refuses the write too - the branch below - but it
+        # must not claim a handover, because it is equally the signature of an
+        # operator, a tmp-reaper or a remount removing the lock of a run nobody
+        # superseded. Collapsing the two put a WARN announcing a handover in
+        # front of an operator who had caused none.
+        if proof is False:
             # Stop the heartbeat too: there is no directory left for it to
             # stamp, and a timer waking every interval to be turned away is
             # the same decision taken over and over.
@@ -11788,22 +12799,109 @@ class RunRecord:
                     "directory now, and this run's own verdict is not worth "
                     "overwriting a live one's state with.", "WARN")
             return False
+        # A VACANCY IS NOT PROOF OF OWNERSHIP, and `_run` is the one key that
+        # needs proof, because `_run` is what says who owns the directory. So
+        # `_run` is written on `is True` and on nothing else: our own lock, or
+        # one we could not READ, which is no evidence that anything changed
+        # hands and which answers True already. On None - the path is gone
+        # while this process is still alive - the write is declined outright.
+        #
+        # A vacant lock is exactly what a replacement that has FINISHED leaves
+        # behind: B takes the directory with --force-unlock-live, records what
+        # it runs, exits and removes its own lock. A, still unwinding, then
+        # reads a path with nothing on it, which is indistinguishable from a
+        # replacement that has not started. A document saying the directory
+        # belongs to A is read by the NEXT run as A's, taken as that run's
+        # PREDECESSOR, and from then on every write A makes is inside the new
+        # run's claim and can never be refused - a live run evicted by a third
+        # identity it has no way to refuse.
+        #
+        # WHAT STOOD HERE DECLINED ONLY THE WRITE THAT WOULD CREATE THE
+        # DOCUMENT, and that is inoperative for every run that has recorded a
+        # stage - which is every real run. The stage record creates the
+        # document one call earlier, and `_run` then merges into the document
+        # the run itself has just made: A parks inside pfam, B takes the
+        # directory and finishes, the document is removed, A's tail records
+        # pfam and stamps `_run`, and the file ends as {_run: A, pfam: A} with
+        # A never latched. Driven with real processes and reproduced in unit
+        # form on a removed document and on a zeroed one, at heartbeat_s 0, 1
+        # and 30 - every one of those orderings wrote `_run`.
+        #
+        # WHAT IT COSTS, and it is now really paid: a run nobody superseded,
+        # whose lock an operator, a tmp-reaper or a remount removed, writes no
+        # `_run` again - no further last_seen and no final verdict. Its `_run`
+        # stays as the last tick left it, `final_status: "running"`, which is
+        # what a console reads as a run that never ended. Measured before
+        # choosing it: an ordinary run's `_run` writes all happen while the
+        # lock is still on disk and still ours - the lock is released by the
+        # atexit hook, which runs after cmd_run's stamp_run("ok"/"failed") and
+        # after main()'s stamp_run("interrupted"), and the SIGTERM handler
+        # releases the lock and os._exit()s without stamping at all. Driven:
+        # `is_still_ours()` answered True at the final stamp of a clean run and
+        # of a Ctrl-C'd one. So no ordinary run pays this, and the run that
+        # does pay it has lost the only evidence it had.
+        #
+        # A STAGE record is deliberately not gated this way, and that is the
+        # whole difference between the two. It names work that really
+        # happened, it is not a claim on the directory, and the document it
+        # creates holds nothing to corrupt - so refusing it would turn the solo
+        # case, a run whose state file is removed from under it, from "loses
+        # the records it had already written" into "records nothing ever
+        # again".
+        if proof is None:
+            self._said_vacant()
+            return False
         lock = self.lock
         if lock is None:
-            save_state(self.path, self.state)
-            return True
+            return self._write()
         # Timed, not blocking: this also runs on the way out of an interrupted
         # run, and a final stamp that hangs the process is worse than one
-        # written a moment out of order. save_state is atomic either way.
+        # written a moment out of order. The write is atomic either way.
         got = lock.acquire(timeout=5.0)
         try:
             if got or required:
-                save_state(self.path, self.state)
-                return True
+                return self._write()
             return False
         finally:
             if got:
                 lock.release()
+
+    def _said_vacant(self):
+        """Say, once, that `_run` is not being written any more.
+
+        Once, because the heartbeat reaches this every interval for the rest
+        of the run, and out loud because the alternative is a `_run` that
+        silently stops advancing - which reads on a console exactly like a
+        process that died, and is the one conclusion a run that is still
+        working must not invite.
+        """
+        _said_once("vacant",
+                   f"the results lock {self.owner.path} is no longer there, "
+                   "so this run cannot prove it still owns this directory and "
+                   "writes no more `_run` records into "
+                   f"{self.path}: no further `last_seen`, and no final "
+                   "status. The stages it finishes are still recorded. A "
+                   "vacant lock is what a run that took this directory with "
+                   "--force-unlock-live and then exited leaves behind, and "
+                   "from in here that is indistinguishable from an operator "
+                   "or a tmp-reaper having removed the lock of a run nobody "
+                   "superseded; `_run` says who owns the directory, so it is "
+                   "not written without proof. Whatever `_run` is in that file "
+                   "stays exactly as the last write left it - "
+                   "`final_status: \"running\"` - and if the file itself went "
+                   "with the lock there is none in it at all.")
+
+    def _write(self):
+        """`_run`, merged into whatever the document holds now.
+
+        One key, named, because that is all this object has ever changed. A
+        tick that wrote the whole in-memory dict was rewriting every stage
+        record from a snapshot taken when the run started - twice a minute,
+        for the length of the run - which is the erasure this merge exists to
+        stop, on the most frequent writer of the file.
+        """
+        return update_state(self.path, self.state, (RUN_KEY,),
+                            claim=self.claim, drop=self.drop)
 
     def watch(self, lock):
         """Start stamping last_seen, sharing the scheduler's lock."""
@@ -18909,7 +20007,14 @@ def cmd_run(args):
         p.mkdirs()
         _LOGFH = open(p.logfile, "a", encoding="utf-8")
         log(f"metaannot {__version__} starting")
-        lock = ResultsLock(p.lock, force=getattr(args, "force_unlock", False))
+        # --force-unlock-live IMPLIES --force-unlock: the refusal it exists to
+        # get past is only reachable through --force-unlock in the first
+        # place, and an operator who has typed the narrower flag has already
+        # said the wider one.
+        force_live = getattr(args, "force_unlock_live", False)
+        lock = ResultsLock(
+            p.lock, force=getattr(args, "force_unlock", False) or force_live,
+            force_live=force_live, state_path=p.state)
         # The BOUND METHOD, not a closure over `lock`. Both of these used to
         # be reachable from a name that this function reassigns further down,
         # and the signal handler duly called threading.Lock.__exit__ and died
@@ -19035,7 +20140,22 @@ def cmd_run(args):
         _RUN = RunRecord(p.state, state, sys.argv,
                          os.path.abspath(args.config) if args.config else None,
                          heartbeat_s, owner=lock)
-        save_state(p.state, state)
+        # The stage outputs this run may PARK if it is superseded mid-stage.
+        # The declared ones only: several stages write one file per item - a
+        # PDB per dark protein, a file per DIAMOND database - and parking
+        # those would leave one undeletable file per item behind in a
+        # directory that rule 5 of CLAUDE.md says must never be cleaned up.
+        # See _park_superseded().
+        _DECLARED_OUTPUTS.clear()
+        _DECLARED_OUTPUTS.update(o for st in STAGES for o in st["out"](p))
+        # Through the record, not a bare update_state(RUN_KEY). This is the
+        # run's FIRST `_run` write and the lock was taken three lines ago, so
+        # the gate cannot say anything but "ours" here - which is the point:
+        # "`_run` is written only on positive proof of ownership" has to have
+        # no exception in it, or the next person to read this file finds two
+        # ways to write that key and gates the one they happen to land on.
+        # That is exactly how the gate this replaced came to be inoperative.
+        _RUN._save()
         write_effective_config(p.effective_config, cfg)
 
     for name in (args.only or []) + ([args.from_stage] if args.from_stage else []):
@@ -19065,9 +20185,32 @@ def cmd_run(args):
         # A dry run takes no lock and writes nothing, so it reads the state
         # only now, and only to plan against.
         state = load_state(p.state)
+    # The set the run still owes the DOCUMENT a deletion of. The pop below is
+    # in memory, exactly as it has always been, and the discard used to reach
+    # the file as a side effect of the next whole-document write. A merged
+    # write only touches the keys it is given, so the pops have to be carried
+    # explicitly - and carried until the stage is written again, which is what
+    # reproduces the old timing to the letter: a --force run that dies in its
+    # first second still leaves every record intact, because nothing has
+    # written yet. Writing tombstones eagerly instead would turn an interrupted
+    # --force into a permanent forget, and the next run would then ADOPT the
+    # stale output under a fresh signature - the opposite of what --force is
+    # for.
+    force_drop = {}
     if args.force:
         for n in selected:
-            state.pop(n, None)
+            was = state.pop(n, None)
+            if was is not None:
+                # The record, not just the name. A discard decided from this
+                # one read must not delete whatever is under that name at the
+                # moment of some later write - see update_state().
+                force_drop[n] = was
+    if _RUN is not None:
+        # Shared object, not a copy: the heartbeat writes `_run` far more
+        # often than any stage writes itself, so it has to carry the same
+        # discards, and it has to stop carrying one the moment finish() has
+        # written that stage again.
+        _RUN.drop = force_drop
 
     def unmet_deps(st):
         """Enabled dependencies that were excluded by --only/--from and have
@@ -19231,12 +20374,40 @@ def cmd_run(args):
         # against before they exist.
         _RUN.watch(state_lock)
 
+    def record(name):
+        """Merge one stage's record into the document on disk.
+
+        The key this write changes is named, so a run that has been overtaken
+        rewrites nothing it no longer knows the truth about, and a record
+        another run wrote while this one was working is read, kept and written
+        back rather than replaced by a snapshot.
+        """
+        wrote = update_state(p.state, state, (name,),
+                             claim=_RUN.claim if _RUN is not None else None,
+                             drop=force_drop)
+        if wrote:
+            # The document now says what --force wanted it to say about this
+            # stage, so the discard is paid and must not be repeated: carried
+            # any further it would delete the record this write just made, on
+            # the next write of any other key.
+            force_drop.pop(name, None)
+        return wrote
+
     def finish(name, action, sig=None, err=None, secs=None):
         nonlocal ran, adopted, skipped
         with state_lock:
+            rid = _own_run_id()
+            # Whether this call has anything to SAY about the stage. The
+            # skipped branch does not: a cached or unselected stage leaves the
+            # document exactly as it found it, and a merged write of a key
+            # this run has no record for would DELETE it - which for a stage
+            # some other run recorded while we were working is precisely the
+            # erasure this whole change is about.
+            changed = True
             if err is not None:
                 state[name] = {"signature": None, "status": "failed",
                                "error": str(err)[:500],
+                               "run_id": rid,
                                "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 failure.append((name, err))
                 # Said here, not after the drain: a stage that fails in its
@@ -19245,16 +20416,20 @@ def cmd_run(args):
                 log(f"stage '{name}' failed: {err}", "FATAL")
             elif action == "adopt":
                 state[name] = {"signature": sig, "status": "adopted",
+                               "run_id": rid,
                                "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 adopted += 1
             elif action == "RUN":
                 state[name] = {"signature": sig, "status": "ok",
                                "seconds": round(secs, 1),
+                               "run_id": rid,
                                "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 ran += 1
             else:
                 skipped += 1
-            save_state(p.state, state)
+                changed = False
+            if changed:
+                record(name)
             done.add(name)
 
     def mark_running(name):
@@ -19263,8 +20438,9 @@ def cmd_run(args):
         left, and the next run adopted it as a finished one."""
         with state_lock:
             state[name] = {"signature": None, "status": "running",
+                           "run_id": _own_run_id(),
                            "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
-            save_state(p.state, state)
+            record(name)
 
     def share(starting):
         """CPU and RAM for the FIRST of `starting`, out of what is free.
@@ -19631,8 +20807,10 @@ def main():
     s.add_argument("--serial", action="store_true",
                    help="one stage at a time (lower peak memory, simpler logs)")
     s.add_argument("--force-unlock", action="store_true",
-                   help="take over a results directory locked by a process "
-                        "that is still alive")
+                   help="remove a lock left behind by a run that is gone")
+    s.add_argument("--force-unlock-live", action="store_true",
+                   help="take the directory even when this host can see the "
+                        "holder is still running (unsupported; see rule 4)")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_run)
 
@@ -19661,6 +20839,11 @@ def main():
     s.add_argument("--no-adopt", action="store_true")
     s.add_argument("--serial", action="store_true")
     s.add_argument("--force-unlock", action="store_true")
+    # Registered on BOTH subparsers, and the pairing is the point: `all` is
+    # the command the tutorial leads with, and a --force-unlock-live that
+    # existed only on `run` would make the refusal above INESCAPABLE there -
+    # a flag the message tells you to pass and argparse then refuses.
+    s.add_argument("--force-unlock-live", action="store_true")
     s.add_argument("--no-render", action="store_true")
     s.add_argument("--no-run", action="store_true")
     s.add_argument("--out", default=None)
