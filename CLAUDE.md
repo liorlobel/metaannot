@@ -126,6 +126,27 @@ it names; do not force the file through another format.
    everywhere here. Do not restore that file from a copy while a run is using
    it, and do not delete it to "reset" anything (rule 5).
 
+   **A write that cannot be MADE is not made, and is accounted for.** That is
+   the other failure and it is nothing to do with concurrency: this run's own
+   filesystem refusing the write — a full disk, an NFS `EIO` or `ESTALE`, a
+   permissions flip, a Windows sharing violation. The read is opened twice
+   before it is called unreadable and the write is retried through the merge
+   loop; when the attempts run out the write is declined and neither half ever
+   raises out of `update_state()`. **A stage that has already succeeded is
+   never failed by this** (rule 1), which it was being, two ways: the `OSError`
+   killed the run from the dispatch loop, and in the drain loop — where
+   `finish()` runs inside a broad `except` — it reported the stage that had
+   SUCCEEDED as the stage that failed. Nothing is held for a later write: a
+   record written later would be written under a later answer about who owns
+   the directory, which is the defect shape above. What is carried is the KEY
+   NAME, in a ledger nothing reads to decide what to write, and the run names
+   those records twice — when each is lost, and in an account before it exits
+   that says whether the next run will recompute the stage or adopt its
+   output. The log file is on the same filesystem, so it is part of the same
+   failure: a line it will not take costs the line, said once, with stderr
+   left raising. A `kill` gets no account at all, because the signal handler
+   may not format a string or take a lock.
+
    Its **outputs** are a weaker claim, and an earlier version of this rule
    said flatly that such a run "does not rename its outputs over them", which
    is false for exactly the case the issue is about. What is true has three

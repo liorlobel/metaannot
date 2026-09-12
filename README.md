@@ -73,16 +73,25 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1652 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1663 passed, 1 skipped, 6 xfailed, 37
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 37
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 57 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1595 passed and 58
+absent, so on a machine with no R the same run reports 1606 passed and 58
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
+
+One more test skips itself where the machine cannot give it what it asks for:
+`test_a_full_log_disk_costs_the_log_line_and_not_the_run` drives a REAL
+filesystem with no free blocks — a small ram disk, made, filled, unmounted and
+detached inside the test — and the recipe for that is macOS's, so it skips
+elsewhere and the count above is one lower there. It skips rather than
+substituting a mock because the measurement is the point: on a full
+filesystem the buffered write succeeds and the `flush()` after it raises,
+which is the reason the guard covers both.
 
 Windows is not run from this machine, so what follows is read off the code and
 the test markers rather than measured. `doctor --fix` there is not a recipe
@@ -1935,9 +1944,21 @@ gone, so the next run starts without `--force-unlock`. `_run` still says
 signature of this path, not evidence of anything worse. The stage that was
 mid-flight is still recorded `"running"` because `mark_running()` stamped it
 before it started, and the next run reads that, says `the previous run was
-interrupted while this stage was writing, so its output may be truncated;
-recomputing`, and redoes it. You do not have to `--force` anything, and you
-should not delete anything.
+interrupted while this stage was writing, or could not write the stage's
+record, so its output may be truncated; recomputing`, and redoes it. Both
+readings are in that sentence because from the next run's position they are the
+same bytes: `mark_running()` writes before the stage starts and `finish()`
+writes when it ends, so a state file that goes unwritable in between leaves
+this record for a stage that finished perfectly well (the I/O part below). The
+verdict is the same either way and it is the safe one. You do not have to
+`--force` anything, and you should not delete anything.
+
+One thing a `kill` does **not** leave is an account of what the run could not
+record. A run that reaches its own exit says which records never got there;
+`SIGKILL`, and the `SIGTERM` handler that releases the lock and `_exit`s
+without unwinding, say nothing, because that handler may not format a string or
+take a lock. On Windows `TerminateProcess` runs nothing at all. That is why
+each such loss is also said in the log at the moment it happens.
 
 The one thing to check first is `ps`. The handler stops metaannot, not the
 tools metaannot launched: an InterProScan, a DIAMOND or a TMbed started by the
@@ -2045,6 +2066,60 @@ clock"** about the whole of it, and that sentence was wrong:
   the signature section). The alternative, a dying run putting a live run's
   records back to its own older view of them, costs a results table that looks
   fine and is not.
+
+**And what happens when the write cannot be made at all**, which is a
+different failure from every one above: not another writer, but this run's own
+filesystem refusing it — a full disk, an NFS `EIO` or `ESTALE`, a permissions
+flip, a Windows sharing violation from an indexer. Both halves of a state write
+can meet it: the read before it, and the write itself, which is a temp file,
+its bytes, its close and a rename. ENOSPC can only meet the second of those —
+a read needs no blocks — which is why the arm that declines an unreadable
+document could never have covered the errno this section leads with.
+
+* **It is declined, and it never raises.** The pre-write read gets 2 attempts
+  (`STATE_READ_TRIES`) before it is called unreadable — one immediate retry,
+  no sleep, which is the whole remedy for an `ESTALE` the next `open()`
+  revalidates and for a sharing violation that clears when the other holder
+  closes. A write that fails is
+  retried through the same loop that redoes a lost merge, and each attempt
+  re-reads and re-judges ownership, so a write that lands on the last attempt
+  lands under the answer derived from the read before it. When the attempts run
+  out the write is declined: nothing is written blind, and nothing is held for
+  a later write either.
+* **A stage that has already succeeded is never failed by it.** That is the
+  rule this part exists for, and it was being broken two ways: an `OSError` out
+  of the state write left `finish()` and killed the run — at hour thirty, with
+  the stage's output already complete on disk — and in the drain loop, where
+  `finish()` runs inside a broad `except`, the stage that had *succeeded* was
+  reported as the stage that failed and the run exited `1`. A run whose records
+  are all refused now does its work and exits on its stages' verdict.
+* **The run says what it lost, twice.** Once per key when it happens, naming
+  the stage and quoting the error, because an interrupt exits by a door that
+  reaches no end-of-run report; and once as an account before the run exits,
+  which names the records that never landed and says which of the two residues
+  the next run will act on — a stage already recorded `running` is
+  **recomputed**, a stage with no record at all is **adopted**, with the
+  warning that says outright it cannot tell a finished file from an interrupted
+  one. That second one is the one to look at: those outputs were produced while
+  the filesystem was refusing writes. `--force --only <stage>` redoes one,
+  `--no-adopt` refuses the adoptions wholesale, and there is no supported way
+  to write a record by hand.
+* **A declined `_run` leaves the same trace a `kill` does.** `final_status`
+  stays `running`, which a console reads as a run that never ended, and
+  `last_seen` stops advancing. The heartbeat says so out loud rather than going
+  quiet — that warning had never been able to fire on a read error, because it
+  counted exceptions and a declined write raises none.
+* **The log file is part of this and not beside it.** `results/metaannot.log`
+  is on the same filesystem as the state file, so the same ENOSPC stops the
+  line that explains the declined write. A log file that will not take a line
+  now costs the line: it is said once that the rest of the run's log is on
+  stderr only, later lines are still attempted so the log resumes if space is
+  freed, and **stderr itself is left raising** — a log nobody is watching live
+  and the channel `tmux` keeps are different facts.
+
+What none of that recovers is the record itself. A write that cannot be made is
+not made, so the cost is the same one the rest of this section trades in: a
+recomputation, or an adoption with a warning, never a wrong answer.
 
 `_run` is the one key held to a stricter rule, because it is not a record of
 work but a **claim about who owns the directory**. A run writes it only on

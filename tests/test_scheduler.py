@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+import warnings
 
 import pytest
 
@@ -2045,6 +2048,16 @@ def test_an_unreadable_state_file_writes_nothing_rather_than_erasing_the_others(
     adopt or recompute, never corruption. The next write of the SAME key - the
     stage's own next record, or the heartbeat's `_run` - reaches the file
     normally once a read succeeds.
+
+    TWO THINGS CHANGED HERE AND ONE DID NOT (issue #37). The read is now
+    retried before it is called unreadable, so this fixture has to refuse
+    EVERY open rather than one; and the sentence said about it is about this
+    write rather than a standing policy, because the old one - "nothing is
+    written to it until a read succeeds" - was false the moment the next write
+    succeeded, which is the last thing this test asserts. What did NOT change
+    is the decision: nothing is carried, nothing is held, and the record this
+    call was given is named at the end of the run instead of being written
+    later under a later answer about who owns the directory.
     """
     path = str(tmp_path / ".metaannot_state.json")
     ma.save_state(path, {"dbcan": {"status": "ok", "signature": "b"}})
@@ -2063,8 +2076,9 @@ def test_an_unreadable_state_file_writes_nothing_rather_than_erasing_the_others(
     monkeypatch.undo()
     assert "pfam" not in _doc(path), "a declined record was written anyway"
     assert _doc(path)["dbcan"]["signature"] == "b", "the read error erased a record"
-    assert "nothing is written to it until a read succeeds" \
-        in capsys.readouterr().err
+    said = capsys.readouterr().err
+    assert "could not be read" in said and "this write was not made" in said
+    assert "Nothing is held for a later write" in said
 
     # and once the read works again, the same key writes exactly as it would
     # have. Nothing was carried and nothing had to be.
@@ -3841,3 +3855,597 @@ def test_neither_the_message_nor_the_readme_reads_as_a_clean_bill_of_health(
         assert stage in para, \
             "the sentinel limitation names the stages rather than counting them"
     assert "three stages" not in para
+
+
+# ----------------------------------------------------------------------
+# the state file's I/O errors: declined, accounted for, never fatal (#37)
+#
+# Every failure below is driven rather than mocked wherever the kernel will
+# produce it: a read-only directory for the EACCES a permissions flip gives,
+# a chmod-000 document for the one a refused read gives, and a real ram disk
+# with no free blocks for ENOSPC. The two injected ones are injected AT A
+# CHOSEN CALL - os.replace, and the second call of save_state - because what
+# they pin is a retry landing and a temp being cleaned up, and neither can be
+# staged on a filesystem that fails every time.
+# ----------------------------------------------------------------------
+def _needs_enforced_permissions(tmp_path):
+    """Skip unless a mode really stops this process reading and writing.
+
+    PROBED rather than guessed from the platform, because two separate things
+    make a chmod inert and only one of them is a platform: root writes into a
+    directory it may not write into, and on Windows `os.chmod` sets a
+    read-only FLAG on files and does nothing whatever to a directory. A test
+    that drove neither would assert its way to green while proving nothing,
+    which is worse than not running - so it says which it is and skips.
+    """
+    d = tmp_path / "probe-permissions"
+    d.mkdir()
+    f = d / "f"
+    f.write_text("x", encoding="utf-8")
+    try:
+        os.chmod(str(d), 0o500)
+        try:
+            with open(str(d / "new"), "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
+        else:
+            pytest.skip("a read-only directory is still writable here, so "
+                        "there is no real EACCES to drive")
+        os.chmod(str(f), 0o000)
+        try:
+            with open(str(f), encoding="utf-8"):
+                pass
+        except OSError:
+            return
+        pytest.skip("an unreadable file is still readable here, so there is "
+                    "no real EACCES to drive")
+    finally:
+        os.chmod(str(d), 0o700)
+        os.chmod(str(f), 0o600)
+
+
+@contextlib.contextmanager
+def _read_only(directory):
+    """`directory`, with this user's write bit off, put back afterwards.
+
+    A REAL failure and not an injected one: every write of the state file
+    begins by creating its temp in the state file's own directory, so this is
+    an EACCES out of the kernel at the exact call the ENOSPC of the issue
+    arrives at. Restored in a finally, because a read-only tmp_path would take
+    the rest of the session with it.
+    """
+    before = stat.S_IMODE(os.stat(directory).st_mode)
+    os.chmod(directory, 0o500)
+    try:
+        yield directory
+    finally:
+        os.chmod(directory, before)
+
+
+def test_a_state_write_onto_a_read_only_directory_declines_instead_of_raising(
+        ma, tmp_path, capsys):
+    """The write half, which had no guard at all.
+
+    `update_state` had one `try` in it and it was around the read-BACK: the
+    write itself was bare, so a permissions flip, a full disk or a Windows
+    sharing violation left an OSError through every caller. A read needs no
+    blocks, which is why the `unreadable` arm could never have caught the
+    errno this is about.
+    """
+    _needs_enforced_permissions(tmp_path)
+    d = tmp_path / "results"
+    d.mkdir()
+    path = str(d / ".metaannot_state.json")
+    ma.save_state(path, {"dbcan": {"status": "ok", "signature": "b"}})
+    capsys.readouterr()
+    with _read_only(str(d)):
+        assert ma.update_state(path, {"pfam": {"signature": "a"}},
+                               ("pfam",)) is False
+    err = capsys.readouterr().err
+    assert _doc(path) == {"dbcan": {"status": "ok", "signature": "b"}}
+    assert "did not reach" in err and "Permission denied" in err
+    assert not [f for f in os.listdir(str(d)) if ".part" in f]
+    # NOT a race, and not a success reported as one: the obvious way to get
+    # this wrong is to `continue` on the last attempt too, which falls out of
+    # the retry loop into the line about another process writing the file and
+    # returns True to a caller whose record never landed.
+    assert "changed underneath" not in err
+
+
+def test_a_failed_state_write_leaves_no_part_file_behind(ma, tmp_path,
+                                                         monkeypatch):
+    """The temp, and the reason for removing it is the BLOCKS.
+
+    On a full disk a half-written temp holds the space the next attempt
+    needs, so leaving it makes the next write fail for a reason this one
+    caused. Injected at `os.replace` because that is the one ordering where a
+    temp really is left behind: a filesystem with no room at all fails at the
+    open, with nothing yet to clean up.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {"dbcan": {"status": "ok"}})
+    real = os.replace
+
+    def full(a, b):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", full)
+    assert ma.update_state(path, {"pfam": {"signature": "a"}},
+                           ("pfam",)) is False
+    monkeypatch.setattr(os, "replace", real)
+    assert _doc(path) == {"dbcan": {"status": "ok"}}
+    assert sorted(os.listdir(str(tmp_path))) == [".metaannot_state.json"]
+
+
+def test_the_pre_write_read_is_retried_once_before_the_write_is_declined(
+        ma, tmp_path, monkeypatch, capsys):
+    """One ESTALE costs nothing and says nothing.
+
+    An NFS stale handle is cleared by the next open() revalidating it, and
+    before this it cost a record: the read was called unreadable on the first
+    failure, the write was declined, and the stage was left with whatever
+    record it already had. Injected at the open, one failure deep, because a
+    filesystem that fails every time cannot show a retry LANDING - and the
+    silence is asserted too, since `_said_once` would otherwise spend the one
+    line a permanent failure needs later on a blip that cost nothing.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {"dbcan": {"status": "ok"}})
+    opens, real_open = [], open
+
+    def flaky(p, *a, **k):
+        if str(p) == path:
+            opens.append(1)
+            if len(opens) == 1:
+                raise OSError(116, "Stale file handle")
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", flaky)
+    capsys.readouterr()
+    assert ma.update_state(path, {"pfam": {"signature": "a"}},
+                           ("pfam",)) is True
+    monkeypatch.undo()
+    assert len(opens) >= 2, "the read was not retried at all"
+    assert _doc(path)["pfam"]["signature"] == "a"
+    assert _doc(path)["dbcan"] == {"status": "ok"}
+    err = capsys.readouterr().err
+    assert "Stale file handle" not in err, err
+    assert ma._STATE_LOSSES == {}
+
+
+def test_a_write_that_fails_once_is_retried_and_the_record_lands(
+        ma, tmp_path, monkeypatch, capsys):
+    """The write half gets the same second chance, through the loop that was
+    already there for a lost merge - so the retry re-reads and re-merges,
+    which is also what makes it safe: the write that lands is judged against
+    the read that preceded it.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {"dbcan": {"status": "ok"}})
+    real, calls = ma.save_state, []
+
+    def flaky(p, s):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(28, "No space left on device")
+        return real(p, s)
+
+    monkeypatch.setattr(ma, "save_state", flaky)
+    capsys.readouterr()
+    assert ma.update_state(path, {"pfam": {"signature": "a"}},
+                           ("pfam",)) is True
+    assert _doc(path)["pfam"]["signature"] == "a"
+    assert _doc(path)["dbcan"] == {"status": "ok"}
+    assert "did not reach" not in capsys.readouterr().err
+    assert ma._STATE_LOSSES == {}
+
+
+def test_a_record_that_lands_after_a_declined_write_is_not_named_at_the_end(
+        ma, tmp_path, capsys):
+    """The ledger counts CONSECUTIVE declines, because a landed write clears
+    the key. A stage whose record was refused once and written a minute later
+    has lost nothing, and an account that named it would send an operator
+    looking for a record that is in the file.
+    """
+    _needs_enforced_permissions(tmp_path)
+    d = tmp_path / "results"
+    d.mkdir()
+    path = str(d / ".metaannot_state.json")
+    ma.save_state(path, {})
+    with _read_only(str(d)):
+        assert ma.update_state(path, {"pfam": {"signature": "a"}},
+                               ("pfam",)) is False
+    assert "pfam" in ma._STATE_LOSSES
+    assert ma.update_state(path, {"pfam": {"signature": "a"}},
+                           ("pfam",)) is True
+    assert ma._STATE_LOSSES == {}
+    capsys.readouterr()
+    ma.report_state_losses()
+    assert capsys.readouterr().err == ""
+
+
+def _stage(name, fn, out_name=None):
+    """One stage of a throwaway graph, writing into a subdirectory."""
+    return dict(name=name, enabled=None, gpu=False, deps=[], keys=[],
+                inp=lambda c, p: [],
+                out=lambda p, n=(out_name or name): [
+                    os.path.join(p.R, "outs", n + ".out")],
+                fn=fn)
+
+
+@contextlib.contextmanager
+def _graph(ma, monkeypatch, proj, stages):
+    """A throwaway stage graph for one in-process cmd_run.
+
+    In process rather than through the CLI, because these tests need to make
+    the results root read-only from INSIDE a stage - which is the only way to
+    have the run's own writes start failing part way through, with the lock
+    taken and the log file already open. `_LOGFH` is set to its own value so
+    that monkeypatch's restore runs and the run's log handle does not leak
+    into the rest of the session, exactly as the GPU-lease test does it.
+    """
+    os.makedirs(os.path.join(proj.results, "outs"), exist_ok=True)
+    monkeypatch.setattr(ma, "STAGES", stages)
+    monkeypatch.setattr(ma, "STAGE_NAMES", [st["name"] for st in stages])
+    monkeypatch.setattr(ma, "_LOGFH", ma._LOGFH)
+    try:
+        yield
+    finally:
+        # The stages below make the results root read-only and leave it that
+        # way; pytest's own cleanup cannot remove a directory it may not
+        # write to.
+        os.chmod(proj.results, 0o700)
+
+
+def _writer(name, delay=0.0):
+    def fn(cfg, p):
+        time.sleep(delay)
+        with open(os.path.join(p.R, "outs", name + ".out"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("x\n")
+    return fn
+
+
+def test_a_stage_that_finished_is_never_reported_as_failed_when_its_record_cannot_be_written(
+        ma, tmp_path, monkeypatch, capsys):
+    """THE DRAIN LOOP, which is where the standing rule was inverted.
+
+    finish() there sits inside `except BaseException as e: log(f"stage '...'
+    failed: {e}", "FATAL"); failure.append(...)`, so an OSError out of the
+    state write of a stage that SUCCEEDED was reported as that stage failing.
+    Driven with a real EACCES: the first stage makes the state file's own
+    directory read-only and then fails for a reason of its own, which both
+    ends dispatch - leaving the two slow stages to be drained - and makes
+    every state write from then on fail in the kernel.
+    """
+    _needs_enforced_permissions(tmp_path)
+    proj = build_project(tmp_path / "drain", stage_workers=3, threads=6)
+
+    def boom(cfg, p):
+        os.chmod(p.R, 0o500)
+        ma.die("this stage really did fail")
+
+    stages = [_stage("pfam", boom), _stage("dbcan", _writer("dbcan", 0.8)),
+              _stage("cluster", _writer("cluster", 0.8))]
+    with _graph(ma, monkeypatch, proj, stages):
+        capsys.readouterr()
+        rc = ma.cmd_run(_run_args(proj.config_path))
+    err = capsys.readouterr().err
+    assert rc == 1, "the stage that really failed must still fail the run"
+    assert "failed: pfam" in err
+    assert "stage(s) are still running" in err, \
+        "the two slow stages were not drained, so this drives the wrong loop"
+    assert "stage 'dbcan' failed" not in err, \
+        "a stage that finished was reported as failed by its own bookkeeping"
+    assert "stage 'cluster' failed" not in err
+    assert os.path.exists(os.path.join(proj.results, "outs", "dbcan.out"))
+    assert os.path.exists(os.path.join(proj.results, "outs", "cluster.out"))
+    assert "the record for 'dbcan' did not reach" in err
+    assert "never reached" in err
+
+
+def test_a_run_whose_records_are_all_refused_still_exits_on_its_stages_verdict(
+        ma, tmp_path, monkeypatch, capsys):
+    """Every state write refused by a real EACCES, from the first stage on.
+
+    The run does its work, exits 0, and says at the end which records never
+    got there and what the next run will do with them.
+    """
+    _needs_enforced_permissions(tmp_path)
+    proj = build_project(tmp_path / "account", stage_workers=2, threads=4)
+
+    def first(cfg, p):
+        _writer("pfam")(cfg, p)
+        os.chmod(p.R, 0o500)
+
+    stages = [_stage("pfam", first),
+              _stage("dbcan", _writer("dbcan"))]
+    stages[1]["deps"] = ["pfam"]
+    with _graph(ma, monkeypatch, proj, stages):
+        capsys.readouterr()
+        rc = ma.cmd_run(_run_args(proj.config_path))
+    err = capsys.readouterr().err
+    assert rc == 0, "a filesystem that will not record a run does not fail it"
+    assert "FATAL" not in err and "failed: " not in err, err
+    assert "the record for 'dbcan' did not reach" in err
+    assert "never reached" in err and "dbcan" in err
+    assert "`_run`" in err and 'final_status: "running"' in err
+    assert "NOT ONE OF THOSE STAGES WAS FAILED BY THIS" in err
+    assert "ADOPTS the output" in err and "--force --only" in err
+
+
+def test_a_heartbeat_whose_reads_are_refused_gives_up_instead_of_freezing_silently(
+        ma, tmp_path, capsys):
+    """HEARTBEAT_GIVE_UP, on the failure its own comment names.
+
+    `_beat` counted EXCEPTIONS, and a declined write raises none - so a
+    read-side EACCES or EIO reset `misses` to zero on every tick, the give-up
+    warning never fired, and `_run.last_seen` froze in the file for the rest
+    of the run with nothing said about it. That was already true before the
+    write half was guarded; guarding it would have made it true of every I/O
+    failure there is.
+
+    Two halves in one test, because the counter has to tell them apart. A
+    VACANT lock also declines the write, legitimately and for a reason that is
+    not about this filesystem, and counting it would put an I/O warning in
+    front of an operator whose tmp-reaper removed a lock.
+    """
+    _needs_enforced_permissions(tmp_path)
+    state = tmp_path / ".metaannot_state.json"
+    lock = ma.ResultsLock(str(tmp_path / "c.lock"))
+    lock.__enter__()
+    st = ma._State()
+    rec = ma.RunRecord(str(state), st, ["metaannot", "run"], config_path=None,
+                       interval=0.02, owner=lock)
+    os.remove(lock.path)                    # vacant: declined, but not I/O
+    capsys.readouterr()
+    rec.watch(threading.Lock())
+    try:
+        assert not _wait_for(lambda: "giving up" in capsys.readouterr().err,
+                             timeout=2.0), \
+            "a vacant lock armed the I/O give-up counter"
+        assert any(t.name == "metaannot-heartbeat"
+                   for t in threading.enumerate()), \
+            "the heartbeat stopped for a reason that was not its own"
+    finally:
+        rec._stop.set()
+    lock.__exit__()
+
+    # and now a real permissions flip on the document itself, which is one of
+    # the errors the issue names: every read of it fails in the kernel.
+    ma.save_state(str(state), {})
+    os.chmod(str(state), 0o000)
+    st2 = ma._State()
+    rec2 = ma.RunRecord(str(state), st2, ["metaannot", "run"],
+                        config_path=None, interval=0.02)
+    said = []
+
+    def gave_up():
+        said.append(capsys.readouterr().err)
+        return "giving up" in "".join(said)
+
+    rec2.watch(threading.Lock())
+    try:
+        assert _wait_for(gave_up, timeout=20.0), \
+            "a heartbeat whose writes are all declined froze silently"
+    finally:
+        rec2._stop.set()
+        os.chmod(str(state), 0o600)
+    msg = "".join(said)
+    assert "Permission denied" in msg, \
+        "the give-up warning does not say what the filesystem said"
+    assert "frozen in the" in msg and "NOTHING about whether this run is " \
+        "alive" in msg
+    assert not any(t.name == "metaannot-heartbeat"
+                   for t in threading.enumerate()), \
+        "a heartbeat that has given up must stop, not spin"
+
+
+def test_a_write_a_superseded_run_declines_is_not_reported_as_an_io_loss(
+        ma, tmp_path, capsys):
+    """The ledger is about this filesystem and nothing else.
+
+    A superseded run declines its writes too, and for a reason that has
+    nothing to do with I/O: it no longer owns the directory. Reporting that as
+    a record lost to a disk error would send an operator to the mount for a
+    handover, and would arm the heartbeat's give-up warning about a filesystem
+    that is perfectly healthy.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {ma.RUN_KEY: {"run_id": "20260101T000000-9",
+                                      "host": "other", "pid": 9,
+                                      "started": "2026-01-01T00:00:00"}})
+    st = ma._State()
+    rec = ma.RunRecord(path, dict(st), ["metaannot", "run"], config_path=None)
+    # A third identity holds the document, so the succession check stands this
+    # run down on its next write.
+    claim = rec.claim
+    st["pfam"] = {"status": "ok", "signature": "a"}
+    capsys.readouterr()
+    assert ma.update_state(path, st, ("pfam",), claim=claim) is False
+    err = capsys.readouterr().err
+    assert "another run holds this results directory" in err
+    assert ma._STATE_LOSSES == {}, \
+        "a write refused over ownership was ledgered as an I/O failure"
+    ma.report_state_losses()
+    assert "never reached" not in capsys.readouterr().err
+
+
+def test_the_next_run_does_not_call_a_record_lost_to_io_an_interrupted_writer(
+        ma, tmp_path, monkeypatch, capsys):
+    """The whole chain, and the sentence at the end of it.
+
+    mark_running() writes `running` before the stage starts and finish()
+    writes the real record when it ends, so a state file that goes bad in
+    between leaves `running` behind for a stage that finished perfectly well.
+    The next run recomputes it - over-invalidating, which is the right
+    direction - but it used to say flatly that the previous run "was
+    interrupted while this stage was writing", which for this failure is
+    simply false. The verdict stays; the sentence now names both readings.
+    """
+    _needs_enforced_permissions(tmp_path)
+    proj = build_project(tmp_path / "resume", stage_workers=1, threads=2)
+
+    def first(cfg, p):
+        _writer("pfam")(cfg, p)
+        os.chmod(p.R, 0o500)             # the `ok` record cannot be written
+
+    with _graph(ma, monkeypatch, proj, [_stage("pfam", first)]):
+        assert ma.cmd_run(_run_args(proj.config_path)) == 0
+    assert _doc(proj.rpath(".metaannot_state.json"))["pfam"]["status"] == \
+        "running", "the residue this whole sentence is about is not there"
+
+    # The lock is released when the process exits, not when cmd_run returns,
+    # so a second in-process run has to be given the directory by hand.
+    os.remove(proj.rpath(".metaannot.lock"))
+    ran = []
+    with _graph(ma, monkeypatch, proj,
+                [_stage("pfam", lambda c, p: ran.append(1))]):
+        capsys.readouterr()
+        assert ma.cmd_run(_run_args(proj.config_path)) == 0
+    err = capsys.readouterr().err
+    assert ran == [1], "a `running` record must still recompute the stage"
+    assert "or could not write the stage's record" in err
+    assert _doc(proj.rpath(".metaannot_state.json"))["pfam"]["status"] == "ok"
+
+
+# ----------------------------------------------------------------------
+# a real full filesystem
+# ----------------------------------------------------------------------
+def _run(*argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=120)
+
+
+@contextlib.contextmanager
+def _no_space_left(where):
+    """A REAL filesystem with no free blocks, mounted at `where`/full.
+
+    A ram disk rather than a mock, because ENOSPC is the errno this issue
+    leads with and because it arrives in places no mock would think to put it:
+    driven here, a buffered log write SUCCEEDED and the flush that followed it
+    raised, which is why the log guard covers both.
+
+    Yields (mountpoint, fill), and `fill` is separate on purpose - a file that
+    does not exist yet cannot be created on a filesystem that is already
+    full, so a test has to make its log file and its state file BEFORE the
+    space goes.
+
+    Skipped rather than faked where the recipe is not available; every step
+    has a timeout, and the unmount is in a finally so a failing test cannot
+    leave a volume attached to the machine running the suite.
+    """
+    if sys.platform != "darwin" or not shutil.which("hdiutil"):
+        pytest.skip("no recipe for a real full filesystem on this platform")
+    made = _run("hdiutil", "attach", "-nomount", "ram://4096")
+    if made.returncode != 0 or not made.stdout.strip():
+        pytest.skip(f"could not attach a ram disk: {made.stderr.strip()}")
+    device = made.stdout.split()[0]
+    mnt = os.path.join(str(where), "full")
+    os.makedirs(mnt, exist_ok=True)
+    try:
+        if _run("newfs_hfs", "-v", "metaannotfull", device).returncode != 0:
+            pytest.skip("could not make a filesystem on the ram disk")
+        if _run("mount", "-t", "hfs", device, mnt).returncode != 0:
+            pytest.skip("could not mount the ram disk")
+
+        def fill():
+            for i in range(40):
+                try:
+                    with open(os.path.join(mnt, f"filler{i}"), "wb") as fh:
+                        for _ in range(4096):
+                            fh.write(b"x" * 1024)
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                except OSError:
+                    pass
+                try:
+                    with open(os.path.join(mnt, "probe"), "wb") as fh:
+                        fh.write(b"x" * 4096)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.unlink(os.path.join(mnt, "probe"))
+                except OSError:
+                    return True
+            return False
+
+        yield mnt, fill
+    finally:
+        # TRIED HARD, AND THEN SAID OUT LOUD, because the failure mode is a
+        # ram disk left attached to the machine running the suite: pytest's
+        # own tmp_path cleanup then warns about it for the rest of the
+        # session, and `umount` on a volume something touched a moment ago
+        # really does answer "Resource busy" - measured, on the first version
+        # of this teardown. Every call has a timeout, so none of it can hang.
+        for _ in range(10):
+            if _run("umount", mnt).returncode == 0:
+                break
+            time.sleep(0.2)
+        else:
+            # `umount -f` and not `diskutil unmount force` or
+            # `hdiutil detach -force`: measured on a volume this test had
+            # left busy, the first of those worked and both of the others
+            # answered "Resource busy" and changed nothing.
+            _run("umount", "-f", mnt)
+        if _run("hdiutil", "detach", device).returncode != 0:
+            _run("hdiutil", "detach", "-force", device)
+        # macOS puts a .fseventsd back into the mountpoint the moment it is
+        # free, so an empty rmdir is not enough. This is the test's own
+        # scaffolding under tmp_path, not a results directory; rule 5 is
+        # about those.
+        shutil.rmtree(mnt, ignore_errors=True)
+        if device in _run("hdiutil", "info").stdout:
+            warnings.warn(f"the ram disk {device} for this test is still "
+                          "attached; detach it by hand with "
+                          f"`hdiutil detach -force {device}`")
+
+
+def test_a_full_log_disk_costs_the_log_line_and_not_the_run(ma, tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """The prerequisite for every other guard here, on a real full disk.
+
+    `p.state` and `p.logfile` are both under the results root, so they share
+    a filesystem: the ENOSPC that stops a stage record being written stops the
+    line explaining it being written too. update_state says what it declined
+    through log(), so an unguarded log() puts the OSError straight back on the
+    path the state guard was written to clear.
+    """
+    with _no_space_left(tmp_path) as (mnt, fill):
+        logpath = os.path.join(mnt, "metaannot.log")
+        state = os.path.join(mnt, ".metaannot_state.json")
+        fh = open(logpath, "a", encoding="utf-8")
+        # EVERYTHING from here in the try, including the setup: an open
+        # handle on that filesystem is what makes `umount` answer "Resource
+        # busy", so a body that fails before the close - which is what an
+        # assertion in this test IS - would leave a ram disk attached to the
+        # machine running the suite. Learnt by doing it.
+        try:
+            ma.save_state(state, {"dbcan": {"status": "ok"}})
+            assert fill(), "the ram disk did not fill; nothing is being driven"
+            monkeypatch.setattr(ma, "_LOGFH", fh)
+            monkeypatch.setattr(ma, "_LOG_FILE_BROKEN", False)
+            capsys.readouterr()
+            for i in range(40):
+                ma.log(f"line {i} " + "y" * 200, "WARN")
+            assert ma._LOG_FILE_BROKEN, \
+                "the log file took 40 lines on a full filesystem"
+            # and the state write, whose message has to reach stderr through
+            # the log file that is refusing it.
+            assert ma.update_state(state, {"pfam": {"signature": "a"}},
+                                   ("pfam",)) is False
+            err = capsys.readouterr().err
+            assert "is not accepting lines" in err and "stderr only" in err
+            assert err.count("is not accepting lines") == 1
+            assert "the record for 'pfam' did not reach" in err
+            assert "No space left on device" in err
+            assert _doc(state) == {"dbcan": {"status": "ok"}}
+            assert not [f for f in os.listdir(mnt) if ".part" in f]
+        finally:
+            # The handle still holds the buffered bytes the filesystem would
+            # not take, so its own close() raises; that is the failure under
+            # test and not a failure of the test.
+            try:
+                fh.close()
+            except OSError:
+                pass
