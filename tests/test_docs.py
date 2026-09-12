@@ -1551,10 +1551,30 @@ NUMBER_WORDS.update({f"{w}-{o}": n + i
                      for i, o in enumerate(_ONES) if o})
 
 
+def _newest_section_start(txt):
+    """Where the CHANGELOG section this change set may rewrite begins.
+
+    `## Unreleased` while work is in flight, and the newest `## vX.Y.Z` once a
+    release has been cut — the same section either way, renamed. These scans
+    were written against the literal "## Unreleased" and every one of them
+    broke the moment v0.6.0 was cut, which is the wrong failure: the section
+    did not go away, it acquired a number. A shipped release's entries are a
+    RECORD and are never edited to match a later code base, so only the
+    NEWEST section is in scope, whichever of the two it is.
+    """
+    txt_ = txt
+    i = txt_.find("## Unreleased")
+    if i != -1:
+        return i
+    m = re.search(r"^## v\d+\.\d+\.\d+", txt_, re.M)
+    assert m, "the CHANGELOG has neither an Unreleased nor a released section"
+    return m.start()
+
+
 def _unreleased_fixed_groups():
     """(heading, entry count) for each `#### ` group under Unreleased/Fixed."""
     txt = _text(CHANGELOG)
-    start = txt.index("## Unreleased")
+    start = _newest_section_start(txt)
     fixed = txt.index("### Fixed", start)
     end = txt.index("\n### Changed", fixed)
     out = []
@@ -1637,7 +1657,7 @@ def test_the_changelog_does_not_name_functions_that_do_not_exist(ma):
         for f in sorted(os.listdir(os.path.join(ROOT, "tests")))
         if f.endswith(".py"))
     txt = _text(CHANGELOG)
-    start = txt.index("## Unreleased")
+    start = _newest_section_start(txt)
     end = txt.index("\n## ", start + 1)
     section = txt[start:end]
     named = set(re.findall(r"`([a-z_][a-z_0-9]{3,})\(\)`", section))
@@ -1950,7 +1970,9 @@ def _unreleased(text):
     A shipped release's entries are a RECORD and are not edited to match a
     later code base, so the scan stops at the first released heading.
     """
-    return text[text.index("## Unreleased"):text.index("\n## v0.5.0")]
+    start = _newest_section_start(text)
+    nxt = text.find("\n## ", start + 1)
+    return text[start:nxt if nxt != -1 else len(text)]
 
 
 def _tests_prose():

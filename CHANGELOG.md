@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 — 2026-09-12
+
+Everything here came out of one question — what can a program, rather than a
+person, find out about a run before and while it happens — and out of answering
+it honestly enough that the answers could be checked.
+
+`doctor --json` is the headline: the other half of the contract `describe
+--json` started, and the piece the console's M2 preflight was blocked on.
+Holding it to its own stated scope turned up **twenty-four live false verdicts**
+in the shipped `doctor`, four states of a path on which it printed no document
+at all, and one on which it never returned.
+
+The defects fixed alongside it were each found by driving rather than by
+review. A **FIFO** at any operator-supplied path hung a run for ever with no
+output and no exit status, and the obvious fix was wrong twice over before the
+right one appeared — the rule in the end was that a pipe may be read once per
+run, derived from the code rather than assumed, because `mkfifo p; zcat
+big.faa.gz > p &` never worked at a path a run opens more than once. **Two
+concurrent runs** could erase each other's stage records, and that took as long
+as it did because each guard in turn proved unreachable on the very path it was
+written for. And the **report** now says out loud when a bin contributes
+nothing to the model, instead of printing two zeros in a tibble and leaving the
+reader to work out that the statistics cover none of the fraction this tool
+exists to study.
+
+`SIGNATURE_VERSION` does not move, and that was checked rather than assumed: no
+stage's `keys` list changed, so upgrading recomputes nothing.
 
 `doctor --json`, the other half of the contract `describe --json` started. The
 console's milestone M2 is a preflight checklist — can this config actually run,

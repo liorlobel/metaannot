@@ -2413,7 +2413,7 @@ stdlib-only file — Python 3.9 or newer, nothing to install, deployable by `scp
 — and it serves one page: a list of the directories it watches, and per
 directory a stage table read out of `.metaannot_state.json`, a log tail, the
 lock, and what the run record says about itself. It is `CONSOLE_VERSION`
-`0.1.0`, and that number is deliberately not `__version__`: the console and the
+`0.1.1`, and that number is deliberately not `__version__`: the console and the
 engine ship in one repository but they are two programs with two audiences, and
 tying their versions together would mean either lying about one of them or
 bumping a number nobody asked about.
