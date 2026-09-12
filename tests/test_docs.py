@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import tokenize
 
 import pytest
@@ -165,6 +166,12 @@ def test_documented_numeric_defaults_match_default_config(ma):
         "emapper_dbmem_min_gb": 64,
         "max_dark_structures": 2000,
         "max_len_structure": 700,
+        # Six hours, and the README argues the number rather than stating it.
+        # It is here because it is the one setting whose default an operator
+        # reads as a PROMISE - "a FIFO nobody writes fails by the morning" -
+        # and a default that moved without the prose moving would make that
+        # promise silently false.
+        "fifo_wait_s": 21600,
     }
     for k, v in checks.items():
         assert d[k] == v, f"{k} changed to {d[k]}; update the docs too"
@@ -174,6 +181,24 @@ def test_documented_numeric_defaults_match_default_config(ma):
         "the README documents these two as deliberately equal"
     assert d["thresholds"]["smorf_max_len"] == 100
     assert "hard floor of 90 nt" in _text(README)
+    # ...and the FIFO wait is documented in both the seconds the config takes
+    # and the hours the prose argues, because an operator plans around one and
+    # writes the other.
+    rd = _norm(_text(README))
+    assert f"fifo_wait_s: {d['fifo_wait_s']}" in rd, \
+        "the README's `fifo_wait_s` example has drifted from DEFAULT_CONFIG"
+    # ...and every document that gives the wait in HOURS gives the same
+    # number of them, in either spelling. None of those sentences is in the
+    # count scanner's reach - a number followed by a unit is a measurement to
+    # that scan, not a count - so this is the only thing holding them to the
+    # config.
+    n = d["fifo_wait_s"] // 3600
+    word = {v: k for k, v in NUMBER_WORDS.items()}[n]
+    for name, txt in (("README.md", rd), ("TUTORIAL.md", _norm(_text(TUTORIAL))),
+                      ("CLAUDE.md", _norm(_text(CLAUDE)))):
+        assert re.search(rf"\b(?:{word}|{n}) hours?\b", txt, re.I), \
+            f"{name} does not say the FIFO wait is {n} hours, which is the " \
+            "half an operator plans a working day around"
 
 
 def test_the_tmbed_length_cap_is_documented(ma):
@@ -672,6 +697,16 @@ def test_the_documented_signal_exit_codes_are_the_conventional_ones(ma):
     assert f"exit status {128 + int(signal.SIGTERM)}" in _norm(_text(TUTORIAL))
 
 
+def test_the_readme_quotes_the_scope_statement_the_engine_authors(ma):
+    # It is published as a literal string for a front end to render verbatim,
+    # and the README quotes it as a block quote - which makes the README a
+    # second home for the sentence, and a second home is where a claim goes
+    # stale. The quote is checked against the constant rather than read.
+    txt = _norm(_text(README)).replace("> ", "")
+    assert _norm(ma.DOCTOR_SCOPE_STATEMENT) in txt, \
+        "the README's scope quote is not the sentence metaannot.py publishes"
+
+
 def test_the_readme_does_not_sell_requirements_as_all_of_doctor(ma):
     # measured: on one project `describe --json` reported 3 not-ok
     # requirements while `doctor` additionally reported the missing input, the
@@ -703,13 +738,20 @@ def test_the_readme_says_what_the_new_files_disclose(ma):
             f"{freeform} is not a config block any more"
 
 
-# `doctor`'s own section headings, minus the two that requirements() feeds
-# (`== tools ==` and `== databases ==`, printed from a variable). The README
-# paragraph that tells a console author what doctor checks BEYOND
-# `requirements` has to name every one of them, because it reads as a closed
-# list and a preflight screen gets built from it.
-DOCTOR_SECTIONS = ("config", "inputs", "precomputed emapper", "gpu", "tmt",
-                   "manifest", "taxonomy", "resources", "R")
+# `doctor`'s own section headings. The README paragraph that tells a console
+# author what doctor checks BEYOND `requirements` has to name every one of
+# them, because it reads as a closed list and a preflight screen gets built
+# from it.
+#
+# Taken from ma.DOCTOR_SECTIONS rather than scraped out of the source with a
+# regex, which is what this did until the sections became data: the scrape was
+# a proxy for "the headings doctor prints", and now there is a real list that
+# both the printed report and `doctor --json` are rendered from. A proxy that
+# has been replaced by the thing it stood for is a test measuring the wrong
+# object.
+DOCTOR_SECTIONS = ("config", "inputs", "precomputed emapper", "tools",
+                   "databases", "gpu", "tmt", "manifest", "taxonomy",
+                   "resources", "R")
 
 
 def test_the_readme_names_every_section_doctor_prints(ma):
@@ -717,13 +759,12 @@ def test_the_readme_names_every_section_doctor_prints(ma):
     # `== R ==` outright, so a preflight built from it is green for a config
     # doctor fails on the manifest-to-column mapping, on a memory split that
     # cannot give eggNOG --dbmem, or on a missing required R package.
-    src = _text(os.path.join(ROOT, "metaannot.py"))
-    printed = set(re.findall(r"== ([A-Za-z][A-Za-z ]*) ==", src))
+    printed = [title for _id, title in ma.DOCTOR_SECTIONS]
     assert printed, "doctor no longer prints section headings"
-    assert printed == set(DOCTOR_SECTIONS), \
-        f"doctor's sections have changed: {printed ^ set(DOCTOR_SECTIONS)}"
+    assert tuple(printed) == DOCTOR_SECTIONS, \
+        f"doctor's sections have changed: {set(printed) ^ set(DOCTOR_SECTIONS)}"
     txt = _norm(_text(README))
-    for name in sorted(printed) + ["tools", "databases"]:
+    for name in printed:
         assert f"`== {name} ==`" in txt, \
             f"the README's list of what doctor checks omits == {name} =="
 
@@ -1071,6 +1112,87 @@ def test_the_console_version_is_documented_as_separate_from_the_tool_version(
         "the README states a CONSOLE_VERSION the console does not have"
 
 
+def test_the_tutorial_says_what_a_fifo_really_does_to_a_run():
+    """symptom, twice over, in the same paragraph.
+
+    The first version said "each stage dies as it opens the path. A FIFO or a
+    socket behaves the same way", of a state where nothing died at all: the
+    open BLOCKED, and `run` was measured on one at every configured input with
+    no output, no traceback and no exit status. The second version said it
+    HANGS, which was true when it was written and is not true now - opener()
+    waits `fifo_wait_s` and then dies naming the path.
+
+    The THIRD version is the one this pins, and it is a fourth fact rather
+    than a rewording of the other three: a verifier drove the workflow the
+    second version recommended and it WORKS AT ONE of the operator-supplied
+    inputs. At the rest the run opens the path again after the pipe has been
+    drained, so the paragraph was selling a six-hour wait for a failure. A
+    paragraph that says "a FIFO is read" without saying WHERE is the version
+    that sends somebody to pipe their FASTA in.
+
+    So this asserts the paragraph carries every fact an operator has to have
+    before leaving a run overnight: that a pipe works only where the run reads
+    that input once, that it is refused at once where it does not, that a
+    writer with nothing to say ends the run, and that `doctor` never waits at
+    all.
+    """
+    tut = _norm(_text(TUTORIAL))
+    assert "behaves the same way" not in tut, \
+        "the TUTORIAL again lumps a FIFO in with the directory beside it"
+    i = tut.index("A **FIFO**")
+    near = tut[i:i + 2600]
+    assert "live writer" in near and "mkfifo" in near, \
+        "the TUTORIAL does not say a FIFO with a writer is read at all"
+    assert re.search(r"reads exactly once|read(s)? (it )?exactly once", near), \
+        "the TUTORIAL does not say a pipe works only at a single-read input"
+    assert "refused immediately" in near or "refused at once" in near, \
+        "the TUTORIAL does not say a multi-read input refuses a pipe at once"
+    assert "proteins_faa" in near and "quant_table" in near, \
+        "the TUTORIAL does not name which inputs are which"
+    assert "no writer" in near and "fifo_wait_s" in near, \
+        "the TUTORIAL does not say what ends the wait, or what sets it"
+    assert re.search(r"\bdies\b", near), \
+        "the TUTORIAL does not say the run ends on an unwritten FIFO"
+    assert "O_NONBLOCK" in near, \
+        "the TUTORIAL does not say why `doctor` itself is immune"
+
+
+def test_no_published_sentence_claims_a_fifo_still_hangs_the_run():
+    """The class the sentence above belongs to, over every published surface,
+    and it is the exact reverse of the scan it replaces.
+
+    That scan read: a sentence naming a FIFO and claiming a death is wrong.
+    It was right while the open blocked, and it is the wrong way round now -
+    a FIFO with no writer DOES kill the stage, after `fifo_wait_s`, and the
+    dangerous sentence is the one that still promises a hang, because it sends
+    an operator to wait for a run that has already exited. Verbs go stale in
+    whichever direction the code moves; what does not go stale is that the
+    published verb has to be the one the code has.
+    """
+    bad = []
+    for name, path in (("README.md", README), ("TUTORIAL.md", TUTORIAL),
+                       ("CHANGELOG.md", CHANGELOG)):
+        for sent in re.split(r"(?<=[.!?]) ", _norm(_text(path))):
+            if "FIFO" not in sent:
+                continue
+            # QUOTED text is exempt, and has to be: this file's own entries
+            # exist to reproduce the wrong sentences - `said "it dies reading
+            # this"` - and a scan that cannot tell a quotation from a claim
+            # would make the record of the defect impossible to write down.
+            claim = re.sub(r'"[^"]*"|\u201c[^\u201d]*\u201d|`[^`]*`', " ",
+                           sent).lower()
+            if not re.search(r"\b(hangs?|hung|hanging|blocks? forever|"
+                             r"never returns?|indefinitely)\b", claim):
+                continue
+            # A sentence saying it does NOT hang, or saying it USED to, is the
+            # record of the fix rather than a live claim.
+            if re.search(r"\b(not|never|no longer|rather than|instead of|nor|"
+                         r"used to|before|until|would have)\b", claim):
+                continue
+            bad.append(f"{name}: {sent}")
+    assert not bad, "\n".join(bad)
+
+
 def test_the_tutorial_meets_the_console_where_an_operator_would():
     # phase 5b is where the tutorial tells you how to watch a run, and the two
     # things it offered were `tail -f` and a hand-rolled json.dumps. The
@@ -1135,9 +1257,12 @@ def test_the_changelog_says_which_console_milestone_shipped(ma):
 # the Windows paragraph, which nothing had ever read against the markers
 # ----------------------------------------------------------------------
 TESTS_DIR = os.path.join(ROOT, "tests")
-NUMBER_WORDS = {"no": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-                "eleven": 11, "twelve": 12}
+# NUMBER_WORDS used to be defined HERE as well, by hand and up to twelve, and
+# the generated one two hundred lines below shadowed it - so the three
+# assertions above that call NUMBER_WORDS.get() were running against a table
+# that had never had the `"no": 0` this one was written for. A test whose
+# table is not the table it thinks it is pins whatever the other table
+# happens to say. There is one now, it is generated, and `"no"` is in it.
 
 
 def _windows_paragraph():
@@ -1354,3 +1479,1371 @@ def test_the_uc_dark_rescue_numbers_reconcile_with_each_other():
     assert j, "the eggNOG-PFAMs join sentence moved"
     with_pfam, no_ko = (int(g.replace(",", "")) for g in j.groups())
     assert no_ko - with_pfam == before, (no_ko, with_pfam, before)
+
+
+# ----------------------------------------------------------------------
+# the changelog's Fixed section, which claimed a count it did not have
+# ----------------------------------------------------------------------
+_ONES = ("", "one", "two", "three", "four", "five", "six", "seven", "eight",
+         "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+         "sixteen", "seventeen", "eighteen", "nineteen")
+_TENS = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty", 60: "sixty",
+         70: "seventy", 80: "eighty", 90: "ninety"}
+# Generated rather than typed out, which is this section's own rule applied to
+# itself: a table of number words that stops at twenty plus one hand-added
+# "thirty-three" is a table that fails the day a count passes it, and the
+# failure reads as a KeyError rather than as a drifted number.
+NUMBER_WORDS = {w: i for i, w in enumerate(_ONES) if w}
+# "no counts as zero" for the sentences that say "no unmarked items", which is
+# the one word this table needs that counting cannot produce.
+NUMBER_WORDS["no"] = 0
+NUMBER_WORDS.update({w: n for n, w in _TENS.items()})
+NUMBER_WORDS.update({f"{w}-{o}": n + i
+                     for n, w in _TENS.items()
+                     for i, o in enumerate(_ONES) if o})
+
+
+def _unreleased_fixed_groups():
+    """(heading, entry count) for each `#### ` group under Unreleased/Fixed."""
+    txt = _text(CHANGELOG)
+    start = txt.index("## Unreleased")
+    fixed = txt.index("### Fixed", start)
+    end = txt.index("\n### Changed", fixed)
+    out = []
+    for part in re.split(r"^#### ", txt[fixed:end], flags=re.M)[1:]:
+        head = part.split("\n", 1)[0].strip()
+        out.append((head, len(re.findall(r"^\*\*", part, flags=re.M))))
+    return out
+
+
+def test_the_changelog_fixed_section_is_countable(ma):
+    """symptom: the Unreleased section said the count of false verdicts "is
+    now the number of entries under Fixed". There were twenty-one bolded
+    entries and fourteen false verdicts, and the two were never going to be
+    the same number: a correction to what the document says about ITSELF
+    changes no config's exit status and is not a verdict at all. The first
+    wave also printed EIGHT entries under a paragraph saying "Seven were in
+    the shipped doctor", with nothing marking the eighth as an attribution
+    rather than a verdict.
+
+    The section is grouped now, each heading leads with its own count, and
+    this counts them.
+    """
+    groups = _unreleased_fixed_groups()
+    assert groups, "the Fixed section is no longer grouped under headings"
+    total = 0
+    for head, n in groups:
+        word = head.split()[0].lower()
+        assert word in NUMBER_WORDS, \
+            f"the heading {head!r} does not lead with a count"
+        assert NUMBER_WORDS[word] == n, \
+            f"{head!r} claims {word} entries and has {n}"
+        total += n
+    txt = _norm(_text(CHANGELOG))
+    m = re.search(r"### Fixed (\w+(?:-\w+)?) entries, in (\w+) groups", txt)
+    assert m, "the Fixed section no longer says how many entries it has"
+    # _count_value() and not NUMBER_WORDS: the table of number words is
+    # generated up to ninety-nine and this total has passed it, so the count
+    # is written as a NUMERAL - which is what the document already does for
+    # every number that big, and what the count scanner already reads.
+    assert _count_value(m.group(1)) == total, \
+        f"the section claims {m.group(1)} entries and has {total}"
+    assert NUMBER_WORDS[m.group(2).lower()] == len(groups)
+
+
+def test_the_changelog_false_verdict_count_is_the_verdict_groups(ma):
+    # The OTHER number, which is the one the prose above the section is
+    # actually about: the groups whose headings say "false verdicts". The two
+    # counts are different on purpose and the section now says so.
+    groups = _unreleased_fixed_groups()
+    verdicts = sum(n for head, n in groups if "false verdict" in head.lower())
+    waves = [head for head, _ in groups if "false verdict" in head.lower()]
+    txt = _norm(_text(CHANGELOG))
+    m = re.search(r"turned up \*\*([\w-]+)\*\* live false verdicts, in ([\w-]+) "
+                  r"waves", txt)
+    assert m, "the changelog no longer states a false-verdict count"
+    assert NUMBER_WORDS[m.group(1).lower()] == verdicts, \
+        f"the prose claims {m.group(1)} false verdicts; the groups hold " \
+        f"{verdicts}"
+    assert NUMBER_WORDS[m.group(2).lower()] == len(waves)
+    # ...and it no longer claims that number IS the size of the section. The
+    # sentence that says they are NOT the same is allowed to name it.
+    assert "is now the number of entries under Fixed" not in txt
+    assert "they are not the number of entries under fixed" in txt.lower()
+
+
+def test_the_changelog_does_not_name_functions_that_do_not_exist(ma):
+    """symptom: four sentences added by this change set named a
+    `read_protein_table` that has never existed in this tool, and two named a
+    `taxon_map()` where the function is `resolve_taxonomy()`. A changelog is
+    read by someone going to the code next, so a name it invents costs a grep.
+    """
+    src = _text(METAANNOT_PY) + "".join(
+        _text(os.path.join(ROOT, "tests", f))
+        for f in sorted(os.listdir(os.path.join(ROOT, "tests")))
+        if f.endswith(".py"))
+    txt = _text(CHANGELOG)
+    start = txt.index("## Unreleased")
+    end = txt.index("\n## ", start + 1)
+    section = txt[start:end]
+    named = set(re.findall(r"`([a-z_][a-z_0-9]{3,})\(\)`", section))
+    # Names this tool defines, or attribute calls on something it imports.
+    for name in sorted(named):
+        assert f"def {name}(" in src or f".{name}(" in src, \
+            f"the changelog names {name}(), which is defined nowhere in " \
+            "metaannot.py or the suite"
+
+
+# ======================================================================
+# V: every count in prose is DERIVED from the thing it counts, or pinned
+# ======================================================================
+# Three consecutive rounds of this change set shipped a wrong hand-written
+# count, and twice it was inside the comment on the very constant that
+# enforces the set being counted:
+#
+#   * "NULL IS AN EIGHTH VALUE" beside a tuple of nine
+#   * the caveat on every TMT annotation row said "three checks" in PUBLISHED
+#     text while the scope statement beside it said four
+#   * "the 768-config sweep", of a sweep that has eleven configs
+#   * TUTORIAL's "that block probes four packages", of a probe that reads
+#     fourteen and was widened two releases ago
+#
+# ...and a FOURTH round shipped one after this scanner was written:
+#
+#   * "a consumer reading the eight fields it knew about is unaffected by a
+#     NINTH appearing", sitting above BOTH of the two keys that had just been
+#     added, over a per-stage dict that emits ten
+#
+# That one is the interesting one, because this scanner was already running
+# and did not see it - and it did not see it for three STRUCTURAL reasons,
+# each of which is fixed here rather than in the sentence:
+#
+#   1. DIGITS WERE OUTSIDE THE SCAN. The alternation was number WORDS only, so
+#      every count written 200,000 / 200 / 9 / 12 / 14 / 768 was invisible.
+#      768 had been caught only by a bespoke test written for that one string.
+#   2. tests/ WAS NOT A SURFACE. Two of the three stale counts found in the
+#      fourth round lived in this very file, including the one in the
+#      docstring of the test that counts the CHANGELOG's own entries.
+#   3. THE EMITTED DOCUMENT IS WIDER THAN THE CONSTANTS THIS READ.
+#      `DMND_READS` publishes "up to 200,000 records" and "up to 200 deflines"
+#      as caveat text on real rows; both were hand-written, one function away
+#      from the literals that decide them. Those literals are constants now
+#      and the caveats are built from them, and this scan reads them.
+#
+# ...and a FIFTH round shipped two more, after the scanner had been through
+# four readings:
+#
+#   * README's "thirteen test modules", of a directory holding sixteen
+#   * a CHANGELOG entry describing the state sweep as six states and thirty
+#     cells, of a sweep that had already outgrown both numbers
+#
+# NEITHER WAS INVISIBLE BY ACCIDENT, and that is what this round changes. The
+# nouns the scan knew were a WHITELIST - a hand-written alternation of the
+# things this codebase has a set of - so it could not see "modules", and it
+# could not see a count that points at its noun with a pronoun ("all thirty of
+# THEM"). Adding `modules` to the list would have fixed one sentence and left
+# the class where it was; the list cannot see "vocabularies", "tests",
+# "callers", "assertions", "branches", "sentences", "helpers", "functions",
+# "guards" or "arms" either, and nobody is going to think of the eleventh.
+#
+# So the rule is NEGATIVE SPACE now. Anything shaped like a plural noun after
+# a number is a count until this table says otherwise, and what is written
+# down is the exceptions: units, the words that end in s without being nouns,
+# and three classes of number that are not cardinalities at all. See
+# _S_NOT_A_NOUN, _count_head() and _count_phrase(), each of which carries its
+# own argument.
+#
+# This is the class: a scanner over the six surfaces a count can live in -
+# metaannot.py's comments and docstrings, the document `doctor --json` emits,
+# the test suite's own comments and docstrings, the README, the TUTORIAL and
+# the CHANGELOG's Unreleased section - which finds every "<number> <plural
+# noun>" and requires each to be CLASSIFIED here. The number of surfaces is
+# itself one of the counts it scans, and it is DERIVED from _count_surfaces().
+#
+#   DERIVED  the number is recomputed from the source and compared. If the
+#            code grows a value, this test fails and names the sentence.
+#   MEASURED not recomputable - a fact about a dataset, a machine or an
+#            observation. The pin is that the SENTENCE STILL EXISTS, so an
+#            edit cannot strand a measurement whose subject has gone.
+#   PROSE    not a cardinality of anything this codebase has ("the first value
+#            was renamed", "two columns in different namespaces"). Exempt, and
+#            the reason is written down so the exemption is a decision rather
+#            than an oversight.
+#
+# `one` and `no` are outside the scan on purpose: "one row per protein" and
+# "no stage dies" are articles and negations, not sums, and including them
+# buries the real counts under hundreds of them.
+COUNT_WORDS = dict(NUMBER_WORDS, **{
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+    "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
+    "twelfth": 12, "twenty-one": 21, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+})
+# The units a number can carry between itself and a noun. "a 4 MB state file"
+# and "a 40 KB file" are MEASUREMENTS of one thing, not counts of four states
+# or forty files, and letting the head slot swallow a unit is how a scan that
+# reads digits fills up with them.
+_UNITS = frozenset("""
+mb kb gb tb kib mib gib byte bytes bit bits hour hours minute minutes second
+seconds ms residue residues line lines char chars cpu plex aa min px nt kda
+times plddt
+""".split())
+# `times` is in there as a unit rather than a noun because it is a RATIO:
+# "four times hungrier", "ten times better", "sixteen times" - a multiplier of
+# something, never a number of things.
+# Words that END IN S and are not plural nouns. THE NEGATIVE SPACE, and the
+# whole point of the rewrite: `_NOUNS` used to be a WHITELIST of the things
+# this codebase has a set of, and a whitelist cannot see a noun nobody thought
+# of. It could not see modules, vocabularies, tests, callers, assertions,
+# branches, sentences, helpers, functions, guards or arms - and two counts
+# shipped wrong through the gap, "thirteen test modules" of sixteen and a cell
+# count two states stale. Listing the nouns it happened to miss would have
+# fixed those sentences and left the class exactly where it was; nobody is
+# going to think of the next noun either.
+#
+# So the rule is inverted. A head is anything that LOOKS like a plural noun,
+# and what has to be written down is the exceptions - verbs, possessives and
+# adverbs that happen to end in s. That list is English, not this project's
+# vocabulary: it does not grow when the code does, which is the property the
+# whitelist did not have.
+_S_NOT_A_NOUN = frozenset("""
+is was has does its this thus his hers theirs ours yours says keeps means
+gives leaves goes takes makes runs needs wants reads writes calls names
+carries costs holds knows lives looks matters moves passes puts raises reaches
+reports returns sends sets shows stays stops turns uses works less across
+always perhaps yes plus versus unless whereas nevertheless else
+becomes covers exits ships measures satisfies previous various serious dies
+""".split())
+# A count may point at its noun with a pronoun - "all thirty of them" - and
+# that is still a count. It is in fact the shape of one of the two counts this
+# rewrite exists for, which is why the pronouns are heads rather than noise:
+# the classification such a phrase forces is either a recompute or, better, a
+# rewritten sentence that names the thing.
+_PRONOUN_HEADS = frozenset(("them", "these", "those"))
+# Ordinals are POSITIONS - "the first column", "the fifth reading", "the
+# second command above" - and there are hundreds of them. They are out of the
+# negative space and INTO the table only when a sentence opts one in, which is
+# what the "one past the end" idiom does: "a NINTH format", "a TENTH value",
+# "the FIFTH entry" are claims about the size of a set and are recomputed as
+# such below. An ordinal the table does not name is a position and is not
+# scanned.
+_ORDINALS = frozenset("""first second third fourth fifth sixth seventh eighth
+ninth tenth eleventh twelfth""".split())
+# Generated from COUNT_WORDS, longest first so "twenty-seven" wins over
+# "seven". Typing the alternation out by hand is how "twenty-seven entries"
+# was read as "seven entries" the first time this test ran.
+#
+# DIGITS as well as words, which is the fix for the fourth wrong count: a
+# number spelled 200,000 was not a number as far as this was concerned. The
+# lookbehind is what keeps that from drowning the scan - it refuses a digit
+# that is part of a larger token, so `2.4 MB` is not "4 MB", `mode-000` is not
+# "000", `cost-3 stages` is not "3 stages" and `#5` is not "5".
+_NUMBER = ("|".join(sorted((w for w in COUNT_WORDS if w not in ("one", "no")),
+                           key=len, reverse=True))
+           + r"|\d+(?:,\d{3})*")
+# The number, and the two words after it. TWO, because a count is written
+# either bare ("twenty-one stages") or with one adjective ("twenty-four LIVE
+# false verdicts", "thirteen TEST modules") and a wider window starts finding
+# the plural at the far end of the next clause instead.
+_COUNT_RE = re.compile(r"(?<![\w.,#-])(" + _NUMBER + r")((?:[ \-]+[a-z]+){0,2})",
+                       re.I)
+
+
+def _count_head(number, tail):
+    """The noun a number counts, or None when it counts nothing nameable.
+
+    `tail` is the two words after the number, with the separator that joined
+    each. The head is the first of them that is a plural noun by SHAPE, or a
+    pronoun standing in for one, or - for the first word only, and only when a
+    hyphen joined it to the number - an attributive singular, because "a
+    9-field row" counts fields and says so.
+
+    Returning None is a decision and not a gap: a number with no plural within
+    two words is not making a claim about the size of anything this codebase
+    has, and where a sentence hides a real count that way the answer is to
+    rewrite the sentence so it names what it counts. That is what happened to
+    "asserts stdout parses as JSON in all thirty of them", which is now a
+    number followed by the noun it is about.
+    """
+    # Lowercased first, so that a unit written the way units are written -
+    # "4 GB resources", "94 GB to WSL2" - is seen as the unit it is. A
+    # case-sensitive scan skips it as if it were punctuation and reads the
+    # word after it as the head, which is how a machine's memory became a
+    # count of four resources.
+    for i, (sep, word) in enumerate(re.findall(r"([ \-]+)([a-z]+)",
+                                               tail.lower())):
+        if word in _UNITS:
+            # A unit ENDS the search rather than being stepped over: "2 cpu,
+            # 4 GB resources" is a machine's size twice, and a scan that walks
+            # past the unit to the next plural reads it as four resources.
+            return None
+        # A TIGHT hyphen, and a word long enough to be one: "a 9-field row"
+        # is attributive, while "median length 15 - and returned 0 hits" and
+        # "on one job of seven -- a race" are a number, a dash and the next
+        # clause. Spaced dashes read as hyphens is how a scan fills up with
+        # "15 and" and "seven a".
+        if i == 0 and sep == "-" and len(word) >= 3:
+            return word
+        if word in _PRONOUN_HEADS:
+            return word
+        if len(word) >= 3 and word.endswith("s") and word not in _S_NOT_A_NOUN:
+            return word
+    return None
+
+
+def _count_phrase(m):
+    """"<number> <noun>" for one match, or None when it is out of the scan.
+
+    What is out of the scan is out by CLASS, and every class has its reason
+    written here rather than left to be inferred from a table with nothing in
+    it:
+
+    * an ORDINAL, unless the table names the phrase - see _ORDINALS.
+    * a number with a LEADING ZERO, which in this codebase is a file mode and
+      nothing else - 0700 on a socket directory, 0755 on a results directory -
+      and a mode is one number about one thing.
+    * the digits 0 and 1, for exactly the reason "one" and "no" are out of the
+      alternation: "0 disables", "1 if fails else 0", "1 row per protein" are
+      values, articles and negations, and including them buries every real
+      count under them.
+    * TWO, and it is the only cardinal that is out. It is the number this
+      codebase writes most and the one it writes least dangerously: "the two
+      stage lists", "two files on purpose", "the difference of the two group
+      means" - a pair is SPELLED OUT in the sentence that counts it, so the
+      number and the list cannot part company the way "thirteen test modules"
+      and a directory of sixteen can. Twenty-five of the exemptions this table
+      carried before the rule changed said nothing but "a named pair", which
+      is a rule being retyped rather than written down. A `two` that IS the
+      cardinality of a set - DOCTOR_FAIL_REASONS has two values - is opted
+      back in by naming it below, and the table always wins over a class.
+    * a number of a thousand or more. Nothing in this codebase has a thousand
+      of anything - the largest set it counts is twenty-one stages - so a
+      number that big is a measurement of a dataset, a file or a machine, and
+      its pin is that the sentence still exists, which is what MEASURED
+      already means. The one big number that IS derived, the DIAMOND record
+      cap, is named in the table and checked there.
+    """
+    tok = m.group(1).lower()
+    head = _count_head(tok, m.group(2))
+    if head is None:
+        return None
+    phrase = f"{tok} {head}"
+    if phrase in COUNT_PROSE:
+        return phrase
+    if tok in _ORDINALS or tok == "two":
+        return None
+    if tok[0].isdigit():
+        # A LEADING ZERO is a file mode in this codebase and nothing else -
+        # 0700 on a socket directory, 0755 on a results directory, 0777 on a
+        # parent - and a mode is one number about one thing, never a count.
+        if tok.startswith("0"):
+            return None
+        n = int(tok.replace(",", ""))
+        if n in (0, 1) or n >= 1000:
+            return None
+    return phrase
+
+
+def _phrase_re(key):
+    """Where a classified phrase is allowed to be written.
+
+    The same shape the scan reads, run the other way: the number, an optional
+    adjective, the noun. It is what keeps a SINGULAR or ORDINAL entry in the
+    table alive - "a ninth format", "a 9-field row" - when the negative-space
+    rule above would not have found it, and it is what makes the staleness
+    check honest, because a key that matches nothing anywhere is a rule with
+    nothing under it.
+    """
+    num, noun = key.split(" ", 1)
+    return re.compile(r"(?<![\w.,#-])" + re.escape(num)
+                      + r"[ \-]+(?:(?!(?:" + "|".join(sorted(_UNITS))
+                      # {1,14}, not {2,14}: `_count_head` steps over a
+                      # one-letter adjective and this has to reach the same
+                      # phrase, or "the 35 R tests" is a count the scan finds
+                      # and the table cannot locate.
+                      + r")[ \-])[a-z]{1,14}[ \-]+)?"
+                      + re.escape(noun).replace("\\ ", r"[ \-]+") + r"\b",
+                      re.I)
+
+
+def _count_value(tok):
+    """The integer a matched number means, word or digits."""
+    tok = tok.lower()
+    return COUNT_WORDS[tok] if tok in COUNT_WORDS else int(tok.replace(",", ""))
+
+
+def _py_prose(path):
+    """Every comment and docstring in a Python file, and no code.
+
+    The surface the bad counts keep turning up in - in metaannot.py, and in
+    this suite, which was not scanned at all until a count in this very file's
+    docstrings turned out to be two rounds stale.
+    """
+    src = _text(path)
+    out = [l for l in src.splitlines() if l.lstrip().startswith("#")]
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                          ast.AsyncFunctionDef)):
+            d = ast.get_docstring(n)
+            if d:
+                out.append(d)
+    return "\n".join(out)
+
+
+def _unreleased(text):
+    """The CHANGELOG section this change set is allowed to rewrite.
+
+    A shipped release's entries are a RECORD and are not edited to match a
+    later code base, so the scan stops at the first released heading.
+    """
+    return text[text.index("## Unreleased"):text.index("\n## v0.5.0")]
+
+
+def _tests_prose():
+    """Every comment and docstring in the suite, as one surface.
+
+    One surface and not one per file, so "six surfaces" stays a number about
+    KINDS of place a count can live rather than a number that moves whenever
+    somebody adds a test module.
+    """
+    d = os.path.join(ROOT, "tests")
+    return "\n".join(_py_prose(os.path.join(d, f))
+                     for f in sorted(os.listdir(d)) if f.endswith(".py"))
+
+
+_EMITTED = {}
+
+
+def _doctor_documents(ma):
+    """Real `doctor --json` documents, built in process.
+
+    THE DOCUMENT, not a list of the constants somebody remembered to name.
+    The surface used to be five hand-listed constants, and it grew by one each
+    time a reading found a number in a sentence that was not on the list -
+    which is the same defect as the noun whitelist, one surface over: a
+    hand-kept list of where to look cannot see the place nobody thought of.
+    Every string in a real document is in the scan by construction, including
+    the ones built per row out of a path, a stage list or a config value.
+
+    Three configs, because a document only carries the rows its config
+    reaches. The bare one is most of them; the DIAMOND one is the only way to
+    reach `db:diamond:<tag>:usable`, whose caveat is where the record and
+    defline caps are published; and `fragpipe_tmt` is the only way to reach
+    the `tmt` block. Memoised, because building one costs a few seconds of
+    probing PATH and this file scans the surfaces more than once.
+    """
+    if "docs" in _EMITTED:
+        return _EMITTED["docs"]
+    import fixtures as F
+    out = []
+    for name in ("bare", "diamond", "tmt"):
+        root = tempfile.mkdtemp(prefix=f"ma_doc_{name}_")
+        cfg = json.loads(json.dumps(ma.DEFAULT_CONFIG))
+        cfg["results_dir"] = os.path.join(root, "results")
+        if name == "diamond":
+            db = os.path.join(root, "db")
+            os.makedirs(db)
+            F.write_dmnd(os.path.join(db, "vfdb.dmnd"))
+            with open(os.path.join(db, "vfdb.fasta"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(">a one\nMKV\n>b two\nMKW\n")
+            cfg["db"]["diamond"] = {"vfdb": os.path.join(db, "vfdb.dmnd")}
+            cfg["run"]["diamond"] = True
+        if name == "tmt":
+            plex = os.path.join(root, "tmt", "TMT1")
+            os.makedirs(plex)
+            with open(os.path.join(plex, "ion.tsv"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("Peptide\tCharge\t126\n")
+            cfg["quant_table"] = os.path.join(root, "tmt")
+            cfg["quant_format"] = "fragpipe_tmt"
+        # PATH EMPTIED for every one of them, because a document's text
+        # depends on what is installed and a surface that changes shape with
+        # the machine would make this scan pass on a laptop and fail on the
+        # server. The DIAMOND row is the one that proves it: the caveat
+        # carrying the record and defline caps is written only when `diamond`
+        # is NOT on PATH - with the binary there the row reads the database
+        # header instead and says something with no numbers in it at all, so
+        # on a machine with DIAMOND installed those two counts would simply
+        # stop being anywhere, and the table would call them stale.
+        old_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = ""
+            p = ma.Paths(cfg)
+            reqs = ma.requirements(cfg, p)
+            out.append(ma.doctor(cfg, p, reqs,
+                                 ma.doctor_checks(cfg, p, reqs, None)))
+        finally:
+            os.environ["PATH"] = old_path
+    _EMITTED["docs"] = out
+    return out
+
+
+def _emitted_prose(ma):
+    """Every string a real `doctor --json` document publishes, as one surface.
+
+    Every string, and not the ones that look like sentences: a `detail` is
+    where the numbers are, but a `caveat`, a `finding`, a `not_counted_reason`
+    and a `verdict.rule` are all published prose too, and picking which keys
+    to read would be the hand-kept list again.
+    """
+    out = []
+
+    def walk(v):
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(_doctor_documents(ma))
+    # Two things this join has to get right, both learned from the document
+    # itself. A string with NO WHITESPACE is an identifier and not prose - a
+    # stage name, a check id, a version, a hostname, the `generated`
+    # timestamp - and none of them can carry a claim about a count. And the
+    # pieces are separated by something a count cannot be read across:
+    # joined with a space, the `generated` timestamp ran straight into the
+    # `host` beside it, and the seconds field followed by a hostname is a
+    # number followed by a plural-looking word - so the scan reported a count
+    # of the machine this suite happened to run on.
+    return " || ".join(x for x in out if " " in x.strip())
+
+
+def _count_surfaces(ma):
+    """(name, prose) for each of the six surfaces a count can live in.
+
+    The emitted document is one of them and is generated, not typed: every
+    sentence in it that carries a number is built from a constant, and this is
+    what says so rather than leaving it to be assumed.
+    """
+    return [
+        ("metaannot.py comments and docstrings", _py_prose(METAANNOT_PY)),
+        ("the emitted document", _emitted_prose(ma)),
+        ("tests/ comments and docstrings", _tests_prose()),
+        ("README.md", _text(README)),
+        ("TUTORIAL.md", _text(TUTORIAL)),
+        ("CHANGELOG.md (Unreleased)", _unreleased(_text(CHANGELOG))),
+    ]
+
+
+def _no_manifest_formats(ma):
+    """How many quant formats have no reader that opens a manifest at all."""
+    n = 0
+    for fmt in sorted(ma.ALL_FORMATS):
+        cfg = json.loads(json.dumps(ma.DEFAULT_CONFIG))
+        cfg["quant_format"] = fmt
+        cfg["run"].update(join=True, unipept=True, taxonomy=True)
+        if not ma._manifest_readers(cfg):
+            n += 1
+    return n
+
+
+def _example_configs():
+    d = os.path.join(ROOT, "examples", "server-run-plan")
+    return sum(1 for _r, _ds, fs in os.walk(d)
+               for f in fs if f.endswith((".yaml", ".yml")))
+
+
+def _evidence_columns():
+    """The columns the README's `peptide_evidence.tsv` sentence lists.
+
+    A count of what the sentence itself enumerates, and each name checked
+    against a literal in the engine. It cannot see a TENTH column appearing in
+    `rollup_features()` that nobody documented - that is what
+    `test_every_bin_is_documented` and its neighbours are for - but it does
+    stop the number and the list from parting company, and stops the list
+    naming a column the tool does not write.
+    """
+    m = re.search(r"`peptide_evidence\.tsv` has one row per protein and "
+                  r"(\w+) columns:\s*(.+?)\. The last two",
+                  _norm(_text(README)))
+    assert m, "the README no longer describes peptide_evidence.tsv's columns"
+    names = re.findall(r"`([a-z_]+)`", m.group(2))
+    src = _text(METAANNOT_PY)
+    for name in names:
+        assert f'"{name}"' in src or f"'{name}'" in src, \
+            f"the README lists a peptide_evidence column the tool never " \
+            f"writes: {name}"
+    return COUNT_WORDS[m.group(1).lower()], len(names)
+
+
+def _scope_heading_states():
+    """How many states the doctor suite's scope heading enumerates.
+
+    The heading is `exists / right kind / not empty - the three states of one
+    path`, and the number in it was classified DERIVED with a recompute of
+    `3`. Counting the slash-separated items is what makes the classification
+    mean something: the sentence and its own number can no longer part
+    company, which is the whole point of the registry.
+    """
+    src = _text(os.path.join(TESTS_DIR, "test_doctor_json.py"))
+    m = re.search(r"^# (.+?) - the \w+ states of one path$", src, re.M)
+    assert m, "the doctor suite no longer carries that scope heading"
+    return len([x for x in m.group(1).split("/") if x.strip()])
+
+
+def _miss_cols_slice():
+    """How many unmatched quant columns the `manifest:mapping` row prints.
+
+    The README and the TUTORIAL both quote this number, and it is a literal
+    slice in `_manifest_checks` - `miss_cols[:N]` - so it is derivable rather
+    than a thing to remember.
+    """
+    src = _text(METAANNOT_PY)
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_manifest_checks")
+    body = ast.get_source_segment(src, fn)
+    # Scoped to the doctor row on purpose: stage_join's own WARN truncates the
+    # same list at a different length, and the sentence in the docs is about
+    # what `doctor` prints.
+    m = re.search(r"miss_cols\[:(\d+)\]", body)
+    assert m, "the mapping row no longer truncates its unmatched columns"
+    return int(m.group(1))
+
+
+def _describe_per_stage_keys():
+    """The keys describe() emits for one stage, off the dict literal itself.
+
+    The count that was wrong for the fourth consecutive round. Read from the
+    source rather than from a document, because the sentence being checked is
+    a comment sitting on that literal and the two have to be the same thing.
+    """
+    src = _text(METAANNOT_PY)
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "describe")
+    for node in ast.walk(fn):
+        if isinstance(node, ast.ListComp) and isinstance(node.elt, ast.Dict):
+            return [k.value for k in node.elt.keys
+                    if isinstance(k, ast.Constant)]
+    raise AssertionError("describe() no longer builds its stage dicts inline")
+
+
+def _suite_tuple_len(module, name):
+    """How many entries a module-level tuple in a test module has.
+
+    tests/ is a surface now, so a count in a test's own comment about a list
+    in a test module is derivable exactly as one about an engine constant is.
+    Read by AST rather than by import: importing a test module to count one
+    tuple pulls its whole fixture stack in for nothing.
+    """
+    src = _text(os.path.join(ROOT, "tests", module))
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name
+                for t in node.targets):
+            return len(node.value.elts)
+    raise AssertionError(f"tests/{module} no longer defines {name}")
+
+
+def _fn_list_len(fn_name, var):
+    """How many elements a list literal assigned inside a function has."""
+    src = _text(METAANNOT_PY)
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == var
+                        for t in node.targets)
+                and isinstance(node.value, ast.List)):
+            return len(node.value.elts)
+    raise AssertionError(f"{fn_name}() no longer assigns a list to {var}")
+
+
+# phrase -> (bucket, note, recompute or None)
+COUNT_PROSE = {
+    # ---- DERIVED: recomputed from the source, right here -------------
+    "four checks": ("DERIVED", "the checks that read INTO a file",
+                    lambda ma: len(ma.DOCTOR_DEEP_CHECKS)),
+    "fifth entry": ("DERIVED", "the next DOCTOR_DEEP_CHECKS entry",
+                    lambda ma: len(ma.DOCTOR_DEEP_CHECKS) + 1),
+    "tenth value": ("DERIVED", "null, one past DOCTOR_FOUND_KINDS",
+                    lambda ma: len(ma.DOCTOR_FOUND_KINDS) + 1),
+    "twenty-one stages": ("DERIVED", "STAGES", lambda ma: len(ma.STAGES)),
+    "eight formats": ("DERIVED", "ALL_FORMATS", lambda ma: len(ma.ALL_FORMATS)),
+    "eight format": ("DERIVED", "ALL_FORMATS", lambda ma: len(ma.ALL_FORMATS)),
+    "ninth format": ("DERIVED", "the next quant format",
+                     lambda ma: len(ma.ALL_FORMATS) + 1),
+    "four formats": ("DERIVED", "formats with no manifest reader",
+                     _no_manifest_formats),
+    "fourteen packages": ("DERIVED", "RNEED + ROPT",
+                          lambda ma: len(ma.RNEED) + len(ma.ROPT)),
+    "three values": ("DERIVED", "TMBED_GPU_MODES",
+                     lambda ma: len(ma.TMBED_GPU_MODES)),
+    "three command": ("DERIVED", "TMBED_GPU_MODES' command lines",
+                      lambda ma: len(ma.TMBED_GPU_MODES)),
+    "fourth mode": ("DERIVED", "the next TMBED_GPU_MODES entry",
+                    lambda ma: len(ma.TMBED_GPU_MODES) + 1),
+    "fourth value": ("DERIVED", "the next TMBED_GPU_MODES entry",
+                     lambda ma: len(ma.TMBED_GPU_MODES) + 1),
+    "two values": ("DERIVED", "DOCTOR_FAIL_REASONS",
+                   lambda ma: len(ma.DOCTOR_FAIL_REASONS)),
+    "five values": ("DERIVED", "ASSIGNMENT_CLASSES",
+                    lambda ma: len(ma.ASSIGNMENT_CLASSES)),
+    "eight configs": ("DERIVED", "examples/server-run-plan",
+                      lambda ma: _example_configs()),
+    "nine columns": ("DERIVED", "the columns the README's own sentence lists",
+                     lambda ma: _evidence_columns()[1]),
+    # The self-correction groups are the ones whose headings are about what
+    # the document CLAIMS - "Six claims the first draft made about ITSELF",
+    # "Six claims the third reading corrected". The attribution group and the
+    # engine-defect group are each their own noun in the same sentence and are
+    # counted beside this one.
+    "twenty-eight corrections": ("DERIVED", "the groups that correct the document",
+                           lambda ma: sum(
+                               n for h, n in _unreleased_fixed_groups()
+                               if "claims" in h.lower())),
+
+    "four columns": ("DERIVED", "the miss_cols slice in _manifest_checks",
+                     lambda ma: _miss_cols_slice()),
+
+    # ---- DERIVED, added by the FIFTH reading, when the scan grew -----
+    # Digits, tests/ and the wider emitted document all arrived together, and
+    # these are the counts that only became visible because of it.
+    "ten keys": ("DERIVED", "the per-stage dict describe() emits",
+                 lambda ma: len(_describe_per_stage_keys())),
+    "200,000 records": ("DERIVED", "DMND_FASTA_RECORD_CAP",
+                        lambda ma: ma.DMND_FASTA_RECORD_CAP),
+    "200 deflines": ("DERIVED", "DMND_DEFLINE_CAP",
+                     lambda ma: ma.DMND_DEFLINE_CAP),
+    "six surfaces": ("DERIVED", "the surfaces this scan reads",
+                     lambda ma: len(_count_surfaces(ma))),
+    "eleven configs": ("DERIVED", "CONFIGS in tests/test_doctor_json.py",
+                       lambda ma: _suite_tuple_len("test_doctor_json.py",
+                                                   "CONFIGS")),
+    "four rows": ("DERIVED", "UNREADABLE_FALSE_PASSES",
+                  lambda ma: _suite_tuple_len("test_doctor_json.py",
+                                              "UNREADABLE_FALSE_PASSES")),
+    "four keys": ("DERIVED", "UNREADABLE_FALSE_PASSES",
+                  lambda ma: _suite_tuple_len("test_doctor_json.py",
+                                              "UNREADABLE_FALSE_PASSES")),
+    "21 stages": ("DERIVED", "STAGES", lambda ma: len(ma.STAGES)),
+    "9 field": ("DERIVED", "the custom --outfmt 6 columns parse_diamond reads",
+                lambda ma: _fn_list_len("parse_diamond", "cols")),
+    # C4: this was ("DERIVED", ..., lambda ma: 3) - a DERIVED entry whose
+    # recompute was the literal it was checking, so it could only ever agree
+    # with itself. That is the "rule with nothing under it" the staleness half
+    # of this test exists to prevent, one level up: a reader meets DERIVED and
+    # believes the number is pinned to something. It is pinned now, to the
+    # thing the sentence itself enumerates - the slash-separated states in the
+    # scope heading it sits in - which is the same shape as "nine columns"
+    # above and fails if somebody adds a fourth state to the list and leaves
+    # the word alone.
+    "three states": ("DERIVED", "the states the scope heading itself lists",
+                     lambda ma: _scope_heading_states()),
+
+    # ---- MEASURED added by the fifth reading --------------------------
+    # A fact about a dataset, a host, someone else's file format, or an
+    # observation of what a tool or a browser really did.
+    # Not recomputable; the pin is that the SENTENCE STILL EXISTS.
+    "seven paths": ("MEASURED", "the paths `run` was measured hanging on, "
+                                "one FIFO at a time"),
+    # Was DERIVED, as "one input key through every state", and the sweep has
+    # grown two states since - so the recompute moved to "nine cells" above
+    # and this phrase is left pointing at what it always meant in the sentence
+    # it appears in: the cells where `doctor` and `run` actually disagreed,
+    # counted once, on a machine, at a time.
+    "seven cells": ("MEASURED", "the FIFO cells where the differential sweep "
+                                "found doctor and run disagreeing"),
+    "1 row": ("MEASURED", "how often a structure column is non-empty, "
+                          "observed on the real run"),
+    "1,237,468 values": ("MEASURED", "the real 8-plex run's matrix"),
+    "6 groups": ("MEASURED", "the real run's design"),
+    "4 stages": ("MEASURED", "stage_workers in a worked sizing example"),
+    "5 databases": ("MEASURED", "the DIAMOND databases of the real run"),
+    "262 entries": ("MEASURED", "BAGEL4's motif seed set"),
+    "12 columns": ("MEASURED", "DIAMOND's own default --outfmt 6"),
+    "10 field": ("MEASURED", "a legacy foldseek row's width, observed"),
+    "10 column": ("MEASURED", "a legacy row's width before a column was "
+                              "appended, observed"),
+    "11 column": ("MEASURED", "the same row with target_db appended"),
+    "tenth column": ("PROSE", "'a TENTH column appearing in "
+                              "rollup_features()' - a hypothetical about a "
+                              "column nobody has documented"),
+    "11 field": ("MEASURED", "a foldseek row's width with target_db appended"),
+    "ten fields": ("MEASURED", "the foldseek output fields both lists ask "
+                               "for, observed against the binary"),
+    "18 columns": ("MEASURED", "hmmsearch --tblout's fixed columns"),
+    "23 column": ("MEASURED", "hmmsearch --domtblout's fixed columns"),
+    "14 column": ("MEASURED", "InterProScan's TSV with -iprlookup -goterms"),
+    "9 column": ("MEASURED", "the DIAMOND custom format, in a fixture's "
+                             "docstring and in this file's own example"),
+    "30 columns": ("MEASURED", "the hhsearch hit table's name column"),
+    "46 columns": ("MEASURED", "the annotation columns one heuristic swept "
+                               "into an assay, observed"),
+    "1000 rows": ("MEASURED", "readr's type-guess window"),
+    "3 values": ("MEASURED", "limma's minimum valid values per group"),
+    "21 rows": ("MEASURED", "the console rows one distinction governs"),
+    "ten rows": ("MEASURED", "the console rows a caveat used to sit on"),
+    "thirteen rows": ("MEASURED", "the console rows one reproduction showed"),
+    "eight rows": ("MEASURED", "the console rows that all read 'results'"),
+    "five columns": ("MEASURED", "what a browser did to a table whose widths "
+                                 "were style attributes"),
+    "four stages": ("MEASURED", "the auditor's reproduction of the queue"),
+    "nine stages": ("MEASURED", "the stages the README's worked example "
+                                "turns on"),
+    "nine fields": ("MEASURED", "the documented describe fields one commit "
+                                "deleted, listed beside the number"),
+
+    # ---- PROSE added by the fifth reading -----------------------------
+    "0 row": ("PROSE", "'a 0-row matrix' - an empty one, not a count"),
+    "3 file": ("PROSE", "'the chunk 3 whose file is on disk' - an index"),
+    "1 stage": ("PROSE", "a quotation of a rendered console line"),
+    "3 stages": ("PROSE", "'`cost-3 stages` is not \"3 stages\"' - this "
+                          "scanner's own worked example of what it refuses"),
+    "forty files": ("PROSE", "'not counts of four states or forty files' - "
+                             "this scanner's own example of a unit"),
+    "768 config": ("PROSE", "the sweep that never existed, quoted as the "
+                            "record of the defect and asserted nowhere; "
+                            "test_the_changelog_names_the_config_sweep_this_"
+                            "suite_really_runs pins that it stays a quote"),
+    "eight fields": ("PROSE", "a quotation of the fourth wrong count, kept "
+                              "as the record of the defect"),
+    "seven fields": ("PROSE", "the per-stage fields before `cost` - a "
+                              "history, and the rule it illustrates"),
+    "eight entries": ("PROSE", "a history: what the first wave printed under "
+                               "a paragraph that said seven"),
+    "twenty-one entries": ("PROSE", "a history: the bolded entries at the "
+                                    "time, quoted"),
+    "fourteen verdicts": ("PROSE", "a history: the false verdicts at the "
+                                   "time, quoted"),
+    "thirty-three entries": ("PROSE", "a quotation of the sentence that "
+                                      "accounted for thirty-two of them"),
+    "14 entries": ("PROSE", "a history: the non-verdict entries the section "
+                            "held when the sentence was written"),
+    "sixteen stages": ("PROSE", "a quotation of what a shipped CHANGELOG "
+                                "entry used to say"),
+    "seven entries": ("PROSE", "'was read as \"seven entries\"' - the "
+                               "misreading this alternation exists to stop"),
+    "twenty-seven entries": ("PROSE", "the phrase that was misread, quoted"),
+    "fifth status": ("PROSE", "'a fifth status cannot appear' - a "
+                              "hypothetical about a set that has not grown"),
+    "first flag": ("PROSE", "'bounded by the first flag' - a position"),
+    "second key": ("PROSE", "'a SECOND key the row never mentioned' - an "
+                            "ordinal in a narrative, not a cardinality"),
+    "three files": ("PROSE", "a named trio, listed in the same sentence"),
+    "three reasons": ("PROSE", "'for three STRUCTURAL reasons', listed "
+                               "immediately and numbered"),
+    "two reasons": ("PROSE", "'for two reasons', and both follow"),
+    "three rows": ("PROSE", "'three rows in the engine also had' - the "
+                            "sentences one round corrected, named"),
+    "two stage": ("PROSE", "'the two stage lists' - `blocks` and `degrades`, "
+                           "a named pair"),
+    "two file": ("PROSE", "'a two-file commit' - what a pin would cost"),
+    "two files": ("PROSE", "'Two files on purpose' - a named pair"),
+    "two flags": ("PROSE", "a named pair of booleans"),
+    "two group": ("PROSE", "'the difference of the two group means' - a "
+                           "contrast between two named groups"),
+    "two keys": ("PROSE", "'the LAST of two identical keys' - a named pair"),
+    "two paths": ("PROSE", "'two different paths' - a named pair"),
+    "two record": ("PROSE", "'the last two record how' - `record` is the "
+                            "verb here"),
+    "two records": ("PROSE", "'writes two records for every protein' - an "
+                             "arity, not a total"),
+    "two rows": ("PROSE", "'the two usability rows' - a named pair"),
+
+    # ---- MEASURED added by the fourth reading -------------------------
+    "three columns": ("MEASURED", "the eggNOG 2.0.x columns spelled "
+                                  "differently from 2.1.x, observed"),
+    "twelve stages": ("MEASURED", "a worked example of the scheduler queue"),
+
+    # ---- PROSE added by the fourth reading ----------------------------
+    "two verdicts": ("PROSE", "'the difference is two false verdicts' - what "
+                              "one wrong helper cost, named"),
+    "two column": ("PROSE", "'two different column names' - a named pair"),
+    "four check": ("PROSE", "'it used to probe four and check neither' - a "
+                            "history, and the four is pinned as four packages"),
+    "first entries": ("PROSE", "'a table whose first three entries' - a "
+                               "position in a runbook's own timing table, not "
+                               "a count of anything this codebase has"),
+    "seven verdicts": ("PROSE", "a group heading, counted by the group test"),
+    "five false verdicts": ("PROSE", "a group heading, counted by the group "
+                                     "test"),
+    # ---- MEASURED: a fact about a dataset, a host or an observation ---
+    "five databases": ("MEASURED", "the DIAMOND databases of the real run"),
+    "four tiers": ("MEASURED", "the real search database's prefixes"),
+    "three key spaces": ("MEASURED", "the real search database's namespaces"),
+    "two tiers": ("MEASURED", "two prefixes of one namespace, measured"),
+    "six groups": ("MEASURED", "the real run's design"),
+    "three stages": ("MEASURED", "the timing table's concurrency, and "
+                      "'adopted three stages later', a distance"),
+
+    # ---- PROSE: not a cardinality of anything this codebase has -------
+    "first value": ("PROSE", "'the first value was called stage_dies' - a "
+                             "history of one rename, not a count"),
+    "first wave": ("PROSE", "the scheduler's first dispatch, not a count"),
+    "first verdict": ("PROSE", "'the first verdict wins' - precedence"),
+    "first column": ("PROSE", "a column position in someone else's file"),
+    "second command": ("PROSE", "'the second command above' - a reference"),
+    "third state": ("PROSE", "'a directory is a third state again' - one more"),
+    "third kind": ("PROSE", "'a third kind of failure' - a hypothetical"),
+    "third wave": ("PROSE", "'the third wave' names a heading, which is "
+                            "counted by the group test"),
+    "sixth kind": ("PROSE", "'or a sixth kind to the other' - a hypothetical "
+                            "about a set that has not grown"),
+    "seven values": ("PROSE", "a quotation of what the README USED to say"),
+    "three checks": ("PROSE", "a quotation of what the document USED to say"),
+    "eighth value": ("PROSE", "a quotation of the wrong count, kept as the "
+                              "record of the defect"),
+    "two checks": ("PROSE", "'two checks about one file' - a pair, named"),
+    "two stages": ("PROSE", "a named pair - esmfold and tmbed, or the two "
+                            "that fall back"),
+    "two columns": ("PROSE", "a named pair of columns being compared"),
+    "two commands": ("PROSE", "'the two commands above' - a reference"),
+    "two database": ("PROSE", "'two database downloads' - a named pair"),
+    "two states": ("PROSE", "'two states of one file' - a named pair"),
+    "two depths": ("PROSE", "'anything comparing two depths' - an arity"),
+    "three depths": ("PROSE", "'the other three depths', immediately listed"),
+    "two sections": ("PROSE", "'two sections later' - a distance"),
+    "three verdicts": ("PROSE", "'THREE verdicts on one key', listed"),
+    "four waves": ("PROSE", "counted by the false-verdict group test"),
+    "fourth wave": ("PROSE", "'the fourth wave' names a group, which the "
+                             "group test counts"),
+    "two waves": ("PROSE", "'two waves ago' - a distance in this file"),
+    "twelve corrections": ("PROSE", "a quotation of the sentence that left "
+                                    "the engine defect out"),
+    "twenty-four false verdicts": (
+        "DERIVED", "the entries under the false-verdict groups",
+        lambda ma: sum(n for h, n in _unreleased_fixed_groups()
+                       if "false verdict" in h.lower())),
+    "four states": ("MEASURED", "the four path states measured taking the "
+                                "whole document down"),
+    "four packages": ("PROSE", "a quotation of what the TUTORIAL used to say"),
+    "ten columns": ("PROSE", "'asked for the same ten columns again' - a "
+                             "foldseek output format, quoted"),
+    "twelve tier": ("PROSE", "'the twelve-tier budget' - a cap, not a count "
+                             "of things that exist"),
+    "two tier": ("PROSE", "'under two tier prefixes' - a named pair"),
+    "four package": ("PROSE", "'the old four-package probe' - the record of "
+                              "what it used to be"),
+    # ---- DERIVED, added by the SIXTH reading, when the whitelist went ----
+    # The negative-space rule surfaced a pile of counts that had never been
+    # visible. These are the ones that are recomputable, and several of them
+    # are the sweeps' own sizes, which is what the two wrong counts this round
+    # fixed were about.
+    "sixteen modules": ("DERIVED", "the test modules in tests/",
+                        lambda ma: len([f for f in os.listdir(
+                            os.path.join(ROOT, "tests"))
+                            if f.startswith("test_") and f.endswith(".py")])),
+    "nine states": ("DERIVED", "PATH_STATES in tests/test_doctor_json.py",
+                     lambda ma: _suite_tuple_len("test_doctor_json.py",
+                                                 "PATH_STATES")),
+    "fifty-four cells": ("DERIVED", "the input sweep: every key in every state",
+                        lambda ma: (_suite_tuple_len("test_doctor_json.py",
+                                                     "INPUT_PATH_KEYS")
+                                    * _suite_tuple_len("test_doctor_json.py",
+                                                       "PATH_STATES"))),
+    "81 cases": ("DERIVED", "the whole sweep: the input keys and the TMT tree",
+                 lambda ma: ((_suite_tuple_len("test_doctor_json.py",
+                                               "INPUT_PATH_KEYS")
+                              + _suite_tuple_len("test_doctor_json.py",
+                                                 "TMT_READ_PATHS"))
+                             * _suite_tuple_len("test_doctor_json.py",
+                                                "PATH_STATES"))),
+    "nine cells": ("DERIVED", "one input key through every state",
+                    lambda ma: _suite_tuple_len("test_doctor_json.py",
+                                                "PATH_STATES")),
+    "104 entries": ("DERIVED", "the Unreleased/Fixed groups",
+                            lambda ma: sum(
+                                n for _h, n in _unreleased_fixed_groups())),
+    "fifteen groups": ("DERIVED", "the Unreleased/Fixed groups",
+                      lambda ma: len(_unreleased_fixed_groups())),
+    "eighty entries": ("DERIVED", "the entries that are NOT false verdicts",
+                           lambda ma: sum(
+                               n for h, n in _unreleased_fixed_groups()
+                               if "false verdict" not in h.lower())),
+    "three configs": ("DERIVED", "the documents _emitted_prose() is built from",
+                      lambda ma: len(_doctor_documents(ma))),
+    "seven vocabularies": ("PROSE", "'five of the seven closed vocabularies' "
+                                    "- a history: what there were before "
+                                    "`section` turned out to be the eighth"),
+
+    # ---- MEASURED, added by the sixth reading ---------------------------
+    # Facts about a dataset, a run, a machine or somebody else's file format.
+    # Not recomputable; the pin is that the SENTENCE STILL EXISTS, so an edit
+    # cannot strand a measurement whose subject has gone.
+    "30 rows": ("MEASURED", "what a taxonomy run over a CHAR-DEVICE manifest "
+                            "really returned - the measurement that proved "
+                            "the manifest row's 'every stage goes with it' "
+                            "false and its `blocks: [join]` right"),
+    "141 proteins": ("MEASURED", "the real run's `3s_structure_only` bin"),
+    "604 proteins": ("MEASURED", "the first real run's effector shortlist"),
+    "40 proteins": ("MEASURED", "a worked example of the min_plexes message"),
+    "5 proteins": ("MEASURED", "the ~10^5 proteins a real database holds"),
+    "10 proteins": ("MEASURED", "the fixture taxon, 7 of its 10 in one plex"),
+    "10 members": ("MEASURED", "the same fixture taxon, in the README"),
+    "thirty proteins": ("MEASURED", "the TMT fixture's protein set"),
+    "twelve proteins": ("MEASURED", "the taxonomy fixture's T1 taxon"),
+    "fifty proteins": ("MEASURED", "the dark-fold example in the README"),
+    "fifty singletons": ("MEASURED", "the same example's comparison"),
+    "30 features": ("MEASURED", "the assignment sweep's fixture"),
+    "four features": ("MEASURED", "the four kinds of feature one fixture has"),
+    "four peptides": ("MEASURED", "a finding's worked example"),
+    "three peptides": ("MEASURED", "the TMT fixture, per protein"),
+    "36 samples": ("MEASURED", "a worked example of the centring problem"),
+    "75 samples": ("MEASURED", "the second real dataset"),
+    "four samples": ("MEASURED", "the TMT fixture's design"),
+    "8 plexes": ("MEASURED", "the real 8-plex TMT run"),
+    "six plexes": ("MEASURED", "where the pool sat in the real 8-plex run"),
+    "88 channels": ("MEASURED", "the same run, 11 channels x 8 plexes"),
+    "16 channels": ("MEASURED", "a TMTpro plex, in the mixed-sizes note"),
+    "16 channel": ("MEASURED", "the annotation a 16-channel plex writes"),
+    "four channels": ("MEASURED", "the TMT fixture's plex"),
+    "three channels": ("MEASURED", "the one-plex fixture"),
+    "262 sequences": ("MEASURED", "BAGEL4's motif seed set"),
+    "91 sequences": ("MEASURED", "the ESMFold run's long tail"),
+    "7 sequences": ("MEASURED", "the sequences one OOM killed a stage over"),
+    "5 taxids": ("MEASURED", "eggNOG 5's seed taxids, from a 2018 taxonomy"),
+    "965 hits": ("MEASURED", "the largest VFDB category on a real gut set"),
+    "22 cores": ("MEASURED", "the workstation the timing table was run on"),
+    "4 threads": ("MEASURED", "DIAMOND's sublinear thread scaling, worked"),
+    "4 jobs": ("MEASURED", "the same worked example"),
+    "four jobs": ("MEASURED", "the README's peak-memory example"),
+    "90 chunks": ("MEASURED", "a resumed run's chunk count"),
+    "33 requests": ("MEASURED", "the console's concurrency reproduction"),
+    "30 attempts": ("MEASURED", "the SIGTERM race, 8 of 30"),
+    "30 tries": ("MEASURED", "the same race, the other sentence about it"),
+    "256 parts": ("MEASURED", "the chunk planner's overshoot, worked"),
+    "4 points": ("MEASURED", "what a zeroed vfdb weight still scored"),
+    "10 directories": ("MEASURED", "the banner one console reproduction read"),
+    "eleven directories": ("MEASURED", "the fixture tree behind that banner"),
+    "eight directories": ("MEASURED", "the directories one cache bug hid"),
+    "fifteen directories": ("MEASURED", "what `describe` used to leave behind"),
+    "eight datasets": ("MEASURED", "the worked example's real plan"),
+    "eight functions": ("MEASURED", "the Windows-skipped signal tests"),
+    "eight items": ("MEASURED", "what those eight functions collect as"),
+    "five tests": ("MEASURED", "the tests the open xfail markers sit on"),
+    "35 tests": ("MEASURED", "the R selection, counted exactly by "
+                             "test_the_readme_test_counts_are_the_counts_"
+                             "this_suite_really_has"),
+    "seven strings": ("MEASURED", "the class names three outputs share"),
+    "seven markers": ("MEASURED", "the console's status markers"),
+    "four endpoints": ("MEASURED", "the console's JSON routes"),
+    "fourteen routes": ("MEASURED", "the console's routes, in a test's note"),
+    "six predicates": ("MEASURED", "the predicates one fixture combines"),
+    "three genus": ("MEASURED", "the taxonomy fixture's tree"),
+    "21 claims": ("MEASURED", "what the console page asserted about a "
+                              "directory it knew nothing about"),
+    "500 characters": ("MEASURED", "the stage-error cap"),
+    "500 character": ("MEASURED", "the same cap, attributively"),
+    "eight failures": ("MEASURED", "what fits on the console page at that cap"),
+    "five failures": ("MEASURED", "what pushed the vitals off screen at "
+                                  "1440x860"),
+    "three failures": ("MEASURED", "the failures one `.dead` block held"),
+    "five misses": ("MEASURED", "the heartbeat reproduction, 5 x 0.5s"),
+    "three days": ("MEASURED", "how long a first full run takes"),
+    "3 days": ("MEASURED", "the same estimate, in the runbook's table"),
+    "three day": ("MEASURED", "the run a reversed kill order would hit"),
+    "six months": ("MEASURED", "when somebody opens the directory again"),
+    "three tools": ("MEASURED", "the concurrency the timing table really used"),
+    "three orders": ("MEASURED", "the fixture's plex effect, in log2"),
+    "four orders": ("MEASURED", "the size-factor example, in log2"),
+    "2 orders": ("MEASURED", "how much slower tmbed is on a CPU"),
+    "four ratios": ("MEASURED", "what a median can rest on at the threshold"),
+    "three spaces": ("MEASURED", "the real search database's namespaces"),
+    "4 mer": ("MEASURED", "the LP.TG motif's length"),
+    "3 letter": ("MEASURED", "the `Xre` substring that matched everything"),
+    "7 digit": ("MEASURED", "the accession widths one database uses"),
+    "six character": ("MEASURED", "the mark the human report prints"),
+    "three levels": ("MEASURED", "how deep `--root` scans"),
+    "eleven configs": ("DERIVED", "CONFIGS in tests/test_doctor_json.py",
+                       lambda ma: _suite_tuple_len("test_doctor_json.py",
+                                                   "CONFIGS")),
+
+    # ---- PROSE, added by the sixth reading ------------------------------
+    # Not a cardinality of anything this codebase has: a pair named in the
+    # sentence, a position, a history quoted as the record of a defect, or
+    # this scanner's own worked example of something it refuses.
+    "143 matches": ("PROSE", "an exit status, not a count of anything"),
+    "2 others": ("PROSE", "'minus 2 if others share the machine' - a margin"),
+    "2 settings": ("PROSE", "'your phase 2 settings' - a phase, not a count"),
+    "50 these": ("PROSE", "'50 for these three because' - a threshold"),
+    "25 them": ("PROSE", "'25 of them is hours between log lines' - a rate"),
+    "264 them": ("PROSE", "'264 of them' - the parts the planner overshot to"),
+    "993 them": ("PROSE", "the models that passed the pLDDT gate, measured "
+                          "in the same sentence as the 1,821 built"),
+    "eight them": ("PROSE", "'All eight of them' - the refused matrices, "
+                            "listed immediately"),
+    "eight these": ("PROSE", "'a real run writes eight of these' - the "
+                             "refused files, named in the same comment"),
+    "five them": ("PROSE", "'five of them went unguarded' - a history: the "
+                           "vocabularies before `section` became the eighth"),
+    "five those": ("PROSE", "'Five of those seven markers are new' - a "
+                            "subset of a count pinned beside it"),
+    "seven them": ("PROSE", "'all SEVEN of them have now been measured' - "
+                            "the seven paths, pinned as `seven paths`"),
+    "three these": ("PROSE", "'All three of these were real' - a named trio"),
+    "four these": ("PROSE", "'false for four of these twelve' - a subset"),
+    "thirty them": ("PROSE", "'all thirty of them' - the sentence this rule "
+                             "was written for, quoted in the comment that "
+                             "explains why a pronoun is a head"),
+    "three ones": ("PROSE", "'the three security ones' - a named trio"),
+    "five ones": ("PROSE", "'like the five stock ones' - the stock DIAMOND "
+                           "databases, pinned as `five databases`"),
+    "six others": ("PROSE", "'six others exist' - a quotation of the banner "
+                            "that counted without naming"),
+    "3 aminomutase": ("PROSE", "'3-aminomutase' - part of an identifier"),
+    "3 tuple": ("PROSE", "'a 3-tuple' - an arity"),
+    "four step": ("PROSE", "'a four-step runbook' - the steps are listed"),
+    "three way": ("PROSE", "'the three-way split' - the branches follow"),
+    "768 way": ("PROSE", "'the 768-way product this sentence imagined' - the "
+                         "sweep that never existed, quoted"),
+    "four constants": ("PROSE", "a history: what `_emitted_prose()` read "
+                                "before it was built from a document"),
+    "four readings": ("PROSE", "a history: the readings before this one"),
+    "four rounds": ("PROSE", "'four verification rounds' - a history"),
+    "three rounds": ("PROSE", "'for three rounds' - a history"),
+    "six reproductions": ("PROSE", "a heading over the reproductions it lists"),
+    "six claims": ("PROSE", "a group heading, counted by the group test"),
+    "ten claims": ("PROSE", "a group heading, counted by the group test"),
+    "ten defects": ("PROSE", "a group heading, counted by the group test"),
+    "twelve defects": ("PROSE", "a group heading, counted by the group test"),
+    "seventeen defects": ("PROSE", "a group heading, counted by the group "
+                                   "test"),
+    "seven defects": ("PROSE", "a group heading, counted by the group test"),
+    "six tests": ("PROSE", "'five of the six unmarked tests were marked' - a "
+                           "history of one count reaching one"),
+    "490 tests": ("PROSE", "a history: how far the README's numbers had "
+                           "drifted, quoted"),
+    "thirteen modules": ("PROSE", "the wrong count, kept as the record of "
+                                  "the defect"),
+    "six states": ("PROSE", "a quotation of what the sweep entry used to say"),
+    "thirty cells": ("PROSE", "the same quotation's other half"),
+    "twelve cells": ("PROSE", "the DIFFERENCE between two counts in one "
+                              "sentence, both of which are pinned above"),
+    "four cells": ("PROSE", "a history: the cells the differential sweep "
+                            "turned up before the other three were measured"),
+    "seven hangs": ("PROSE", "'all seven hangs' - the seven paths, pinned "
+                             "as `seven paths`"),
+    "four spurious": ("PROSE", "a history: what one duplicated row cost"),
+    "three previous rounds": ("PROSE", "a history, in the CHANGELOG"),
+    "three assertions": ("PROSE", "a history: what a shadowed table broke"),
+    "three cases": ("PROSE", "'the three cases say three different things' - "
+                             "the cases are named in the sentence"),
+    "three sources": ("PROSE", "'Three sources, two answers' - a named trio"),
+    "five instances": ("PROSE", "'The class, not the five instances' - the "
+                                "same rule, in the helper it names"),
+    "four resources": ("PROSE", "'a count of four resources' - this "
+                                "scanner's own example of what a unit does"),
+    "four callers": ("PROSE", "the callers of one helper, listed beside it"),
+    "four copies": ("PROSE", "'one row rather than four copies' - the "
+                             "copies that would have been"),
+    "four hmmpress": ("PROSE", "'the four hmmpress siblings' - the files "
+                               "hmmpress writes, pinned as `four siblings`"),
+    "four siblings": ("MEASURED", "what hmmpress writes beside a library"),
+    "four items": ("PROSE", "'four collected items between them' - the "
+                            "tests one tree held, named"),
+    "four places": ("PROSE", "'written by hand in four places' - a history"),
+    "four sentences": ("PROSE", "'four sentences added by this change set' - "
+                                "a history"),
+    "four shapes": ("PROSE", "'the four falsy shapes' - listed in the test"),
+    "four skips": ("PROSE", "'turns three names into four skips' - an "
+                            "arithmetic worked in the sentence"),
+    "four slots": ("PROSE", "'compete for four slots' - the default "
+                            "stage_workers, quoted as an example"),
+    "four statements": ("PROSE", "'three of the four statements of the "
+                                 "verdict rule' - the statements are listed"),
+    "four terms": ("PROSE", "'an OR of four terms' - the terms are listed"),
+    "four tests": ("PROSE", "'all four describe tests' - a named set"),
+    "four things": ("PROSE", "'an OR of four things' - listed in the doc"),
+    "three answers": ("PROSE", "'Three answers, not two' - each is given"),
+    "three arms": ("PROSE", "'exactly three arms' - the arms are the code "
+                            "below the sentence"),
+    "three behaviours": ("PROSE", "'Three behaviours on one key' - listed"),
+    "three branches": ("PROSE", "'the three branches that used to write' - a "
+                                "history"),
+    "three buckets": ("PROSE", "'the three buckets it happened to name' - a "
+                               "history of one sentence"),
+    "three causes": ("PROSE", "'The three causes are not the same' - listed"),
+    "three claims": ("PROSE", "'Three claims, and each of them' - listed"),
+    "three classes": ("PROSE", "'the three utility classes' - a section "
+                               "heading over the three it holds"),
+    "three conditions": ("PROSE", "'as three separate conditions' - the "
+                                  "conditions are written out"),
+    "three copies": ("PROSE", "'three copies of it had already' - a history"),
+    "three counts": ("PROSE", "'let three other counts drift' - a history"),
+    "three decisions": ("PROSE", "'three decisions matter more' - listed"),
+    "three facts": ("PROSE", "'the three urgent facts' - named in the test"),
+    "three functions": ("PROSE", "'a NoneType traceback three functions "
+                                 "later' - a distance"),
+    "three instances": ("PROSE", "'the STRUCTURE and not the three "
+                                 "instances' - the same rule this scanner is"),
+    "three limits": ("PROSE", "'Three limits are worth knowing' - listed"),
+    "three lists": ("PROSE", "'Three different lists come' - named"),
+    "three outcomes": ("PROSE", "'Three outcomes:' - a table follows"),
+    "three places": ("PROSE", "'in this list in three places' - a history"),
+    "three probes": ("PROSE", "'Three probes, because no one' - listed"),
+    "three refusals": ("PROSE", "'the three refusals' - the console's, named "
+                                "in CLAUDE.md and in the test"),
+    "three renderings": ("PROSE", "'three renderings of one rule' - named"),
+    "three sentences": ("PROSE", "'Three published sentences said' - the "
+                                 "history this verb's docstring records"),
+    "three settings": ("PROSE", "'the three settings cmd_run validates' - "
+                                "listed immediately"),
+    "three tests": ("PROSE", "'the three tests beside it' - named"),
+    "three things": ("PROSE", "'the same three things as ion.tsv' - named"),
+    "three ways": ("PROSE", "'The verdict, three ways' - each is written"),
+}
+
+
+def test_every_count_in_prose_is_derived_from_the_thing_it_counts_or_pinned():
+    """The class, not the five instances. See the block comment above.
+
+    Two halves, and they do different jobs. The NEGATIVE SPACE half reads the
+    six surfaces and refuses any "<number> <plural noun>" the table does not
+    classify - that is the half that would have caught "thirteen test modules"
+    and "all thirty of them", and it is the half that is new. The TABLE half
+    goes the other way: it looks for each classified phrase where it is
+    allowed to be written, recomputes the DERIVED ones, and fails on a key
+    nothing in the tree says any more. That half is what keeps a singular or
+    ordinal pin - "a ninth format", "a 9-field row" - alive, since the shape
+    rule above would not have found either.
+    """
+    import metaannot as _unused                              # noqa: F401
+    ma = _load_ma()
+    surfaces = [(name, _norm(text).replace("**", ""))
+                # Markdown emphasis stripped: `**twenty-four** live false
+                # verdicts` put two asterisks between the number and the
+                # thing, and the scan read straight past the one count in this
+                # file that had already been wrong once.
+                for name, text in _count_surfaces(ma)]
+
+    unclassified = []
+    for name, flat in surfaces:
+        for m in _COUNT_RE.finditer(flat):
+            phrase = _count_phrase(m)
+            if phrase is None or phrase in COUNT_PROSE:
+                continue
+            unclassified.append(
+                f"{name}: {phrase!r} is a count of something this codebase "
+                f"has and nothing pins it. Context: "
+                f"...{flat[max(0, m.start() - 90):m.end() + 60]}...")
+    assert not unclassified, "\n".join(unclassified)
+
+    wrong, stale = [], []
+    for phrase, entry in sorted(COUNT_PROSE.items()):
+        rx = _phrase_re(phrase)
+        seen = [(name, m) for name, flat in surfaces for m in rx.finditer(flat)]
+        if not seen:
+            stale.append(phrase)
+            continue
+        if entry[0] != "DERIVED":
+            continue
+        want, got = entry[2](ma), _count_value(phrase.split(" ", 1)[0])
+        if got != want:
+            name, m = seen[0]
+            flat = dict(surfaces)[name]
+            wrong.append(f"{name}: {phrase!r} says {got}, but {entry[1]} is "
+                         f"{want}. Context: "
+                         f"...{flat[max(0, m.start() - 90):m.end() + 60]}")
+    assert not wrong, "\n".join(wrong)
+    # A registry entry for a sentence nobody writes any more is a rule with
+    # nothing under it, and the next reader believes it is still enforced.
+    assert not stale, \
+        f"COUNT_PROSE classifies phrases that appear in none of the six " \
+        f"surfaces any more: {stale}"
+
+
+def _load_ma():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_ma_docs", METAANNOT_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_readme_peptide_evidence_column_count_is_the_list_beside_it():
+    # The narrow half of the rule above, spelled out: the number and the list
+    # in one sentence cannot part company, and no name in the list is one the
+    # tool never writes.
+    said, listed = _evidence_columns()
+    assert said == listed, \
+        f"the README says {said} columns and lists {listed}"
+
+
+def test_the_changelog_non_verdict_entries_add_up_to_the_section(ma):
+    """symptom: the sentence accounted for thirty-two of thirty-three entries.
+
+    "one attribution that was never a verdict and twelve corrections to what
+    the document says about ITSELF" came to 13 against a section that then
+    held 14 entries that are not false verdicts - the fourteenth was the
+    ENGINE defect a verdict uncovered, which changes no config's `doctor`
+    verdict either and was in no bucket the sentence named.
+
+    BOTH NUMBERS HAVE MOVED SINCE, and this docstring said them in the present
+    tense for two rounds after they stopped being true - which is exactly the
+    class the scanner above is for, and exactly why tests/ is one of its
+    surfaces now. They are written here as the history they are; what the
+    section holds TODAY is not written down anywhere, because this test sums
+    EVERY clause of the sentence against the groups rather than checking the
+    three buckets it happened to name, so a bucket left out of the sentence
+    fails here whatever the totals have grown to.
+    """
+    groups = _unreleased_fixed_groups()
+    total = sum(n for _h, n in groups)
+    verdicts = sum(n for h, n in groups if "false verdict" in h.lower())
+    txt = _norm(_text(CHANGELOG))
+    m = re.search(r"That section also carries (.+?) — ([\w-]+) entries that "
+                  r"change no config", txt)
+    assert m, "the changelog no longer says what the non-verdict entries are"
+    # Every clause of the sentence, summed, rather than three named ones: the
+    # defect this pins is a bucket left OUT of it, so the test may not know in
+    # advance how many buckets there are.
+    named = sum(NUMBER_WORDS[w.lower()]
+                for w in re.findall(r"\b([\w-]+)\b", m.group(1))
+                if w.lower() in NUMBER_WORDS)
+    assert NUMBER_WORDS[m.group(2).lower()] == named, \
+        f"the sentence lists {named} and then totals {m.group(2)}"
+    assert named == total - verdicts, \
+        f"the sentence accounts for {named} non-verdict entries; the section " \
+        f"has {total - verdicts}"
+
+
+def test_the_changelog_names_the_config_sweep_this_suite_really_runs(ma):
+    # symptom: "The 768-config sweep could not have caught this". There is no
+    # 768-config sweep: `CONFIGS` in tests/test_doctor_json.py is the list the
+    # doctor tests parametrise over, and it is a named handful.
+    txt = _norm(_text(CHANGELOG))
+    assert "There is no 768-config sweep." in txt, \
+        "the entry that corrects the number is the only place it may appear"
+    assert txt.count("768-config sweep") == 2, \
+        "768 is quoted twice, in the entry that retires it, and asserted " \
+        "nowhere"
+    assert "`CONFIGS` in `tests/test_doctor_json.py`" in txt, \
+        "the changelog should name the sweep rather than count it"
+    src = _text(os.path.join(ROOT, "tests", "test_doctor_json.py"))
+    assert re.search(r"^CONFIGS = \(", src, re.M), \
+        "the changelog names a list this suite no longer has"
+
+
+def test_no_derived_count_recomputes_a_literal():
+    """C4, as a rule rather than as the one entry that broke it.
+
+    `COUNT_PROSE["three states"]` was classified DERIVED with a recompute of
+    `lambda ma: 3` - a rule with nothing under it, which is exactly the defect
+    the staleness half of the scan above exists to prevent, one level up. A
+    reader meeting DERIVED believes the number is pinned to the thing it
+    counts; a recompute that is the literal can only ever agree with itself,
+    so the classification is a claim about the registry that the registry does
+    not keep.
+
+    The test is structural, not a list of exceptions: a recompute that reads
+    NOTHING - no global, no attribute, no closure - cannot be deriving
+    anything. Every honest entry names at least one thing (`ma.STAGES`,
+    `_example_configs()`, `ma.DMND_FASTA_RECORD_CAP`), so this costs the real
+    ones nothing and catches the next literal the day it is written.
+    """
+    dead = []
+    for phrase, entry in sorted(COUNT_PROSE.items()):
+        if entry[0] != "DERIVED":
+            continue
+        code = entry[2].__code__
+        if not code.co_names and not code.co_freevars:
+            dead.append(f"{phrase!r} ({entry[1]}) recomputes "
+                        f"{code.co_consts!r} and reads nothing")
+    assert not dead, (
+        "a DERIVED count derives nothing - classify it MEASURED or PROSE "
+        "with the reason, or give it a real recompute:\n" + "\n".join(dead))

@@ -63,8 +63,15 @@ Optional, add as needed:
 mamba install -y -c bioconda kofamscan hmmer          # kofam stage
 mamba install -y -c bioconda hhsuite                  # hhblits stage
 pip install tmbed && tmbed download                   # GPU host only
-pip install "fair-esm[esmfold]"                       # GPU host only
+pip install transformers                              # GPU host only, ESMFold
 ```
+
+Either ESMFold backend will do. `stage_esmfold` imports `fair-esm` first and
+falls back to `transformers`, which ships the same `facebook/esmfold_v1`
+weights — and on a current card that fallback is the only route that builds,
+because `fair-esm[esmfold]` needs an openfold pinned to a 2022 commit whose
+CUDA kernels do not compile against a modern toolkit. `doctor` accepts either
+and suggests `transformers`.
 
 SignalP 6.0 and InterProScan are separate installs (SignalP needs an academic
 licence; InterProScan is a large Java distribution). Skip both on the first
@@ -293,6 +300,102 @@ V13`, the NCBIfam archive layout) against the provider before a big download.
 
 **Prefer `--install-plan` on a shared server.** It gives you a script to read
 before anything touches the filesystem.
+
+**Read the marks the way `doctor` means them.** They are not a severity scale,
+and two of them changed meaning in the release that added `doctor --json`:
+
+- **`MISS` means something you asked for will die on this.** That is now the
+  whole rule: `doctor` exits 1 if and only if an enabled **stage** dies on
+  something, or a whole **command** — `run`, `report`, `object` — refuses or
+  dies on it, or a key you wrote is being silently ignored. Nothing else moves
+  the exit status. The command half is easy to forget and is not rare: a
+  missing `limma` kills `metaannot report` and `metaannot object` and no stage
+  at all, and a `proteins_faa` that is not there makes `run` refuse before it
+  schedules anything. The JSON says which — `blocks` names stages,
+  `blocks_commands` names commands, and a row can name only the second. The
+  ignored key is the **one** deliberate exception, and it is there because an
+  unrecognised key kills nothing and yet the setting you believe is in force
+  is not: the run finishes, having answered a different question than the
+  config asked. `doctor` has always exited 1 on a misspelled key and still
+  does.
+- **`WARN` means the run finishes and produces less.** A missing quant table
+  with `run.join` on is a WARN, because `stage_join` logs and returns — you get
+  a complete annotation and no `annotated_quant.tsv`. A missing DIAMOND
+  database is a WARN for the same reason: that one database is skipped and the
+  others are searched. Neither fails `doctor`, and both used to.
+- **`-` means nothing enabled reads this.** A `gff` with `run.context` off, a
+  `contigs_fna` with `run.smorf` off.
+- **`MANUAL` is about the REMEDY, never the severity.** It says `doctor` will
+  not fetch the thing. A missing InterProScan with `run.interpro` on still
+  kills that stage, hours in.
+
+Two states of one file are not the same verdict, and this is the one to
+remember: a quant table that is **absent** is survivable, and one that is
+**zero bytes** is not — `stage_join` tests `os.path.exists`, so an empty file
+gets past the skip branch and dies in the reader. The same is true of
+`proteins_faa`: `run` refuses outright on a missing one, and an empty one gets
+all the way to `integrate` before dying on `no sequences in ...`. A
+**directory** where a file belongs is a third state again, and it is the one
+that looks most like nothing is wrong: `os.path.exists` is true for it, so
+`run` does not refuse and each stage dies as it opens the path. A **FIFO** is
+reported as `wrong_kind` too, and `doctor` gives it the same verdict — but it
+is the one state where `run` is allowed to do something other than die, and
+this is the one to know about before you leave a run overnight.
+
+**A FIFO works at an input this run reads exactly once, and is refused
+immediately at one it reads more than once**, because a pipe can be drained
+once and the second reader finds an empty one. `doctor`'s row tells you which
+this is and counts the reads. On a default label-free project `quant_table`,
+`manifest` and each `emapper_precomputed` entry are read once and take a pipe;
+`proteins_faa` is read three times (once by the emapper stage, twice by
+integrate) and does not.
+
+**Which those are is a property of your config, so read the row rather than
+this paragraph.** Turn `run.taxonomy` on and the manifest is read twice — the
+join reads it, and so does the taxonomy stage, through the same reader — so
+the pipe that worked yesterday is refused today, correctly. The database
+paths count too: `unipept.result` is read once, and each `.dmp` file under
+`db.ncbi_taxonomy` is read once with `run.taxonomy` on and twice if you also
+set `taxon_rank`, because the join resolves its own lineages. Where it is allowed, a FIFO with a **live writer** is
+read to completion: `mkfifo p; zcat big.faa.gz > p &` is how you feed this
+tool from a disk you have no room on. Where it is not, the refusal arrives in
+the first second and lists the reads, instead of arriving six hours later —
+which is what it used to do, quoting a workflow that could not work at that
+path.
+
+A FIFO with no writer used to **hang** the run — a read-only open of one
+blocks, so there was no output, no traceback and no exit status to wait on.
+It no longer can. The reader says on the log that it is waiting, waits
+`fifo_wait_s` (6 hours by default) **for each next byte**, and then **dies**
+naming the path and saying whether anything was holding the write end at all.
+A stream that stops early is a failure and not a shorter input: pipe it
+**gzipped** if you can, because the end-of-stream marker catches a truncation
+wherever it happens. Set `fifo_wait_s: 0` if you never pipe anything in and
+would rather a FIFO were refused on the spot. `doctor` never waits at all —
+every path it reads it opens with `O_NONBLOCK` and answers immediately, which
+is why it can tell you about the pipe before the run starts. A
+directory whose permissions will not let `doctor` list it is `unreadable`
+rather than missing, because the fix is a permission and not a file. `doctor`
+reports these separately — `missing`, `empty`, `wrong_kind`,
+`dangling_symlink`, `unreadable` — because the fix differs and so does what
+happens if you ignore it. **The manifest is one of them**: a directory there
+used to take `doctor` itself down with an `IsADirectoryError` before it could
+print anything at all.
+
+**One more state to know about, because it is the trap this release closed:**
+`taxon_rank: genus` (or any rank) needs `db.ncbi_taxonomy`, and it needs it
+for the **join** stage, not only for `run.taxonomy`. `collapse_taxon_rank`
+dies with `taxon_rank='genus' needs db.ncbi_taxonomy`, and the log line that
+suggests setting `taxon_rank` in the first place is printed on every run that
+leaves it empty. `doctor` now asks for the taxdump whenever a rank is set and
+`run.join` is on, and does not ask for it when no rank is.
+
+If you are driving `doctor` from a script or a front end rather than reading
+it, `--json` puts the same report on stdout as one object — one entry per
+printed line, each naming the stages it blocks — and nothing else. See the
+`doctor --json` section of `README.md`. `--json` cannot be combined with
+`--fix`, which exits 2 if you try; run `doctor --json`, decide, then
+`--install-plan`.
 
 ### 4b. Dry run
 
@@ -552,6 +655,21 @@ worse than being slow — but at a few hundred thousand proteins that judgement
 inverts, which is why the run says the protein count out loud before starting
 the CPU path.
 
+`doctor` gives a **different verdict for each of the three**, because the
+stage does three different things with them. Under `auto` on a host with no
+CUDA it warns and reports `degrades: ["tmbed"]`: the stage runs, slowly. Under
+`true` it **fails**, with `blocks: ["tmbed"]` — `true` means `--use-gpu
+--no-cpu-fallback`, TMbed tolerates a missing device only under
+`--cpu-fallback`, so every chunk fails and the stage dies on "tmbed finished 0
+of N prediction(s)". Set `tmbed_allow_partial: true` and that becomes a
+warning again: the stage logs the shortfall and finishes with an EMPTY
+prediction file, so nothing dies and no protein gets topology evidence. Under
+`false` it warns and says so as the configuration rather than as a fallback,
+and it does **not** suggest setting `tmbed_use_gpu: false` to someone who
+already has. A value that is none of the three is a `fail` before any device
+is looked at: `stage_tmbed` exits on `unknown tmbed_use_gpu` at its first
+line.
+
 **On Apple Silicon**, `torch.cuda.is_available()` is False regardless of how
 good the chip is: neither `tmbed` nor `esmfold` has an MPS path today. Treat a
 Mac as a no-GPU host for these two stages. See `docs/gui-design.md` for the
@@ -564,7 +682,7 @@ rsync -av server:$PROJ/input/ ./input/
 rsync -av server:$PROJ/config.yaml ./
 rsync -av server:$PROJ/results/dark.faa \
          server:$PROJ/results/annotation_pass1.tsv ./results/   # after phase 5
-pip install tmbed "fair-esm[esmfold]" && tmbed download
+pip install tmbed transformers && tmbed download   # or fair-esm[esmfold]
 
 python metaannot.py run --config config.yaml --only tmbed --serial
 python metaannot.py run --config config.yaml --only esmfold --serial --ram 16
@@ -684,11 +802,14 @@ BiocManager::install(c("limma","clusterProfiler","QFeatures","SummarizedExperime
 python metaannot.py doctor --config config.yaml   # the "== R ==" block
 ```
 
-That block probes four packages (SummarizedExperiment, QFeatures, limma,
-rmarkdown) and checks neither knitr nor pandoc, while the Rmd also loads readr,
-dplyr, tidyr, tibble, stringr, ggplot2 and purrr. A clean machine can pass
-`doctor` and then fail at the first `library()` call; install what it names by
-hand and rerun.
+That block probes fourteen packages — every one the generated Rmd's setup
+chunk and `build_object.R` load (`RNEED`) plus the three that are used when
+present (`ROPT`) — and it checks `pandoc` too, because `rmarkdown::render`
+shells out to it and a bare R install has none. It used to probe four and
+check neither `knitr` nor `pandoc`, so a clean machine passed `doctor` and
+then died at the report's first `library(readr)`, after the whole pipeline had
+run. Each package is its own row with its own install line, because
+`BiocManager::install` and `install.packages` are not interchangeable.
 
 Set the design in the config's `analysis:` block. Contrasts are derived from
 the manifest automatically; override only for a non-pairwise comparison or to
