@@ -2117,7 +2117,7 @@ def _phrase_re(key):
                       + r"[ \-]+(?:(?!(?:" + "|".join(sorted(_UNITS))
                       # {1,14}, not {2,14}: `_count_head` steps over a
                       # one-letter adjective and this has to reach the same
-                      # phrase, or "the 57 R tests" is a count the scan finds
+                      # phrase, or "the 60 R tests" is a count the scan finds
                       # and the table cannot locate.
                       + r")[ \-])[a-z]{1,14}[ \-]+)?"
                       + re.escape(noun).replace("\\ ", r"[ \-]+") + r"\b",
@@ -2826,7 +2826,7 @@ COUNT_PROSE = {
                                  "test_the_readme_names_every_signal_test_"
                                  "windows_really_skips"),
     "five tests": ("MEASURED", "the tests the open xfail markers sit on"),
-    "57 tests": ("MEASURED", "the R selection, counted exactly by "
+    "60 tests": ("MEASURED", "the R selection, counted exactly by "
                              "test_the_readme_test_counts_are_the_counts_"
                              "this_suite_really_has"),
     "seven strings": ("MEASURED", "the class names three outputs share"),
@@ -2918,10 +2918,10 @@ COUNT_PROSE = {
                             "drives, written out in order beside it"),
     "four defects": ("PROSE", "a group heading, counted by the group test"),
     "six defects": ("PROSE", "a group heading, counted by the group test"),
-    "twenty-three entries": ("DERIVED", "the Unreleased/Fixed entries",
+    "twenty-four entries": ("DERIVED", "the Unreleased/Fixed entries",
                              lambda ma: sum(n for _h, n
                                             in _unreleased_fixed_groups())),
-    "five groups": ("DERIVED", "the Unreleased/Fixed groups",
+    "six groups": ("DERIVED", "the Unreleased/Fixed groups",
                     lambda ma: len(_unreleased_fixed_groups())),
     "seven defects": ("PROSE", "a group heading, counted by the group test"),
     "2 attempts": ("DERIVED", "the opens of the pre-write state read",

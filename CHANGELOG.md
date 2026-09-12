@@ -4,6 +4,36 @@
 
 ### Added
 
+**The join stage now says how many proteins it quantified from nothing.**
+`{n}/{total} protein(s) had every feature dropped under '<mode>': they have a
+row in peptide_evidence.tsv, no number in annotated_quant.tsv, and appear in no
+report table.` Nothing anywhere printed this before — the features line counts
+FEATURES, not proteins, and the `min_features_per_protein` WARN's own
+denominator has already excluded them — so a reader filtering
+`peptide_evidence.tsv` had no way to learn that a majority of its rows held no
+number. It is the count removed from the dominance rate's denominator, owed to
+the reader on every run that has any, INCLUDING the runs where that WARN is
+silent. Deliberately INFO and never WARN however large it gets: in a
+strain-redundant database this is the rule the user chose doing exactly what it
+says, and a WARN that fires on every real run is the line a reader learns to
+skip — taking the real one with it.
+
+**The report reads `taxon_unique_dominated`, which until now nothing did.** The
+flag reached `annotated_quant.tsv` and the R object's `rowData` and had no
+consumer, so the only place the finding existed was one line of stderr that a
+reader of the HTML report never sees. The feature-support chunk now states the
+rate over the proteins THIS DOCUMENT is about, after both
+`min_features_per_protein` and `analysis.min_features` — on the first real run
+`784/1,282`, 61.2%, where the join stage's line says 54.7%. The two
+denominators differ on purpose and each names its own: a stage reports the
+population the stage decided, and the report cannot borrow that number because
+it filters again afterwards. Gated on `COVERAGE_MIN_N`, the same floor every
+other coverage claim in the document uses, and the join stage's
+`ASSESSABLE_MIN_N` is pinned equal to it so the two halves of the tool call the
+same size "too few" — below it the counts are printed without the percentage,
+because a fraction over a handful of proteins is what gets pasted into a
+methods section.
+
 **Longest-first dispatch now discriminates inside the hours class, which is the
 only place it ever mattered.** `stage_priority(name)` returned
 `STAGE_COSTS[name]` and nothing else — a three-level ordinal, 3 = hours, 2 =
@@ -334,7 +364,7 @@ of each loss is also said when it happens rather than only at the end.
 
 ### Fixed
 
-twenty-three entries, in five groups. Each heading carries its own count and a
+twenty-four entries, in six groups. Each heading carries its own count and a
 test counts the entries under it.
 
 #### Four defects in the check this change set added
@@ -694,6 +724,46 @@ site is the session and the registration, and a second test now asserts those:
 `start_new_session=True` in the launch, a tool slot claimed for the launched
 pid — only the helper claims one — and `stdin` on `/dev/null`. It fails on the
 old spawn site, which is what the one beside it never did.
+
+#### One defect in the join stage's most quoted number
+
+**The taxon-unique dominance rate was denominated on rows that could never be
+counted in it, and reported a majority finding as a minor caveat.** `ev` is
+built by an OUTER join of the per-protein counts of KEPT features with the
+per-protein counts of DROPPED ones, so a razor protein whose every feature was
+dropped arrives as a row whose `n_features_used`, `n_unique`,
+`n_taxon_unique` and `n_family_unique` are all 0. The flag is
+`(n_taxon_unique + n_family_unique) > n_unique`, and `(0 + 0) > 0` is False,
+so such a row can never reach the numerator while still swelling the
+denominator — and those rows hold no measurement at all: they have a row in
+`peptide_evidence.tsv`, which is where this change's new INFO line counts them,
+and no number in the quant matrix and no place in any report table. On the first full run on real data 5,039 of the
+8,238 rows were such rows, and the line read **1,749/8,238 — 21.2%**. Over the
+proteins the assignment rule actually decided something about it
+reads **1,749/3,199 — 54.7%**, which is the same numerator and the same
+`peptide_evidence.tsv`, byte for byte: any archived run can be recomputed both
+ways from the file it already wrote. The denominator is not a new invention —
+`before` in the `min_features_per_protein` WARN two lines below is `len(quant)`,
+i.e. exactly this count, so that line already reported `1,282/3,199` beside the
+old line's 8,238 with nothing saying they were different populations.
+
+The per-protein flag is unchanged, and that is the point: it was never wrong.
+`taxon_unique_dominated` is true of exactly the rows whose taxon- plus
+family-unique features outnumber their own unique ones, a tie is False because
+"rests more on" is strict, and under `protein_unique` it is structurally
+always False rather than broken. No per-protein claim, and no published
+column, moves. What moves is one summary line, in one direction: the loudest
+number in the join log more than doubles on that run, with no change to the
+classifier, so two logs from the same data are no longer comparable line for
+line.
+
+Not fixed here, and not folded in: under `peptide_assignment: razor` nothing is
+dropped, so a protein quantified entirely from cross-taxon `shared` features
+sits in the denominator with the flag False — worse than dominated and counted
+as clean. The flag is not misclassifying it; its coverage is incomplete, which
+wants either a second flag or a decision to widen a predicate whose current
+meaning is exactly right. Under `razor` the rate is therefore a floor.
+
 
 ## v0.6.0 — 2026-09-12
 

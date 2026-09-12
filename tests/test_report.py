@@ -61,6 +61,46 @@ def test_a_missing_analysis_param_is_refused_before_the_knit(ma, project):
     assert "fdr" in str(e.value)
 
 
+def test_the_report_reads_the_per_protein_dominance_flag(ma):
+    # symptom: taxon_unique_dominated is written into annotated_quant.tsv and
+    # into the R object's rowData, and NOTHING read it back - the only place
+    # the finding existed was one line of stderr, which the reader of an HTML
+    # report never sees. The feature-support chunk is where it belongs,
+    # because `aq` there is already this document's own protein set.
+    code = next(c for lab, c in _chunks(ma.RMD_TEMPLATE)
+                if lab.strip().startswith("feature-support"))
+    assert "taxon_unique_dominated" in code
+    assert "col_or_na(aq, \"taxon_unique_dominated\")" in code
+
+
+def test_the_report_states_its_dominance_rate_over_its_own_protein_set(ma):
+    # the denominator is nrow(aq) AFTER analysis.min_features has run, not
+    # anything the join stage logged: the join stage reports over the proteins
+    # its assignment rule decided about, and this document reports over the
+    # proteins it is about. Pinned because the whole point of the change that
+    # introduced this line was that a rate must name its own population.
+    code = next(c for lab, c in _chunks(ma.RMD_TEMPLATE)
+                if lab.strip().startswith("feature-support"))
+    dom = code[code.index("dom <- as.logical"):]
+    assert "nrow(aq)" in dom
+    assert "params$min_features" not in dom, \
+        "the rate must be computed after the filter, not alongside it"
+    # and it carries the same denominator floor as every other coverage claim
+    # in this document, so the two halves of the tool call the same size
+    # 'too few'.
+    assert "COVERAGE_MIN_N" in dom
+    assert "Too few for that to be a rate" in dom
+
+
+def test_the_two_halves_of_the_tool_agree_on_what_counts_as_too_few(ma):
+    # ASSESSABLE_MIN_N gates the join stage's percentage and COVERAGE_MIN_N
+    # gates the report's. They are deliberately the same number, and a docs
+    # pin is the only thing that keeps one from being tuned without the other.
+    r = re.search(r"^COVERAGE_MIN_N <- (\d+)$", ma.RMD_TEMPLATE, re.M)
+    assert r, "COVERAGE_MIN_N is no longer declared in the report"
+    assert ma.ASSESSABLE_MIN_N == int(r.group(1))
+
+
 def test_the_analysis_block_has_no_key_the_report_ignores(ma):
     # the other direction: analysis: is checked for typos precisely because
     # its keys ARE the Rmd's params, so a key nothing reads is dead config.
@@ -589,6 +629,72 @@ def test_no_report_helper_shadows_a_dplyr_or_tidyr_export(ma, tmp_path):
     assert r.returncode == 0, r.stderr
     clashes = r.stdout.split()
     assert clashes == [], f"report helpers shadow tidyverse exports: {clashes}"
+
+
+def _dominance_probe(ma, tmp_path, aq_expr, name="dom.R"):
+    """Run the report's OWN dominance lines over a constructed `aq`.
+
+    The helpers and the floor are lifted from RMD_TEMPLATE rather than
+    restated here, so the probe cannot pass against an R snippet the report no
+    longer contains.
+    """
+    t = ma.RMD_TEMPLATE
+    helpers = t[t.index("note <- function"):t.index("need <- function")]
+    floor = re.search(r"^COVERAGE_MIN_N <- \d+$", t, re.M).group(0)
+    code = next(c for lab, c in _chunks(t)
+                if lab.strip().startswith("feature-support"))
+    snippet = code[code.index("  dom <- as.logical"):code.index("  ev_path <-")]
+    script = tmp_path / name
+    script.write_text(f"{helpers}\n{floor}\naq <- {aq_expr}\n{snippet}\n",
+                      encoding="utf-8")
+    r = subprocess.run(["Rscript", str(script)], capture_output=True,
+                       text=True, timeout=600)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def _aq(n_dom, n_clean):
+    return (f"data.frame(taxon_unique_dominated = c(rep(TRUE, {n_dom}), "
+            f"rep(FALSE, {n_clean})))")
+
+
+@needs_r()
+def test_the_reports_dominance_rate_is_denominated_on_the_rows_it_kept(
+        ma, tmp_path):
+    # the number a reader of the RESULTS stands on, which the join stage
+    # cannot state honestly because the report filters again after it. Its
+    # denominator is nrow(aq) at the point the line runs - this document's own
+    # protein set, after min_features_per_protein and analysis.min_features.
+    out = _dominance_probe(ma, tmp_path, _aq(7, 5))
+    assert out.startswith("GATE")
+    assert "7/12 (58.3%)" in out
+    assert "taxon_unique_dominated" in out
+    assert "protein_unique" in out, \
+        "the line must name the run that shows what survives the assumption"
+
+
+@needs_r()
+def test_the_reports_dominance_rate_withholds_a_percentage_below_the_floor(
+        ma, tmp_path):
+    # same floor as every other coverage claim in this document: over a
+    # handful of proteins a percentage is an anecdote wearing a decimal point.
+    out = _dominance_probe(ma, tmp_path, _aq(3, 4), name="few.R")
+    assert out.startswith("NOTE")
+    assert "3 of the 7 protein(s)" in out
+    assert "%" not in out
+
+
+@needs_r()
+def test_the_reports_dominance_line_is_silent_when_nothing_is_flagged(
+        ma, tmp_path):
+    # a line that fires on every protein_unique run is the line a reader
+    # learns to skip, and the zero is already one column of the table.
+    assert _dominance_probe(ma, tmp_path, _aq(0, 40), name="none.R") == ""
+    # and a protein-level input, which carries no evidence columns at all,
+    # must produce a rate rather than an error - col_or_na fills with NA.
+    out = _dominance_probe(ma, tmp_path, "data.frame(bin = rep('x', 12))",
+                           name="na.R")
+    assert "rest more" not in out
 
 
 # --- a full knit ------------------------------------------------------

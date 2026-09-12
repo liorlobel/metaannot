@@ -10385,6 +10385,18 @@ ASSIGNMENT_CLASSES = ("unique", "taxon_unique", "family_unique", "shared",
                       "shared_unknown_taxon")
 ROLLUP_METHODS = ("sum", "median_polish")
 
+# How many proteins the assignment rule must have decided about before the
+# share of them that came out taxon_unique_dominated is stated as a
+# PERCENTAGE. Deliberately the same number as COVERAGE_MIN_N in the R report,
+# for the reason written out there: "none of them" - or "most of them" - over
+# a handful of proteins is an anecdote rather than a statement about a
+# population, and the two halves of this tool should not disagree about what
+# counts as too few. Nothing is suppressed below the floor; the counts are
+# still printed, at INFO, without the fraction. The fraction is what gets
+# pasted into a methods section, and "54.7% of proteins" computed from seven
+# of them is a claim about a population that was never observed.
+ASSESSABLE_MIN_N = 10
+
 
 def _nanmed(a, axis):
     """Median over the observed entries; 0 where a whole row/column is NaN.
@@ -10628,26 +10640,109 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
                                      + ev["n_family_unique"])
                                     > ev["n_unique"])
     n_dom = int(ev["taxon_unique_dominated"].sum())
+    # WHICH POPULATION THIS RATE IS ABOUT, and why it is not len(ev).
+    #
+    # `ev` comes from an OUTER join with `dropped` a few lines above, so a
+    # protein whose every feature was dropped arrives here as a row whose
+    # n_features_used, n_unique, n_taxon_unique and n_family_unique are every
+    # one of them 0 - there was nothing to count. The flag below is
+    # (0 + 0) > 0, which is False for such a row for ever: it can never be
+    # counted in the numerator while still swelling the denominator. On the
+    # first full real run that was 5,039 of 8,238 rows, and it turned a
+    # 54.7% finding into a 21.2% one - the difference between "a minor
+    # caveat" and "most of what this rule decided rests on a taxon
+    # representative". A rate must contain its own negatives: a protein
+    # carried entirely by its own peptides is the NEGATIVE here and belongs
+    # in the denominator. A protein with no assigned feature is not a weaker
+    # measurement, it is no measurement - it has no row in
+    # annotated_quant.tsv and appears in no report table - and counting it is
+    # a positivity rate over patients who were never tested.
+    #
+    # The denominator is therefore the proteins the assignment rule actually
+    # decided something about, and that is not a new invention: `before` in
+    # the min_features block below is len(quant), i.e. exactly this count, so
+    # the next WARN in the log already reports over it. Before this change the
+    # two lines printed "1,749/8,238" and then "1,282/3,199" - adjacent, and
+    # with nothing saying they were different populations.
+    #
+    # It is deliberately NOT the set that reaches annotated_quant.tsv, which
+    # is the number a reader of the results most wants. A stage reports the
+    # population the stage decided; min_features_per_protein defaults to 1
+    # precisely because this repo does the feature-support filtering in the
+    # report instead (analysis.min_features), where the drop is visible per
+    # bin, and the report narrows again after that - so a join-stage line
+    # claiming to describe "the proteins your results are about" is wrong the
+    # moment the report filters. That rate is stated where its population
+    # lives, in the report's feature-support chunk, over the report's own
+    # protein set.
+    #
+    # n_elig cannot be 0 while n_dom is non-zero - a flagged row has at least
+    # one taxon- or family-unique feature, hence at least one assigned one -
+    # so the guard below is also what keeps the percentage from dividing by
+    # zero on a run where nothing was assigned at all.
+    n_none = int((ev["n_features_used"] == 0).sum())
+    n_elig = len(ev) - n_none
     if n_dom:
-        log(f"{n_dom}/{len(ev)} protein(s) rest more on shared-but-taxon- "
-            "(or family-) unique features than on their own unique ones "
-            "(taxon_unique_dominated in peptide_evidence.tsv and "
-            "annotated_quant.tsv)", "WARN")
+        # One claim, built once, with the same pair of counts in both tiers:
+        # below the floor only the tier and the quotable percentage move.
+        assessable = n_elig >= ASSESSABLE_MIN_N
+        frac = f"{n_dom:,}/{n_elig:,}"
+        if assessable:
+            frac += f" ({100 * n_dom / n_elig:.1f}%)"
+        claim = (f"{frac} protein(s) with at least one assigned feature rest "
+                 "more on shared-but-taxon- (or family-) unique features than "
+                 "on their own unique ones (taxon_unique_dominated in "
+                 "peptide_evidence.tsv and annotated_quant.tsv)")
+        # Owed to the reader the moment rows are taken out of a denominator:
+        # the count that was taken out, inside the sentence that used it.
+        tail = ("" if not n_none else
+                f" peptide_evidence.tsv has {len(ev):,} rows; the other "
+                f"{n_none:,} had every feature dropped, are quantified "
+                "nowhere, and so could never be flagged.")
+        if assessable:
+            log(claim + "." + tail, "WARN")
+        else:
+            log(claim + "; too few to state as a rate." + tail, "INFO")
+
+    # The other half of the duty owed for narrowing the denominator above:
+    # the count of rows removed from it, printed on every run that has any,
+    # INCLUDING the runs where the WARN above is silent. Nothing else in this
+    # pipeline states it - the features line counts FEATURES, not proteins,
+    # and `before` in the min_features WARN below has already excluded these
+    # proteins - so a reader computing a rate straight off peptide_evidence.tsv
+    # makes the same mistake this block was written to fix, one file
+    # downstream.
+    #
+    # Deliberately INFO, and never WARN however large it gets: in a
+    # strain-redundant database this is the documented, intended behaviour of
+    # the rule the user chose, and a line that fires loudly on every real run
+    # is exactly the line a reader learns to skip - taking the real one with
+    # it. That is the same instinct as the report's silent tier for a bin with
+    # nothing to lose.
+    if n_none:
+        log(f"{n_none:,}/{len(ev):,} protein(s) had every feature dropped "
+            f"under '{mode}': they have a row in peptide_evidence.tsv, no "
+            "number in annotated_quant.tsv, and appear in no report table")
 
     # Said out loud whatever the threshold is: most proteins <= 100 aa are
     # single-peptide by nature, so this number is the size of the population
     # min_features_per_protein would remove.
     single = int((ev["n_features_used"] == 1).sum())
     if single:
-        log(f"{single} protein(s) rest on a single assigned feature "
+        log(f"{single:,} protein(s) rest on a single assigned feature "
             f"(min_features_per_protein = {min_features})")
     if min_features > 1:
         enough = ev.loc[ev["n_features_used"].fillna(0) >= min_features, "protein_id"]
         before = len(quant)
         quant = quant.loc[quant.index.isin(set(enough))]
-        log(f"{len(quant)}/{before} proteins retained with >= {min_features} "
-            f"assigned features; the {before - len(quant)} dropped are absent "
-            "from annotated_quant.tsv and from every report table", "WARN")
+        # Thousands separators, as the dominance line above uses: `before` is
+        # that line's denominator too, and one funnel printing the same
+        # number as "3,199" and then "3199" reads as two different
+        # populations, which is the defect that line was just fixed for.
+        log(f"{len(quant):,}/{before:,} proteins retained with "
+            f">= {min_features} assigned features; the "
+            f"{before - len(quant):,} dropped are absent from "
+            "annotated_quant.tsv and from every report table", "WARN")
     return (quant.reset_index().rename(columns={"_assigned": "group_id"}),
             ev, feats)
 
@@ -15818,6 +15913,38 @@ if (all(is.na(n_used))) {
     bin_tab <- aq %>% count(bin, .drop = FALSE) %>%
       mutate(pct = round(100 * n / sum(n), 1))
     cat("\nbin composition after the feature-support filter:\n"); print(bin_tab)
+  }
+  # taxon_unique_dominated reaches annotated_quant.tsv, and until this line
+  # NOTHING read it: the per-protein flag the join stage writes had no reader
+  # in the report it was written for, so the only place the finding existed
+  # was one line of stderr.
+  #
+  # This rate and the join stage's are denominated differently ON PURPOSE.
+  # That stage reports over the proteins its assignment rule decided about,
+  # because that is the population that stage decided; this document reports
+  # over the proteins IT is about, after min_features_per_protein and
+  # analysis.min_features have both run. The stage cannot state this number
+  # honestly - the report filters again after it - and this chunk cannot state
+  # that one, because the proteins it would be about are not in aq.
+  dom <- as.logical(col_or_na(aq, "taxon_unique_dominated"))
+  n_dom_q <- sum(dom, na.rm = TRUE)
+  if (nrow(aq) > 0 && !all(is.na(dom)) && n_dom_q > 0) {
+    # Same denominator floor as every other coverage claim in this report:
+    # over a handful of proteins a percentage is an anecdote wearing a
+    # decimal point, so the counts are printed and the fraction is not.
+    if (nrow(aq) >= COVERAGE_MIN_N)
+      gate(paste("%d/%d (%.1f%%) of the proteins in this document rest more",
+                 "on shared-but-taxon- (or family-) unique features than on",
+                 "their own unique ones (taxon_unique_dominated).\n      Their",
+                 "intensity is real; WHICH member of the taxon it belongs to",
+                 "is the assignment rule's assumption, not a measurement.",
+                 "peptide_assignment=protein_unique is the run that shows what",
+                 "survives without it."),
+           n_dom_q, nrow(aq), 100 * n_dom_q / nrow(aq))
+    else
+      note(paste("%d of the %d protein(s) here are taxon_unique_dominated.",
+                 "Too few for that to be a rate: read those rows, not the",
+                 "fraction."), n_dom_q, nrow(aq))
   }
   ev_path <- file.path(RD, "quant", "peptide_evidence.tsv")
   if (file.exists(ev_path))
