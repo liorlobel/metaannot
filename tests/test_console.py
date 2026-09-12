@@ -295,6 +295,63 @@ def test_a_log_that_grew_between_two_reads_delivers_only_the_delta(
     assert second["off"] == second["size"]
 
 
+def test_a_log_still_being_written_never_hands_over_half_a_line(
+        console, results):
+    """A window that ends mid-line must hold the fragment back.
+
+    The leading half of this was always handled: a read that seeks into the
+    middle of a line drops the fragment it lands on. The TRAILING half was not,
+    and `off` made it a real defect rather than a cosmetic one -- it advanced
+    past the fragment, so the next poll returned the REST of that line as a
+    line of its own. The reader saw one engine line split in two, and the
+    second half, having no `[   Ns] LEVEL ` prefix, parsed as a continuation
+    and inherited whatever level was above it.
+
+    Measured through /api/log against a log being appended underneath it: a
+    client received `line 4` and then `2`.
+    """
+    path = results.log("[    0.0s] INFO  first\n")
+    first = console.tail_log(path)
+    # A whole line and then half of one, exactly as an appending writer leaves
+    # it between its own two writes.
+    with open(path, "a") as fh:
+        fh.write("[    1.0s] INFO  second\n[    2.0s] INFO  thi")
+    second = console.tail_log(path, first["off"], first["ident"])
+
+    assert second["reset"] is False, second["note"]
+    assert second["text"] == "[    1.0s] INFO  second\n", second["text"]
+    # `off` sits on the line break, NOT at the end of the file, so the partial
+    # line is re-read whole next time instead of arriving in two pieces.
+    assert second["off"] < second["size"]
+    assert second["off"] == first["off"] + len("[    1.0s] INFO  second\n")
+
+    with open(path, "a") as fh:
+        fh.write("rd\n")
+    third = console.tail_log(path, second["off"], second["ident"])
+    assert third["text"] == "[    2.0s] INFO  third\n", third["text"]
+    assert third["off"] == third["size"]
+
+
+def test_a_window_that_is_all_one_unterminated_line_still_advances(
+        console, results):
+    """The case the holdback must NOT apply to.
+
+    Holding back a fragment when there is no line break in the window at all
+    would leave `off` where it was for ever, and a live log would look frozen
+    -- so a window with nothing to hold back to keeps today's behaviour and
+    says so in `note`.
+    """
+    path = results.log("[    0.0s] INFO  first\n")
+    first = console.tail_log(path)
+    with open(path, "a") as fh:
+        fh.write("progress: " + "=" * 200)          # no newline anywhere
+    second = console.tail_log(path, first["off"], first["ident"])
+    assert second["reset"] is False, second["note"]
+    assert second["off"] == second["size"], \
+        "off must still advance, or a log with no line break looks frozen"
+    assert second["text"].startswith("progress: ")
+
+
 def test_a_truncated_log_resets_and_says_so(console, results):
     path = results.log("[    0.0s] INFO  " + "x" * 5000 + "\n")
     first = console.tail_log(path)
@@ -1063,6 +1120,21 @@ def test_the_log_endpoint_survives_a_log_being_appended_underneath_it(
             break
     stop.set()
     thread.join(10)
+    # Asserted before the arithmetic, because without it a writer thread that
+    # the scheduler never got to produced an IndexError out of the line below
+    # and said nothing about which of the two had gone wrong.
+    assert seen, (
+        "the writer produced nothing the endpoint returned in 60 polls, so "
+        "this test proved nothing about appending underneath it")
+    # No fragment may reach a reader: every line the endpoint returns carries
+    # the engine's own `[   Ns] LEVEL ` prefix, so a text with no space in it
+    # is half a line. This is what caught the trailing-fragment defect - the
+    # endpoint returned `line 4` and then `2` - and it failed as an IndexError
+    # from the rsplit below, which named neither the file nor the cause.
+    frags = [t for t in seen if " " not in t]
+    assert not frags, ("the endpoint returned %d partial line(s), so one "
+                       "engine line reached the reader split in two: %r"
+                       % (len(frags), frags[:5]))
     numbers = [int(t.rsplit(" ", 1)[1]) for t in seen]
     assert numbers == list(range(numbers[0], numbers[0] + len(numbers)))
 

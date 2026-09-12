@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1610 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1612 passed, 1 skipped, 6 xfailed, 37
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 37
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 35 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1575 passed and 36
+absent, so on a machine with no R the same run reports 1577 passed and 36
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
