@@ -11502,7 +11502,7 @@ UNIPEPT_KEYS = ["unipept.result", "unipept.allow_http", "unipept.api_url",
 # `diamond:<tag>` family, whose ids are created per configured database and
 # cannot be listed statically.
 STAGES = [
-    dict(name="emapper", cost=3, enabled="eggnog",
+    dict(name="emapper", cost=3, order_s=3, enabled="eggnog",
          out=lambda p: [p.emapper],
          inp=lambda c, p: [c["proteins_faa"]] + (
              [c["emapper_precomputed"]] if isinstance(c["emapper_precomputed"], str)
@@ -11512,24 +11512,27 @@ STAGES = [
                "emapper_min_coverage", "db.eggnog_data"],
          requires=("eggnog-mapper", "eggnog_data"), degraded_by=(),
          deps=[], fn=stage_emapper),
-    dict(name="pfam", cost=3, enabled="pfam", out=lambda p: [p.pfam],
+    dict(name="pfam", cost=3, order_s=1620, enabled="pfam",
+         out=lambda p: [p.pfam],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["pfam_hmm"]],
          keys=["db.pfam_hmm"],
          requires=("hmmer", "pfam_hmm"), degraded_by=(),
          deps=[], fn=stage_pfam),
-    dict(name="dbcan", cost=2, enabled="dbcan", out=lambda p: [p.dbcan],
+    dict(name="dbcan", cost=2, order_s=41, enabled="dbcan",
+         out=lambda p: [p.dbcan],
          inp=lambda c, p: [c["proteins_faa"], c["db"]["dbcan_hmm"]],
          keys=["db.dbcan_hmm", "thresholds.dbcan_evalue"],
          requires=("hmmer", "dbcan_hmm"), degraded_by=(),
          deps=[], fn=stage_dbcan),
-    dict(name="diamond", cost=2, empty_ok=True, enabled="diamond",
+    dict(name="diamond", cost=2, order_s=10, empty_ok=True, enabled="diamond",
          out=lambda p: [p.diamond_done],
          inp=lambda c, p: [c["proteins_faa"]] + list((c["db"].get("diamond") or {}).values()),
          keys=["db.diamond", "thresholds.diamond_evalue", "diamond_evalues",
                "thresholds.diamond_min_pident", "diamond_min_pidents"],
          requires=("diamond",), degraded_by=("diamond:*",),
          deps=[], fn=stage_diamond),
-    dict(name="signalp", cost=3, enabled="topology", out=lambda p: [p.signalp],
+    dict(name="signalp", cost=3, order_s=3348, enabled="topology",
+         out=lambda p: [p.signalp],
          inp=lambda c, p: [c["proteins_faa"]], keys=["signalp_mode"],
          requires=("signalp6",), degraded_by=(),
          deps=[], fn=stage_signalp),
@@ -11544,7 +11547,8 @@ STAGES = [
     # prediction in them, and listing it would throw away a 30-hour stage
     # because someone tuned a checkpoint size. The two keys that DO change
     # what is in the file - how much of a failure is tolerated - are listed.
-    dict(name="tmbed", cost=3, enabled="topology", gpu=True, empty_ok=True,
+    dict(name="tmbed", cost=3, order_s=3132, enabled="topology",
+         gpu=True, empty_ok=True,
          out=lambda p: [p.tmbed],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["gpu_device", "tmbed_use_gpu", "tmbed_max_len",
@@ -11552,32 +11556,38 @@ STAGES = [
                "tmbed_max_consecutive_failures"],
          requires=("tmbed",), degraded_by=(),
          deps=[], fn=stage_tmbed),
-    dict(name="cluster", cost=1, enabled="cluster", out=lambda p: [p.cluster],
+    dict(name="cluster", cost=1, order_s=14, enabled="cluster",
+         out=lambda p: [p.cluster],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["thresholds.cluster_min_seq_id", "thresholds.cluster_coverage"],
          requires=("mmseqs2",), degraded_by=(),
          deps=[], fn=stage_cluster),
-    dict(name="ncbifam", cost=3, enabled="ncbifam", out=lambda p: [p.ncbifam],
+    dict(name="ncbifam", cost=3, order_s=1440, enabled="ncbifam",
+         out=lambda p: [p.ncbifam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("ncbifam_hmm", "")],
          keys=["db.ncbifam_hmm", "thresholds.ncbifam_cutoff"],
          requires=("hmmer", "ncbifam_hmm"), degraded_by=(),
          deps=[], fn=stage_ncbifam),
-    dict(name="kofam", cost=3, enabled="kofam", out=lambda p: [p.kofam],
+    dict(name="kofam", cost=3, order_s=1764, enabled="kofam",
+         out=lambda p: [p.kofam],
          inp=lambda c, p: [c["proteins_faa"], c["db"].get("kofam_ko_list", "")],
          keys=["db.kofam_profiles", "db.kofam_ko_list"],
          requires=("kofamscan", "kofam_db"), degraded_by=(),
          deps=[], fn=stage_kofam),
-    dict(name="interpro", cost=3, enabled="interpro", out=lambda p: [p.interpro],
+    dict(name="interpro", cost=3, order_s=10224, enabled="interpro",
+         out=lambda p: [p.interpro],
          inp=lambda c, p: [c["proteins_faa"]],
          keys=["interpro_applications", "db.interproscan_sh"],
          requires=("interproscan",), degraded_by=(),
          deps=[], fn=stage_interpro),
-    dict(name="smorf", cost=1, empty_ok=True, enabled="smorf", out=lambda p: [p.smorf_faa],
+    dict(name="smorf", cost=1, order_s=10, empty_ok=True, enabled="smorf",
+         out=lambda p: [p.smorf_faa],
          inp=lambda c, p: [c.get("contigs_fna", "")],
          keys=["smorf_mode", "thresholds.smorf_max_len"],
          requires=(), degraded_by=("smorf",),
          deps=[], fn=stage_smorf),
-    dict(name="context", cost=1, enabled="context", out=lambda p: [p.context],
+    dict(name="context", cost=1, order_s=10, enabled="context",
+         out=lambda p: [p.context],
          inp=lambda c, p: [c.get("gff") or "", p.emapper, p.pfam, p.signalp,
                            p.dbcan],
          keys=["gff", "context_window", "immunity_max_len", "immunity_max_gap",
@@ -11585,7 +11595,7 @@ STAGES = [
                "thresholds.dbcan_evalue"],
          requires=(), degraded_by=(),
          deps=['emapper', 'pfam', 'signalp', 'dbcan'], fn=stage_context),
-    dict(name="integrate", cost=2, enabled=None,
+    dict(name="integrate", cost=2, order_s=30, enabled=None,
          out=lambda p: [p.pass1, p.dark, p.dark_all],
          inp=lambda c, p: [c["proteins_faa"], p.emapper, p.pfam, p.dbcan,
                            p.signalp, p.tmbed, p.cluster, p.context,
@@ -11612,20 +11622,26 @@ STAGES = [
          deps=['emapper', 'pfam', 'dbcan', 'diamond', 'signalp', 'tmbed', 'cluster', 'ncbifam', 'kofam', 'interpro', 'context'], fn=stage_integrate_pass1),
     # dark_all.faa, not dark.faa: the profile searches query the whole
     # unannotated set, the structure work-list is a GPU budget.
-    dict(name="jackhmmer", cost=3, empty_ok=True, enabled="jackhmmer", out=lambda p: [p.jackhmmer],
+    dict(name="jackhmmer", cost=3, order_s=1000,
+         empty_ok=True, enabled="jackhmmer",
+         out=lambda p: [p.jackhmmer],
          inp=lambda c, p: [p.dark_all, c["db"].get("jackhmmer_db", "")],
          keys=["db.jackhmmer_db", "jackhmmer_iterations",
                "thresholds.jackhmmer_evalue"],
          requires=("hmmer", "jackhmmer_db"), degraded_by=(),
          deps=['integrate'], fn=stage_jackhmmer),
-    dict(name="hhblits", cost=3, empty_ok=True, enabled="hhblits", out=lambda p: [p.hhr_done],
+    dict(name="hhblits", cost=3, order_s=1000,
+         empty_ok=True, enabled="hhblits",
+         out=lambda p: [p.hhr_done],
          inp=lambda c, p: [p.dark_all, c["db"].get("hhblits_db", "")],
          keys=["db.hhblits_db", "hhblits_iterations"],
          requires=("hhsuite", "hhblits_db"), degraded_by=(),
          deps=['integrate'], fn=stage_hhblits),
     # gpu=True: ESMFold peaked at 13.3 GB on a single short sequence, so it
     # cannot share a 16 GB card with tmbed; see gpu_workers.
-    dict(name="esmfold", cost=3, empty_ok=True, enabled="structure", gpu=True,
+    dict(name="esmfold", cost=3, order_s=5760,
+         empty_ok=True, enabled="structure",
+         gpu=True,
          out=lambda p: [p.struct_done],
          inp=lambda c, p: [p.dark],
          keys=["max_len_structure", "esmfold_chunk_size",
@@ -11634,7 +11650,9 @@ STAGES = [
                "esmfold_vram_reserve_gb"],
          requires=("esmfold",), degraded_by=(),
          deps=['integrate'], fn=stage_esmfold),
-    dict(name="foldseek", cost=2, empty_ok=True, enabled="structure", out=lambda p: [p.foldseek],
+    dict(name="foldseek", cost=2, order_s=57,
+         empty_ok=True, enabled="structure",
+         out=lambda p: [p.foldseek],
          inp=lambda c, p: [p.struct_done],
          keys=["db.foldseek_target", "db.foldseek_extra_targets",
                "thresholds.foldseek_evalue", "foldseek_self_cluster",
@@ -11644,7 +11662,7 @@ STAGES = [
                "thresholds.foldseek_cluster_coverage"],
          requires=("foldseek", "foldseek_target"), degraded_by=(),
          deps=['esmfold'], fn=stage_foldseek),
-    dict(name="finalise", cost=2, enabled=None,
+    dict(name="finalise", cost=2, order_s=30, enabled=None,
          out=lambda p: [p.final, p.summary, p.agreement],
          inp=lambda c, p: [p.pass1, p.foldseek, p.context, p.fold_clusters,
                            p.ncbifam, p.kofam, p.interpro,
@@ -11657,19 +11675,21 @@ STAGES = [
                "foldseek_target_priority"],
          requires=(), degraded_by=(),
          deps=['integrate', 'jackhmmer', 'hhblits', 'foldseek', 'context'], fn=stage_integrate_final),
-    dict(name="unipept", cost=3, enabled="unipept", out=lambda p: [p.unipept_lca],
+    dict(name="unipept", cost=3, order_s=1000, enabled="unipept",
+         out=lambda p: [p.unipept_lca],
          inp=lambda c, p: quant_inputs(c) + [(c.get("unipept") or {}).get("result", "")],
          keys=UNIPEPT_KEYS + ["quant_table", "quant_format", "tmt",
                "peptide_only_reader", "exclude_id_prefixes"],
          requires=(), degraded_by=(),
          deps=[], fn=stage_unipept),
-    dict(name="taxonomy", cost=1, enabled="taxonomy", out=lambda p: [p.taxonomy_comparison],
+    dict(name="taxonomy", cost=1, order_s=10, enabled="taxonomy",
+         out=lambda p: [p.taxonomy_comparison],
          inp=lambda c, p: [p.unipept_lca, p.final] + quant_inputs(c),
          keys=UNIPEPT_KEYS + ["db.ncbi_taxonomy", "peptide_only_reader",
                "exclude_id_prefixes", "quant_format", "tmt"],
          requires=(), degraded_by=("ncbi_taxonomy",),
          deps=['unipept', 'finalise'], fn=stage_taxonomy),
-    dict(name="join", cost=2, enabled="join",
+    dict(name="join", cost=2, order_s=30, enabled="join",
          out=lambda p: [f"{p.quant_dir}/annotated_quant.tsv"],
          # taxonomy_comparison is a real input: join merges its columns and
          # resolves effective_taxid from it. Omitting it left annotated_quant
@@ -11695,30 +11715,201 @@ STAGE_NAMES = [s["name"] for s in STAGES]
 # interproscan took 2.8 h, signalp 56 min, tmbed 52 min, kofam 29 min, pfam
 # 27 min, ncbifam 24 min, dbcan 41 s, cluster 14 s; on 455,571 proteins
 # kofam took 14.3 h, pfam 7.2 h, ncbifam 5.6 h, dbcan 10 min, diamond 5 min,
-# cluster 109 s, and interproscan was still running after two days. Three
-# ranks is all the resolution the scheduler can use: it decides which ready
-# stage claims a worker first, not when anything finishes.
+# cluster 109 s, and interproscan was still running after two days.
+#
+# THE RANK IS WHAT THE MACHINE IS DIVIDED BY, and that is all it is now. This
+# comment used to end "three ranks is all the resolution the scheduler can
+# use", and that sentence was the defect it was describing:
+# eleven stages below declare cost 3, the durations measured inside that one
+# rank run from seconds (an emapper reuse) to more than two days
+# (interproscan on 455,571 proteins), and a stable sort over a
+# three-level ordinal therefore left the whole hours class in TABLE ORDER --
+# with interproscan, the longest stage in the pipeline by an order of
+# magnitude and the stage the ordering was written for, seventh of them.
+#
+# So the resolution the dispatch ORDER can use is per stage, and it is
+# STAGE_ORDER_S below. The resolution the CPU DIVISION can use really is
+# three ranks, and that is why the rank survives untouched: weighted_share
+# turns a weight into a RATIO of the box, and a ratio built out of seconds
+# would give interproscan 21 of 22 cores and leave each of its round-mates
+# one, for the whole life of the run, because a tool's thread count is fixed
+# when it is launched. A rank is a ratio; seconds are only an order. They are
+# different quantities that used to share one accessor -- see stage_cost()
+# and stage_priority() below.
 STAGE_COSTS = {st["name"]: st["cost"] for st in STAGES}
+
+# What each stage took on ONE REFERENCE RUN, in seconds. It breaks the ties in
+# the rank above and does nothing else, so the only thing claimed here is the
+# ORDER these numbers put the stages in.
+#
+# THE RUN THEY COME FROM. 38,204 proteins on one workstation -- 22 cores, 94
+# GB, one 16 GB card, three stages at a time -- the run whose per-stage table
+# is in README's Scale section and TUTORIAL's resource guide. Every figure
+# below that is a measurement is that table's, converted to seconds:
+# interpro 2.84 h, esmfold 1.6 h (1,805 models at or under 478 aa), signalp
+# 0.93 h, tmbed 0.87 h, kofam 0.49 h, pfam 0.45 h, ncbifam 0.40 h, foldseek
+# 57 s, dbcan 41 s, cluster 14 s, diamond 9.7 s, emapper 3.0 s.
+#
+# THAT CLAIM IS CHECKED FOR THE ROWS THE TABLE STATES SEPARATELY, AND ONLY
+# THOSE. test_the_dispatch_order_table_is_the_published_measurements in
+# tests/test_docs.py parses README's Scale table and compares every row it
+# finds -- interpro, signalp, tmbed, kofam, pfam, ncbifam, foldseek and dbcan
+# -- so a figure edited here to change a dispatch order cannot quietly stop
+# being the measurement it says it is. FOUR of the twelve are not reachable
+# that way and are not checked: cluster, diamond and emapper are inside
+# README's combined "under a minute each" rather than on rows of their own,
+# and esmfold's 1.6 h is qualified by the model count it belongs to. They are
+# measurements from the same run; what they are not is independently pinned,
+# and saying "every measured row" of them was the kind of over-claim this
+# whole change exists to remove.
+#
+# WHICH ROWS ARE MEASUREMENTS AND WHICH ARE NOT, because a reader has to be
+# able to tell without leaving this file:
+#   * the stages named in the paragraph above are measured.
+#   * integrate, finalise and join were recorded only as a BOUND -- "under a
+#     minute each" -- so they carry the middle of that bound and carry it
+#     equally, which keeps them in table order among themselves. They are
+#     sequenced by the dependency graph in any case: integrate waits on every
+#     stage that feeds it, and join is the terminal one.
+#   * jackhmmer, hhblits, unipept, context, smorf and taxonomy were NOT
+#     ENABLED on that run, so no figure for them exists anywhere in this
+#     repository. They carry a round number that places them below every
+#     measured stage of their own rank, on two arguments: jackhmmer and
+#     hhblits query the DARK SET -- a few percent of a proteome -- rather than
+#     all of it, and unipept is a rate-limited service call over the quant
+#     table whose result may have been produced by hand before the run ever
+#     started. Those are arguments and not measurements, which makes these six
+#     rows the weakest part of the table, and they are named here so that a
+#     reader knows which rows to distrust first. Two things bound what they
+#     can cost: the rank still leads, so a placement can only ever reshuffle a
+#     stage inside its own class; and jackhmmer, hhblits and esmfold become
+#     ready in the same round, so at stage_workers of 3 or more all three
+#     start whatever their order says -- esmfold's start is decided by
+#     gpu_lease rather than by the sort in any case. The rest is measured
+#     rather than asserted, by
+#     test_the_saving_does_not_rest_on_the_stages_no_run_has_timed, which
+#     scales these rows in both directions and says what it costs.
+#   * emapper's 3.0 s is a REUSE of a precomputed eggNOG table, which is what
+#     every config in examples/ does and what the reference run did. A run
+#     that computes those annotations itself is hours-class, which is why the
+#     RANK stays 3; inside the rank it sorts last, which is right for a reuse
+#     and pessimistic for a full eggnog-mapper run.
+#
+# WHY THE MAGNITUDES ARE NOT NORMALISED, SCALED OR AVERAGED, and why nobody
+# should "fix" them into a per-rank constant or fit a factor per machine: list
+# scheduling reads only the ORDER of its priority list, so any monotone
+# rescaling of every number here produces a byte-identical schedule. A box
+# four times faster, or a dataset an order of magnitude larger, schedules the
+# same -- which is checkable, and is checked, against the 455,571-protein run:
+# 11.9x the proteins, 8x-66x per stage, and the same order for every stage
+# both runs timed. What WOULD reorder this table is an accelerator that moves
+# some stages and not others, because that is not a rescaling; a card that
+# runs tmbed and esmfold much faster than the reference box moves exactly
+# those two rows. That is the real machine-specific risk, and it is narrower
+# than "durations differ between machines", which is true and never read.
+#
+# WHY THIS IS A TABLE IN THE SOURCE AND NOT THE `seconds` IN
+# .metaannot_state.json, which is the obvious alternative and was tried on
+# paper first. The reasons, in the order of how much they decide it.
+#   1. A recorded duration exists only where the stage ALREADY RAN HERE, and
+#      decide() removes a cached or adopted stage from the ready set before
+#      the sort ever sees it -- so a state-file key pays out on a rerun that
+#      recomputes, and pays nothing on a first run. Every one of the eight
+#      configs in examples/server-run-plan runs in its own results directory
+#      and so starts cold, and so did the run that found this defect. A table
+#      that ships with the release is right on the first run, on a fresh
+#      clone, on a read-only directory and under --force alike.
+#   2. It would make scheduling a consumer of a document that v0.6.0 and #39
+#      have just finished making honest about being missing, unparseable, or
+#      written by another run, and would add a fourth consequence to each of
+#      those failure modes: today an unreadable state file changes what is
+#      RECOMPUTED, and load_state() warns in exactly those terms.
+#   3. `seconds` is not a property of a stage. It is a property of the stage,
+#      the dataset, the box, and the CPU cut share() happened to give it --
+#      interproscan's own figure was measured at `-cpu 7` because signalp and
+#      tmbed were beside it, see weighted_share -- so feeding it back closes a
+#      loop in which the scheduler's past decision is its present input. A
+#      number in the source is reviewable in a diff; a number in a results
+#      directory is not reviewed by anyone.
+# A local measurement is still better evidence than this table where it
+# exists, and reading it is a defensible LATER change -- but it needs this
+# table anyway, as the fallback for every stage that has no record, and a
+# per-stage fallback is strictly more information than the per-rank median or
+# the "unknown means longest" sentinel a bare state-file key has to invent.
+#
+# THE ONE ROW THAT CARRIES THE RESULT is interpro's. An order that knows only
+# "interpro is the longest hours-class stage" already puts the schedule on
+# this graph's critical path; getting any other row wrong inside its rank
+# costs at most the shorter stage's own length, because the rank still leads
+# and no measurement can move a stage out of its class.
+#
+# And it reaches no signature. Scheduling order cannot change a stage's
+# output, so no `keys` list names `order_s` any more than it names `cost`.
+STAGE_ORDER_S = {st["name"]: st["order_s"] for st in STAGES}
+
+
+def stage_cost(name):
+    """The stage's cost rank -- what the MACHINE is divided by.
+
+    Split out of stage_priority() when that became a two-element sort key,
+    and the split is the containment: share() weights the CPU and RAM cut by
+    THIS, and the starvation WARN asks THIS whether a stage is hours-class.
+    Feeding either of them a dispatch key would divide 22 cores in the ratio
+    of two durations, which weighted_share() cannot do arithmetic on and
+    refuses loudly rather than quietly -- but the reason to keep them apart is
+    not that the failure is loud. It is that a rank is a RATIO of a machine
+    and seconds are only an ORDER of dispatch, and one accessor returning both
+    is how they came to be confused.
+
+    Indexing, not .get: an unknown name is a mistake in OUR table and must
+    raise. See stage_priority().
+    """
+    return STAGE_COSTS[name]
 
 
 def stage_priority(name):
     """Sort key for one round's ready stages: the longest one goes first.
 
-    Every stage with no dependencies is ready in the first round, and
-    stage_workers is 4, so the first four IN TABLE ORDER started and the rest
-    waited. That put cluster (109 s) and dbcan (10 min) on the box while
-    interproscan — the longest stage in the pipeline by an order of magnitude
-    — sat in the queue behind them. Longest-processing-time-first is the
-    standard greedy answer to that, and here it costs one sort of a list that
-    is never longer than 21.
+    WHERE IT CAME FROM. Every stage with no dependencies is ready in the first
+    round, and stage_workers is 4, so before v0.4.0 the first four IN TABLE
+    ORDER started and the rest waited. That put cluster (109 s) and dbcan
+    (10 min) on the box while interproscan — the longest stage in the pipeline
+    by an order of magnitude — sat in the queue behind them.
+    Longest-processing-time-first is the standard greedy answer to that, and
+    here it costs one sort of a list that is never longer than 21.
 
-    Two things this must NOT do. It must not reach the cache: scheduling
-    order cannot change a stage's output, so no signature and no keys list
-    mentions cost. And it must not default: indexing STAGE_COSTS raises
-    KeyError on an unknown name, where a .get(name, 1) would quietly rank a
-    stage added without a cost as trivial and reintroduce the exact problem.
+    Two elements, and the order of them is the whole design. The COST RANK
+    leads, so no duration -- stale, curated on another box, or hand-edited in
+    a fork -- can move a stage out of its class: a seconds-class stage can
+    never outrank an hours-class one, which is what
+    test_a_short_stage_never_outranks_a_long_one_wherever_the_table_puts_it
+    and the orphan rule below it pin for EVERY possible duration rather than
+    for the ones that happen to be in the table today. The REFERENCE SECONDS
+    break the tie inside the class, which is where the whole defect lived.
+    v0.4.0 shipped the rank alone: every stage with no dependencies is ready
+    in the first round, eleven stages declare cost 3, Python's sort is stable,
+    and so the hours class was dispatched in TABLE ORDER with interproscan
+    seventh of it -- the longest stage in the pipeline, the one the ordering
+    was written for, waiting for a worker while shorter members of its own
+    rank held them. The mechanism was tested and the discrimination never was;
+    a test named for the tie pinned the table order as if it were a neutral
+    tiebreak, and it is not a neutral one, it is a specifically bad one.
+
+    Cost is a RATIO and these seconds are only an ORDER. That is why they are
+    two elements of one key rather than one number, why share() weights by
+    stage_cost() instead, and why nothing here is normalised: see the comment
+    on STAGE_ORDER_S for what the numbers are, which run they come from, and
+    what is and is not claimed about them.
+
+    Two things this must NOT do, and neither has changed. It must not reach
+    the cache: scheduling order cannot change a stage's output, so no
+    signature and no keys list mentions cost or order_s. And it must not
+    default: indexing raises KeyError on an unknown name, where a
+    .get(name, 1) would quietly rank a stage added without a cost as trivial,
+    and a .get(name, 0) would quietly sort a stage added without a duration
+    last inside its rank -- the same silent-default bug in a new field.
     """
-    return STAGE_COSTS[name]
+    return (STAGE_COSTS[name], STAGE_ORDER_S[name])
 
 
 def weighted_share(free, weights):
@@ -18053,10 +18244,24 @@ def describe(cfg, p, config_path=None):
             "gpu": bool(st.get("gpu")),
             "empty_ok": bool(st.get("empty_ok")),
             "outputs": list(st["out"](p)),
-            # Longest-first scheduling: 1 seconds, 2 minutes, 3 hours. What
-            # the scheduler sorts each round's ready set by, so a front end
-            # can order or annotate the table the same way.
+            # Longest-first scheduling: 1 seconds, 2 minutes, 3 hours. The
+            # FIRST of the two keys the scheduler sorts each round's ready set
+            # by, and the one the machine is divided by, so a front end can
+            # order or annotate the table the same way. It is no longer
+            # sufficient on its own: eleven stages declare 3, and what
+            # separates them is `order_s` below. A consumer that ranks by
+            # `cost` alone still never claims a lower-ranked stage is
+            # dispatched ahead of a higher-ranked one, but inside a rank it
+            # will differ from the engine until it reads both.
             "cost": st.get("cost"),
+            # The SECOND key: what that stage took on this release's reference
+            # run, in seconds, which is how the ties in `cost` are broken.
+            # Emitted so a front end can reproduce the engine's dispatch order
+            # exactly, from the release alone and without reading anyone's
+            # results directory -- which is also why it is a static figure
+            # here and not the `seconds` a run records per stage. Only the
+            # ORDER of these numbers is claimed; see STAGE_ORDER_S.
+            "order_s": st.get("order_s"),
             # Which requirements() ids this stage DIES without, and which it
             # merely does less without. Added for `doctor --json`'s `blocks`,
             # and emitted here too because a field on STAGES that describe does
@@ -18071,7 +18276,7 @@ def describe(cfg, p, config_path=None):
             # arrived together - the fourth consecutive round to ship a
             # hand-written count that was wrong, and the reason the scanner in
             # tests/test_docs.py now reads digits and reads tests/ too. The
-            # dict emits ten keys, and that number is counted off the dict
+            # dict emits eleven keys, and that number is counted off the dict
             # literal itself rather than remembered.
             "requires": list(st.get("requires", ())),
             "degraded_by": list(st.get("degraded_by", ())),
@@ -22527,6 +22732,10 @@ def cmd_run(args):
 
     if args.dry_run:
         print(f"{'stage':12s} {'action':28s} outputs")
+        # Collected in this loop rather than recomputed after it: decide()
+        # logs on two of its branches, and a second pass would say those
+        # things twice.
+        would_run = []
         for st in STAGES:
             action = decide(st)
             if action == "RUN":
@@ -22535,10 +22744,29 @@ def cmd_run(args):
                 unmet = unmet_deps(st)
                 if unmet:
                     action = f"refused: needs {' '.join(unmet)}"
+                else:
+                    would_run.append(st["name"])
             print(f"{st['name']:12s} {action:28s} {', '.join(st['out'](p))}")
         print("\nnote: a dry run evaluates every stage against the files as they "
               "are now,\nso a stage shown as cached may still rerun once an "
               "upstream stage rewrites its input.")
+        # THE ORDER, and a dry run can state it EXACTLY rather than guess it,
+        # which is a property of where the two sort keys live: both are in
+        # STAGES, so the order is a fact about this release and not about this
+        # results directory. A scheduler that ranked by what some previous run
+        # had recorded could not honestly print this line here at all, because
+        # a dry run takes no lock and must not be the thing that tells you
+        # what a real run would do with a file it has not read.
+        #
+        # Only the stages that would RUN: decide() removes a cached, adopted,
+        # disabled or unselected stage before the sort ever sees it, so
+        # including them here would describe a queue that never forms.
+        if len(would_run) > 1:
+            print("\ndispatch order, longest first: "
+                  + ", ".join(sorted(would_run, key=stage_priority,
+                                     reverse=True))
+                  + "\nby cost rank, then by what each stage took on this "
+                    "release's reference run; `describe --json` gives both.")
         # After the table, because the table is the answer a dry run was asked
         # for and this is a remark about it - and here rather than nowhere,
         # which is where it was: a dry run calls decide() for every stage, so
@@ -22683,10 +22911,21 @@ def cmd_run(args):
         stages in one round are not equal: see weighted_share. The cut is now
         proportional to the cost rank, which for a round of equally-ranked
         stages is arithmetically the same even split as before.
+
+        stage_cost(), NOT stage_priority(). They were one accessor until the
+        dispatch key grew a second element, and the two want different
+        quantities out of it: this is a RATIO of the machine, where the
+        reference seconds are only an ORDER of dispatch. Weighting the box by
+        seconds would hand interproscan 21 of 22 cores and leave each of its
+        round-mates one, for the life of the run, because a tool's thread
+        count is fixed when it is launched. The cuts are therefore unchanged
+        by the ordering change: within a rank the weights are equal, so
+        reordering two same-rank stages moves only which of them takes the
+        remainder of a division of equals.
         """
         room = max(1, workers - len(futures))
         take = list(starting)[:room] or [None]
-        ws = [stage_priority(n) if n else 1 for n in take]
+        ws = [stage_cost(n) if n else 1 for n in take]
         free_cpu = total_cpu - sum(a[0] for a in alloc.values())
         cpu = weighted_share(free_cpu, ws)
         ram = 0
@@ -22712,6 +22951,37 @@ def cmd_run(args):
         return bool(by_name[name].get("gpu"))
 
     remaining = [st["name"] for st in STAGES]
+    # THE ORDER IS DISCLOSED ONCE PER RUN, and this line is part of the
+    # ordering change rather than decoration on it. Until the dispatch key grew
+    # a second element the within-rank order was predictable by reading STAGES
+    # top to bottom; now it
+    # comes from the reference seconds beside each `cost`, and an order a
+    # reader of the log cannot reconstruct is the thing this refuses to ship.
+    #
+    # ONCE, not per dispatch, because stage_priority() is a total order over
+    # stage names: the order of any round's ready set is this order restricted
+    # to that set, so naming it here describes every round -- including the
+    # rounds --only and --from narrow, which make the ties matter more per
+    # slot rather than less. And no seconds in the line: they are this
+    # release's figures for another dataset, and printed beside a stage about
+    # to start they would be read as an estimate of THIS run, which is exactly
+    # what the resource guide tells an operator not to do. `describe --json`
+    # carries the numbers for anyone who wants to reproduce the order.
+    _order_say = sorted(
+        (n for n in remaining
+         if n in selected and (not by_name[n]["enabled"]
+                               or cfg["run"].get(by_name[n]["enabled"], False)
+                               or n in only_set)),
+        key=stage_priority, reverse=True)
+    if len(_order_say) > 1:
+        log("stage order for this selection, longest first: "
+            + ", ".join(_order_say)
+            + " — by cost rank, then by what each stage took on this "
+              "release's reference run (`describe --json` gives both numbers "
+              "per stage). Every round's ready set is taken in this order, so "
+              "it decides which ready stage claims a worker first; it does not "
+              "decide when anything finishes, and a stage that turns out "
+              "cached, adopted or disabled never reaches the queue at all.")
     alloc = {}                    # future -> (cpu, ram) committed to a stage
     gpu_waiting = set()           # said once per stage, not once per round
     starved = set()               # said once per stage, not once per finish
@@ -22787,9 +23057,16 @@ def cmd_run(args):
                         continue
                     run_now.append(name)
                 # Longest first, so a long stage late in the table does not wait
-                # behind a short one ahead of it for a worker. Python's sort is
-                # stable, so stages of equal rank keep table order and the run
-                # log reads the way it always did.
+                # behind a short one ahead of it for a worker -- by cost rank,
+                # and then, INSIDE the rank, by what each stage took on the
+                # reference run. The rank alone was not enough and that was the
+                # whole of the defect: eleven stages declare cost 3, a stable
+                # sort left all of them in table order, and interproscan went
+                # seventh. Python's sort is still stable, so two stages with
+                # the same rank AND the same reference seconds keep table
+                # order; the run log's order is a property of the release, not
+                # of anything in this results directory, and `metaannot
+                # describe --json` reproduces it.
                 run_now.sort(key=stage_priority, reverse=True)
                 # The GPU is not divisible the way the CPU and RAM budgets are, so
                 # it is leased rather than shared. A deferred stage stays in
@@ -22852,8 +23129,12 @@ def cmd_run(args):
                     for other in list(futures.values()):
                         held = next((a[0] for f, a in alloc.items()
                                      if futures.get(f) == other), 0)
+                        # stage_cost(), not the dispatch key: this asks
+                        # which CLASS of stage is worth saying it about, and
+                        # a class is one number. The dispatch key is a pair
+                        # and `< 3` on a pair is not a question.
                         if (other in starved or not held or free_cpu < held
-                                or stage_priority(other) < 3):
+                                or stage_cost(other) < 3):
                             continue
                         starved.add(other)
                         log(f"{other} holds {held} of {total_cpu} cpu and "

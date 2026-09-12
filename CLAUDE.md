@@ -282,6 +282,26 @@ it names; do not force the file through another format.
 - `-dp` on InterProScan disables the precalculated lookup, which only holds
   UniParc matches and is useless for novel metagenome ORFs.
 - Foldseek searches its targets serially. Two 100 GB+ indices at once thrash.
+- **The dispatch order is two numbers per stage and only their ORDER is a
+  claim.** `cost` (3 hours / 2 minutes / 1 seconds) is the rank, and it is
+  also the ratio `share()` divides the machine by, which is why it stays
+  coarse. `order_s` is what that stage took on the 38,204-protein reference
+  run whose table is in README's Scale section, and it exists only to break
+  the ties in the rank: eleven stages are hours-class, they tied on the
+  ordinal, and a stable sort therefore dispatched InterProScan — the longest
+  stage in the pipeline — seventh of its own rank until the tie-break was
+  added. Three things not to "fix". Do not normalise, average or fit those
+  seconds, and do not replace them with a constant per rank: list scheduling
+  reads only their order, so any monotone rescaling schedules identically and
+  a constant is the ordinal again. Do not hand the dispatch key to `share()`
+  or to the starvation WARN — a rank is a ratio of a machine and seconds are
+  only an order, which is what `stage_cost()` exists for. And do not make the
+  scheduler read `seconds` out of `.metaannot_state.json` without reading the
+  long comment at `STAGE_ORDER_S` first: a recorded duration exists only where
+  that stage already ran in that directory, so it is worth nothing on a first
+  run — which is every cohort directory in `examples/server-run-plan` — and
+  `seconds` is partly a product of the CPU cut `share()` gave the stage, so
+  feeding it back makes the scheduler's past decision its present input.
 - `MANUAL` items in `doctor` are not oversights; they are licence-gated or
   version-specific and must not be automated.
 - The taxon reference is a median of ratios, not a sum. A sum is biased by any

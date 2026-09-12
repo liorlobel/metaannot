@@ -3642,6 +3642,16 @@ def test_a_ready_stage_says_which_other_ready_stages_the_engine_takes_first(
     ncbifam, kofam and interpro. The operator reads the first NEXT as the stage
     about to start; the engine starts ncbifam, and on the run this comes from
     dbcan did not get a worker for over 27 hours.
+
+    AND THE SAME DEFECT ONE LEVEL DOWN, which is why the expectation below
+    moved. `cost` is a three-level ordinal on which eleven stages tie, so it
+    orders none of the hours class: the engine now sorts by
+    `(cost, order_s)` — the rank, then what that stage took on the release's
+    reference run — and a page ranking by `cost` alone put ncbifam, kofam and
+    interpro in ITS table order when the engine takes them longest-first, with
+    interpro at 10224 s going first out of exactly this set. So the row a
+    reader would have taken for the next stage names them in the engine's
+    order, and the assertions here are that order rather than the table's.
     """
     on = queued_run(results, contract)
     monkeypatch.setattr(console.Project, "config_run",
@@ -3652,22 +3662,24 @@ def test_a_ready_stage_says_which_other_ready_stages_the_engine_takes_first(
     assert ready == ["dbcan", "diamond", "cluster", "ncbifam", "kofam",
                      "interpro"], ready
     # the row a reader would have taken for the next stage names the three the
-    # engine ranks ahead of it
-    assert "ncbifam" in rows["dbcan"]["detail"], rows["dbcan"]["detail"]
-    assert rows["dbcan"]["ahead"] == ["ncbifam", "kofam", "interpro"]
-    # cost 3 first, and among equals the engine's own table order, because its
-    # sort is stable over exactly this sequence
-    assert rows["ncbifam"]["ahead"] == []
-    assert rows["kofam"]["ahead"] == ["ncbifam"]
-    assert rows["cluster"]["ahead"] == ["ncbifam", "kofam", "interpro",
+    # engine ranks ahead of it, in the order the engine takes them
+    assert "interpro" in rows["dbcan"]["detail"], rows["dbcan"]["detail"]
+    assert rows["dbcan"]["ahead"] == ["interpro", "kofam", "ncbifam"]
+    # cost 3 first, and inside the rank the longest on the reference run:
+    # interpro 10224 s, kofam 1764 s, ncbifam 1440 s. Table order would have
+    # been the other way round, which is the defect this row pins.
+    assert rows["interpro"]["ahead"] == []
+    assert rows["kofam"]["ahead"] == ["interpro"]
+    assert rows["ncbifam"]["ahead"] == ["interpro", "kofam"]
+    assert rows["cluster"]["ahead"] == ["interpro", "kofam", "ncbifam",
                                         "dbcan", "diamond"]
-    assert "ranks this one first" in rows["ncbifam"]["detail"]
+    assert "ranks this one first" in rows["interpro"]["detail"]
     # the table is still in the engine's stage order - the annotation carries
     # the queue, not the row order
     names = [r["name"] for r in v["rows"]]
-    assert names.index("dbcan") < names.index("ncbifam")
+    assert names.index("dbcan") < names.index("interpro")
     html = console.render_project(v, contract)
-    assert html.index(">dbcan<") < html.index(">ncbifam<")
+    assert html.index(">dbcan<") < html.index(">interpro<")
     assert "longest-first" in html
 
 

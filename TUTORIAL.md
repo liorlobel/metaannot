@@ -1125,8 +1125,22 @@ InterProScan is the longest stage in the pipeline and it started **27 hours
 in**, because it is tenth in a table whose first three entries include one
 that takes ten minutes. Since v0.4.0 the scheduler sorts each round's ready
 stages longest-first, so the hours-class stages claim the workers and dbcan
-waits instead. It is still worth giving InterProScan its own pass at this
-scale — see below — but it no longer queues behind a ten-minute stage.
+waits instead.
+
+**That fixed dbcan and not InterProScan, and this release is the other half.**
+The v0.4.0 sort key was the cost rank alone — hours, minutes, seconds — and
+eleven stages are hours-class. They tied, the sort is stable, and so the whole
+hours class was dispatched in the order the stage table happens to list it,
+with InterProScan seventh of it: the queue it no longer waited behind was the
+short-stage queue, and the one it went on waiting behind was its own rank. Each
+stage now carries the duration it took on the reference run whose table sits
+above this one, purely to break that tie, so InterProScan is dispatched first
+and everything else in its class follows in measured order. Replaying these
+measurements through the dispatch loop is what the figures in the CHANGELOG
+entry are, and `metaannot describe --json` publishes the two numbers (`cost`
+and `order_s`) the order comes from. It is still worth giving InterProScan its
+own pass at this scale — see below — because the ordering cannot make the
+longest stage shorter; what it can do is stop it starting a day late.
 
 ### Sizing your run
 

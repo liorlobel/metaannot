@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -417,6 +418,40 @@ def test_dry_run_shows_the_refusal_a_real_invocation_would_give(tmp_path,
     assert "refused: needs" in proc.stdout
 
 
+def test_a_dry_run_states_the_dispatch_order_it_would_really_take(tmp_path,
+                                                                  stub_bin,
+                                                                  ma):
+    """A dry run can PREVIEW the order, exactly, because the order is static.
+
+    Both sort keys live in STAGES, so the dispatch order is a property of the
+    release rather than of a results directory, and a command that takes no
+    lock and reads nothing can still print the order a real run would take.
+    That is worth a test of its own because it is the property that would be
+    lost first: a scheduler that ranked by what a previous run had recorded
+    could print nothing truthful here — tests/test_scheduler.py's own
+    test_a_dry_run_writes_neither_artefact pins that a dry run leaves no state
+    file behind, and a dry run on a directory nobody has run has no durations
+    to have read.
+
+    Pinned against stage_priority() over the stages the table itself marks
+    RUN, so the line cannot drift from the sort: a cached, adopted, disabled
+    or unselected stage never reaches the sort, and must not be named here.
+    """
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proc = run_metaannot("run", "--config", proj.config_path, "--dry-run",
+                         cwd=proj.root)
+    said = re.search(r"dispatch order, longest first: (.+)", proc.stdout)
+    assert said, proc.stdout
+    order = [n.strip() for n in said.group(1).split(",")]
+    would_run = [line.split()[0] for line in proc.stdout.splitlines()
+                 if len(line.split()) > 1 and line.split()[1] == "RUN"]
+    assert sorted(order) == sorted(would_run), (order, would_run)
+    assert order == sorted(would_run, key=ma.stage_priority, reverse=True)
+    # and the line says where the numbers behind it come from, because an
+    # order a reader cannot reproduce is the thing this whole change refuses
+    assert "describe --json" in proc.stdout
+
+
 def test_dry_run_marks_disabled_stages(tmp_path, stub_bin):
     proj = _searchable(tmp_path, tmp_path / "p")
     proc = run_metaannot("run", "--config", proj.config_path, "--dry-run",
@@ -627,9 +662,131 @@ def test_the_run_says_which_gpu_stages_share_one_device(tmp_path, stub_bin):
 # 455,571-protein run that handed workers to cluster (109 s) and dbcan
 # (10 min) while signalp and tmbed — nearly an hour each on a set an order
 # of magnitude smaller — queued behind them.
+#
+# SECOND SYMPTOM, and the reason half of this block was rewritten: v0.4.0
+# sorted by the cost rank ALONE, which is a three-level ordinal. The eleven
+# hours-class stages tied on it, Python's sort is stable, and so the whole
+# hours class was dispatched in TABLE ORDER — with interpro, the longest stage
+# in the pipeline, seventh of it. The two tests written to prove the ordering
+# worked pinned that: one asserted a first wave with interpro ABSENT, and one
+# asserted the tie order as though table order were a neutral tiebreak. The
+# mechanism was tested; the discrimination never was. See stage_priority().
 def _wave_one(ma):
     """The stages a fresh run finds ready in its first round."""
     return [st["name"] for st in ma.STAGES if not st["deps"]]
+
+
+def _ordinal_only(ma):
+    """stage_priority() as v0.4.0 shipped it: the cost rank and nothing else.
+
+    Written out here rather than described, because every test below is a
+    claim about the DIFFERENCE between the two keys, and a claim about a
+    difference needs both sides of it in the file.
+    """
+    return lambda name: ma.STAGE_COSTS[name]
+
+
+# The two runs this repository has published per-stage durations for, in
+# seconds. Every figure for a stage those runs ACTUALLY RAN is a measurement
+# quoted in README's Scale section or TUTORIAL's resource guide: the cells
+# that still said "still running" when those tables were written are the ones
+# the ordering work finally measured — InterProScan at 57.9 h, and SignalP
+# and TMbed at the 57 h that weighted_share()'s own docstring already records
+# for the pair.
+#
+# THE STAGES NEITHER RUN ENABLED — jackhmmer, hhblits, unipept, context, smorf
+# and taxonomy — carry the same placements STAGE_ORDER_S gives them, because
+# nothing better exists for them anywhere in this repository and a replay has
+# to give every selected stage some duration. That makes those rows the
+# one part of these tables that is not independent of the thing being tested,
+# so the test below multiplies them up and down and shows the comparison does
+# not rest on them.
+#
+# The tables are here to be REPLAYED, which is the point: the tests below do
+# not assert that the new order is better, they compute what each order costs
+# on measured durations and compare the two. A hand-written expected makespan
+# could agree with a wrong implementation; a replay of measurements cannot.
+UNTIMED_BY_EITHER_RUN = ("jackhmmer", "hhblits", "unipept", "context",
+                         "smorf", "taxonomy")
+MEASURED_38K = {
+    "emapper": 3, "pfam": 1620, "dbcan": 41, "diamond": 10, "signalp": 3348,
+    "tmbed": 3132, "cluster": 14, "ncbifam": 1440, "kofam": 1764,
+    "interpro": 10224, "smorf": 10, "context": 10, "integrate": 30,
+    "jackhmmer": 1000, "hhblits": 1000, "esmfold": 5760, "foldseek": 57,
+    "finalise": 30, "unipept": 1000, "taxonomy": 10, "join": 30,
+}
+MEASURED_455K = dict(MEASURED_38K, emapper=76, diamond=291, cluster=109,
+                     dbcan=617, ncbifam=20160, pfam=25920, kofam=51480,
+                     interpro=208396, signalp=205200, tmbed=205200)
+# What the eight configs in examples/server-run-plan select: no topology, no
+# structure, no hhblits, jackhmmer, context, smorf, unipept or taxonomy. Their
+# hours class is a different set from the full pipeline's — emapper, pfam,
+# ncbifam, kofam, interpro, with interpro LAST in the table — which is why
+# they are replayed separately from the whole pipeline.
+COHORT_SELECTION = frozenset({"emapper", "pfam", "dbcan", "diamond", "cluster",
+                              "ncbifam", "kofam", "interpro", "integrate",
+                              "finalise", "join"})
+
+
+def _replay(ma, durations, key, slots, selection=None, gpu_slots=1):
+    """The makespan the dispatch loop produces for one priority key.
+
+    A model of the loop, and only of its TIMING: the graph comes from
+    ma.STAGES, the lease from ma.gpu_lease(), the order from `key`, and the
+    four statements are in the loop's own order — recompute the ready set over
+    `remaining` in table order, sort it, lease the card, cap at the free slots
+    — with one completion per pass, which is what the `break` after
+    as_completed() makes true. Stages outside `selection` are what decide()
+    removes before the sort ever sees them: a disabled or unselected
+    dependency is satisfied rather than pending, exactly as unmet_deps()
+    treats a disabled one.
+    """
+    sel = set(ma.STAGE_NAMES if selection is None else selection)
+    by_name = {st["name"]: st for st in ma.STAGES}
+    remaining = [n for n in ma.STAGE_NAMES if n in sel]
+    done, running, now = set(), {}, 0.0
+    started = {}
+    while remaining or running:
+        ready = [n for n in remaining
+                 if all(d in done for d in by_name[n]["deps"] if d in sel)]
+        run_now = sorted(ready, key=key, reverse=True)
+        run_now, _ = ma.gpu_lease(run_now, list(running), gpu_slots,
+                                  lambda n: bool(by_name[n].get("gpu")))
+        for name in run_now:
+            if len(running) >= slots:
+                break
+            remaining.remove(name)
+            started[name] = now
+            running[name] = now + durations[name]
+        if not running:                      # nothing can start: unreachable
+            break
+        # Ties broken by table order, so the replay is deterministic.
+        nxt = min(running, key=lambda n: (running[n], ma.STAGE_NAMES.index(n)))
+        now = running.pop(nxt)
+        done.add(nxt)
+    return now, started
+
+
+def _critical_path(ma, durations, selection=None):
+    """The longest chain of the selected graph — a bound no order can beat.
+
+    The floor to measure against, and not sum(durations)/slots, which is the
+    INDEPENDENT-JOBS bound: it ignores that integrate is a barrier all of its
+    feeders must clear and that integrate → esmfold → foldseek → finalise →
+    taxonomy → join runs out on one worker at the end. A sum/slots figure
+    below this chain is not attainable and quoting it would put hours of
+    "still on the table" into a document that cannot be collected.
+    """
+    sel = set(ma.STAGE_NAMES if selection is None else selection)
+    by_name = {st["name"]: st for st in ma.STAGES}
+    memo = {}
+
+    def rpl(name):
+        if name not in memo:
+            memo[name] = durations[name] + max(
+                [rpl(d) for d in by_name[name]["deps"] if d in sel] or [0])
+        return memo[name]
+    return max(rpl(n) for n in sel)
 
 
 def test_the_first_wave_no_longer_goes_to_the_shortest_stages_in_table_order(
@@ -641,8 +798,49 @@ def test_the_first_wave_no_longer_goes_to_the_shortest_stages_in_table_order(
     assert before == ["emapper", "pfam", "dbcan", "diamond"]
     assert {"dbcan", "diamond"} & set(after) == set()
     # every stage that now claims a first-round worker is an hours-class one
-    assert all(ma.stage_priority(n) == 3 for n in after), after
-    assert after == ["emapper", "pfam", "signalp", "tmbed"]
+    assert all(ma.stage_cost(n) == 3 for n in after), after
+    # AND THE LONGEST OF THEM IS IN IT, which is the assertion this test was
+    # missing. It used to end `after == ["emapper", "pfam", "signalp",
+    # "tmbed"]` — a first wave with interpro absent, pinned as correct for two
+    # releases, because the cost rank alone left the hours class in table
+    # order and interpro seventh of it.
+    assert after == ["interpro", "signalp", "tmbed", "kofam"]
+    assert after[0] == max(ready, key=lambda n: ma.STAGE_ORDER_S[n])
+
+
+def test_a_run_says_on_its_log_which_order_it_is_taking(tmp_path, stub_bin,
+                                                        ma):
+    """The disclosure, and it is part of the ordering change rather than trim.
+
+    Until the sort key grew a second element an operator could predict the
+    within-rank order by reading STAGES top to bottom. Now it comes from the
+    reference seconds beside each `cost`, so a reader of the log who has not
+    read this source cannot reconstruct it — and an order nobody can
+    reconstruct is what turns a scheduling decision into a mystery about a
+    slow disk. So the run names the order, once.
+
+    ONCE, not per dispatch, and that is asserted here too: stage_priority() is
+    a total order over stage names, so the order of any round's ready set is
+    this order restricted to it, and one line describes every round. No
+    durations in the line, deliberately: they are this release's figures for
+    another dataset, and printed beside a stage about to start they would be
+    read as an estimate of THIS run, which is the one thing the resource guide
+    asks an operator not to do.
+    """
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proc = proj.run()
+    said = re.search(r"stage order for this selection, longest first: ([^—]+)",
+                     proc.stderr)
+    assert said, proc.stderr
+    order = [n.strip() for n in said.group(1).split(",")]
+    assert len(order) > 1, order
+    assert order == sorted(order, key=ma.stage_priority, reverse=True), order
+    # where the numbers behind it are, so the order is reproducible
+    assert "describe --json" in proc.stderr
+    # once for the run, not once per dispatch
+    assert proc.stderr.count("stage order for this selection") == 1
+    # and no seconds in the line, which would read as an estimate of this run
+    assert " s" not in said.group(1) and " h" not in said.group(1)
 
 
 def test_a_short_stage_never_outranks_a_long_one_wherever_the_table_puts_it(
@@ -655,14 +853,107 @@ def test_a_short_stage_never_outranks_a_long_one_wherever_the_table_puts_it(
             f"{short} is dispatched before interpro: {order}")
 
 
-def test_equal_cost_stages_keep_table_order(ma):
-    # the sort has to be stable, or the run log reorders itself between
-    # releases for no reason a reader could explain.
-    names = [st["name"] for st in ma.STAGES]
+def test_interpro_is_dispatched_before_every_measurably_shorter_stage(ma):
+    """The tie inside a cost rank is broken by measurement, not by the table.
+
+    THE TEST THIS REPLACES was `test_equal_cost_stages_keep_table_order`, and
+    it pinned the very property that made longest-first ordering inert: "the
+    sort has to be stable, or the run log reorders itself between releases for
+    no reason a reader could explain". The stability was real and the
+    conclusion was not. Eleven stages declare cost 3, the durations measured
+    inside that one rank run from seconds to more than two days, and a stable
+    sort over a three-level ordinal therefore dispatched the whole hours class
+    in TABLE ORDER — interpro seventh of it, waiting on shorter members of its
+    own rank for a worker. Its predecessor tested the MECHANISM of the sort
+    and never the DISCRIMINATION the sort exists for, which is why a test
+    named for the tie could pass while the feature it guarded did nothing.
+
+    So this pins the discrimination, and it FAILS against an ordinal-only
+    stage_priority(): the ordinal ties interpro with ten other stages, and
+    table order then puts six of them — every one of which this repository has
+    measured as shorter — ahead of it. That is checked here rather than
+    described, against _ordinal_only().
+    """
+    names = ma.STAGE_NAMES
+    shorter = [n for n in names
+               if ma.STAGE_ORDER_S[n] < ma.STAGE_ORDER_S["interpro"]]
+    # it is the longest stage in the pipeline, so that is every other stage
+    assert len(shorter) == len(names) - 1
+
     order = sorted(names, key=ma.stage_priority, reverse=True)
-    for rank in (3, 2, 1):
-        same = [n for n in order if ma.stage_priority(n) == rank]
-        assert same == [n for n in names if ma.stage_priority(n) == rank], rank
+    for name in shorter:
+        assert order.index("interpro") < order.index(name), (
+            f"{name} is measurably shorter than interpro and is dispatched "
+            f"before it: {order}")
+
+    # and the same claim against the key that shipped, so the test cannot
+    # quietly become vacuous if the tie-break is ever removed again
+    was = sorted(names, key=_ordinal_only(ma), reverse=True)
+    ahead = [n for n in was[:was.index("interpro")]
+             if ma.STAGE_ORDER_S[n] < ma.STAGE_ORDER_S["interpro"]]
+    assert ahead, "the ordinal-only key no longer reproduces the defect"
+
+
+def test_the_cost_rank_still_leads_so_no_duration_crosses_a_class(ma):
+    """The containment, stated as the invariant rather than as the code.
+
+    The reference seconds break ties INSIDE a rank and can do nothing else:
+    the rank is the first element of the key, so no figure in the table — and
+    no figure a later refinement might read from a results directory — can
+    promote a seconds-class stage past an hours-class one. That is what makes
+    the two tests above true for every possible duration rather than for the
+    numbers that happen to be in the table today.
+    """
+    order = sorted(ma.STAGE_NAMES, key=ma.stage_priority, reverse=True)
+    ranks = [ma.stage_cost(n) for n in order]
+    assert ranks == sorted(ranks, reverse=True), order
+    for name in ma.STAGE_NAMES:
+        assert ma.stage_priority(name)[0] == ma.stage_cost(name), name
+
+
+def test_stages_with_the_same_reference_seconds_keep_table_order(ma):
+    """The half of the replaced test that was right, aimed at the right thing.
+
+    Stability still matters — a run log that reorders itself for no reason a
+    reader can explain is the harm the old test was written about — so the
+    claim is kept, narrowed to what it can honestly cover: two stages the
+    reference run cannot tell apart keep table order. It is not vacuous; the
+    table has three such groups, and the old test WAS vacuous the moment the
+    key became a pair, because `stage_priority(n) == 3` is False for every
+    stage and it compared two empty lists.
+    """
+    names = ma.STAGE_NAMES
+    order = sorted(names, key=ma.stage_priority, reverse=True)
+    groups = {ma.stage_priority(n) for n in names}
+    tied = [k for k in groups if sum(ma.stage_priority(n) == k
+                                     for n in names) > 1]
+    assert tied, "the table no longer has two stages with the same key"
+    for key in groups:
+        same = [n for n in order if ma.stage_priority(n) == key]
+        assert same == [n for n in names
+                        if ma.stage_priority(n) == key], key
+
+
+def test_the_dispatch_key_is_not_a_quantity_the_machine_can_be_divided_by(ma):
+    """Why the key is a PAIR and the rank kept its own accessor.
+
+    weighted_share() turns a weight into a ratio of the box, and a ratio built
+    out of seconds would give interpro 21 of 22 cores and leave each of its
+    round-mates one — for the whole life of the run, because a tool's thread
+    count is fixed when it is launched. So the two call sites that want a
+    CLASS take stage_cost(), and handing either of them the dispatch key
+    fails loudly rather than dividing a machine by a duration.
+    """
+    with pytest.raises(TypeError):
+        ma.weighted_share(22, [ma.stage_priority("interpro"),
+                               ma.stage_priority("unipept")])
+    with pytest.raises(TypeError):
+        assert ma.stage_priority("dbcan") < 3
+    # and the ratio itself is untouched by the ordering change: within a rank
+    # the weights are equal, so reordering two same-rank stages moves only
+    # which of them takes the remainder
+    assert ma.weighted_share(22, [ma.stage_cost("interpro"),
+                                  ma.stage_cost("unipept")]) == 11
 
 
 def test_every_stage_declares_a_cost_and_it_is_a_known_rank(ma):
@@ -672,11 +963,36 @@ def test_every_stage_declares_a_cost_and_it_is_a_known_rank(ma):
     assert set(ma.STAGE_COSTS) == {st["name"] for st in ma.STAGES}
 
 
+def test_every_stage_declares_a_reference_duration_and_it_is_a_real_one(ma):
+    """A stage added without one must not be orderable at all.
+
+    The same discipline as the cost rank, for the same reason: a stage that
+    reached STAGES without a duration has to fail at the accessor, because the
+    alternative is a silent default — and a default of 0 sorts the new stage
+    last inside its rank while a default of anything else invents a
+    measurement. Positive and finite, because these are seconds of wall clock
+    and a bool, a zero or a NaN in this table would sort without ordering.
+    """
+    for st in ma.STAGES:
+        assert "order_s" in st, f"{st['name']} declares no order_s"
+        secs = st["order_s"]
+        assert isinstance(secs, int) and not isinstance(secs, bool), st["name"]
+        assert secs > 0, (st["name"], secs)
+    assert set(ma.STAGE_ORDER_S) == {st["name"] for st in ma.STAGES}
+
+
 def test_an_unknown_stage_name_raises_rather_than_ranking_as_trivial(ma):
     # a .get(name, 1) default would silently rank a stage added without a
-    # cost as seconds-class, which is the bug this ordering exists to fix.
+    # cost as seconds-class, which is the bug this ordering exists to fix;
+    # a .get(name, 0) on the duration would silently sort a stage added
+    # without one last inside its rank, which is the same bug in the new
+    # field. Note the deliberate asymmetry with a bad duration in somebody
+    # else's file, which a later refinement must tolerate rather than raise
+    # on: an unknown stage is a mistake in OUR table.
     with pytest.raises(KeyError):
         ma.stage_priority("no_such_stage")
+    with pytest.raises(KeyError):
+        ma.stage_cost("no_such_stage")
 
 
 def test_a_stage_nothing_waits_on_never_outranks_one_integrate_needs(ma):
@@ -687,6 +1003,12 @@ def test_a_stage_nothing_waits_on_never_outranks_one_integrate_needs(ma):
               [st["name"] for st in ma.STAGES
                if st["name"] not in depended_on and not st["deps"]]
     assert "smorf" in orphans, orphans
+    # A pair now, not a rank, and that makes this test STRICTER rather than
+    # looser: smorf must sit at or below the shortest thing integrate is
+    # waiting for, by rank AND then by its reference seconds. That is a real
+    # constraint on the table rather than a free pass — smorf's figure cannot
+    # exceed context's or cluster's — and it is what keeps a stage that blocks
+    # nothing from taking a worker off the critical path.
     floor = min(ma.stage_priority(d) for d in by_name["integrate"]["deps"])
     for name in orphans:
         if name == "join":                 # the terminal stage, waits on all
@@ -696,16 +1018,21 @@ def test_a_stage_nothing_waits_on_never_outranks_one_integrate_needs(ma):
             f"waiting for")
 
 
-def test_the_cost_rank_never_enters_a_cache_signature(ma):
+def test_neither_scheduling_number_ever_enters_a_cache_signature(ma):
     # scheduling order cannot change a stage's output, so changing it must
-    # not recompute anything.
+    # not recompute anything. The substring check covers `cost` and `order_s`
+    # by name: the version of this that read `"cost" in k` would not have
+    # noticed a key called order_s at all.
     for st in ma.STAGES:
-        assert not any("cost" in k for k in st["keys"]), st["name"]
+        for field in ("cost", "order_s"):
+            assert not any(field in k for k in st["keys"]), (st["name"], field)
     cfg = {"full_content_digest": False, "tool_args": {}}
-    cheap = dict(name="x", cost=1, inp=lambda c, p: [], keys=[],
+    cheap = dict(name="x", cost=1, order_s=1, inp=lambda c, p: [], keys=[],
                  out=lambda p: [])
     dear = dict(cheap, cost=3)
     assert ma.signature(cheap, cfg, None) == ma.signature(dear, cfg, None)
+    slower = dict(cheap, order_s=208396)
+    assert ma.signature(cheap, cfg, None) == ma.signature(slower, cfg, None)
 
 
 def test_the_scheduler_sorts_the_ready_set_before_it_caps_at_stage_workers(
@@ -723,6 +1050,206 @@ def test_the_scheduler_sorts_the_ready_set_before_it_caps_at_stage_workers(
     lease = src.index("run_now, waiting = gpu_lease(", decide)
     cap = src.index("if len(futures) >= workers:", decide)
     assert decide < srt < lease < cap
+
+
+def test_the_measured_durations_replay_to_a_shorter_run(ma):
+    """The saving, replayed from measurements rather than asserted.
+
+    THE ASSERTION IS A COMPARISON OF TWO REPLAYS, not a remembered makespan:
+    the same durations, the same graph, the same loop, once under the key
+    v0.4.0 shipped and once under the key this release ships. A hand-written
+    expected figure can agree with a wrong implementation; this cannot, and it
+    is also why the numbers below are this repository's published measurements
+    rather than a shape invented to make the point.
+
+    The selections replayed are the ones that run: the full pipeline at the
+    default stage_workers of 4, the full pipeline at the 3 the workstation
+    runs, and the eight cohort configs' selection at the 3 they all set. Every one of them is strictly shorter under the new key, on both
+    measured datasets — and on the two configurations that reach it, the new
+    order is on the graph's critical path, which is the real floor and is the
+    most that any ordering can be worth.
+    """
+    cases = [("full pipeline", None, 4), ("full pipeline", None, 3),
+             ("cohort selection", COHORT_SELECTION, 3)]
+    for label, durations in (("38,204 proteins", MEASURED_38K),
+                             ("455,571 proteins", MEASURED_455K)):
+        for what, selection, slots in cases:
+            was, _ = _replay(ma, durations, _ordinal_only(ma), slots, selection)
+            now, first = _replay(ma, durations, ma.stage_priority, slots,
+                                 selection)
+            assert now < was, (
+                f"{label}, {what}, {slots} slots: the cost rank alone gives "
+                f"{was / 3600:.2f} h and the two-element key {now / 3600:.2f} "
+                "h, so the ordering bought nothing")
+            floor = _critical_path(ma, durations, selection)
+            assert now >= floor           # the replay cannot beat the graph
+            # interpro starts at t=0 under the new key in every one of these,
+            # which is where the whole saving comes from: its completion is
+            # the makespan, so every hour it waits is an hour on the wall.
+            assert first["interpro"] == 0.0, (label, what, slots)
+            assert _replay(ma, durations, ma.stage_priority, slots,
+                           selection)[0] == now      # deterministic
+
+    # and on the selections whose longest stage is on the critical path, the
+    # new order is not merely better but optimal
+    for durations in (MEASURED_38K, MEASURED_455K):
+        for selection, slots in ((None, 4), (COHORT_SELECTION, 3)):
+            now, _ = _replay(ma, durations, ma.stage_priority, slots,
+                             selection)
+            assert now == _critical_path(ma, durations, selection)
+
+
+def test_no_slot_count_is_made_worse_by_the_tie_break(ma):
+    """The criterion that matters more than the saving: it cannot be worse.
+
+    Swept rather than argued, over both measured datasets, both selections and
+    every worker count from serial to more workers than the first wave has
+    stages. The structural reason is the key's own shape — the rank leads, so
+    no duration moves a stage out of its class — and this is the behavioural
+    half of that claim.
+
+    Note what it does NOT claim, which the test below measures instead: a
+    table that is wrong about the ORDER inside a rank can cost a little, and
+    the rank is what bounds how much. "Never worse" here is a statement about
+    these tables, not a theorem about any table.
+    """
+    for durations in (MEASURED_38K, MEASURED_455K):
+        for selection in (None, COHORT_SELECTION):
+            for slots in range(1, 7):
+                was, _ = _replay(ma, durations, _ordinal_only(ma), slots,
+                                 selection)
+                now, _ = _replay(ma, durations, ma.stage_priority, slots,
+                                 selection)
+                assert now <= was, (slots, was, now)
+
+
+def test_the_saving_does_not_rest_on_the_stages_no_run_has_timed(ma):
+    """The sensitivity of every claim above to the placed rows.
+
+    jackhmmer, hhblits, unipept, context, smorf and taxonomy have never been
+    enabled on a run this repository publishes durations for, so both tables
+    above carry the placements STAGE_ORDER_S gives them, and a comparison that
+    depended on those placements would be arguing with itself. This scales
+    them and reports what actually happens, in both directions.
+
+    DOWN, which is the direction the placement argues for — the three
+    hours-class ones query the dark set, a few percent of a proteome, rather
+    than all of it — nothing changes direction at all.
+
+    UP BY TEN, so that stages nothing has ever timed become the longest things
+    in their own rank while the table still dispatches them near the bottom of
+    it, the two-element key can lose a little on the smaller dataset. That is
+    the honest cost of a placement being wrong about ORDER rather than about
+    magnitude, it is bounded by the length of the one misplaced stage, it does
+    not appear at all on the 455,571-protein durations, and it is the reason
+    the comment at STAGE_ORDER_S names interpro's row as the one that carries
+    the result: a placement can only ever reshuffle a stage inside its rank.
+    """
+    cases = [(None, 4), (None, 3), (COHORT_SELECTION, 3)]
+
+    def scaled(base, factor):
+        out = dict(base)
+        for name in UNTIMED_BY_EITHER_RUN:
+            out[name] = max(1, int(base[name] * factor))
+        return out
+
+    for factor in (0.01, 0.1, 1):
+        for base in (MEASURED_38K, MEASURED_455K):
+            dur = scaled(base, factor)
+            for selection, slots in cases:
+                was, _ = _replay(ma, dur, _ordinal_only(ma), slots, selection)
+                now, _ = _replay(ma, dur, ma.stage_priority, slots, selection)
+                assert now < was, (factor, slots, was, now)
+
+    for factor in (10, 100, 1000):
+        dur = scaled(MEASURED_455K, factor)
+        for selection, slots in cases:
+            was, _ = _replay(ma, dur, _ordinal_only(ma), slots, selection)
+            now, _ = _replay(ma, dur, ma.stage_priority, slots, selection)
+            assert now < was, ("the larger dataset", factor, slots, was, now)
+        dur = scaled(MEASURED_38K, factor)
+        for selection, slots in cases:
+            was, _ = _replay(ma, dur, _ordinal_only(ma), slots, selection)
+            now, _ = _replay(ma, dur, ma.stage_priority, slots, selection)
+            assert now - was <= max(dur[n] for n in UNTIMED_BY_EITHER_RUN), \
+                ("a misplaced stage costs more than its own length",
+                 factor, slots, was, now)
+
+
+def test_the_order_survives_any_rescaling_of_the_reference_seconds(ma):
+    """Why the table is not normalised, averaged, or fitted to a machine.
+
+    List scheduling reads only the ORDER of its priority list, so a monotone
+    rescaling of every figure in STAGE_ORDER_S produces the same dispatch
+    order and the same schedule. That is the whole licence for shipping one
+    run's durations as a static table: a box four times faster, or a dataset
+    an order of magnitude larger, schedules identically, and the only thing
+    that could reorder the table is a change that moves some stages and not
+    others — an accelerator, not a faster machine. It is also the reason the
+    next reader must not "fix" these numbers into a constant per rank: a
+    constant is not a rescaling, it is the ordinal again.
+    """
+    scales = [lambda s: s / 3600.0, lambda s: math.log(s), lambda s: s ** 0.5,
+              lambda s: 7 * s + 11, lambda s: s * 0.03]
+    want = sorted(ma.STAGE_NAMES, key=ma.stage_priority, reverse=True)
+    for scale in scales:
+        key = lambda n: (ma.stage_cost(n), scale(ma.STAGE_ORDER_S[n]))  # noqa
+        assert sorted(ma.STAGE_NAMES, key=key, reverse=True) == want
+        for durations in (MEASURED_38K, MEASURED_455K):
+            assert _replay(ma, durations, key, 3)[1] == \
+                _replay(ma, durations, ma.stage_priority, 3)[1]
+
+
+def test_remaining_path_length_would_order_this_graph_the_same_way(ma):
+    """Why the priority is own duration and not longest-remaining-path.
+
+    Longest-remaining-path-first is the right greedy for a DAG where own
+    duration is only the right greedy for independent jobs, so the honest
+    question is whether this graph is one of the cases where they differ. It
+    is not, and the reason is structural: `integrate` is the single confluence
+    — ten of the twelve stages ready in the first round feed it — so for every
+    one of them the remaining path is its own duration plus the SAME constant,
+    and adding a constant to every key reorders nothing.
+
+    This test exists so that the precondition is visible rather than
+    rediscovered. The day a second confluence appears, or the day foldseek
+    grows a chain of its own behind something in the first wave, it fails and
+    the question is asked again instead of being assumed away.
+    """
+    by_name = {st["name"]: st for st in ma.STAGES}
+    dependents = {n: [st["name"] for st in ma.STAGES if n in st["deps"]]
+                  for n in ma.STAGE_NAMES}
+    memo = {}
+
+    def tail(name):                     # the longest chain AFTER this stage
+        if name not in memo:
+            memo[name] = max([ma.STAGE_ORDER_S[d] + tail(d)
+                              for d in dependents[name]] or [0])
+        return memo[name]
+
+    feeders = [n for n in _wave_one(ma) if "integrate" in dependents[n]]
+    assert len(feeders) >= 8, feeders
+    assert len({tail(n) - tail("integrate") - ma.STAGE_ORDER_S["integrate"]
+                for n in feeders}) <= 2, \
+        "the first wave no longer shares one confluence at integrate"
+    # The bonus takes two values over the feeders, and they differ by
+    # exactly the duration of `context`, which four of them route through. So
+    # the two keys can disagree only about a pair whose own durations are
+    # closer together than one seconds-class stage — diamond and emapper, at
+    # ten seconds and three — and a pair that close cannot move a makespan
+    # measured in hours. Above that margin they agree, pair for pair.
+    spread = max(tail(n) for n in feeders) - min(tail(n) for n in feeders)
+    assert spread == ma.STAGE_ORDER_S["context"], spread
+    for name in feeders:
+        for other in feeders:
+            if ma.STAGE_ORDER_S[name] - ma.STAGE_ORDER_S[other] > spread:
+                assert ma.STAGE_ORDER_S[name] + tail(name) > \
+                    ma.STAGE_ORDER_S[other] + tail(other), (name, other)
+    # the two stages that bypass integrate are the two nothing waits on for
+    # it, and both are correctly demoted by their own duration alone
+    assert [n for n in _wave_one(ma) if "integrate" not in dependents[n]] == \
+        ["smorf", "unipept"]
+    assert by_name["smorf"]["deps"] == []
 
 
 # --- the lock and a killed run ----------------------------------------
@@ -1884,14 +2411,33 @@ def test_the_split_never_divides_by_zero_or_returns_nothing(ma):
 
 
 def test_the_weight_is_the_cost_rank_so_the_two_cannot_drift(ma):
-    # share() must weight by stage_priority and nothing else, or the ranks and
-    # the allocation tell different stories about which stage is long.
+    """share() weights by the CLASS, and the class is the head of the order.
+
+    This used to be `"stage_priority(n)" in body` and nothing else, which was
+    a grep standing in for an invariant. Two things were wrong with it. It
+    could not survive the dispatch key growing a second element, because
+    share() must NOT take that key — a ratio built out of seconds gives
+    interpro 21 of 22 cores and each of its round-mates one, for the life of
+    the run — and it would have gone on passing against
+    `stage_priority(n)[0]`, which is the same drift wearing a subscript.
+
+    So the grep is replaced by the property it was reaching for: the
+    allocation is weighted by stage_cost(), and stage_cost() is provably the
+    first element of the very key the dispatcher sorts by. The ranks and the
+    allocation therefore cannot tell different stories about which stage is
+    long, which is what the old name promised and only a string match
+    delivered.
+    """
     src = io.open(METAANNOT_PY, encoding="utf-8").read()
     body = src[src.index("    def share(starting):"):
                src.index("    def worker(st, cpu, ram):")]
-    assert "stage_priority(n)" in body
+    assert "stage_cost(n)" in body
+    assert "stage_priority" not in body.split('"""')[-1], \
+        "share() must weight by the rank, never by the dispatch key"
     assert "weighted_share(" in body
     assert "// slots" not in body, "the even split is gone"
+    for name in ma.STAGE_NAMES:
+        assert ma.stage_priority(name)[0] == ma.stage_cost(name), name
 
 
 def test_a_stage_that_cannot_grow_into_freed_cpu_is_told_about(ma):
@@ -1905,7 +2451,7 @@ def test_a_stage_that_cannot_grow_into_freed_cpu_is_told_about(ma):
     i = src.index("# CPU freed here cannot be handed to a stage that is")
     body = src[i:src.index("break", i)]
     assert "other in starved" in body, "must be said once per stage"
-    assert "stage_priority(other) < 3" in body, "minutes-class stages finish first"
+    assert "stage_cost(other) < 3" in body, "minutes-class stages finish first"
     assert "free_cpu < held" in body, "only when it could at least double"
     assert "--only" in body, "the message has to say what to do"
     assert "starved = set()" in src, "the once-per-stage set must exist"
@@ -4497,8 +5043,30 @@ def _pid_alive(pid):
     return True
 
 
-def _stub_pids(pidfile, roles=("tool", "child")):
-    """{role: [pid, ...]} as the stub recorded them."""
+def _stub_pids(pidfile, roles=("tool", "child"), want=(), timeout=20.0):
+    """{role: [pid, ...]} as the stub recorded them.
+
+    `want` names roles the caller is about to SUBSCRIPT, and they are waited
+    for rather than assumed. The stub forks its child and the child writes its
+    own line, so on a loaded box the run can finish and this can be read
+    before that write has landed: measured as `KeyError: 'child'` in a full
+    suite, passing every time in isolation. A test that fails because a fork
+    was slow says nothing about the sweep it exists to pin, and reads to
+    whoever sees it as the sweep being broken.
+
+    Bounded, and the KeyError is still there at the end of it: if the role
+    never appears that IS the finding, and the caller's subscript raises
+    exactly as it did before.
+    """
+    deadline = time.time() + timeout
+    while True:
+        out = _read_stub_pids(pidfile, roles)
+        if all(r in out for r in want) or time.time() >= deadline:
+            return out
+        time.sleep(0.05)
+
+
+def _read_stub_pids(pidfile, roles):
     out = {}
     try:
         with open(pidfile, encoding="utf-8") as fh:
@@ -4815,7 +5383,7 @@ def test_a_tool_that_exits_zero_leaving_a_child_behind_does_not_leak_it(
     try:
         proc = proj.run("--only", "pfam", env=e, timeout=180)
         assert "done:" in proc.stderr
-        child = _stub_pids(pidfile)["child"][0]
+        child = _stub_pids(pidfile, want=("child",))["child"][0]
         assert _wait_for(lambda: not _pid_alive(child), timeout=20), \
             (f"a tool exited 0 and left pid {child} behind, which is then "
              "unreachable from the signal handler as well")
@@ -4850,7 +5418,7 @@ def test_a_kill_9_leaves_an_orphan_and_the_next_run_refuses_to_join_it(
     gate = str(tmp_path / "gate_k9")
     proc = _run_with_children(proj, pidfile, gate, STUB_GROW="1")
     try:
-        tool = _stub_pids(pidfile)["tool"][0]
+        tool = _stub_pids(pidfile, want=("tool",))["tool"][0]
         # Wait until the orphan-to-be has actually written something, so the
         # `.part` file the next run reasons about exists.
         hm = os.path.dirname(proj.rpath("hmm", "x"))
