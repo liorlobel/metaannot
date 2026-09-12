@@ -242,6 +242,17 @@ def test_the_stage_record_shapes_are_what_the_table_renders(console, ran):
     with `.get()` on the console side, and it is not a status — the vocabulary
     test below is unmoved. The assertion stays EXACT so that the next field
     cannot arrive without this being read again.
+
+    It has not moved since, and the one change that came closest is worth
+    recording here because the next reader will look for it. The check that
+    reports a `cached` stage whose declared output was written after the record
+    describing it was deliberately built with NO new key: it dates the file
+    against the `finished` stamp every `ok` record has always carried, so this
+    assertion did not have to move, an earlier build's results directory needs
+    no migration, and the console reads exactly what it read before. The
+    alternative considered was an `outputs` list of per-file sizes in the
+    record, which would have widened this set to admit a nested value into a
+    record whose every other value is a scalar. It was not taken.
     """
     contract = console.Contract(describe())
     with open(os.path.join(ran, contract.state_name)) as fh:

@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1636 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1652 passed, 1 skipped, 6 xfailed, 37
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 37
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 57 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1579 passed and 58
+absent, so on a machine with no R the same run reports 1595 passed and 58
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -2118,9 +2118,19 @@ whole of what this buys. Read them separately:
   with a plain `open()`. A superseded run still puts all of those into the
   live run's directory, with no check and no warning.
 
-And one case is beyond any ownership check whatever: a run `SIGKILL`ed between
-its rename and its record writes nothing and can prove nothing, so the next run
-reports `cached` over an output it was never told about.
+And one case is beyond any ownership check whatever — though not the one it
+looks like. A run `SIGKILL`ed between its rename and its record leaves the
+`"running"` record `mark_running` wrote *before* the stage started, and the next
+run reads that and recomputes: the solo kill is covered, by over-invalidating.
+What is left is the case where the record that **survives** belongs to a
+different run than the **bytes** do. A marks `pfam` running; the operator
+`--force-unlock`s; B recomputes `pfam` and records it `ok` over A's `running`;
+A's rename then lands on top of B's file inside the clock above; A is killed and
+writes nothing at all. B's record, A's bytes, a signature that agrees, and
+`cached` over an output nothing was ever told about. The same shape needs no
+kill whatever: a table copied in by hand, a parked `.superseded.*` moved back,
+an over-broad copy back from the GPU box. `signature()` hashes inputs and config
+and never an output, so nothing else here is capable of noticing any of it.
 
 **So `--force-unlock` on a run that is still alive remains unsupported, and
 none of this changes that** — what changed is that it now says so. Where the
@@ -2134,6 +2144,107 @@ disprove — is taken over with the single flag exactly as before. It is what
 `CLAUDE.md` rule 4 and the troubleshooting table already say: find out what the
 other process is first. A run that is genuinely gone writes nothing, and none
 of the above applies to it.
+
+**So the file is dated against its own record, and the run says so when the two
+disagree.** On the `cached` branch, and for an `ok` record only, `decide()`
+compares each declared output's mtime against the `finished` stamp of the record
+that describes it. **Nothing else happens.** The verdict is still `cached`, the
+stage is still reused, no record is rewritten and nothing is deleted —
+recomputing would rename over the one artefact that shows anything happened, and
+would spend hours of InterProScan or ESMFold on evidence that has legitimate
+ways to be wrong. `--force --only <stage>` is how to act on it, and the message
+says so.
+
+**It is one `WARN` per run, not one per stage.** Whatever the directory holds,
+the run says this once: a heading, then a line per stage naming the file, its
+size, when it was last written and the run whose record it is, then the reading.
+*"cached, and the record is no longer about the file that is there."* The size of
+that report grows with the number of late stages and its **count does not**,
+which is the whole of why it is collected rather than said where it is found: a
+report whose line count grows with the directory is the report that gets turned
+off, and it would be turned off by *following the advice in it* — one
+`--force --only <stage>` on a copied directory re-records one stage and leaves
+every other one to be re-reported on every run for ever. The line arrives at the
+end of the run rather than at the moment the stage was reused, and that is the
+price: this check changes nothing about the run either way, so it is something to
+read afterwards.
+
+Read it in one direction, because that is the only direction it holds in:
+
+* **A disagreement is evidence, not a verdict.** It says the record is not about
+  that file. It cannot say what wrote it, or whether what is there is any good.
+* **Agreement proves nothing at all.** An overwrite that landed before the
+  record, or one that kept the file's timestamp, leaves no trace here — nor does
+  anything inside `OUTPUT_STAMP_SLACK_S` of the record, which is the hole the
+  slack buys. The slack is derived rather than chosen: `strftime` floors a stamp
+  to the whole second and a filesystem's timestamp granularity can be coarser
+  still, so with no slack at all every healthy stage of every resume would be
+  reported. It is deliberately far smaller than `min(heartbeat_s,
+  STATE_PROBE_S)`, the window a superseded run's rename has to land inside.
+* **Where several stages are late at once, the cause is not knowable and the
+  line does not claim one.** A results directory copied with `cp -r`, unpacked
+  from an archive or restored from a backup has every timestamp in it rewritten
+  at one moment and looks exactly like this — and so do that many separate
+  replacements. There is nothing in a timestamp that separates the two: measured
+  on this project's own results directory, a `cp -r` puts every output inside
+  twenty milliseconds of every other, and so does overwriting the two outputs
+  that a `--only pfam dbcan` run leaves. So the line names both readings, says
+  that rebuilding stage by stage would spend hours of compute for nothing if it
+  is the first, and leaves the choice with whoever knows the directory's history.
+  (`rsync -a`, which the two-machine workflow in `TUTORIAL.md` prescribes
+  everywhere, preserves mtimes and reaches none of this.)
+* **Declared outputs only, which is narrower than it sounds.** `diamond`,
+  `hhblits` and `esmfold` declare a `.done` sentinel, so for those stages a
+  sentinel that dates cleanly says nothing whatever about the per-database
+  tables, the per-query `<id>.hhr` files, `plddt.tsv`, `esmfold_failed.tsv` or
+  the per-protein PDBs beside it. (The tables and the PDBs *are* covered by the
+  ownership gate above — they go through `atomic_out`. They are outside *this*
+  check because they are not declared.) The sentinel is still the only witness
+  those files have anywhere: a superseded run that completes one of those stages
+  re-touches its `.done` with a plain `open()` that no gate covers at all.
+* **`adopted` records are never dated.** `finished` on one of those is when this
+  box *noticed* the file, not when the box that made it wrote it, and `rsync -a`
+  preserves the source mtime. Dating the GPU hand-off against it would report
+  that hand-off on every run, for ever.
+* **`--force` compares nothing**, having already decided to recompute.
+* **A stamp that names no single instant is declined rather than dated, and the
+  run says which record.** A `finished` stamp is a naive local time, so the hour
+  a zone repeats when it leaves summer time is two moments carrying one text and
+  the hour it skips entering summer time is none at all. Dating one of those
+  wrong by an hour is far outside the slack, and a stage that went unjudged in
+  silence could not be told from one that dated cleanly, so it is named.
+* **One case reports itself on every run, and nothing silences it.** A stage
+  this box ran and recorded `ok`, over which the operator later `rsync`s a
+  newer output from the GPU box, is a record that really is no longer about the
+  file that is there — so it is reported, correctly, and nothing re-records it.
+  The remedy the message names, `--force --only <stage>`, would recompute a GPU
+  stage on the wrong machine. Re-recording a stage *without* recomputing it is
+  a change of its own and is not in this one.
+* **`emapper` is the one declared output a kill can genuinely truncate**: its
+  live branch lets `emapper.py` write `eggnog/emapper.emapper.annotations`
+  itself, with no temp file and no rename. A timestamp says nothing about
+  truncation, and this check does not claim to.
+
+Where the timestamps themselves cannot be read, the run says *that* instead,
+once, and compares nothing further — and there is exactly one such case, because
+it is the only one that is a **measurement** rather than a reading. A filesystem
+whose clock leads this machine's — measured against a file the run has just
+written — makes every output look newer than its record for as long as the mount
+is skewed, and two clocks compared against each other say nothing at all.
+
+**A `--dry-run` cannot take that measurement, and says so rather than leaving it
+to be inferred.** The skew is measured on a file the run has just written; a dry
+run writes nothing, on purpose, and a plan check that created files in order to
+measure them would stop being one. So a dry run — which calls `decide()` for
+every stage, and is therefore the one command that reports a whole directory
+without running anything — reports it and adds that the clock question was not
+asked at all.
+
+None of this needs a migration, and nothing in the state file moved for it: the
+check is built out of `finished`, which every `ok` record has always carried, so
+a results directory written by an earlier build is read exactly as one written
+by this one, and a record this build cannot parse at all is compared against
+nothing and reported as nothing.
 
 ### `describe`: what this build is, as JSON
 

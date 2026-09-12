@@ -86,6 +86,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import copy
+import datetime
 import errno
 import fnmatch
 import glob
@@ -11821,6 +11822,133 @@ def _stamp_epoch(s):
         return None
 
 
+def _stamp_instant(s):
+    """The ONE instant a '%Y-%m-%dT%H:%M:%S' state stamp names, or None where
+    the text does not name exactly one.
+
+    WHY THIS EXISTS BESIDE _stamp_epoch() RATHER THAN INSIDE IT. Every stamp
+    in a state file is a NAIVE local time, written by strftime() on whatever
+    zone the recording machine was in, and a naive local time is not a moment.
+    Twice a year a zone makes that plain. When it leaves summer time an hour
+    REPEATS, so one text names two instants an hour apart; when it enters
+    summer time an hour is SKIPPED, so one text names none at all. mktime()
+    answers anyway, silently picking the earlier reading of a repeated hour
+    and shifting a skipped one, and with TZ=America/New_York the second
+    01:30:00 of 2026-11-01 is epoch 1793514600 while `_stamp_epoch` reads the
+    text it was written from back as 1793511000 - an hour early, which is
+    twelve hundred times OUTPUT_STAMP_SLACK_S. A stage recorded `ok` in that
+    hour would then have an output an hour "newer" than its own record on
+    every run for ever, and because only SOME stages of a run that straddles
+    the hour are affected nothing else in the comparison could absorb it.
+
+    ROUND-TRIPPING THE TEXT IS NOT ENOUGH, and that is worth writing down
+    because it is the obvious test and it fails. strftime(localtime(e)) on the
+    earlier reading of a repeated hour gives back the SAME text, so the round
+    trip succeeds on exactly the case that needs catching; measured, it
+    catches only the skipped hour. What separates the two is PEP 495's `fold`:
+    for a local time that names one instant the fold=0 and fold=1 readings are
+    the same number, and for one that names two - or none - they differ, by
+    the size of the offset change and not by an assumed hour, which is what
+    makes this right for the half-hour shifts of Lord Howe Island too.
+
+    AN AMBIGUOUS STAMP IS NOT EVIDENCE, so the answer is None and the caller
+    declines to judge that record. The alternative considered was recording
+    the epoch beside the text, which would have been exact - and would have
+    put a new key into a document whose per-stage record shape
+    tests/test_console_contract.py asserts EXACTLY, for a defect that costs
+    one hour a year and costs it in the direction of silence. `_stamp_epoch`
+    is deliberately left alone: it is what the adoption paths have always read
+    and this change is not the place to move them.
+
+    WHAT LEAVING IT ALONE COSTS THERE, stated because it is not the same
+    direction and it would be easy to assume it was. The adoption gate asks
+    `all(_mtime(o) > when for o in outs)` against a FAILED record's stamp, and
+    `_stamp_epoch` hands it the EARLIER reading of a repeated hour - so the
+    test becomes more likely to pass, not less. A file written up to an hour
+    before the failure it is being compared against is then adopted, while the
+    run logs that every output is newer than that failure and so came from
+    somewhere else. That is under-invalidation and a false sentence, where the
+    dating path above costs only silence, and it is why the two call sites want
+    different functions rather than one made stricter. Pre-existing, one hour a
+    year per zone, and not this change's to move.
+    """
+    try:
+        dt = datetime.datetime.strptime(str(s), "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    try:
+        early = dt.replace(fold=0).timestamp()
+        later = dt.replace(fold=1).timestamp()
+    except (OSError, OverflowError, ValueError):
+        # A stamp outside what this platform's local-time arithmetic can
+        # place. Same answer as an unparseable one, for the same reason.
+        return None
+    return None if early != later else early
+
+
+# How much later than the record that describes it a declared output's mtime
+# may be before decide() reports that the record is no longer about that file.
+#
+# DERIVED, and whatever it is set to IS the size of the hole. In a healthy run
+# atomic_out renames before the stage returns and finish() stamps `finished`
+# after it has, so an output's mtime is at or before the moment its own record
+# names. The only legitimate excess is strftime's floor to the whole second
+# (under a second) plus the filesystem's own timestamp granularity, which is
+# up to two seconds on FAT and SMB. Three covers both. Driven the other way
+# the slack is mandatory rather than decorative: a comparison with none at all
+# fires on every healthy stage of every resume, because that floor alone
+# guarantees a stamp a shade earlier than the file it is about.
+#
+# And it is deliberately far SMALLER than the window it is aimed at, which is
+# the part a later reader will want to raise. A superseded run whose rename
+# lands after the replacement's record has to still be inside
+# min(heartbeat_s, STATE_PROBE_S) - thirty seconds as shipped - because that
+# is the longest _directory_still_ours() can go on answering "ours" after a
+# handover. A slack of a minute would swallow that whole window and leave a
+# check that could only see writes later than the case it exists for. What it
+# does leave uncovered is the first few seconds after a record, and an
+# overwrite inside those is invisible here.
+OUTPUT_STAMP_SLACK_S = 3.0
+
+
+def _outputs_written_late(paths, when):
+    """Declared outputs last written more than the slack after `when`.
+
+    TOTAL, and it has to be. This runs on the cached path of an ordinary
+    resume, where the alternative to an answer is not a missing warning but a
+    traceback out of decide() on a run that was about to reuse work which took
+    hours - evidence-gathering destroying the thing it was gathering evidence
+    about. `_mtime` answers 0.0 for anything it cannot stat, which is never
+    later than a stamp; a stamp that is absent, unparseable, or a local time
+    naming two moments or none is None - see _stamp_instant() - and is
+    compared against nothing. There is no path out of here that is not a list.
+    """
+    if when is None:
+        return []
+    return [o for o in paths if _mtime(o) > when + OUTPUT_STAMP_SLACK_S]
+
+
+def _fs_clock_ahead(path):
+    """Seconds by which the filesystem's clock leads this process's, measured
+    on a file this process has just written. None when there is nothing here
+    to measure it on.
+
+    Only the LEADING direction is ever asked about, and that is a decision
+    rather than an omission. A `finished` stamp is the recording machine's
+    wall clock; an mtime is the filesystem's, and on an NFS or SMB results
+    directory those are two different clocks. One that runs AHEAD makes every
+    output look newer than the record describing it - a false sentence, on the
+    commonest path in the program, for as long as the mount is skewed. One
+    that runs BEHIND makes every output look older, which costs silence and
+    never a wrong word, and silence here is what a stamp in agreement already
+    means.
+    """
+    try:
+        return os.path.getmtime(path) - time.time()
+    except OSError:
+        return None
+
+
 # Threads of THIS process, and nothing else. It never implied anything about
 # other processes and does not now; what changed is that update_state() holds
 # it across a read, a write and a read-back rather than around the write
@@ -20243,6 +20371,11 @@ def cmd_run(args):
 
     p = Paths(cfg)
     state = None
+    # Whether this machine's clock and the results directory's filesystem
+    # agree, for the one check that compares a stamp against an mtime - see
+    # _fs_clock_ahead() and decide(). None until something has been written
+    # that it can be measured on, which is never in a dry run.
+    fs_ahead = None
     if not args.dry_run:
         # Not before the dry-run branch: a plan check should not leave fifteen
         # new directories behind for the next person to wonder about.
@@ -20398,6 +20531,11 @@ def cmd_run(args):
         # ways to write that key and gates the one they happen to land on.
         # That is exactly how the gate this replaced came to be inoperative.
         _RUN._save()
+        # Measured HERE because the line above has just written that file, so
+        # the mtime it now carries is the filesystem's opinion of a moment
+        # this process can name. Any later write of it would do as well; this
+        # is simply the first.
+        fs_ahead = _fs_clock_ahead(p.state)
         write_effective_config(p.effective_config, cfg)
 
     for name in (args.only or []) + ([args.from_stage] if args.from_stage else []):
@@ -20479,6 +20617,239 @@ def cmd_run(args):
                 bad.append(d)
         return bad
 
+    # ---- does the record still describe the file that is there? ---------
+    #
+    # WHAT THIS IS NOT FOR, first, because the issue behind it said otherwise
+    # and the next reader will believe the issue. A run SIGKILLed between
+    # atomic_out's rename and finish() leaves the `running` record that
+    # mark_running() wrote before the stage started, and the branch below
+    # recomputes on it: the solo kill is already covered, by over-
+    # invalidation, and needs nothing from the file.
+    #
+    # What is left uncovered is narrower and worse. The record that SURVIVES
+    # belongs to a different run than the BYTES do. Run A marks pfam running;
+    # an operator --force-unlocks; run B recomputes pfam and records it `ok`
+    # over A's `running`; A is still inside st["fn"], and
+    # _directory_still_ours() is a clock and not an exclusion, so A's rename
+    # lands on top of B's file AFTER B recorded it; A is then killed and
+    # writes nothing at all. B's record, A's bytes, a signature that agrees,
+    # `cached`, and not a word said. The same shape needs no kill whatever: a
+    # table copied in by hand, a parked `.superseded.*` moved back, an
+    # over-broad copy back from the GPU box. signature() hashes INPUTS and
+    # CONFIG and never an output, so nothing else in this program is capable
+    # of noticing any of it.
+    #
+    # So the question is not "was a write interrupted" - atomic_out renames a
+    # COMPLETE temp file - but "does this record still describe the file that
+    # is there". The one fact already recorded that the file can be compared
+    # against is `finished`, and the comparison reads in ONE DIRECTION:
+    # disagreement is evidence and never a verdict, while agreement proves
+    # nothing whatever, since an overwrite that landed before the record, or
+    # one that kept the file's timestamp, leaves no trace here at all.
+    #
+    # DECLARED OUTPUTS ONLY - and the limitation is not the one the issue
+    # named. diamond's per-database <tag>.tsv and esmfold's per-protein PDBs
+    # DO go through atomic_out and ARE covered by the ownership gate; see
+    # _park_superseded(), which lists what is not. They are outside THIS check
+    # because they are not DECLARED. diamond, hhblits and esmfold each declare
+    # a zero-byte `.done` sentinel, so for those stages a stamp in agreement
+    # says nothing at all about the per-query .hhr files, plddt.tsv,
+    # esmfold_failed.tsv or the PDBs sitting beside it. The sentinel is still
+    # worth comparing, and it is the only witness anywhere for those files: a
+    # superseded run that completes hhblits or esmfold re-touches its `.done`
+    # with a plain open().close() that no gate covers at all, and where it
+    # does so more than OUTPUT_STAMP_SLACK_S after the live run recorded that
+    # stage, this is what says so. Subject to that slack, which is why it is a
+    # witness and not a guarantee.
+    #
+    # WHAT IT CANNOT SEE, stated so that nobody later reads silence as health.
+    # A rename that lands BEFORE the record it is being compared against, or
+    # inside OUTPUT_STAMP_SLACK_S of it, is invisible - and so is any write
+    # that preserved the file's timestamp, which is what a copy tool asked to
+    # preserve times does. Nor does a timestamp say anything about TRUNCATION:
+    # emapper's live branch hands emapper.py the output path and lets it write
+    # eggnog/emapper.emapper.annotations itself, with no temp file and no
+    # rename, so that is the one declared output a kill can leave genuinely
+    # short - and this check would have nothing to say about it.
+    #
+    # AND IT WARNS RATHER THAN RECOMPUTING, which is the one place in this
+    # file where over-invalidating is not the cheap direction. Recomputing
+    # would rename over the very file it disagreed with, which is the only
+    # artefact that shows anything happened - a warning system consuming the
+    # evidence it reacted to, against rule 5 in spirit - and it would spend
+    # hours of interpro or esmfold on evidence that has legitimate ways to be
+    # wrong.
+    # Whoever knows whether this directory was --force-unlocked is the
+    # operator, and `--force --only <stage>` is already the blessed way to act
+    # on it.
+    #
+    # AND IT IS SAID ONCE FOR THE WHOLE RUN, which is the part that was got
+    # wrong first and is worth the space, because the wrong version was
+    # plausible. That version logged one WARN per late stage and then tried to
+    # SUPPRESS the whole set whenever every `ok` record in the document was
+    # late, reading that as a directory copied, extracted or restored rather
+    # than as a replaced file. Both halves of it were wrong.
+    #
+    # The suppression was all-or-nothing, so the remedy the message itself
+    # names took it apart. In a `cp -r` copy of a finished project the first
+    # run says one line about the directory; a single `--force --only pfam` -
+    # the action every one of these lines recommends - then re-records one
+    # stage, "every record is late" stops holding, and every run after that
+    # says the per-stage sentence about each of the stages left, for ever,
+    # with nothing that silences them and each one recommending a
+    # recompute of a real InterProScan or ESMFold stage on evidence that is
+    # nothing but the copy's restamp. That is exactly the failure
+    # OUTPUT_STAMP_SLACK_S's own comment claims to prevent, reached by
+    # following the advice.
+    #
+    # AND THE READING UNDER IT IS NOT AVAILABLE FROM TIMESTAMPS AT ALL, which
+    # is why this does not key the suppression on something sturdier instead.
+    # Three candidates were driven over real directories before this was
+    # written, and each is recorded here so that nobody spends the afternoon
+    # again:
+    #
+    #   * that the late outputs' mtimes CLUSTER within seconds of each other.
+    #     A `cp -r` of this project's own results directory puts every late
+    #     output inside twenty milliseconds - and so does overwriting the two
+    #     outputs that a `--only pfam dbcan` run leaves, which is the very
+    #     shape this check exists for. The two are indistinguishable on this,
+    #     measured, and a directory of two stages is not a smaller version of
+    #     the problem, it is the other case.
+    #   * that they cluster with the STATE FILE's own mtime as well. Every run
+    #     rewrites that file before the first stage is decided, so its mtime
+    #     is this run's and not the copy's; reading it before the write
+    #     instead puts it at whenever the last run wrote it, which the
+    #     `--force --only` above has just moved. It lands in the cluster only
+    #     when the run happens to follow the copy immediately, which makes it
+    #     a measurement of how fast the operator typed.
+    #   * that the DEPENDENCY ORDER is broken - an output no older than the
+    #     output of a stage that READS it, which nothing that computed the two
+    #     could produce, since the second had to read the first. A restamp
+    #     does break it (eleven such pairs in the copy above, twelve in an
+    #     unpacked tar). So does one replaced input, necessarily: a late
+    #     pfam.tblout is newer than the integrate output that read it, so
+    #     suppressing on this swallows the case the check is for.
+    #
+    # So the cause is NOT KNOWABLE here and the code does not claim one. What
+    # was actually wrong with seven lines was that there were seven of them,
+    # and that is answered by saying it once: ONE WARN per run, naming every
+    # stage and every file, whose LENGTH grows with the number of late stages
+    # and whose COUNT does not. A copied directory says one line before the
+    # `--force --only` and one line after it. Where more than one stage is in
+    # it the line offers both readings - a directory whose timestamps were
+    # rewritten wholesale, or that many separate replacements - names neither
+    # as the cause, and says that a per-stage rebuild is the wrong answer to
+    # the first, which is the half the seven lines got wrong.
+    #
+    # Collected rather than logged where it is found, and the cost of that is
+    # real: on a three-day run the line arrives at the end, not at the minute
+    # the stage was reused. It is the right trade because this check changes
+    # nothing about the run - the stage is reused either way - so it is
+    # something to read afterwards rather than something to act on now; and
+    # because the alternative is a report whose size grows with the directory,
+    # which is the report that gets turned off.
+    #
+    # The one suppression left is a MEASUREMENT and not a reading: a
+    # filesystem whose clock leads this machine's, measured on a file this run
+    # has just written, makes every output look newer than the record that
+    # describes it, and two clocks compared against each other say nothing
+    # whatever. A dry run writes nothing, so it has no file of its own to
+    # measure that on - and it says so rather than leaving the question
+    # looking as though it had been asked and answered no.
+    #
+    # {name: (record, [late paths])} and {name: stamp}, in the order the
+    # stages were decided. Dicts and not lists because a stage is decided once
+    # but the loop that decides it is a retry loop, and one keyed collection
+    # cannot double-count.
+    late_reuse = {}
+    undated_reuse = {}
+
+    def report_output_stamps():
+        """Say, once, what dating this run's reused outputs turned up.
+
+        Called from the end of the dry-run branch and from the end of
+        dispatch, because those are the two places where every decide() has
+        been made, and neither of them is reachable from inside decide().
+        Nothing here is asked unless something already looked late, so an
+        ordinary resume pays for none of it.
+        """
+        if undated_reuse:
+            log("the `finished` stamp on these records"
+                " names no single instant"
+                ", so their outputs are being compared against nothing: "
+                + "; ".join(f"{n} says {s}" for n, s in undated_reuse.items())
+                + ". A state stamp is a naive local time, and an hour REPEATS "
+                "when a zone leaves summer time - the same text is then two "
+                "moments an hour apart - while the hour a zone skips entering "
+                "it is no moment at all. Dating one of those wrong by an hour "
+                f"is {3600 / OUTPUT_STAMP_SLACK_S:.0f} times the slack this "
+                "comparison allows, so it is not attempted. Nothing has been "
+                "recomputed, nothing has been deleted and every one of them "
+                "is being reused exactly as it would have been.", "WARN")
+        if not late_reuse:
+            return
+        if fs_ahead is not None and fs_ahead > OUTPUT_STAMP_SLACK_S:
+            log("output timestamps under this results directory are"
+                " not being read as evidence of anything: the filesystem"
+                f" holding {cfg['results_dir']} stamped a file this run"
+                f" had just written {fs_ahead:.0f} s ahead of this machine's"
+                " clock, so every output here looks newer than the record"
+                " that describes it. Those are two clocks and not one, and"
+                " nothing can be "
+                "concluded from comparing them. Nothing has been recomputed "
+                "and nothing has been deleted; every stage is being reused "
+                "exactly as it would have been. This is the only notice of it "
+                "this run gives.", "WARN")
+            return
+        # ONE log() call, and the newlines in it are what makes that bearable:
+        # log() indents every line after the first under its own prefix, so
+        # one WARN can be a heading, a list and a paragraph while still being
+        # one WARN. The whole list on one physical line came to four
+        # thousand characters, which is a report nobody reads to the end of.
+        log(f"{len(late_reuse)} stage(s) this run is reusing: cached, and the "
+            "record is no longer about the file that is there."
+            + "".join(
+                f"\n    [{n}] " + "; ".join(_file_note(o) for o in late)
+                + "\n        written after the record "
+                f"{rec.get('run_id') or 'an earlier run'} left for this "
+                f"stage, which says it finished at {rec.get('finished')}."
+                for n, (rec, late) in late_reuse.items())
+            + "\nSomething other than the run that left the record has written "
+            "these since: if this directory was --force-unlocked, a run "
+            "killed after renaming its output and before recording it looks "
+            "exactly like this, and so does a file put here by hand or an "
+            "over-broad copy back from another machine. Nothing has been "
+            "recomputed, nothing has been deleted and every one of them is "
+            "still being reused — a timestamp is evidence, not a verdict. "
+            + ("Rebuild a stage you cannot account for with `--force --only "
+               "<stage>`. "
+               if len(late_reuse) == 1 else
+               "THAT IS SEVERAL STAGES AT ONCE, AND THIS CANNOT TELL YOU "
+               "WHICH OF TWO THINGS IT IS: a results directory copied, "
+               "extracted or restored has every timestamp in it rewritten at "
+               "once and looks exactly like this, and so do that many "
+               "separate replacements. Where it is the first, rebuilding "
+               "stage by stage would spend hours of InterProScan or ESMFold "
+               "on nothing but the restamp, so read the whole list above "
+               "before rebuilding any of it; where you can account for the "
+               "directory's history, `--force --only <stage>` is still how to "
+               "redo one. (`rsync -a`, which the two-machine workflow in "
+               "TUTORIAL.md prescribes everywhere, preserves mtimes and never "
+               "causes this.) ")
+            + "THIS READS IN ONE DIRECTION ONLY: an output that is NOT newer "
+            "than its record proves nothing whatever, because an overwrite "
+            "that landed before the record, or one that kept the file's "
+            "timestamp, leaves no trace here — and only the outputs a stage "
+            "DECLARES are compared, which for diamond, hhblits and esmfold is "
+            "a `.done` sentinel and says nothing about the per-query .hhr "
+            "files, plddt.tsv, esmfold_failed.tsv or the per-protein PDBs "
+            "beside it."
+            + (" This is a dry run, which writes nothing, so it has no file "
+               "of its own to measure this filesystem's clock against this "
+               "machine's: a mount whose clock LEADS makes every output here "
+               "look newer than its record, and that question has not been "
+               "asked at all." if args.dry_run else ""), "WARN")
+
     def decide(st):
         """Cached / adopted / RUN, for the stage as things stand right now."""
         name = st["name"]
@@ -20509,6 +20880,29 @@ def cmd_run(args):
             if name in only_set:
                 log(f"{name}: cached — nothing it reads has changed. Use "
                     f"--force --only {name} to recompute it anyway.")
+            if prev.get("status") == "ok":
+                # `ok` records only, and that restriction is why this is quiet
+                # on the two-machine workflow rather than quiet by luck. On an
+                # `adopted` record `finished` is when THIS box noticed the
+                # file, not when the box that made it wrote it, and `rsync -a`
+                # preserves the source mtime - so the two numbers are neither
+                # on one clock nor about one event, and comparing them would
+                # report the documented GPU hand-off on every run for ever,
+                # with no supported way to silence it. A `failed` record
+                # describes no file, and `running` was answered above.
+                stamp = prev.get("finished")
+                when = _stamp_instant(stamp)
+                if when is None and _stamp_epoch(stamp) is not None:
+                    # Readable as text and still not one moment: the repeated
+                    # or the skipped local hour. Said, because a record this
+                    # build declines to date is a stage the operator will
+                    # otherwise wonder about the silence of - unlike a stamp
+                    # it cannot parse at all, which no build of this tool has
+                    # ever written and which is left to speak for itself.
+                    undated_reuse[name] = stamp
+                late = _outputs_written_late(outs, when)
+                if late:
+                    late_reuse[name] = (prev, late)
             return "cached"
         if args.no_adopt or not exists_all(outs):
             return "RUN"
@@ -20558,6 +20952,12 @@ def cmd_run(args):
         print("\nnote: a dry run evaluates every stage against the files as they "
               "are now,\nso a stage shown as cached may still rerun once an "
               "upstream stage rewrites its input.")
+        # After the table, because the table is the answer a dry run was asked
+        # for and this is a remark about it - and here rather than nowhere,
+        # which is where it was: a dry run calls decide() for every stage, so
+        # it is the one command that can report a whole directory without
+        # running anything.
+        report_output_stamps()
         return 0
 
     # ---- schedule over the DAG ------------------------------------------
@@ -20868,6 +21268,11 @@ def cmd_run(args):
                 log(f"stage '{futures[fut]}' failed: {e}", "FATAL")
                 failure.append((futures[fut], e))
         futures.pop(fut, None)
+
+    # Before both summaries and outside either, so a run that ends in a
+    # failure still says what it found: the stages it reused were reused
+    # whatever happened to the ones that ran.
+    report_output_stamps()
 
     if failure:
         # Each one was already reported the moment it happened; this is the

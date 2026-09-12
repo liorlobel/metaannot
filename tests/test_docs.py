@@ -477,6 +477,9 @@ def test_the_troubleshooting_table_quotes_messages_the_code_can_emit():
         "--force-unlock refused",
         "another run holds this results directory",
         "NOT renamed into place",
+        "no longer about the file that is there",
+        "names no single instant",
+        "not being read as evidence of anything",
         "is no longer there, so ",
         # split across two source lines in the die() call, so only the first
         # half is a contiguous literal
@@ -1571,17 +1574,87 @@ def _newest_section_start(txt):
     return m.start()
 
 
-def _unreleased_fixed_groups():
-    """(heading, entry count) for each `#### ` group under Unreleased/Fixed."""
-    txt = _text(CHANGELOG)
+def _newest_section(txt):
+    """The text of the newest CHANGELOG section, and nothing else.
+
+    EVERY SCAN OF THAT SECTION HAS TO BE BOUNDED BY IT, which is what this
+    exists to make unavoidable. `_newest_section_start()` answers where the
+    section begins and nothing was stopping a search from running off the end
+    of it: `txt.index("### Fixed", start)` over a document whose newest
+    section is an `## Unreleased` holding only `### Added` walks PAST that
+    section and lands under the shipped release below - measured, every group
+    of the shipped `## v0.6.0` read out as though it were in flight. The
+    consumers then passed, because a shipped section is internally consistent
+    and will stay that way for ever; what they had stopped doing was checking
+    the section in flight. A shipped release's entries are a RECORD and are
+    never edited to match a later code base, so reading one is never right
+    here, and a silent change of subject is the worst way to be wrong.
+    """
     start = _newest_section_start(txt)
-    fixed = txt.index("### Fixed", start)
-    end = txt.index("\n### Changed", fixed)
+    nxt = txt.find("\n## ", start + 1)
+    return txt[start:nxt if nxt != -1 else len(txt)]
+
+
+def _fixed_groups(section):
+    """(heading, entry count) for each `#### ` group under `### Fixed` in one
+    CHANGELOG section, or [] where that section has no `### Fixed`.
+
+    Takes the SECTION rather than the document, so the bound is in the type
+    rather than in the care of the caller. [] and not an exception for the
+    empty case: a change set with nothing to correct is the ordinary state of
+    an `## Unreleased` heading, and its consumers say what they assert about
+    it instead of inheriting a crash.
+    """
+    fixed = section.find("### Fixed")
+    if fixed == -1:
+        return []
+    end = section.find("\n### ", fixed + 1)
+    body = section[fixed:end if end != -1 else len(section)]
     out = []
-    for part in re.split(r"^#### ", txt[fixed:end], flags=re.M)[1:]:
+    for part in re.split(r"^#### ", body, flags=re.M)[1:]:
         head = part.split("\n", 1)[0].strip()
         out.append((head, len(re.findall(r"^\*\*", part, flags=re.M))))
     return out
+
+
+def _unreleased_fixed_groups():
+    """(heading, entry count) for each `#### ` group under the Fixed section
+    of the CHANGELOG section in flight."""
+    return _fixed_groups(_newest_section(_text(CHANGELOG)))
+
+
+def test_the_changelog_fixed_groups_are_read_from_the_newest_section_only():
+    """C5, as the helper rather than as the tests built on it.
+
+    The defect was an unbounded `str.index` crossing a section boundary, and
+    the reason it went unnoticed for a release is that every consumer of it
+    went on passing: the section it had wandered into was a shipped one, and a
+    shipped section agrees with its own prose for ever. So the boundary is
+    pinned here, directly, on a document built to have the trap in it - a
+    newest section with no `### Fixed` at all and a released section below
+    full of them. Nothing about this test depends on what the real CHANGELOG
+    happens to hold today, which is the whole point of it.
+    """
+    doc = ("# Changelog\n\n## Unreleased\n\n### Added\n\n"
+           "**Something that corrects nothing.** Prose.\n\n"
+           "## v9.9.9 — 2026-01-01\n\n### Fixed\n\n"
+           "#### Two things that were wrong\n\n"
+           "**One.** Prose.\n\n**Two.** Prose.\n\n### Changed\n\n"
+           "**Not a fix.** Prose.\n")
+    assert _fixed_groups(_newest_section(doc)) == [], \
+        "a Fixed section under a SHIPPED release is being read as the one in " \
+        "flight"
+    # ...and the same document with the work in flight reads its own groups.
+    moved = doc.replace("## Unreleased\n\n### Added\n\n"
+                        "**Something that corrects nothing.** Prose.\n\n",
+                        "## Unreleased\n\n### Fixed\n\n"
+                        "#### One thing that was wrong\n\n**One.** Prose.\n\n")
+    assert _fixed_groups(_newest_section(moved)) == \
+        [("One thing that was wrong", 1)]
+    # A released-only document is the section in flight, renamed.
+    released = doc[doc.index("## v9.9.9"):]
+    assert _fixed_groups(_newest_section("# Changelog\n\n" + released)) == \
+        [("Two things that were wrong", 2)]
 
 
 def test_the_changelog_fixed_section_is_countable(ma):
@@ -1596,9 +1669,24 @@ def test_the_changelog_fixed_section_is_countable(ma):
 
     The section is grouped now, each heading leads with its own count, and
     this counts them.
+
+    BOTH SIDES OF THE PAIRING, and both of them read the section in FLIGHT.
+    Neither the groups nor the sentence that counts them may exist without the
+    other, so a section with nothing to correct - which is the ordinary state
+    of an `## Unreleased` heading - asserts that it counts nothing, and there
+    is no state of the document in which this test asserts nothing at all.
+    That is the second half of C5: bounding the scan was the fix, and a
+    consumer that quietly does nothing once the scan is bounded has only moved
+    the silence.
     """
     groups = _unreleased_fixed_groups()
-    assert groups, "the Fixed section is no longer grouped under headings"
+    section = _norm(_newest_section(_text(CHANGELOG)))
+    m = re.search(r"### Fixed (\w+(?:-\w+)?) entries, in (\w+) groups",
+                  section)
+    if not groups:
+        assert m is None, \
+            "the section in flight counts Fixed entries and has no groups"
+        return
     total = 0
     for head, n in groups:
         word = head.split()[0].lower()
@@ -1607,8 +1695,6 @@ def test_the_changelog_fixed_section_is_countable(ma):
         assert NUMBER_WORDS[word] == n, \
             f"{head!r} claims {word} entries and has {n}"
         total += n
-    txt = _norm(_text(CHANGELOG))
-    m = re.search(r"### Fixed (\w+(?:-\w+)?) entries, in (\w+) groups", txt)
     assert m, "the Fixed section no longer says how many entries it has"
     # _count_value() and not NUMBER_WORDS: the table of number words is
     # generated up to ninety-nine and this total has passed it, so the count
@@ -1626,9 +1712,20 @@ def test_the_changelog_false_verdict_count_is_the_verdict_groups(ma):
     groups = _unreleased_fixed_groups()
     verdicts = sum(n for head, n in groups if "false verdict" in head.lower())
     waves = [head for head, _ in groups if "false verdict" in head.lower()]
+    # The section in FLIGHT, both for the groups and for the sentence. A
+    # change set that turned up no false verdicts has nothing here to count,
+    # and says so by carrying neither - which is asserted rather than assumed,
+    # because "the scan found nothing" and "the scan was looking at the wrong
+    # section" printed the same result until C5.
+    section = _norm(_newest_section(_text(CHANGELOG)))
     txt = _norm(_text(CHANGELOG))
     m = re.search(r"turned up \*\*([\w-]+)\*\* live false verdicts, in ([\w-]+) "
-                  r"waves", txt)
+                  r"waves", section)
+    if not waves:
+        assert m is None, \
+            "the section in flight counts false verdicts and groups none"
+        assert "is now the number of entries under Fixed" not in txt
+        return
     assert m, "the changelog no longer states a false-verdict count"
     assert NUMBER_WORDS[m.group(1).lower()] == verdicts, \
         f"the prose claims {m.group(1)} false verdicts; the groups hold " \
@@ -1656,10 +1753,11 @@ def test_the_changelog_does_not_name_functions_that_do_not_exist(ma):
         _text(os.path.join(ROOT, "tests", f))
         for f in sorted(os.listdir(os.path.join(ROOT, "tests")))
         if f.endswith(".py"))
-    txt = _text(CHANGELOG)
-    start = _newest_section_start(txt)
-    end = txt.index("\n## ", start + 1)
-    section = txt[start:end]
+    # `_newest_section()`, not a fourth open-coded bound: the WHY on that
+    # helper says every scan of the section has to be bounded by it, and this
+    # was the one place still computing its own — correctly, but by hand, which
+    # is exactly how the bound that DID run off the end came to exist.
+    section = _newest_section(_text(CHANGELOG))
     named = set(re.findall(r"`([a-z_][a-z_0-9]{3,})\(\)`", section))
     # Names this tool defines, or attribute calls on something it imports.
     for name in sorted(named):
@@ -1968,11 +2066,11 @@ def _unreleased(text):
     """The CHANGELOG section this change set is allowed to rewrite.
 
     A shipped release's entries are a RECORD and are not edited to match a
-    later code base, so the scan stops at the first released heading.
+    later code base, so the scan stops at the first released heading. One line
+    now, delegating to `_newest_section()`: two implementations of "the
+    section in flight" is how one of them came to be unbounded.
     """
-    start = _newest_section_start(text)
-    nxt = text.find("\n## ", start + 1)
-    return text[start:nxt if nxt != -1 else len(text)]
+    return _newest_section(text)
 
 
 def _tests_prose():
@@ -2240,7 +2338,6 @@ COUNT_PROSE = {
                     lambda ma: len(ma.DOCTOR_FOUND_KINDS) + 1),
     "twenty-one stages": ("DERIVED", "STAGES", lambda ma: len(ma.STAGES)),
     "eight formats": ("DERIVED", "ALL_FORMATS", lambda ma: len(ma.ALL_FORMATS)),
-    "eight format": ("DERIVED", "ALL_FORMATS", lambda ma: len(ma.ALL_FORMATS)),
     "ninth format": ("DERIVED", "the next quant format",
                      lambda ma: len(ma.ALL_FORMATS) + 1),
     "four formats": ("DERIVED", "formats with no manifest reader",
@@ -2263,16 +2360,6 @@ COUNT_PROSE = {
                       lambda ma: _example_configs()),
     "nine columns": ("DERIVED", "the columns the README's own sentence lists",
                      lambda ma: _evidence_columns()[1]),
-    # The self-correction groups are the ones whose headings are about what
-    # the document CLAIMS - "Six claims the first draft made about ITSELF",
-    # "Six claims the third reading corrected". The attribution group and the
-    # engine-defect group are each their own noun in the same sentence and are
-    # counted beside this one.
-    "twenty-eight corrections": ("DERIVED", "the groups that correct the document",
-                           lambda ma: sum(
-                               n for h, n in _unreleased_fixed_groups()
-                               if "claims" in h.lower())),
-
     "four columns": ("DERIVED", "the miss_cols slice in _manifest_checks",
                      lambda ma: _miss_cols_slice()),
 
@@ -2317,13 +2404,6 @@ COUNT_PROSE = {
     # Not recomputable; the pin is that the SENTENCE STILL EXISTS.
     "seven paths": ("MEASURED", "the paths `run` was measured hanging on, "
                                 "one FIFO at a time"),
-    # Was DERIVED, as "one input key through every state", and the sweep has
-    # grown two states since - so the recompute moved to "nine cells" above
-    # and this phrase is left pointing at what it always meant in the sentence
-    # it appears in: the cells where `doctor` and `run` actually disagreed,
-    # counted once, on a machine, at a time.
-    "seven cells": ("MEASURED", "the FIFO cells where the differential sweep "
-                                "found doctor and run disagreeing"),
     "1 row": ("MEASURED", "how often a structure column is non-empty, "
                           "observed on the real run"),
     "1,237,468 values": ("MEASURED", "the real 8-plex run's matrix"),
@@ -2435,11 +2515,13 @@ COUNT_PROSE = {
     "first entries": ("PROSE", "'a table whose first three entries' - a "
                                "position in a runbook's own timing table, not "
                                "a count of anything this codebase has"),
-    "seven verdicts": ("PROSE", "a group heading, counted by the group test"),
-    "five false verdicts": ("PROSE", "a group heading, counted by the group "
-                                     "test"),
     # ---- MEASURED: a fact about a dataset, a host or an observation ---
     "five databases": ("MEASURED", "the DIAMOND databases of the real run"),
+    "twenty milliseconds": ("MEASURED", "how wide the mtime cluster of a "
+                                        "`cp -r` of this project's own "
+                                        "results directory was, measured"),
+    "eleven pairs": ("MEASURED", "the dependency pairs a `cp -r` put out of "
+                                 "order in that same measurement"),
     "four tiers": ("MEASURED", "the real search database's prefixes"),
     "three key spaces": ("MEASURED", "the real search database's namespaces"),
     "two tiers": ("MEASURED", "two prefixes of one namespace, measured"),
@@ -2456,10 +2538,6 @@ COUNT_PROSE = {
     "second command": ("PROSE", "'the second command above' - a reference"),
     "third state": ("PROSE", "'a directory is a third state again' - one more"),
     "third kind": ("PROSE", "'a third kind of failure' - a hypothetical"),
-    "third wave": ("PROSE", "'the third wave' names a heading, which is "
-                            "counted by the group test"),
-    "sixth kind": ("PROSE", "'or a sixth kind to the other' - a hypothetical "
-                            "about a set that has not grown"),
     "seven values": ("PROSE", "a quotation of what the README USED to say"),
     "three checks": ("PROSE", "a quotation of what the document USED to say"),
     "eighth value": ("PROSE", "a quotation of the wrong count, kept as the "
@@ -2475,16 +2553,8 @@ COUNT_PROSE = {
     "three depths": ("PROSE", "'the other three depths', immediately listed"),
     "two sections": ("PROSE", "'two sections later' - a distance"),
     "three verdicts": ("PROSE", "'THREE verdicts on one key', listed"),
-    "four waves": ("PROSE", "counted by the false-verdict group test"),
-    "fourth wave": ("PROSE", "'the fourth wave' names a group, which the "
-                             "group test counts"),
-    "two waves": ("PROSE", "'two waves ago' - a distance in this file"),
     "twelve corrections": ("PROSE", "a quotation of the sentence that left "
                                     "the engine defect out"),
-    "twenty-four false verdicts": (
-        "DERIVED", "the entries under the false-verdict groups",
-        lambda ma: sum(n for h, n in _unreleased_fixed_groups()
-                       if "false verdict" in h.lower())),
     "three revisions": ("PROSE", "the rounds of the issue-23 fix that kept "
                                  "the whole-document rebuild and guarded it "
                                  "- history, not a set that exists now"),
@@ -2507,33 +2577,6 @@ COUNT_PROSE = {
                         lambda ma: len([f for f in os.listdir(
                             os.path.join(ROOT, "tests"))
                             if f.startswith("test_") and f.endswith(".py")])),
-    "nine states": ("DERIVED", "PATH_STATES in tests/test_doctor_json.py",
-                     lambda ma: _suite_tuple_len("test_doctor_json.py",
-                                                 "PATH_STATES")),
-    "fifty-four cells": ("DERIVED", "the input sweep: every key in every state",
-                        lambda ma: (_suite_tuple_len("test_doctor_json.py",
-                                                     "INPUT_PATH_KEYS")
-                                    * _suite_tuple_len("test_doctor_json.py",
-                                                       "PATH_STATES"))),
-    "81 cases": ("DERIVED", "the whole sweep: the input keys and the TMT tree",
-                 lambda ma: ((_suite_tuple_len("test_doctor_json.py",
-                                               "INPUT_PATH_KEYS")
-                              + _suite_tuple_len("test_doctor_json.py",
-                                                 "TMT_READ_PATHS"))
-                             * _suite_tuple_len("test_doctor_json.py",
-                                                "PATH_STATES"))),
-    "nine cells": ("DERIVED", "one input key through every state",
-                    lambda ma: _suite_tuple_len("test_doctor_json.py",
-                                                "PATH_STATES")),
-    "104 entries": ("DERIVED", "the Unreleased/Fixed groups",
-                            lambda ma: sum(
-                                n for _h, n in _unreleased_fixed_groups())),
-    "fifteen groups": ("DERIVED", "the Unreleased/Fixed groups",
-                      lambda ma: len(_unreleased_fixed_groups())),
-    "eighty entries": ("DERIVED", "the entries that are NOT false verdicts",
-                           lambda ma: sum(
-                               n for h, n in _unreleased_fixed_groups()
-                               if "false verdict" not in h.lower())),
     "three configs": ("DERIVED", "the documents _emitted_prose() is built from",
                       lambda ma: len(_doctor_documents(ma))),
     "seven vocabularies": ("PROSE", "'five of the seven closed vocabularies' "
@@ -2667,22 +2710,19 @@ COUNT_PROSE = {
     "3 aminomutase": ("PROSE", "'3-aminomutase' - part of an identifier"),
     "3 tuple": ("PROSE", "'a 3-tuple' - an arity"),
     "four step": ("PROSE", "'a four-step runbook' - the steps are listed"),
+    "four steps": ("PROSE", "'the four steps' - the sequence the #36 test "
+                            "drives, written out in order beside it"),
+    "four defects": ("PROSE", "a group heading, counted by the group test"),
+    "six entries": ("DERIVED", "the Unreleased/Fixed entries",
+                    lambda ma: sum(n for _h, n in _unreleased_fixed_groups())),
+    "three candidates": ("PROSE", "'Three candidates were driven over real "
+                                  "directories' - the three are the bullets "
+                                  "immediately under the sentence"),
     "three way": ("PROSE", "'the three-way split' - the branches follow"),
-    "768 way": ("PROSE", "'the 768-way product this sentence imagined' - the "
-                         "sweep that never existed, quoted"),
-    "four constants": ("PROSE", "a history: what `_emitted_prose()` read "
-                                "before it was built from a document"),
     "four readings": ("PROSE", "a history: the readings before this one"),
     "four rounds": ("PROSE", "'four verification rounds' - a history"),
     "three rounds": ("PROSE", "'for three rounds' - a history"),
     "six reproductions": ("PROSE", "a heading over the reproductions it lists"),
-    "six claims": ("PROSE", "a group heading, counted by the group test"),
-    "ten claims": ("PROSE", "a group heading, counted by the group test"),
-    "ten defects": ("PROSE", "a group heading, counted by the group test"),
-    "twelve defects": ("PROSE", "a group heading, counted by the group test"),
-    "seventeen defects": ("PROSE", "a group heading, counted by the group "
-                                   "test"),
-    "seven defects": ("PROSE", "a group heading, counted by the group test"),
     "six tests": ("PROSE", "'five of the six unmarked tests were marked' - a "
                            "history of one count reaching one"),
     "490 tests": ("PROSE", "a history: how far the README's numbers had "
@@ -2690,18 +2730,8 @@ COUNT_PROSE = {
     "thirteen modules": ("PROSE", "the wrong count, kept as the record of "
                                   "the defect"),
     "six states": ("PROSE", "a quotation of what the sweep entry used to say"),
-    "thirty cells": ("PROSE", "the same quotation's other half"),
-    "twelve cells": ("PROSE", "the DIFFERENCE between two counts in one "
-                              "sentence, both of which are pinned above"),
     "four cells": ("PROSE", "a history: the cells the differential sweep "
                             "turned up before the other three were measured"),
-    "seven hangs": ("PROSE", "'all seven hangs' - the seven paths, pinned "
-                             "as `seven paths`"),
-    "four spurious": ("PROSE", "a history: what one duplicated row cost"),
-    "three previous rounds": ("PROSE", "a history, in the CHANGELOG"),
-    "three assertions": ("PROSE", "a history: what a shadowed table broke"),
-    "three cases": ("PROSE", "'the three cases say three different things' - "
-                             "the cases are named in the sentence"),
     "three sources": ("PROSE", "'Three sources, two answers' - a named trio"),
     "five instances": ("PROSE", "'The class, not the five instances' - the "
                                 "same rule, in the helper it names"),
@@ -2864,9 +2894,18 @@ def test_the_changelog_non_verdict_entries_add_up_to_the_section(ma):
     groups = _unreleased_fixed_groups()
     total = sum(n for _h, n in groups)
     verdicts = sum(n for h, n in groups if "false verdict" in h.lower())
-    txt = _norm(_text(CHANGELOG))
+    # The section in FLIGHT. This sentence is the accounting between the
+    # false-verdict groups and everything else, so a section with no
+    # false-verdict groups has nothing for it to account for and may not carry
+    # it; one that HAS them must.
+    section = _norm(_newest_section(_text(CHANGELOG)))
     m = re.search(r"That section also carries (.+?) — ([\w-]+) entries that "
-                  r"change no config", txt)
+                  r"change no config", section)
+    if not verdicts:
+        assert m is None, \
+            "the section in flight accounts for false-verdict entries and " \
+            "groups none"
+        return
     assert m, "the changelog no longer says what the non-verdict entries are"
     # Every clause of the sentence, summed, rather than three named ones: the
     # defect this pins is a bucket left OUT of it, so the test may not know in
