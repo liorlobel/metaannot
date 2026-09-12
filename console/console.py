@@ -53,7 +53,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-CONSOLE_VERSION = "0.1.0"
+CONSOLE_VERSION = "0.1.1"
 
 # The log tail is read by seeking to (size - window), never by reading the file:
 # these logs run for days and reach hundreds of megabytes. 256 KB is far more
