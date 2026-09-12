@@ -56,7 +56,100 @@ it names; do not force the file through another format.
 
 4. **One run per results directory.** A second run refuses with
    `another metaannot is already running here`. Do not pass `--force-unlock`
-   to get past it — find out what the other process is first.
+   to get past it — find out what the other process is first. The tool now
+   holds you to that where it can prove it: if the lock names a pid on **this**
+   host that the process table says is running, `--force-unlock` is refused
+   and prints the pid, the host, when the run started, when it last stamped
+   `_run`, the stages it has recorded running and the `ps -p` to run. Do that
+   check. `--force-unlock-live` takes the directory anyway and is a claim you
+   are making, not a retry — do not reach for it without asking. A lock from
+   another node of the array is unprovable from here and is **not** refused:
+   that is the case `--force-unlock` exists for.
+
+   What a superseded run does to the replacement's **stage records** has the
+   same three parts as its outputs below, and an earlier version of this rule
+   called the whole of it "a guarantee with no clock in it", which it is not:
+
+   - A **guarantee**: a state write names the keys it changes and writes
+     **only** those. Into a readable document it merges them and writes every
+     other record back unchanged; where the document is missing or unparseable
+     it creates one holding just those keys. A run never rebuilds the rest of a
+     document out of its own in-memory snapshot — three revisions kept that
+     rebuild behind a guard and no guard works, because a replacement that has
+     *finished* leaves a vacant lock and no `_run` to read, and a vacant lock
+     cannot be told from a replacement that has not started. `--force`'s
+     discard carries the record it was decided about, not just the stage name,
+     so it deletes only what this run read at the start. And a run told by
+     either ownership gate that it lost the directory writes nothing further at
+     all: that latch is asked before anything is read, and nothing it observes
+     afterwards gives the directory back.
+   - A **clock**, and not the thirty-second one below: a record another process
+     writes **between this run's pre-write read and its `os.replace`** is
+     dropped rather than merged. That is a plain lost update and nothing
+     detects it — the read-back after the write catches only a writer that
+     lands *after* the rename. The window is one read-modify-rename, not a
+     configurable interval, and it is the whole of what `update_state()` says
+     it shrinks the loss to rather than eliminates. The mechanism is
+     demonstrated by injecting a write into that gap; nobody has won that race
+     at shipped speeds, so **treat the width as unmeasured, not as small**.
+     `_judge_ownership` closes it for a *superseded* run only once that run has
+     READ the replacement's `_run` — until then it is writing normally.
+   - **Not covered at all**: the file itself, below.
+
+   `_run` is not a record of work but the claim about **who owns the
+   directory**, so it is written on positive proof and nothing else: a lock
+   this run reads and finds is still its own, or one it could not read, which
+   is no evidence that anything changed hands. On a **vacant** lock it is not
+   written — and that is where a *guarantee* costs something rather than
+   nothing. A vacancy is exactly what a replacement that took the directory and
+   then exited leaves behind, and from inside a live run it is the same bytes
+   as no replacement at all: nothing. So a run whose lock an operator, a
+   tmp-reaper or a remount removed writes **no further `_run`** — no
+   `last_seen`, no `final_status`, no `finished` — and a console reads it
+   afterwards as a run that never ended. It goes on recording its stages. No
+   ordinary run pays this: the lock comes off in an `atexit` hook that runs
+   *after* the final stamp, and `kill` releases it and exits without stamping
+   at all.
+
+   The gate this replaced declined only the write that would **create** the
+   document, and that gate was inoperative for every run that had recorded a
+   stage — which is every real run. The stage record creates the document one
+   call earlier, and `_run` then merged into the document the run had itself
+   just made.
+
+   What none of that protects is the file itself. If the state file is
+   removed, or a remount or power loss leaves NULs in it, the records that
+   were in it are gone, and the run says so once and carries on writing a
+   document holding only what it writes from then on. **That costs a
+   recomputation, not a wrong answer**: the outputs are still on disk and only
+   their provenance is missing, and over-invalidating is the trade taken
+   everywhere here. Do not restore that file from a copy while a run is using
+   it, and do not delete it to "reset" anything (rule 5).
+
+   Its **outputs** are a weaker claim, and an earlier version of this rule
+   said flatly that such a run "does not rename its outputs over them", which
+   is false for exactly the case the issue is about. What is true has three
+   parts:
+
+   - A **guarantee**: a stage that STARTS after the handover cannot rename,
+     because `mark_running` is a merged write, so the succession check reads
+     the document and refuses before the stage begins. This holds as long as
+     the document was readable and its `_run` named the replacement.
+   - A **clock**: a stage already running when the directory changed hands is
+     only NOTICED, at whichever comes first of the next heartbeat tick and the
+     fallback probe — `min(heartbeat_s, STATE_PROBE_S)`, thirty seconds as
+     shipped. Inside that window nothing detects the handover, and the stage
+     renames over the live run's output. A takeover that finishes in under a
+     second is caught by nothing. Once it IS noticed, a declared output is
+     parked as `.superseded.<stem>.<run_id>` and nothing is deleted.
+   - **Not covered at all**: files a stage writes without going through
+     `atomic_out` — `hhblits`' per-query `<id>.hhr`, `esmfold`'s `plddt.tsv`
+     and `esmfold_failed.tsv`, and the `.done` sentinels of `diamond`,
+     `hhblits` and `esmfold`. Those land in the live run's directory with no
+     check and no warning.
+
+   All of it is damage control after the fact, not permission: one writer per
+   results directory is still the rule.
 
 5. **Never delete anything under a results directory.** Stages are cached by
    signature, so deleting an output to "clean up" triggers a silent

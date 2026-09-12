@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1539 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1612 passed, 1 skipped, 6 xfailed, 37
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 37
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 35 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1504 passed and 36
+absent, so on a machine with no R the same run reports 1577 passed and 36
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1189,6 +1189,18 @@ message. So an ordinary crashed run on Windows exits with `another metaannot is
 already running here` and needs `--force-unlock`, which is the escape hatch for
 a holder you are certain is gone.
 
+`--force-unlock` is refused in the one case where this host can prove you are
+wrong about that: the lock names a pid **here**, and the process table says it
+is running. The refusal prints what you would otherwise go and assemble — pid,
+host, when it started, when it last stamped `_run`, the stages it has recorded
+running, its command line, and the `ps -p` to run — and `--force-unlock-live`
+takes the directory anyway if that is really what you mean. Note the asymmetry
+with the paragraph above, which is deliberate: reclaiming needs proof of
+DEATH, refusing needs proof of LIFE, and everything unprovable — another node,
+another user's garbled file, every lock on Windows — is left exactly where it
+was. A refusal that fired on "not provably dead" would take `--force-unlock`
+away on the cluster, which is the machine this tool runs on.
+
 The `_run.last_seen` heartbeat below does **not** change that. It is advisory:
 it tells you *how long* a lock has been silent, and nothing reclaims a lock on
 the strength of it. A heartbeat that stopped is not proof that a process
@@ -1823,10 +1835,13 @@ still saying `running` with a `last_seen` from hours ago is most often the
 unwinding, so nothing stamps a verdict on the way out and `running` is simply
 the last thing the record was ever told (the next section spells out why that
 is the right trade). It is also what a `SIGKILL`, a lost machine or a wedged
-process leaves behind, and from the record alone those cases are
-indistinguishable — which is the point of writing it down rather than
-interpreting it. `last_seen` tells you how long ago the process last said
-anything. It is for reading, not for deciding: nothing in metaannot reclaims a
+process leaves behind, and what a run whose **lock** was removed under it
+leaves behind — such a run cannot prove it still owns the directory, so it
+stops writing `_run` altogether and keeps recording its stages, and it says
+that once in the log. From the record alone those cases are indistinguishable —
+which is the point of writing it down rather than interpreting it, and the log
+is where they are told apart. `last_seen` tells you how long ago the process
+last wrote a `_run` it could prove it was entitled to write. It is for reading, not for deciding: nothing in metaannot reclaims a
 lock because a heartbeat went quiet (see the lock section above). Both timestamps are the same
 instant: the string is local time for reading, the epoch is for arithmetic,
 because two hosts sharing one filesystem cannot subtract each other's local
@@ -1901,28 +1916,191 @@ children are actually gone.
 **A run that is unwinding stops writing when it is superseded.** That is the
 Ctrl-C case, and the reason it matters is that a run can still be inside a stage
 when you decide it has hung and `--force-unlock` the directory for a
-replacement. From the moment the lock file is no longer the one that run took,
-it writes nothing further into `.metaannot_state.json` and removes no lock: it
-says `this run no longer holds ...` once, in the log, and exits. So the `_run`
-record and the lock you see afterwards belong to the run you started. A
-`SIGTERM`ed run cannot reach that path at all — it is gone before it could write
+replacement. The lock read has three answers and they are not one rule:
+
+* The lock **now holds somebody else's token** — a replacement took the
+  directory and is still running. The old run writes nothing further into
+  `.metaannot_state.json` at all, removes no lock, says
+  `this run no longer holds ...` once in the log, and exits. The latch is
+  permanent. So the `_run` record and the lock you see afterwards belong to the
+  run you started.
+* The lock is **gone** — the replacement took the directory and has since
+  exited, or something removed the lock outright. That is not proof of either,
+  so the old run stops writing `_run` (which is an ownership claim) and carries
+  on recording its own stage records (which are not). It says
+  `is no longer there, so this run cannot prove it still owns this directory`
+  once. Its `_run` then stays at `"final_status": "running"` for good.
+* The lock is **unreadable** — an NFS `EIO`, an `EACCES`. That is no evidence
+  that anything changed hands, so nothing changes; a transient error must not
+  be able to strand a lock or silence a run.
+
+A `SIGTERM`ed run cannot reach any of that — it is gone before it could write
 anything — which protects the replacement just as effectively and says nothing
 about it.
 
-**Two things that protects, and one it does not.** The `_run` record and the
-lock are safe. The stage that was already running is not: the executor waits
-for it, and `atomic_out` renames its result into place at the end. If the
-replacement has meanwhile finished that same stage and recorded it `"ok"`, the
-old run's output lands under the new run's valid signature, and the run after
-that reports `cached` and reads it. Nothing detects this.
+**What that protects, and what used to be left out of it.** The lock was never
+the hole here: `__exit__` removes on `is_still_ours() is True`, and that answer
+covers a lock it could not read at all, deliberately — a lock we cannot read is
+one we have no evidence has changed hands, and leaving it behind was the
+regression that rule was written against. `_run`
+was *believed* safe and was not — the gate on it declined only the write that
+would create the state file, and a run's own stage record creates that file one
+call earlier, so a superseded run's `_run` went in behind its own `pfam` record
+with nothing latched and nothing warned. That is fixed here; the paragraph on
+`_run` below says what the real gate costs. Two more things were never covered
+at all, and both are addressed now.
+
+The first was every OTHER stage's record. A state write used to hand the whole
+document to `save_state` from one process's in-memory dict, so a superseded run
+recording the single stage it had just finished replaced the file with a
+snapshot that had never heard of the stages the replacement completed
+meanwhile. A reviewer reproduced it: run B finished `pfam`, `dbcan`, `diamond`
+and `cluster`, run A wrote its own older one-stage view over the top, the
+other records were gone, and the next run printed `adopting output this run did
+not produce` for every one of them — the warning that says outright it cannot tell a
+finished file from an interrupted one. Writes name the keys they change now:
+the file is re-read immediately before each one, the changed key is merged into
+what is there, and the file is written back and read back to check it still
+says what we wrote. Where that re-read comes back **missing or unparseable** —
+an operator's `rm`, a remount, a page of NULs where a crashed writer's payload
+should be — the write creates a document holding *only the keys it names*, and
+every other record stays gone. It does **not** rebuild the document from the
+writing run's own snapshot. Three earlier revisions of this fix kept that
+rebuild and tried to gate it, and there is no gate that works: the losing
+ordering needs no race at all, because a replacement that has *finished*
+leaves a vacant lock and no `_run` to read, and a vacant lock reads exactly
+the same as a replacement that has not started yet.
+
+Read what that buys the way the outputs half below is read — as a guarantee, a
+clock and an uncovered part — because it does not all fall in one. An earlier
+version of this section said **"That is a guarantee, and no part of it is a
+clock"** about the whole of it, and that sentence was wrong:
+
+* **The guarantee.** A run never writes a key it did not name. Into a readable
+  document every other record is read, kept and written back; where the
+  document is missing or unparseable the write creates one holding only the
+  keys it names and rebuilds nothing from this run's snapshot. That is what
+  stops the reviewer's failure, in which a whole document was rebuilt from one
+  run's snapshot. It is not a promise that a record can never go backwards: a
+  write that lands in the read-to-rename gap below is not in what this run
+  merged, so this run's older copy of it goes back over the top and nothing is
+  said. `--force`'s discard obeys the same rule: it carries
+  the record it was decided about, not just the stage name, and deletes only
+  while the document still holds that record, so a discard decided from one
+  read at the start of the run cannot delete a record another run wrote
+  afterwards. Driven.
+* **The clock, and it is not the thirty-second one.** A record another process
+  writes **between this run's pre-write read and its `os.replace`** is dropped
+  rather than merged: a plain lost update, one read-to-rename gap wide, not
+  configurable, and nothing detects it. The read-back after the write catches
+  only a writer that lands *after* the rename; one that landed before it is
+  simply not in what we merged, and the file we rename is a complete document
+  without it. This is what `update_state()`'s own docstring means by shrinking
+  the lost-update window rather than closing it. The mechanism is demonstrated
+  by injecting a write into that gap; the race has not been won at shipped
+  speeds, so read the window as *unmeasured*, not as *small*. For a
+  **superseded** run the succession check closes this — but only from the
+  moment that run has READ the replacement's `_run`, and a read that came back
+  missing or unparseable is not that moment.
+* **Not covered at all.** Whatever destroyed the file. If the state file is
+  destroyed under a run, the records in it are destroyed with it, by whatever
+  destroyed the file; the run logs `is no longer there` once, naming the path,
+  and carries on writing a document that holds only what it wrote after that
+  moment. The price is a **recomputation, not a wrong answer** — the outputs
+  are still on disk and only their provenance is gone — and over-invalidating
+  rather than under-invalidating is the trade this tool takes everywhere (see
+  the signature section). The alternative, a dying run putting a live run's
+  records back to its own older view of them, costs a results table that looks
+  fine and is not.
+
+`_run` is the one key held to a stricter rule, because it is not a record of
+work but a **claim about who owns the directory**. A run writes it only on
+positive proof of ownership: a lock it reads and finds is still its own, or one
+it could not read, which is no evidence that anything changed hands. A run
+whose lock has gone **vacant** writes no `_run` at all from that moment — no
+further `last_seen`, no `final_status`, no `finished`. That vacancy is exactly
+what a replacement that took the directory and then finished leaves behind, and
+a state file naming the old run the owner is read by the next run, which adopts
+it as its predecessor and admits its writes for the rest of its life.
+
+**And that gate costs the run its own last word, which is the price of having
+it hold at all.** The version this replaced declined only the write that would
+*create* the state file, so it never fired for a run that had recorded a stage
+— and every real run records a stage, which creates the document one call
+earlier. A run whose lock and document were both removed exited `0` leaving its
+own `_run` in a file it had just made. Now it does not: it records the stage,
+logs one line saying it can no longer prove it owns the directory and is
+writing no more `_run`, and its verdict is lost. **No ordinary run pays that.**
+The lock is released by an `atexit` hook that runs *after* `stamp_run()`, and
+`kill` releases the lock and exits without stamping at all; driven end to end,
+the ownership read answered *ours* at the final stamp of a clean run and of a
+Ctrl-C'd one. The run that does pay it is one whose lock an operator, a
+tmp-reaper or a remount removed under it, and on a console that run reads
+afterwards as one that never ended.
+
+Each stage record also carries the `run_id` that wrote it, so a document two
+runs have both written into can be read rather than guessed at.
+
+The second was the stage output itself. The executor waits for a stage that is
+already running, and `atomic_out` renamed its result into place at the end; if
+the replacement had meanwhile finished that same stage and recorded it `"ok"`,
+the old run's output would land **under the new run's valid signature**, and
+the run after that would report `cached` and read it. The rename now asks
+whether this run still owns the directory, and on proof that it does not a
+**declared** output is *parked* beside its target as
+`.superseded.<stem>.<run_id><ext>` rather than renamed over it — nothing is
+deleted, and the log says where the work went. Declared is the whole of it: the
+check lives in `atomic_out`, so a file a stage writes some other way is not
+covered, and for several stages the declared entry is a `.done` sentinel rather
+than the table beside it. That check is an in-memory flag plus, at most, one rate-limited read
+of the state file; it renames on every doubt, so a transient error can never
+abort a stage that is legitimately finishing. A stage that *starts* after the
+handover cannot rename at all; one already running when the directory changed
+hands is only **noticed**, and the difference between those two words is the
+whole of what this buys. Read them separately:
+
+* **The guarantee.** A stage that *starts* after the handover cannot rename.
+  `mark_running` is a merged write, the succession check reads the document
+  before the stage begins, and the run is stood down there. No timing is
+  involved. (A document that is missing or unreadable at that instant gives
+  the check nothing to read, and that stage falls into the next bullet.)
+* **The clock.** A stage *already running* when the directory changed hands is
+  noticed at whichever comes first of the next heartbeat tick and the fallback
+  probe — `min(heartbeat_s, STATE_PROBE_S)`, thirty seconds as shipped. The
+  fallback probe is not what does it on a default run: `seen` is refreshed by
+  every merge read, a heartbeat tick *is* a merge read, and the two intervals
+  are the same, so the probe essentially never opens the file and the
+  heartbeat's own write is the detector — essentially, because a tick that
+  lands a few milliseconds late does let one probe through, which costs a read
+  and never a wrong answer. The probe covers the runs the heartbeat does not —
+  `heartbeat_s: 0`, or an interval longer than the probe's. Either way,
+  **inside that window nothing detects the handover at all**: a takeover that
+  completes in under a second is caught by nothing, and that stage's output is
+  renamed over the live run's. Narrowing the window means lowering
+  `heartbeat_s`, at one small file rewrite per interval.
+* **What the check never sees.** It lives in `atomic_out`, so it reaches only
+  outputs written through it. `hhblits` renames its per-query `<id>.hhr`
+  itself, `esmfold` appends `plddt.tsv` and writes `esmfold_failed.tsv` in
+  place, and `diamond`, `hhblits` and `esmfold` each create a `.done` sentinel
+  with a plain `open()`. A superseded run still puts all of those into the
+  live run's directory, with no check and no warning.
+
+And one case is beyond any ownership check whatever: a run `SIGKILL`ed between
+its rename and its record writes nothing and can prove nothing, so the next run
+reports `cached` over an output it was never told about.
 
 **So `--force-unlock` on a run that is still alive remains unsupported, and
-this did not change that.** It is what `CLAUDE.md` rule 4 and the
-troubleshooting table already say: use it only when you are certain the other
-process is gone. A run that is genuinely gone writes nothing, and none of the
-above applies. Note that two concurrent runs have always been able to overwrite
-each other's `.metaannot_state.json` — `save_state` rewrites the whole file —
-which is why one-writer-per-directory is a rule rather than a preference.
+none of this changes that** — what changed is that it now says so. Where the
+lock names a pid **on this host that this host can see running**,
+`--force-unlock` refuses with a message naming the pid, the host, when the run
+started, when it last stamped `_run`, which stages it has recorded running, and
+the `ps -p` to run; taking the directory anyway needs `--force-unlock-live` as
+well. The refusal fires on proof and nothing else, so the case the flag exists
+for — a stale lock from another node of the array, which this host can never
+disprove — is taken over with the single flag exactly as before. It is what
+`CLAUDE.md` rule 4 and the troubleshooting table already say: find out what the
+other process is first. A run that is genuinely gone writes nothing, and none
+of the above applies to it.
 
 ### `describe`: what this build is, as JSON
 

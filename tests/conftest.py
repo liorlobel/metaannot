@@ -42,6 +42,28 @@ def ma():
     return _load()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_ownership_watch(ma):
+    """Start every test with the module's ownership watch disarmed.
+
+    `_STATE_WATCH` and `_DECLARED_OUTPUTS` are process-wide because a process
+    runs exactly one metaannot run; a test session runs hundreds in the same
+    interpreter. Without this, one test that drove a run to the point of being
+    superseded would leave `lost` set for the rest of the session, and every
+    later atomic_out() in the process would decline its rename - a green suite
+    turning red three files away, for a reason nothing in the failing test
+    mentions. Reset on the way in as well as out, so a test that fails half
+    way through does not take the next one with it.
+    """
+    def clear():
+        ma._watch_state(None, None, ())
+        ma._DECLARED_OUTPUTS.clear()
+
+    clear()
+    yield
+    clear()
+
+
 CONSOLE_PY = os.path.join(ROOT, "console", "console.py")
 
 

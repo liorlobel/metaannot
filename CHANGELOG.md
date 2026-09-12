@@ -70,6 +70,23 @@ state the row claims.
 
 ### Added
 
+**`--force-unlock-live`, and a `--force-unlock` that refuses a holder it can
+see running.** Registered on `run` and on `all`, because `all` is the command
+the tutorial leads with and a flag the refusal names has to exist wherever the
+refusal can fire. The process-table reading is now three answers rather than a
+boolean — `PROVEN_ALIVE`, `PROVEN_DEAD`, `UNPROVABLE` — and the two callers of
+it want opposite defaults: `_holder_is_alive()` stays `!= PROVEN_DEAD`, branch
+for branch, so unprovable still means alive and nothing about when a lock is
+reclaimed has moved; the refusal reads `== PROVEN_ALIVE` only. That asymmetry
+is the whole care of it. A lock written on another node of the array cannot be
+disproved from here, and a refusal keyed on "not provably dead" would refuse
+there — removing the documented escape hatch on exactly the machine it exists
+for, and on every lock on Windows besides. The message prints what an operator
+would otherwise go and assemble: pid, host, when the run started, `last_seen`
+and how long ago that was, which stages are recorded `running`, the command
+line, and the `ps -p` to run. `_run` stays advisory throughout: it is read as
+text for a person and nothing branches on it.
+
 **`metaannot.py doctor --json`.** One object on stdout and nothing else,
 exactly as `describe --json` does it. The header is describe's header key for
 key, and `requirements` is describe's `requirements` array element for element
@@ -1383,6 +1400,267 @@ never opens it, and what happens next is that tool's answer and not this
 one's.
 
 ### Changed
+
+**The state file is no longer written from one process's snapshot.** `#23`.
+`save_state(path, state)` took a whole in-memory dict and rewrote the document
+with it, and `_STATELOCK` beside it is a `threading.Lock`, which serialises the
+threads of one process and nothing between processes. Two runs sharing a
+results directory therefore each rewrote the file from their own view and the
+last writer won, silently. A reviewer reproduced the consequence: run B
+completed `pfam`, `dbcan`, `diamond` and `cluster`, run A wrote its own older
+one-stage dict wholesale, and run C then printed `adopting output this run did
+not produce` for the stages that had gone — the warning that says outright it
+cannot tell a finished file from an interrupted one.
+
+Every write goes through `update_state(path, state, keys, claim, drop)` now and
+names the keys it changed — which at every site that changes the document is
+exactly one key, and always was. It
+re-reads the document immediately before writing, merges, writes, and reads
+back to check the file still says what it wrote, redoing the merge against the
+current document when it does not. `save_state()` keeps its name, its
+signature and its whole-document semantics as the write step, and is still what
+a failure-injection test patches; a state file that is MISSING and one whose
+bytes will not parse are handled like any other now — the write creates a
+document holding the keys it names and nothing else, and rebuilds no part of
+what was there. The pre-write read is
+deliberately not `load_state()`: that one WARNs "every stage will be
+recomputed" and returns an empty `_State`, so per write it would say that on
+every write and merge into `{}` — deleting every other record because the
+filesystem hiccuped once.
+
+None of this is exclusion and no sentence in it says otherwise. `os.replace`
+was already atomic, so torn files were never the defect; what the merge does is
+shrink the lost-update window from the length of a run to the gap between one
+read and one rename. What is left inside that gap is not noticed: the read-back
+compares the file against the payload just renamed, so it catches a writer that
+lands AFTER the rename and redoes the merge, while one that landed BEFORE it is
+simply not in what was merged — this run's complete document goes over it, the
+read-back matches, and nothing is logged. On NFS, attribute
+caching caps even that, which the comment above `update_state()` says in so
+many words.
+
+**A run whose state file names a run it has never seen stops writing.** The
+merge read produces the succession check for free: `_run`'s identity is
+compared against this run's own and that of the run it took the directory over
+from, captured before `_run` was overwritten so that an ordinary resume — where
+a foreign `_run` is the normal thing to find — keeps writing for the whole of
+its life. A THIRD identity is a replacement, and the run stands down, latching
+the same `superseded` flag `ResultsLock.is_still_ours()` raises. Any doubt at
+all is "still ours": no `_run`, no `run_id`, a record that is not a dict, a
+read that failed. The identity is `(run_id, host, pid, started)` rather than
+`run_id` alone, because `run_id` is `%Y%m%dT%H%M%S-<pid>` with no host in it
+and two nodes of a shared array can mint the same one.
+
+**A superseded run's stage output is parked instead of renamed over the live
+run's.** The variant that never touched the state file at all: a stage still
+inside `st["fn"]` when its run is superseded runs to completion, and
+`atomic_out()` renamed its result into place at the end, under the replacement's
+valid signature if the replacement had already recorded that stage. The rename
+now asks `_directory_still_ours()`, which is an in-memory flag plus at most one
+read of the state file per `STATE_PROBE_S` — `atomic_out()` is called once per
+item by several stages, and the console solved the same shape in the same
+directory with `PART_RESCAN_S`. There is exactly one path to not renaming and
+it needs a read that SUCCEEDED and returned a foreign, parsed identity; every
+failure renames, so the trade the issue rejects — a transient error aborting a
+stage that is legitimately finishing — is not taken. Declared outputs are
+parked as `.superseded.<stem>.<run_id><ext>`, with the marker in FRONT of the
+stem so a console looking for `.<stem>.` does not offer a dead run's leftovers
+as the live run's work in progress. Per-item outputs are not parked at all —
+one PDB per dark protein would be one undeletable file per protein — and keep
+the `.part` convention a crash already leaves.
+
+**What that is a bound on, stated where the claim is made.** Two halves, and
+they are different kinds of thing. A stage that STARTS after the handover
+cannot rename, full stop: `mark_running()` is a merged write and the succession
+check refuses it before the stage begins. A stage ALREADY RUNNING when the
+directory changed hands is only NOTICED, at whichever comes first of the next
+heartbeat tick and the fallback probe — `min(heartbeat_s, STATE_PROBE_S)`, 30 s
+as shipped — and inside that window nothing detects the handover at all: a
+takeover that completes in under a second is caught by nothing and that stage's
+output lands on the live run's. It is a clock, not exclusion, and the earlier
+wording of `CLAUDE.md` rule 4 and of the TUTORIAL — a superseded run "does not
+rename its outputs over them" — was false for exactly the in-flight stage `#23`
+is about. Both now say which half is which. Outputs written WITHOUT
+`atomic_out` are not covered at all, and three stages write some: `hhblits`'
+per-query `<id>.hhr`, `esmfold`'s `plddt.tsv` and `esmfold_failed.tsv`, and the
+`.done` sentinel of `diamond`, `hhblits` and `esmfold`. That is in the
+NOT-DONE list rather than fixed here, because routing them through
+`atomic_out` changes the temp names the `.part` sweep and the console match on.
+
+**Stage records carry the `run_id` that wrote them.** It makes a document two
+runs have both written into auditable rather than inferred from timestamps,
+which is the chief cost of merging. `tests/test_console_contract.py` moves with
+it, since the `ok` record's key set is pinned there exactly.
+
+**A state write whose pre-write read FAILED writes nothing.** Merging into the
+empty dict a failed read returns would write a document holding this run's keys
+and nothing else, deleting every other stage's record because the filesystem
+hiccuped once — the worst failure this design could have. So the write is
+declined and said once in the log. It costs at most the one record that call
+carried, which `decide()` then reads as an output with no record: adopt or
+recompute, never corruption. The next write of the same key — the stage's own
+next record, or the next heartbeat tick — reaches the file normally.
+
+**A write no longer rebuilds a whole document, and `_run` is written only on
+proof of ownership.** `#23` again, after three revisions of the same fix.
+Where the pre-write read came back MISSING or UNPARSEABLE, `update_state()`
+rebuilt the whole document from `state` — the writing process's in-memory
+snapshot — on the reasoning that a document which is not there has nothing in
+it to lose. It has: the records of whatever run holds the directory now. Three
+revisions kept that write and tried to gate it, and every gate was broken in
+turn.
+
+`_STATE_WATCH["lost"]` is raised only by `_judge_ownership()`, which runs only
+on a read that SUCCEEDED and PARSED, so on the exact failure that reaches the
+branch it is guaranteed silent. Asking the lock latch as well was not enough
+either: nothing in `finish()`, `mark_running()` or `record()` reads the lock,
+so in the real ordering neither half is up, and the test that passed did so
+only because its fixture called `RunRecord._save()` first. And no lock read can
+close it, which is the finding that settled it — A parks; B takes the directory
+with `--force-unlock-live`, records `dbcan` and `diamond`, and EXITS, removing
+its own lock; the document is removed; A's tail, or A's heartbeat with no stage
+of its own finished at all, rebuilds `{_run: A, pfam: A}`. `is_still_ours()`
+answers `None` on a vacant path and the lock latch can never come up.
+Reproduced at `heartbeat_s` 0, 1 and 30. **A vacant lock is exactly what a
+FINISHED replacement leaves behind, so vacancy can never license rebuilding a
+document.**
+
+So the write is gone rather than guarded. A run writes only the keys it is
+updating: into a readable document it merges them, and where the document is
+missing or unparseable it creates one holding just those keys. Every other
+record stays gone. That is the trade this codebase already takes everywhere —
+losing a stage RECORD costs a recomputation, because the OUTPUT is still on
+disk and only its provenance is gone, and `signature()` prefers
+over-invalidating to under-invalidating for the same reason. Losing a live
+run's records to a dead run's snapshot costs a results table that looks fine
+and is not. A run whose document goes missing under it says so, once, naming
+the path, and carries on recording.
+
+`_run` needed the same treatment one level up, because it is not a record of
+work but a claim about who owns the directory. It is written only on
+`is_still_ours() is True` — this run's own lock, or one it could not read,
+which is no evidence that anything changed hands. `False` was already refused.
+**`None` — a VACANT path — is now refused too, and the first version of this
+change only pretended to.** That version declined the write that would CREATE
+the document and allowed one into a document already there, on the reasoning
+that such a document "is the one this run has been writing all along, and its
+`_run` is already this run's". It is not: a run's own STAGE record creates the
+document one call earlier, holding a stage key and no `_run` at all, and `_run`
+then merged into it. So the gate never fired for any run that had recorded a
+stage — which is every real run. Driven with real processes: A parks inside
+`pfam`, B takes the directory with `--force-unlock-live`, records its stages
+and exits, the document is removed, A's `pfam` returns — and A exits `0` leaving
+`{_run: A, pfam: A}` having latched nothing and warned about nothing.
+Reproduced in unit form on a removed document and on a zeroed one, at
+`heartbeat_s` 0, 1 and 30.
+
+**What the real gate costs is paid by the run that triggers it and by no other,
+and that was measured before it was chosen.** A run whose lock is vacant writes
+no `_run` again: no `last_seen`, no `final_status`, no `finished`. Its record
+stops where the last heartbeat left it, `final_status: "running"`, which a
+console reads as a run that never ended — so the refusal says so in the log
+rather than going quiet. The same documentation had claimed this cost twice
+already while the code was not paying it: a solo run that lost BOTH its lock and
+its document still exited `0` with `final_status: "ok"` and `finished` set,
+because the stage record recreated the file and `_run` rode in behind it. No
+ordinary run pays it now either: the results lock is released by an `atexit`
+hook that runs AFTER `cmd_run`'s `stamp_run("ok"/"failed")` and after `main()`'s
+`stamp_run("interrupted")`, and `cmd_run`'s SIGTERM handler releases the lock
+and `os._exit()`s without stamping at all. Driven end to end, `is_still_ours()`
+answered `True` at the final stamp of a clean run and of a Ctrl-C'd one.
+
+`cmd_run`'s own first `_run` write now goes through `RunRecord._save()` rather
+than calling `update_state()` with `RUN_KEY` directly. It is three lines after
+`lock.__enter__()`, so the gate cannot answer anything but "ours" there and
+nothing about the run changes — the point is that "`_run` is written only on
+positive proof of ownership" has no exception in it and `RUN_KEY` has exactly
+one writer. Two ways to write that key, one of them gated, is how the gate this
+replaced came to be inoperative in the first place.
+
+STAGE keys are deliberately not gated that way — a stage record claims nothing
+about the directory and the document it creates holds nothing to corrupt, so
+gating it would take the solo case from "loses the records it had already
+written" to "records nothing ever again". `_save()`'s "the final stamp is not
+skippable" reasoning is unchanged for the case it was written for: a run that
+still holds its own lock, or one whose lock is unreadable.
+
+**`--force`'s discard no longer deletes a key the write does not name.** The
+last place in the file where a write touched a record it had no knowledge of,
+and it needed no race to do it. `--force` pops the records of the selected
+stages from ONE read at the start of the run, and every merged write then
+carried those NAMES and popped whatever was under them — so a superseded
+`--force` run writing `pfam` was watched deleting a live run's `dbcan` record,
+silently, out of a document holding no `_run` to stand it down. The discard now
+carries the RECORD it was decided about and deletes only while the document
+still holds that record; where it does not, the record is left alone and the
+reason is logged once. A document with no `_run` in it is the ordinary shape a
+run recreates after its document is removed, and on a replacement running with
+`heartbeat_s: 0` that shape lasts until that run's final stamp, so this was not
+a window to be inside.
+
+`CLAUDE.md` rule 4, README and the TUTORIAL published the old claim as a
+guarantee — "whether or not it has noticed that it was superseded", "That part
+does not depend on timing", "That is a guarantee, and no part of it is a
+clock" — and the records half is not one. What IS timing-free is that a write
+names its keys and rebuilds nothing. What is a CLOCK, and the window is a
+read-modify-rename gap rather than the thirty seconds the outputs half runs on,
+is that a record another process writes between this run's pre-write read and
+its `os.replace` is dropped rather than merged, and the read-back catches only
+a writer that lands after the rename — `update_state()`'s own docstring says
+this and the published sentences contradicted it. The mechanism is demonstrated
+by injecting a write into that gap; the race was not won at shipped speeds, so
+its width is unmeasured rather than small. All of them now say which parts are
+guarantees, which are clocks and which are not covered, and the TUTORIAL's
+troubleshooting row no longer tells an operator that a superseded run leaves
+the live run's outputs untouched.
+
+**What else the same reading turned up.** `_watch_state()` took an `interval`
+and never read it, so it no longer takes one. The comment on `heartbeat_s` said
+"nothing BRANCHES on this number", which is true of the value copied into
+`_run` and false of the config key it sits on: `watch()` returns without
+starting the thread when it is 0, `_beat()` waits on it, and it is half of
+`min(heartbeat_s, STATE_PROBE_S)`. Correcting that sentence then OVERSHOT into
+"nothing anywhere reads `_run.heartbeat_s` and decides something on it", which
+is false in the other direction: `console/console.py`'s `beat_of()` reads that
+exact field and its fresh/late/long bands are arithmetic on it — 3x and 20x —
+and a record carrying `0`, the documented way to turn the heartbeat off, gets a
+band and a sentence of its own. The old wording, "nothing in **this file**",
+was the true one, and it is back, with the console named as the reader. What
+goes into the document is a fact a reader interprets; only the config key is
+private to `metaannot.py`. And `_directory_still_ours()` said in one
+sentence that it "essentially never" opens the state file and in the next that
+it "never opens the file at all" — with `heartbeat_s` equal to `STATE_PROBE_S`
+the margin is tick jitter, so a late tick does let one probe through, which
+costs a read and cannot change an answer. Both sentences now say the same
+thing.
+
+**The state file's temp follows the `.part` convention.** It was
+`<path>.<pid>.<tid>.tmp` in the results root — the one leftover
+`find results -name '.*.part.*'` could not see, in the directory an operator
+opens cold.
+
+**Two improvements were taken back OUT of this change, to be filed on their
+own.** Neither is `#23` and each is a clean standalone change; both were
+written while this one was being written, and bundling them made the
+concurrency fix bigger than the defect and stretched the guarantee the docs
+publish over mechanisms that do not support it.
+
+- *Output sizes in the stage record.* Every `ok`/`adopted` record carried
+  `outputs`: `[{path, size}]`, the size each declared output had when the
+  record was made, and `decide()` WARNed when a cached output no longer
+  matched. It is the only evidence available for the case no ownership check
+  can reach — a run `SIGKILL`ed between `atomic_out`'s rename and its record,
+  which writes nothing and can prove nothing. It is also warn-only, silent
+  whenever the sizes happen to match, a new field in a record whose key set is
+  pinned exactly by `tests/test_console_contract.py`, and about sixty lines.
+  Worth having; not this issue.
+- *Deferred state writes.* An `OSError` in the pre-write read held the keys in
+  a module-level `pending` set and let the next merged write carry them,
+  rather than the record simply not being written. That is error handling for
+  an unrelated failure mode — an `ENOSPC`, an NFS `EIO` — bundled into a
+  concurrency fix, and about thirty lines including the carry into every retry
+  attempt. Declining the write is what ships; deferring it can be filed with
+  the rest of the state file's I/O error handling.
 
 **`doctor --fix` cannot be combined with `--json`**, and the refusal is an
 argparse mutually-exclusive group, so it **exits 2**. `die()` exits 1, which is

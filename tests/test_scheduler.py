@@ -182,13 +182,32 @@ def test_the_lock_is_released_even_when_a_stage_fails(tmp_path, stub_bin):
     assert not os.path.exists(proj.rpath(".metaannot.lock"))
 
 
+def _dead_pid():
+    """A pid on this host that this host can prove is gone."""
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    return dead.pid
+
+
+def _plant_lock(proj, pid, host=None):
+    with open(proj.rpath(".metaannot.lock"), "w", encoding="utf-8") as fh:
+        json.dump({"pid": pid,
+                   "host": host or __import__("socket").gethostname(),
+                   "started": "2026-01-01T00:00:00"}, fh)
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="a pid this host can prove is DEAD is what this "
+                           "needs, and on Windows the proof is OpenProcess "
+                           "rather than os.kill; the refusal below is "
+                           "exercised on the platform that can prove it.")
 def test_force_unlock_takes_over(tmp_path, stub_bin):
+    # The lock this flag exists for: its writer is GONE. The holder used to be
+    # this test's own pid, which is alive on this host and is now refused - see
+    # the test below, which is the case that changed.
     proj = _searchable(tmp_path, tmp_path / "p")
     proj.run()
-    with open(proj.rpath(".metaannot.lock"), "w", encoding="utf-8") as fh:
-        json.dump({"pid": os.getpid(),
-                   "host": __import__("socket").gethostname(),
-                   "started": "2026-01-01T00:00:00"}, fh)
+    _plant_lock(proj, _dead_pid())
     proj.run("--force-unlock")
 
 
@@ -1366,23 +1385,68 @@ def test_the_other_readers_of_the_lock_and_the_state_take_the_same_bytes(
     assert "state file unreadable" in capsys.readouterr().err
 
 
-def test_a_run_whose_lock_vanishes_still_records_how_it_ended(ma, tmp_path):
-    # symptom: the ownership gate answered False for a missing lock, and
-    # RunRecord refused to write on anything but True - so an operator's `rm`,
-    # a tmp-reaper or a remount left a live, unsuperseded run stranded at
-    # final_status "running" with finished null, and the log claimed the
-    # directory had been handed to another run.
+def test_a_run_whose_lock_vanishes_loses_its_verdict_and_says_so(ma, tmp_path,
+                                                                 capsys):
+    """What a vanished lock costs, stated where it is paid.
+
+    `_run` is an ownership CLAIM, and a lock that is gone while this process is
+    still alive is not proof of ownership - it is exactly what a replacement
+    that took the directory with --force-unlock-live and then EXITED leaves
+    behind, and from in here the two readings are the same bytes: nothing.
+    So `_run` is not written, and this run's own last word is the price.
+
+    That price is real and it is this test. What it buys is in
+    test_a_superseded_runs_tail_cannot_stamp_run_after_recording_a_stage: the
+    gate that declined only the write which would CREATE the document did not
+    charge this at all, because a run's own stage record creates the document
+    one call earlier - so it also protected nothing.
+
+    NO ORDINARY RUN PAYS IT, which is what made the trade takeable, and that
+    was measured rather than assumed: the results lock is released by an atexit
+    hook, which runs after cmd_run's stamp_run("ok"/"failed") and after
+    main()'s stamp_run("interrupted"), and cmd_run's SIGTERM handler releases
+    the lock and os._exit()s without stamping anything. Driven end to end,
+    `is_still_ours()` answered True at the final stamp of a clean run and of a
+    Ctrl-C'd one. The test below is the abnormal case on purpose.
+
+    And the WARN must not claim a handover that nothing here proves. The
+    earlier defect in the opposite direction was a run whose lock an operator
+    removed being told the directory "has been handed to another run"; the line
+    now names both readings and says which records are still being written.
+    """
     state = tmp_path / ".metaannot_state.json"
     lock = ma.ResultsLock(str(tmp_path / "c.lock"))
     lock.__enter__()
-    rec = ma.RunRecord(str(state), ma._State(), ["metaannot", "run"],
+    st = ma._State()
+    rec = ma.RunRecord(str(state), st, ["metaannot", "run"],
                        config_path=None, owner=lock)
     rec.stamp("running")
+    assert json.loads(state.read_text())[ma.RUN_KEY]["final_status"] == \
+        "running", "a run holding its own lock must write `_run`"
+    before = state.read_bytes()
+
     os.remove(lock.path)                       # vanished, with no replacement
-    assert rec.stamp("ok") is not False, "the run lost its own final verdict"
-    got = json.loads(state.read_text())[ma.RUN_KEY]
-    assert got["final_status"] == "ok"
-    assert got["finished"], "finished was never stamped"
+    capsys.readouterr()
+    rec.stamp("ok")
+    assert state.read_bytes() == before, \
+        "`_run` was written on a lock this run could not prove was its own"
+    assert json.loads(state.read_text())[ma.RUN_KEY]["final_status"] == \
+        "running", "the verdict reached the file anyway"
+
+    said = capsys.readouterr().err
+    assert "is no longer there" in said and "cannot prove" in said, \
+        f"the run lost its own final verdict silently: {said!r}"
+    assert "handed to another run" not in said and "no longer holds" not in \
+        said, "a vanished lock was reported as a handover nothing proved"
+
+    # NOT superseded, and its stage records go on reaching the file: nothing
+    # proved anything against this run, and a stage record claims nothing
+    # about who owns the directory.
+    assert rec.superseded is False
+    st["pfam"] = {"status": "ok", "signature": "a"}
+    assert ma.update_state(str(state), st, ("pfam",), claim=rec.claim) is True
+    assert json.loads(state.read_text())["pfam"]["status"] == "ok", \
+        "the stage keys were gated like `_run`; they must not be"
 
 
 def test_a_lock_is_held_from_the_moment_the_file_exists(ma, tmp_path,
@@ -1837,3 +1901,1260 @@ def test_a_stage_that_cannot_grow_into_freed_cpu_is_told_about(ma):
     assert "free_cpu < held" in body, "only when it could at least double"
     assert "--only" in body, "the message has to say what to do"
     assert "starved = set()" in src, "the once-per-stage set must exist"
+
+
+# ======================================================================
+# issue #23: one process's snapshot must not be able to erase another
+# process's records, and a superseded run's output must not be able to
+# land under the live run's signature
+# ======================================================================
+def _doc(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_a_stale_run_writing_one_stage_leaves_the_other_records_alone(
+        tmp_path, stub_bin):
+    """The reviewer's reproduction, with two REAL runs and nothing simulated.
+
+    A hangs inside pfam. The operator hands the directory to B, which
+    completes four stages and exits. A's stage then returns and A records the
+    one thing it knows: that IT finished pfam.
+
+    Before this change A's record went to disk as `save_state(path, state)` -
+    the whole document, from A's own in-memory dict, which had never heard of
+    dbcan, diamond or cluster. Those three were erased, and the run after that
+    printed "adopting output this run did not produce" for all three, which is
+    the warning that says outright it cannot tell a finished file from an
+    interrupted one. A writes one key now, and a key it has no record for is
+    not a key it writes.
+    """
+    proj = _searchable(tmp_path, tmp_path / "erase")
+    gate = str(tmp_path / "free_a")
+    a = _gated_run(proj, gate)
+
+    # A is alive and on this host, so --force-unlock alone is refused: this
+    # sequence is exactly what the refusal is for, and the second flag is the
+    # operator saying so out loud.
+    b = proj.run("--only", "pfam", "dbcan", "diamond", "cluster",
+                 "--force-unlock", "--force-unlock-live",
+                 env={"STUB_SLEEP": "0"}, timeout=180)
+    assert "--force-unlock refused" not in b.stderr
+    after_b = _doc(proj.rpath(".metaannot_state.json"))
+    b_run = after_b["_run"]["run_id"]
+    assert [after_b[n]["status"] for n in
+            ("pfam", "dbcan", "diamond", "cluster")] == ["ok"] * 4
+
+    open(gate, "w").close()                 # A's stage returns; A records it
+    _out, a_err = a.communicate(timeout=180)
+
+    st = _doc(proj.rpath(".metaannot_state.json"))
+    for name in ("dbcan", "diamond", "cluster"):
+        assert st.get(name, {}).get("status") == "ok", \
+            f"{name}'s record was erased by a run that never ran it"
+        assert st[name]["run_id"] == b_run
+    assert st["pfam"]["run_id"] == b_run, \
+        "the superseded run's own record landed on top of the live one's"
+    assert st["_run"]["run_id"] == b_run
+    assert "another run holds this results directory" in a_err, \
+        "the superseded run stopped writing without saying why"
+
+    # ...and the run after all of that adopts nothing, because every stage is
+    # recorded, by the run that made it.
+    c = proj.run("--only", "pfam", "dbcan", "diamond", "cluster",
+                 env={"STUB_SLEEP": "0"}, timeout=180)
+    assert "adopting output this run did not produce" not in c.stderr
+
+
+def test_a_write_merges_into_the_file_rather_than_the_snapshot_it_started_from(
+        ma, tmp_path):
+    # the mechanism, on its own: a writer that knows about one stage must
+    # leave every other record exactly as it found it, including one written
+    # after this run read the file.
+    path = str(tmp_path / ".metaannot_state.json")
+    state = {"pfam": {"status": "ok", "signature": "a"}}
+    ma.save_state(path, state)
+    ma.save_state(path, dict(state, dbcan={"status": "ok", "signature": "b"}))
+    state["pfam"] = {"status": "ok", "signature": "a2"}
+
+    assert ma.update_state(path, state, ("pfam",)) is True
+    on_disk = _doc(path)
+    assert on_disk["pfam"]["signature"] == "a2", "our own key never landed"
+    assert on_disk["dbcan"]["signature"] == "b", \
+        "a record this run had never heard of was erased by its write"
+
+
+def test_a_record_this_run_no_longer_holds_is_deleted_rather_than_kept(
+        ma, tmp_path):
+    # the other direction of the same primitive, which --force needs: a key
+    # named in the write and ABSENT from the run's view is a removal, not a
+    # no-op, or `--force --only pfam` could never discard anything.
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {"pfam": {"status": "ok"}, "dbcan": {"status": "ok"}})
+    assert ma.update_state(path, {}, ("pfam",)) is True
+    on_disk = _doc(path)
+    assert "pfam" not in on_disk and on_disk["dbcan"]["status"] == "ok"
+
+
+def test_a_missing_state_file_gets_ONLY_the_keys_the_write_names(ma, tmp_path):
+    """A write creates the document it needs and rebuilds nothing else.
+
+    This branch used to restore the WHOLE of `state` - one run's in-memory
+    snapshot - on the reasoning that a document which is not there has nothing
+    in it to lose. It has: the records of whoever holds the directory now.
+    Three revisions kept the restore and guarded it, and the guard cannot
+    work, so the restore is gone. `dbcan` here is the record this run happens
+    to be carrying and was NOT asked to write; it must not appear.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    state = {"pfam": {"status": "ok"}, "dbcan": {"status": "ok"}}
+    assert ma.update_state(path, state, ("pfam",)) is True
+    assert set(_doc(path)) == {"pfam"}, \
+        "a write rebuilt a whole document from the writer's own snapshot"
+
+
+def test_an_unparseable_state_file_gets_the_same_treatment_and_says_so(
+        ma, tmp_path, capsys):
+    # bytes that are not a document are damage, not a rival's payload - the
+    # same judgement is_still_ours() makes one layer down about the lock - so
+    # they are REPLACED. Replaced by the named keys and nothing else, for the
+    # same reason as the branch above: whatever else was in those bytes, this
+    # run's snapshot is not a reconstruction of it.
+    path = str(tmp_path / ".metaannot_state.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{ not json")
+    capsys.readouterr()
+    state = {"pfam": {"status": "ok"}, "dbcan": {"status": "ok"}}
+    assert ma.update_state(path, state, ("pfam",)) is True
+    assert _doc(path) == {"pfam": {"status": "ok"}}
+    err = capsys.readouterr().err
+    assert "does not parse" in err and "is not in it" in err, \
+        "a rewrite that drops another run's records has to say so"
+
+
+def test_an_unreadable_state_file_writes_nothing_rather_than_erasing_the_others(
+        ma, tmp_path, monkeypatch, capsys):
+    """A read that FAILED says nothing about the document, so nothing is
+    written on the strength of it.
+
+    Writing this run's keys into the empty dict the failed read returned is
+    the single most destructive thing this design could do - one NFS blip and
+    every other stage's record is gone. Declining costs at most the one record
+    this call carried, which decide() then reads as an output with no record:
+    adopt or recompute, never corruption. The next write of the SAME key - the
+    stage's own next record, or the heartbeat's `_run` - reaches the file
+    normally once a read succeeds.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {"dbcan": {"status": "ok", "signature": "b"}})
+    state = {"pfam": {"status": "ok", "signature": "a"},
+             "dbcan": {"status": "ok", "signature": "b"}}
+    real_open = open
+
+    def unreadable(p, *a, **k):
+        if str(p) == path:
+            raise OSError(5, "input/output error")
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", unreadable)
+    capsys.readouterr()
+    assert ma.update_state(path, state, ("pfam",)) is False
+    monkeypatch.undo()
+    assert "pfam" not in _doc(path), "a declined record was written anyway"
+    assert _doc(path)["dbcan"]["signature"] == "b", "the read error erased a record"
+    assert "nothing is written to it until a read succeeds" \
+        in capsys.readouterr().err
+
+    # and once the read works again, the same key writes exactly as it would
+    # have. Nothing was carried and nothing had to be.
+    assert ma.update_state(path, state, ("pfam",)) is True
+    assert _doc(path)["pfam"]["signature"] == "a"
+    assert _doc(path)["dbcan"]["signature"] == "b"
+
+
+def test_a_write_that_loses_a_race_redoes_its_merge_and_both_records_survive(
+        ma, tmp_path, monkeypatch):
+    """The read-back, which is what makes the merge worth having.
+
+    A writer that finds the file is not what it just wrote redoes the merge
+    against the document as it now stands, so the record it clobbered in the
+    gap between its read and its rename comes back. It is optimistic
+    concurrency and not exclusion: it shrinks the window and notices most of
+    what is left in it.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    real, raced = ma.save_state, []
+
+    def racing(p, s):
+        payload = real(p, s)
+        if not raced:
+            raced.append(1)
+            real(p, {"dbcan": {"status": "ok", "signature": "b"}})
+        return payload
+
+    monkeypatch.setattr(ma, "save_state", racing)
+    assert ma.update_state(path, {"pfam": {"status": "ok", "signature": "a"}},
+                           ("pfam",)) is True
+    on_disk = _doc(path)
+    assert on_disk["pfam"]["signature"] == "a"
+    assert on_disk["dbcan"]["signature"] == "b", \
+        "the writer that lost the race left the other record clobbered"
+
+
+def test_the_per_write_read_is_not_the_start_of_run_read(ma, tmp_path,
+                                                         monkeypatch, capsys):
+    """load_state() must never be what a write reads with.
+
+    It WARNs that every stage will be recomputed and returns an empty _State
+    whose `unreadable` flag stops adoption for the whole run. Called once per
+    write it would say that on every write, and the empty dict it returns
+    would make the merge write a document holding only this run's keys - the
+    erasure this change exists to stop, reintroduced through the reader.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {"dbcan": {"status": "ok"}})
+    calls = []
+    monkeypatch.setattr(ma, "load_state",
+                        lambda p: calls.append(p) or ma._State())
+    capsys.readouterr()
+    ma.update_state(path, {"pfam": {"status": "ok"}}, ("pfam",))
+    assert calls == [], "a write went through the start-of-run reader"
+    assert "every stage will be recomputed" not in capsys.readouterr().err
+    assert set(_doc(path)) == {"pfam", "dbcan"}
+
+
+# --- the succession check: the document's own answer to "is this ours" ----
+def _b_record():
+    return {"run_id": "20260101T000000-999", "host": "another-node-of-the-array",
+            "pid": 999, "started": "2026-01-01T00:00:00",
+            "final_status": "running"}
+
+
+def _taken_over(ma, tmp_path, interval=999):
+    """A run whose state file has been taken by a run it never saw.
+
+    No ResultsLock at all, deliberately: this is the OTHER gate, and it has to
+    hold on its own evidence - on another node, on Windows, and every other
+    case where the lock is correctly unprovable.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    state = {}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, interval)
+    assert ma.update_state(path, state, (ma.RUN_KEY,), claim=rec.claim)
+    ma.save_state(path, {ma.RUN_KEY: _b_record(),
+                         "dbcan": {"status": "ok", "signature": "b"}})
+    return rec, path
+
+
+def test_a_run_whose_directory_was_taken_stops_writing_the_state_file(
+        ma, tmp_path, capsys):
+    rec, path = _taken_over(ma, tmp_path)
+    capsys.readouterr()
+    assert rec._tick() is False, "a superseded tick wrote anyway"
+    on_disk = _doc(path)
+    assert on_disk[ma.RUN_KEY] == _b_record(), \
+        "the superseded run stamped the live run's record"
+    assert on_disk["dbcan"]["signature"] == "b"
+    assert rec.superseded and rec._stop.is_set()
+    err = capsys.readouterr().err
+    assert "another run holds this results directory" in err
+    assert _b_record()["run_id"] in err, "the message does not name who has it"
+
+
+def test_a_superseded_run_says_it_once_however_often_it_tries(ma, tmp_path,
+                                                              capsys):
+    rec, _path = _taken_over(ma, tmp_path)
+    capsys.readouterr()
+    rec._tick()
+    rec._tick()
+    rec.stamp("interrupted")
+    said = [l for l in capsys.readouterr().err.splitlines()
+            if "another run holds this results directory" in l]
+    assert len(said) == 1, f"said it {len(said)} times, not once"
+
+
+def test_a_resume_writes_over_its_predecessor_for_the_whole_of_its_life(
+        ma, tmp_path):
+    """The direction that matters on every ordinary resume.
+
+    A foreign `_run` on disk is the NORMAL state at the start of one: it is
+    the previous run's record. A check that did not know the predecessor would
+    stand a legitimate resume down at its first write and say nothing further
+    for the rest of it, which is worse than the defect being fixed.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma.save_state(path, {ma.RUN_KEY: _b_record(),
+                         "pfam": {"status": "ok", "signature": "a"}})
+    state = ma.load_state(path)
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, 999)
+    assert ma.update_state(path, state, (ma.RUN_KEY,), claim=rec.claim) is True
+    assert rec._tick() is True, "a resume was stood down by its predecessor"
+    assert rec.stamp("ok") is None
+    on_disk = _doc(path)
+    assert on_disk[ma.RUN_KEY]["run_id"] == rec.rec["run_id"]
+    assert on_disk["pfam"]["signature"] == "a", "the resume erased a record"
+    assert not rec.superseded
+
+
+def test_a_state_file_with_no_run_record_never_stands_a_run_down(ma, tmp_path):
+    # every kind of doubt writes. A document from a version that did not
+    # record `_run`, or one an operator hand-edited, is not evidence that the
+    # directory changed hands.
+    path = str(tmp_path / ".metaannot_state.json")
+    state = {}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, 999)
+    for doc in ({"pfam": {"status": "ok"}},
+                {ma.RUN_KEY: {"pid": 1}},
+                {ma.RUN_KEY: "not a record"}):
+        ma.save_state(path, doc)
+        assert ma.update_state(path, state, (ma.RUN_KEY,),
+                               claim=rec.claim) is True
+        assert not rec.superseded
+
+
+# --- the atomic_out variant ---------------------------------------------
+def _armed(ma, tmp_path, declared=()):
+    """This process, armed as a run that owns tmp_path's state file."""
+    path = str(tmp_path / ".metaannot_state.json")
+    state = {}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, 999)
+    ma.update_state(path, state, (ma.RUN_KEY,), claim=rec.claim)
+    ma._DECLARED_OUTPUTS.update(declared)
+    return rec, path
+
+
+def _stale_probe(ma):
+    """Make the next rename ask the file rather than trusting what it knows."""
+    ma._STATE_WATCH["seen"] = 0.0
+    ma._STATE_WATCH["tried"] = 0.0
+
+
+def test_a_superseded_run_parks_its_stage_output_instead_of_renaming_it(
+        ma, tmp_path, capsys):
+    """The variant that does not touch the state file at all.
+
+    A stage still inside st["fn"] when its run is superseded RUNS TO
+    COMPLETION - the executor waits for it - and atomic_out renamed its result
+    into place at the end. If the replacement had already finished that stage
+    and recorded it "ok", the old run's output landed under the new run's
+    valid signature and the next run reported `cached` and read it.
+    """
+    out = str(tmp_path / "hmm" / "pfam.tblout")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write("the live run's result\n")
+    _rec, path = _armed(ma, tmp_path, declared=[out])
+    ma.save_state(path, {ma.RUN_KEY: _b_record()})
+    _stale_probe(ma)
+    capsys.readouterr()
+
+    with ma.atomic_out(out) as tmp:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("the superseded run's result\n")
+
+    assert open(out, encoding="utf-8").read() == "the live run's result\n", \
+        "a superseded run renamed its output over the live run's"
+    parked = [f for f in os.listdir(os.path.dirname(out))
+              if f.startswith(ma.SUPERSEDED_SUFFIX)]
+    assert len(parked) == 1, f"the work was not parked: {os.listdir(os.path.dirname(out))}"
+    assert open(os.path.join(os.path.dirname(out), parked[0]),
+                encoding="utf-8").read() == "the superseded run's result\n", \
+        "the parked file is not the work that was done"
+    err = capsys.readouterr().err
+    assert "NOT renamed into place" in err and "nothing was deleted" in err
+    assert "missing input" in err, \
+        "the warning does not say what happens to the rest of this run"
+
+
+def test_a_per_item_output_is_not_parked_but_left_as_a_part_file(
+        ma, tmp_path, capsys):
+    """Parking must not scale with items.
+
+    Several stages write one file per item - a PDB per dark protein, a file
+    per DIAMOND database - and a superseded esmfold would otherwise park one
+    undeletable file per protein into a directory that rule 5 of CLAUDE.md
+    says must never be cleaned up.
+    Only a stage's DECLARED outputs are parked; the rest keep the .part
+    convention, which is already what a crash leaves and is already what
+    `find results -name '.*.part.*'` looks for.
+    """
+    item = str(tmp_path / "structures" / "P00001.pdb")
+    os.makedirs(os.path.dirname(item), exist_ok=True)
+    _rec, path = _armed(ma, tmp_path)           # nothing declared
+    ma.save_state(path, {ma.RUN_KEY: _b_record()})
+    _stale_probe(ma)
+
+    with ma.atomic_out(item) as tmp:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("a model\n")
+
+    left = os.listdir(os.path.dirname(item))
+    assert "P00001.pdb" not in left, "the rename happened anyway"
+    assert not any(f.startswith(ma.SUPERSEDED_SUFFIX) for f in left), \
+        "a per-item output was parked, one file per item"
+    assert [f for f in left if ma.ATOMIC_SUFFIX in f], \
+        "the work was neither renamed, parked, nor left as a .part"
+
+
+def test_a_stage_output_rename_is_never_aborted_by_a_transient_error(
+        ma, tmp_path, monkeypatch):
+    """The trade the issue refuses, refused here too.
+
+    Gating the rename on a lock read would abort a stage that is legitimately
+    finishing the first time a read hiccups, which is worse than what it
+    prevents. So there is exactly ONE path to not renaming and it needs a read
+    that SUCCEEDED and returned a foreign, parsed identity. Every failure
+    renames.
+    """
+    out = str(tmp_path / "hmm" / "pfam.tblout")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    _rec, path = _armed(ma, tmp_path, declared=[out])
+    real_open = open
+
+    def unreadable(p, *a, **k):
+        if str(p) == path:
+            raise OSError(5, "input/output error")
+        return real_open(p, *a, **k)
+
+    for broken in ("unreadable", "garbled", "gone"):
+        _stale_probe(ma)
+        if broken == "unreadable":
+            monkeypatch.setattr("builtins.open", unreadable)
+        elif broken == "garbled":
+            monkeypatch.undo()
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{ not json")
+        else:
+            os.remove(path)
+        with ma.atomic_out(out) as tmp:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(broken + "\n")
+        monkeypatch.undo()
+        assert open(out, encoding="utf-8").read() == broken + "\n", \
+            f"a {broken} state file aborted a stage that was finishing"
+
+
+def test_the_rename_guard_reads_nothing_while_the_document_is_fresh(
+        ma, tmp_path, monkeypatch):
+    """The cost, pinned. atomic_out is called once per ITEM for several
+    stages, so a probe that read the state file on every call would be one
+    open() per protein on a shared array - the shape PART_RESCAN_S exists for
+    on the console side. A write refreshes what the guard knows, so a run with
+    a heartbeat never reaches the file here at all."""
+    out = str(tmp_path / "out.tsv")
+    _rec, path = _armed(ma, tmp_path, declared=[out])
+    reads = []
+    real_open = open
+
+    def counting(p, *a, **k):
+        if str(p) == path and "w" not in str(a[0] if a else k.get("mode", "r")):
+            reads.append(p)
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", counting)
+    for _ in range(5):
+        with ma.atomic_out(out) as tmp:
+            open(tmp, "w", encoding="utf-8").close()
+    assert reads == [], "the rename path read the state file it was just told about"
+
+
+# --- --force-unlock refuses a holder it can see running -------------------
+def test_force_unlock_refuses_a_holder_that_is_provably_alive_on_this_host(
+        tmp_path, stub_bin):
+    """The interim the issue asks for, and the only part of this that PREVENTS
+    rather than detects. The operator reaching for --force-unlock is by
+    definition unsure whether the holder is alive; where this host can SEE
+    that it is, the answer is a message and not a silent takeover."""
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.run()
+    _plant_lock(proj, os.getpid())            # this test runner: provably alive
+    proc = proj.run("--force-unlock", expect=1)
+    assert "--force-unlock refused" in proc.stderr
+    assert f"ps -p {os.getpid()}" in proc.stderr, \
+        "the refusal does not say how to find out what the process is"
+    assert "recycled" in proc.stderr, \
+        "the refusal does not cover the pid this host has handed to someone else"
+    assert "--force-unlock-live" in proc.stderr
+    assert os.path.exists(proj.rpath(".metaannot.lock")), \
+        "a refused --force-unlock removed the lock anyway"
+    # ...and the second flag is the escape, on the same invocation.
+    proj.run("--force-unlock", "--force-unlock-live")
+
+
+def test_the_refusal_and_its_escape_both_reach_the_all_subcommand(
+        tmp_path, stub_bin):
+    """`all` is the command the tutorial leads with, and it reads
+    --force-unlock through the same namespace. A --force-unlock-live
+    registered only on `run` would make the refusal INESCAPABLE there: the
+    message would name a flag argparse then refused."""
+    proj = _searchable(tmp_path, tmp_path / "p")
+    # `--only pfam` throughout: join never runs, so there is no quantified
+    # table and `all` skips the report and the object, which is this test's
+    # business anyway. The lock check is the first thing either command does.
+    proj.run("--only", "pfam")
+    _plant_lock(proj, os.getpid())
+    proc = run_metaannot("all", "--config", proj.config_path, "--only", "pfam",
+                         "--force-unlock", expect=1, cwd=proj.root)
+    assert "--force-unlock refused" in proc.stderr
+    proc = run_metaannot("all", "--config", proj.config_path, "--only", "pfam",
+                         "--force-unlock", "--force-unlock-live",
+                         cwd=proj.root, env={"STUB_SLEEP": "0"})
+    assert "--force-unlock refused" not in proc.stderr
+
+
+def test_force_unlock_still_takes_over_a_lock_it_cannot_disprove(tmp_path,
+                                                                 stub_bin):
+    """The case --force-unlock exists for, and the one a conservative refusal
+    would have killed: a lock left on another node of the array. This host
+    cannot see that process table, so the holder is unprovable - and unprovable
+    still means alive to every OTHER reader of that lock, which is why the
+    refusal keys on proof and not on `_holder_is_alive`."""
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.run()
+    _plant_lock(proj, 4242, host="another-node-of-the-array")
+    proc = proj.run("--force-unlock")
+    assert "--force-unlock refused" not in proc.stderr
+    assert "removing a stale lock" in proc.stderr
+
+
+def test_unprovable_still_means_alive_and_only_proof_refuses(ma):
+    """The split, branch for branch. _holder_is_alive() has to keep answering
+    exactly what it answered before - it is what decides whether an ordinary
+    run refuses to start - while the refusal reads the narrow positive arm of
+    the same evidence."""
+    lk = ma.ResultsLock("/tmp/never", force=False)
+    me = __import__("socket").gethostname()
+    cases = [
+        ({"pid": os.getpid(), "host": me}, ma.PROVEN_ALIVE),
+        ({"pid": 1, "host": me}, ma.PROVEN_ALIVE),   # PermissionError: it exists
+        ({"pid": 4242, "host": "another-node"}, ma.UNPROVABLE),
+        ({}, ma.UNPROVABLE),                         # garbled lock file
+        ({"pid": "not-an-int", "host": me}, ma.UNPROVABLE),
+    ]
+    if os.name != "nt":
+        cases.append(({"pid": _dead_pid(), "host": me}, ma.PROVEN_DEAD))
+    for info, want in cases:
+        assert lk._holder_proof(info) == want, info
+        assert lk._holder_is_alive(info) is (want != ma.PROVEN_DEAD), info
+
+
+# --- --force still discards exactly what it selected ---------------------
+def test_force_discards_the_selected_stages_through_a_merged_write(
+        tmp_path, stub_bin):
+    """--force pops in memory and the discard used to reach the file as a side
+    effect of the next whole-document write. A merged write only touches the
+    keys it is handed, so the pops are carried explicitly - and carried until
+    the stage is recorded again, or `--force --only pfam` would put pfam's old
+    record straight back."""
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.run()
+    first = proj.state()
+    proj.run("--force", "--only", "pfam")
+    st = proj.state()
+    # run_id and not `finished`: the stamp is second-resolution and two runs
+    # of a stub pipeline land in the same second often enough to matter.
+    assert st["pfam"]["run_id"] != first["pfam"]["run_id"], "pfam was not redone"
+    assert st["dbcan"] == first["dbcan"], \
+        "--force --only pfam discarded a record it was not asked to"
+
+
+def test_a_superseded_run_writes_nothing_even_with_the_document_missing(
+        ma, tmp_path):
+    """Rule 4's half of this: a run told it lost the directory stops writing.
+
+    Not the rebuild - nothing rebuilds a document any more, and the tests
+    further down drive that on its own. What this pins is the OTHER rule,
+    which is latched and unconditional: once either ownership gate has stood a
+    run down it writes nothing into that file again, whatever state the file is
+    in. A missing document is the case worth pinning because it is the one
+    where the run would otherwise be creating the file rather than editing it.
+
+    It latches from the DOCUMENT before removing the document, which makes it
+    the easy ordering. The orderings that really happen are below.
+    """
+    rec, path = _taken_over(ma, tmp_path)
+    assert rec._tick() is False and ma._STATE_WATCH["lost"] is not None
+    os.remove(path)
+    assert ma.update_state(path, {"pfam": {"status": "ok"}}, ("pfam",),
+                           claim=rec.claim) is False
+    assert not os.path.exists(path), \
+        "a superseded run wrote its whole snapshot back into the directory"
+
+
+def _handed_over(ma, tmp_path):
+    """A run holding a lock that has since been rewritten by somebody else.
+
+    The LOCK gate and only the lock gate, which is the half `_taken_over`
+    cannot reach: `_STATE_WATCH["lost"]` is raised by a successful, parsed
+    read of the state DOCUMENT, so a document that is missing or garbled can
+    never raise it however long ago the directory changed hands.
+    """
+    lock_path = str(tmp_path / ".metaannot.lock")
+    lock = ma.ResultsLock(lock_path)
+    with lock:
+        pass
+    # Still believed held by this run - the operator has not told it anything.
+    lock.held = True
+    with open(lock_path, "w", encoding="utf-8") as fh:
+        json.dump({"pid": 999, "host": "another-node-of-the-array",
+                   "started": "2026-01-01T00:00:00"}, fh)
+    path = str(tmp_path / ".metaannot_state.json")
+    state = {"pfam": {"status": "ok", "signature": "a"}}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, 999, owner=lock)
+    assert ma.update_state(path, state, (ma.RUN_KEY,), claim=rec.claim)
+    return rec, path, state
+
+
+@pytest.mark.parametrize("damage", ["removed", "zeroed"])
+def test_a_run_stood_down_by_the_lock_writes_nothing_into_damaged_bytes(
+        ma, tmp_path, capsys, damage):
+    """The same rule, latched from the LOCK instead of from the document.
+
+    `_STATE_WATCH["lost"]` is set by `_judge_ownership()` and by nothing else,
+    and that runs only on a read that SUCCEEDED and PARSED - so on a document
+    that is missing or full of NULs it can never be set at all. The other half
+    comes from the LOCK, whose bytes are a different file, and it is what
+    stands this run down here.
+
+    Note what this test has to do to get there: it calls `rec._save()` first.
+    That is the only thing in the process that reads the lock, and nothing in
+    `finish()`, `mark_running()` or `record()` calls it - so in the real
+    ordering neither half of the latch is up, and a fix that depended on one
+    being up was a fix that depended on this fixture. That is why the rebuild
+    was deleted rather than guarded; the tests below are the real orderings,
+    with nothing pre-latched.
+    """
+    rec, path, state = _handed_over(ma, tmp_path)
+    if damage == "removed":
+        os.remove(path)
+    else:
+        with open(path, "wb") as fh:
+            fh.write(b"\x00" * 64)
+    before = open(path, "rb").read() if damage == "zeroed" else None
+    capsys.readouterr()
+
+    # A's tail: the lock gate notices, and then the stage it really finished
+    # tries to record itself. Nothing has read the document successfully.
+    assert rec._save() is False
+    assert rec.superseded is True
+    assert ma._STATE_WATCH["lost"] is None, \
+        "the document gate cannot latch off a document nothing could read; " \
+        "if it can, this test is no longer testing the reported failure"
+
+    state["pfam"] = {"status": "ok", "signature": "a"}
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim) is False, \
+        "a run the lock had already stood down went on writing"
+    if damage == "removed":
+        assert not os.path.exists(path), \
+            "a superseded run recreated the state file it had been shut out of"
+    else:
+        assert open(path, "rb").read() == before, \
+            "a superseded run rewrote the document it had been shut out of"
+    assert "no longer holds" in capsys.readouterr().err, \
+        "the run was stood down without saying so anywhere"
+
+
+# ======================================================================
+# the orderings that really happen: NOTHING pre-latched
+#
+# The rebuild these drive out was guarded three times and broken three
+# times, and the third finding is the one that settles it: no lock read can
+# authorise rebuilding a document, because a VACANT lock is exactly what a
+# replacement that has FINISHED leaves behind. So the write that rebuilt a
+# whole document is gone, and what is pinned below is its absence - in the
+# two orderings that occur, with the two shapes of damage, at three
+# heartbeat intervals, with neither ownership gate consulted first.
+# ======================================================================
+def _after_handover(ma, tmp_path, replacement, carried, interval=30):
+    """Run A, still believing it holds the directory, after a handover.
+
+    Built in the order it happens. A takes the lock and writes `_run`; the
+    directory changes hands; the replacement's records are in the document.
+    Only then does the test damage the document and let A write.
+
+    `replacement` says what the replacement did. "live" rewrote the lock and
+    is still running, so the lock reads as somebody else's. "finished"
+    recorded its work, exited and took its own lock with it, so the path is
+    VACANT - and that is the finding this whole section turns on, because
+    `_save()` writes on None BY DESIGN and no reading of the lock can tell a
+    replacement that has not started from one that has already finished.
+
+    `carried` is what A has in memory to write: "pfam" for a run whose tail is
+    recording the one stage it really did finish, "nothing" for a run whose
+    heartbeat is the only thing that has ever wanted to write.
+
+    NOTHING is pre-latched. A has not been told anything by either gate: the
+    document gate cannot fire on a read that failed, and nothing in finish(),
+    mark_running() or record() reads the lock at all.
+    """
+    lock_path = str(tmp_path / ".metaannot.lock")
+    path = str(tmp_path / ".metaannot_state.json")
+    lock = ma.ResultsLock(lock_path)
+    lock.__enter__()                  # entered and NOT released: A holds it
+    state = {}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, interval,
+                       owner=lock)
+    # cmd_run's own first write, and then one more, because a run has to have
+    # READ this document at least once for the loss of it to be something it
+    # can tell apart from a fresh results directory: the first write creates
+    # the file, the second parses it.
+    assert ma.update_state(path, state, (ma.RUN_KEY,), claim=rec.claim) is True
+    assert rec._tick() is True, "A was stood down before the handover"
+    assert ma._STATE_WATCH["parsed"] is True
+
+    # --- the handover ---
+    if replacement == "live":
+        with open(lock_path, "w", encoding="utf-8") as fh:
+            json.dump({"pid": 999, "host": "another-node-of-the-array",
+                       "started": "2026-01-01T00:00:00"}, fh)
+    else:
+        os.remove(lock_path)
+    ma.save_state(path, {ma.RUN_KEY: _b_record(),
+                         "dbcan": {"status": "ok", "signature": "b"},
+                         "diamond": {"status": "ok", "signature": "b"}})
+    if carried == "pfam":
+        state["pfam"] = {"status": "ok", "signature": "a"}
+    return rec, path, state
+
+
+def _damage(path, how):
+    """Remove the document, or fill it with the NULs a power loss leaves."""
+    if how == "removed":
+        os.remove(path)
+        return None
+    with open(path, "wb") as fh:
+        fh.write(b"\x00" * 64)
+    return open(path, "rb").read()
+
+
+def _unchanged(path, before):
+    if before is None:
+        return not os.path.exists(path)
+    return os.path.exists(path) and open(path, "rb").read() == before
+
+
+@pytest.mark.parametrize("interval", [0, 1, 30])
+@pytest.mark.parametrize("damage", ["removed", "zeroed"])
+@pytest.mark.parametrize("replacement", ["live", "finished"])
+def test_a_superseded_runs_tail_writes_only_its_own_key(
+        ma, tmp_path, capsys, replacement, damage, interval):
+    """A's tail records the one stage it finished, and rebuilds nothing.
+
+    The ordering: A parks inside pfam, the operator hands the directory over
+    with --force-unlock-live, the replacement records its stages, and the
+    document then goes away - an `rm`, a remount, a power loss. A's pfam
+    returns and A records it.
+
+    What A may write is `pfam`. What it may NOT write is `_run`, which is its
+    own identity and an ownership claim: a document that says the directory
+    belongs to A is read by the NEXT run as A's, taken as that run's
+    predecessor, and from then on every write A makes is inside the new run's
+    claim and can never be refused. The rebuild that stood here wrote A's
+    whole in-memory dict, `_run` and all.
+    """
+    rec, path, state = _after_handover(ma, tmp_path, replacement, "pfam",
+                                       interval)
+    _damage(path, damage)
+    capsys.readouterr()
+    assert ma._STATE_WATCH["lost"] is None and rec.superseded is False, \
+        "something latched before the write; this is no longer the real ordering"
+
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim) is True, \
+        "the stage record A really earned was refused"
+    doc = _doc(path)
+    assert set(doc) == {"pfam"}, \
+        f"the write brought back more than the key it named: {sorted(doc)}"
+    assert ma.RUN_KEY not in doc, \
+        "a superseded run wrote its own `_run` into a document it created; " \
+        "the next run will adopt it as its predecessor and never refuse it"
+    assert "dbcan" not in doc and "diamond" not in doc, \
+        "records the replacement wrote came back from A's snapshot"
+    said = capsys.readouterr().err
+    want = "is no longer there" if damage == "removed" else "does not parse"
+    assert want in said, \
+        f"a run that lost the document's records said nothing about it: {said!r}"
+    assert "is not in it" in said or "are not in it" in said, \
+        "the message does not say that other runs' records are gone"
+
+
+@pytest.mark.parametrize("interval", [0, 1, 30])
+@pytest.mark.parametrize("damage", ["removed", "zeroed"])
+@pytest.mark.parametrize("replacement", ["live", "finished"])
+def test_a_superseded_runs_heartbeat_alone_recreates_nothing(
+        ma, tmp_path, capsys, replacement, damage, interval):
+    """The same handover with NO stage of A's finished at all.
+
+    This is the ordering that needs nothing to have happened: A's heartbeat is
+    the only thing in the process that has ever wanted to write, so there is
+    no stage record anywhere to hang a fix on. On a "live" replacement the lock
+    gate stands A down and says so. On a "finished" one it answers VACANT -
+    None, not False - which is what `_save()` used to write on, and that is
+    what let A's own `_run` recreate the document it had been shut out of.
+
+    `_run` is the only key here, and it is the one key that needs positive
+    proof: a vacant lock is what a finished replacement leaves behind, so A
+    does not write `_run` at all while the path is vacant. The test beside
+    this one is the same handover with a stage record in front of it, which is
+    what every real run has and what the earlier gate did not survive.
+
+    Driven at heartbeat_s 0, 1 and 30 because none of this is a race: the
+    interval changes how often A tries, never whether it may.
+    """
+    rec, path, state = _after_handover(ma, tmp_path, replacement, "nothing",
+                                       interval)
+    before = _damage(path, damage)
+    capsys.readouterr()
+    assert ma._STATE_WATCH["lost"] is None and rec.superseded is False
+
+    assert rec._tick() is (replacement == "finished"), \
+        "the tick's own verdict about whether this run carries on is wrong"
+    assert rec._save() is False, "the heartbeat wrote `_run` anyway"
+    assert _unchanged(path, before), \
+        "a run whose lock was gone recreated the state file from its own view"
+    if replacement == "live":
+        assert "no longer holds" in capsys.readouterr().err
+        assert rec.superseded is True and rec._stop.is_set()
+    else:
+        # Not superseded: nothing proved anything against it. It simply has
+        # no document to claim, and it keeps its stage writes.
+        assert rec.superseded is False, \
+            "a vacant lock was read as proof the directory changed hands"
+        state["pfam"] = {"status": "ok", "signature": "a"}
+        assert ma.update_state(path, state, ("pfam",),
+                               claim=rec.claim) is True
+        assert set(_doc(path)) == {"pfam"}, \
+            "the stage keys were gated like `_run`; they must not be"
+
+
+@pytest.mark.parametrize("interval", [0, 1, 30])
+@pytest.mark.parametrize("damage", ["removed", "zeroed"])
+@pytest.mark.parametrize("replacement", ["live", "finished"])
+def test_a_superseded_runs_tail_cannot_stamp_run_after_recording_a_stage(
+        ma, tmp_path, capsys, replacement, damage, interval):
+    """The stage record creates the document; `_run` must still not follow it.
+
+    THE GATE THIS PINS WAS INOPERATIVE FOR EVERY RUN THAT RECORDS ANYTHING.
+    It declined only the write that would CREATE the document - and A's own
+    stage record creates it one call earlier, so by the time A's tail or its
+    heartbeat reaches `_run` there IS a document, it is one A made seconds ago
+    holding a stage key and no `_run`, and the gate waved it through. The file
+    ended as {_run: A, pfam: A} with A never latched: no "no longer holds", no
+    "another run holds". Driven with real processes, and reproduced here at
+    heartbeat_s 0, 1 and 30 on a removed document and on a zeroed one.
+
+    So the two writes are driven in the order a run really makes them: the
+    stage first, then `_run`. The stage record is A's to write; `_run` is not,
+    because a vacant lock is what a FINISHED replacement leaves behind and a
+    document naming A the owner is adopted by the next run as its predecessor.
+    """
+    rec, path, state = _after_handover(ma, tmp_path, replacement, "pfam",
+                                       interval)
+    _damage(path, damage)
+    capsys.readouterr()
+    assert ma._STATE_WATCH["lost"] is None and rec.superseded is False, \
+        "something latched before the write; this is no longer the real ordering"
+
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim) is True, \
+        "the stage record A really earned was refused"
+    assert set(_doc(path)) == {"pfam"}
+
+    # ...and now the write that used to ride in on the back of it.
+    assert rec._save() is False, \
+        "`_run` was stamped into the document this run had just created"
+    assert set(_doc(path)) == {"pfam"}, \
+        "a superseded run's `_run` reached a document it created with a stage " \
+        "record; the next run adopts it as its predecessor and never refuses it"
+    said = capsys.readouterr().err
+    if replacement == "live":
+        assert "no longer holds" in said
+    else:
+        assert "cannot prove it still owns this directory" in said, \
+            f"the refusal was silent: {said!r}"
+
+
+def test_a_write_that_lands_in_the_read_to_rename_gap_is_lost_and_silent(
+        ma, tmp_path, capsys, monkeypatch):
+    """The CLOCK the records half runs on, pinned as a mechanism.
+
+    Three published sentences called the records half "a guarantee with no
+    clock in it". It is not one. The write re-reads the document, merges its
+    key in, and renames a complete file into place, and anything another
+    process writes BETWEEN that read and that rename is not in what we merged -
+    so our complete document goes over it. The read-back afterwards compares
+    the file against the payload we just wrote, so it catches a writer that
+    landed AFTER the rename and redoes the merge; one that landed before it
+    matches, and nothing is said.
+
+    Driven by INJECTION, not by racing: the window is one read-modify-rename
+    wide and has not been won at shipped speeds, so what this pins is that the
+    mechanism exists and is silent - not how wide the window is. A test that
+    tried to win the race would be a flake pretending to be a measurement.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    theirs = {ma.RUN_KEY: _b_record(),
+              "dbcan": {"status": "ok", "signature": "b"},
+              "diamond": {"status": "ok", "signature": "b"}}
+    state = {"pfam": {"status": "ok", "signature": "a"}}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, 0, owner=None)
+    # A's own document, read once, so the loss of it is something A can tell
+    # apart from a fresh results directory.
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim) is True
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim) is True
+    assert ma._STATE_WATCH["parsed"] is True
+    os.remove(path)                        # the `rm`, before A's next write
+
+    real_save = ma.save_state
+    landed = []
+
+    def save_state(p, doc):
+        # the other process's write, IN THE GAP: after A's pre-write read came
+        # back `missing` and before A's own os.replace.
+        if not landed:
+            landed.append(True)
+            real_save(p, theirs)
+        return real_save(p, doc)
+
+    monkeypatch.setattr(ma, "save_state", save_state)
+    capsys.readouterr()
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim) is True
+    assert landed, "the injected write never ran; this proves nothing"
+    doc = _doc(path)
+    assert set(doc) == {"pfam"}, \
+        "the injection did not reproduce the loss this pins"
+    said = capsys.readouterr().err
+    assert "changed underneath" not in said, \
+        "the read-back is being credited with catching this; it does not"
+    assert "dbcan" not in said and "diamond" not in said, \
+        "nothing names the records that were lost, and the docs must not " \
+        "claim it does"
+
+
+def test_the_refusal_names_only_the_running_stages_of_the_run_it_is_about(
+        ma, tmp_path):
+    """The `--force-unlock` refusal, against a document with two runs in it.
+
+    A state file routinely holds `running` records left by an EARLIER run that
+    was killed: SIGTERM does not unwind, so it never stamps, and the record it
+    was in the middle of stays `running` for good. That is the ORDINARY trace
+    of a `kill`, not a corruption, so the refusal meets it constantly.
+
+    It used to collect every `running` record in the document and attribute all
+    of them to the pid in the lock. Measured: SIGTERM a run mid-`pfam`, start a
+    second with `--only dbcan`, and the refusal said "It has dbcan, pfam
+    recorded running" about a process whose own command line — printed by the
+    same message, one clause later — said `--only dbcan`. An operator reading
+    that goes looking for a `pfam` the live process has never touched.
+
+    `run_id` is what separates them and is in every record, so the message can
+    simply ask. A record with no `run_id` predates the field and is nobody's
+    that we can prove, which is the same answer.
+    """
+    state = tmp_path / ".metaannot_state.json"
+    state.write_text(json.dumps({
+        ma.RUN_KEY: {"run_id": "live-2", "pid": 4242,
+                     "argv": ["metaannot.py", "run", "--only", "dbcan"]},
+        # the killed run's, still `running` and never stamped
+        "pfam": {"status": "running", "run_id": "dead-1"},
+        # the live holder's
+        "dbcan": {"status": "running", "run_id": "live-2"},
+        # written before run_id existed: not provably the holder's either
+        "kofam": {"status": "running"},
+        # the holder's, but finished - not what it is "in the middle of"
+        "cluster": {"status": "ok", "run_id": "live-2"},
+    }), encoding="utf-8")
+
+    note = ma._lock_holder_note(str(state))
+    assert "dbcan" in note, note
+    assert "pfam" not in note, \
+        "the refusal named a stage a DIFFERENT run left running: " + note
+    assert "kofam" not in note, \
+        "the refusal named a record it cannot attribute to the holder: " + note
+    assert "cluster" not in note, note
+
+
+def test_a_force_run_does_not_discard_a_record_written_after_it_decided(
+        ma, tmp_path, capsys):
+    """`--force`'s discard set deletes keys the write does not name.
+
+    Not a window and not a race: --force pops the records it means to redo from
+    ONE read at the start of the run, and every merged write then carried those
+    names and popped whatever was under them. A live run's `dbcan` record was
+    watched disappearing, silently, from a document a superseded --force run
+    was writing `pfam` into - reachable whenever the document holds no `_run`
+    to stand the old run down, which is exactly the shape a run recreates after
+    its document is removed, and which lasts until the live run stamps `_run`
+    again (never, on `heartbeat_s: 0`, before its final stamp).
+
+    So the discard carries the RECORD it was decided about, not just the name,
+    and deletes only while the document still holds that record. This is the
+    last place in this file where a write touched a key it did not name; the
+    whole-document rebuild that was the other one is gone.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    mine = {"status": "ok", "signature": "a", "run_id": "A"}
+    theirs = {"status": "ok", "signature": "b", "run_id": "THE-LIVE-RUN"}
+    state = {"pfam": {"status": "ok", "signature": "a"}}
+    rec = ma.RunRecord(path, state, ["metaannot", "run"], None, 0, owner=None)
+
+    # the ordinary --force discard: the record is the one that was popped
+    ma.save_state(path, {"dbcan": mine})
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim,
+                           drop={"dbcan": mine}) is True
+    assert set(_doc(path)) == {"pfam"}, "--force stopped discarding"
+
+    # ...and the same discard against a record somebody else wrote since
+    ma.save_state(path, {"dbcan": theirs})
+    capsys.readouterr()
+    assert ma.update_state(path, state, ("pfam",), claim=rec.claim,
+                           drop={"dbcan": mine}) is True
+    doc = _doc(path)
+    assert doc.get("dbcan") == theirs, \
+        "a --force run deleted a record written after its discard was decided"
+    assert doc["pfam"] == state["pfam"], "the key the write named is missing"
+    said = capsys.readouterr().err
+    assert "not the one this run read at the start" in said, \
+        f"the declined discard was silent: {said!r}"
+
+
+def _doc_or_none(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def test_a_solo_run_whose_document_is_removed_still_records_and_finishes(
+        ma, tmp_path, stub_bin):
+    """The regression the deleted rebuild existed for, end to end.
+
+    No second run anywhere: one process, holding its own lock, whose state
+    file is removed from under it - an operator's `rm`, a tmp-reaper, a
+    remount. It has to go on recording the stages it finishes and it has to
+    exit 0, because the alternative is a tool that stops writing its own
+    results over an accident in a directory nobody else is touching.
+
+    And it has to be explicit about the price, which is the whole reason the
+    rebuild was ever written: the records that were in the file are gone with
+    the file. `pfam` was recorded by the previous run and is NOT in the
+    document afterwards; its OUTPUT is still on disk, so the next run adopts
+    or recomputes it and says so. That is a recomputation, not a wrong answer,
+    and it is the trade taken deliberately over letting any run rebuild a
+    document out of its own snapshot.
+    """
+    proj = _searchable(tmp_path, tmp_path / "solo")
+    proj.run("--only", "pfam", env={"STUB_SLEEP": "0"}, timeout=180)
+    assert proj.state()["pfam"]["status"] == "ok"
+    out = proj.rpath("hmm", "pfam.tblout")
+    assert os.path.exists(out)
+
+    state = proj.rpath(".metaannot_state.json")
+    gate = str(tmp_path / "free_solo")
+    # `--only pfam dbcan`: pfam is cached and writes nothing, so the run is
+    # parked inside dbcan with dbcan already recorded `running`.
+    a = _gated_run(proj, gate, "dbcan", "--serial")
+    try:
+        assert _wait_for(lambda: (_doc_or_none(state) or {})
+                         .get("dbcan", {}).get("status") == "running",
+                         timeout=60), "the run never recorded dbcan running"
+        os.remove(state)
+        open(gate, "w").close()
+        # A timeout, not a bare wait: a regression here is a run that never
+        # writes and never exits, and that has to FAIL rather than wedge the
+        # suite.
+        _out, err = a.communicate(timeout=180)
+    finally:
+        if a.poll() is None:
+            a.kill()
+            a.communicate(timeout=60)
+    assert a.returncode == 0, f"the solo run did not finish:\n{err}"
+
+    assert "is no longer there" in err, \
+        "the run lost every record in the file and said nothing about it"
+    doc = _doc_or_none(state)
+    assert doc is not None, "the run did not recreate the state file at all"
+    assert doc["dbcan"]["status"] == "ok", \
+        "a run whose document was removed stopped recording its own stages"
+    run = doc[ma.RUN_KEY]
+    assert run["final_status"] == "ok" and run["finished"], \
+        "the run holding its own lock lost its own final verdict"
+    # ...and this is what it costs, stated rather than hidden.
+    assert "pfam" not in doc, \
+        "the record of a stage this run never touched came back from somewhere"
+    assert os.path.exists(out), "an output was lost, which is not the trade"
+
+    # The next run pays the price and says so: pfam's output is there with no
+    # record of it, which is adoption with a warning, not silence.
+    c = proj.run("--only", "pfam", "dbcan", env={"STUB_SLEEP": "0"},
+                 timeout=180)
+    assert "adopting output this run did not produce" in c.stderr and \
+        "pfam" in c.stderr, \
+        "the loss of pfam's record was silent on the next run"
+    assert proj.state()["dbcan"]["status"] == "ok"
+
+
+def test_a_solo_run_that_loses_its_lock_too_keeps_its_stages_not_its_verdict(
+        ma, tmp_path, stub_bin):
+    """The same solo accident, one file wider, end to end.
+
+    The test above removes the DOCUMENT and the run keeps its own final
+    verdict, because it still holds its own lock. This one removes the LOCK as
+    well, which is the case `_run`'s gate exists for and the one whose cost the
+    docs state: `_run` is a claim about who owns the directory, a vacant lock
+    is what a replacement that took it and then exited leaves behind, and from
+    inside the process the two readings are the same bytes - nothing.
+
+    So the run records the stage it finishes and exits 0, and its verdict is
+    gone: no `final_status: "ok"`, no `finished`. That is the price, it is paid
+    here rather than claimed, and it is said out loud in the log - a `_run`
+    that simply stopped advancing reads on a console exactly like a process
+    that died.
+    """
+    proj = _searchable(tmp_path, tmp_path / "solo2")
+    proj.run("--only", "pfam", env={"STUB_SLEEP": "0"}, timeout=180)
+    state = proj.rpath(".metaannot_state.json")
+    lock = proj.rpath(".metaannot.lock")
+    gate = str(tmp_path / "free_solo2")
+    a = _gated_run(proj, gate, "dbcan", "--serial")
+    try:
+        assert _wait_for(lambda: (_doc_or_none(state) or {})
+                         .get("dbcan", {}).get("status") == "running",
+                         timeout=60), "the run never recorded dbcan running"
+        assert os.path.exists(lock)
+        os.remove(lock)
+        os.remove(state)
+        open(gate, "w").close()
+        _out, err = a.communicate(timeout=180)
+    finally:
+        if a.poll() is None:
+            a.kill()
+            a.communicate(timeout=60)
+    assert a.returncode == 0, f"the solo run did not finish:\n{err}"
+
+    doc = _doc_or_none(state)
+    assert doc is not None, "the run stopped recording its own stages too"
+    assert doc["dbcan"]["status"] == "ok", \
+        "a stage record was gated like `_run`; only `_run` is an ownership claim"
+    assert ma.RUN_KEY not in doc, \
+        "a run that could not prove it owned the directory claimed it anyway"
+    said = " ".join(err.split())
+    assert "cannot prove it still owns this directory" in said, \
+        f"the run lost its own final verdict silently:\n{err}"
+    assert "no longer holds" not in said, \
+        "a vanished lock was reported as a handover nothing proved"
+
+
+def test_a_run_stood_down_by_the_LOCK_does_not_rename_its_output_either(
+        ma, tmp_path, capsys):
+    """The same two-halves latch, on the rename gate.
+
+    The parking mechanism reads the latch, and asking only the half that a
+    successful read of the DOCUMENT can raise made it inoperative on the
+    ordinary local takeover: RunRecord._save() tests the LOCK before it
+    writes, so the first tick after a handover latches from the lock and
+    returns without ever reaching the succession check. `lost` stays None for
+    the rest of the unwind, and the in-flight stage renamed over the live
+    run's output with the whole clock still answering "ours".
+    """
+    rec, state_path, _state = _handed_over(ma, tmp_path)
+    out = str(tmp_path / "hmm" / "pfam.tblout")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write("the live run's result\n")
+    ma._DECLARED_OUTPUTS.add(out)
+
+    assert rec._save() is False
+    assert rec.superseded is True and ma._STATE_WATCH["lost"] is None
+    capsys.readouterr()
+
+    assert ma._directory_still_ours() is False, \
+        "the rename gate ignored the gate that had already stood this run down"
+    with ma.atomic_out(out) as tmp:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("the superseded run's result\n")
+    with open(out, encoding="utf-8") as fh:
+        assert fh.read() == "the live run's result\n", \
+            "a superseded run renamed its output over the live run's"
+    parked = [f for f in os.listdir(os.path.dirname(out))
+              if f.startswith(ma.SUPERSEDED_SUFFIX)]
+    assert len(parked) == 1, f"the work was not parked: {parked}"
+    assert "NOT renamed into place" in capsys.readouterr().err
+
+
+def test_the_rename_guard_probes_at_most_once_in_its_interval(
+        ma, tmp_path, monkeypatch):
+    """The cost of the fallback read, pinned where it is paid.
+
+    With the heartbeat off there is no merge read to keep the guard's answer
+    fresh, so the rename path reads the state file itself - and atomic_out is
+    called once per ITEM by several stages. A read per call would be one
+    open() per dark protein on a shared array, which is the shape the console
+    answered with PART_RESCAN_S in the same directory.
+    """
+    path = str(tmp_path / ".metaannot_state.json")
+    ma._watch_state(path, None, ())
+    ma._STATE_WATCH["seen"] = ma._STATE_WATCH["tried"] = 0.0
+    ma.save_state(path, {"pfam": {"status": "ok"}})
+    reads = []
+    real_open = open
+
+    def counting(p, *a, **k):
+        if str(p) == path:
+            reads.append(p)
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", counting)
+    for _ in range(50):
+        assert ma._directory_still_ours() is True
+    assert len(reads) == 1, \
+        f"the rename path read the state file {len(reads)} times in one interval"
+    assert ma.STATE_PROBE_S > 0
+
+
+def test_force_unlock_live_implies_force_unlock(tmp_path, stub_bin):
+    # the flag an operator is told to add gets the run through on its own: the
+    # refusal it exists for is only reachable through --force-unlock, so
+    # demanding both would be a second thing to get right at the worst moment.
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proj.run()
+    _plant_lock(proj, os.getpid())
+    proc = proj.run("--force-unlock-live")
+    assert "--force-unlock refused" not in proc.stderr
+
+
+def test_a_superseded_run_does_not_rename_a_later_stage_into_the_directory(
+        tmp_path, stub_bin):
+    """The atomic_out variant, end to end, with two real runs.
+
+    A is parked inside `pfam`; the operator hands the directory to B, which
+    finishes `pfam` and exits. A's `pfam` then returns, A's record of it is
+    refused, and A learns from that refusal that it no longer holds the
+    directory — so `dbcan`, the next stage it runs, cannot put its result into
+    the directory at all. A stage BEGUN under a lost directory can never
+    overwrite: that is the half of this the design guarantees, and it is what
+    this drives. (A stage already in flight at the moment of the handover is
+    only NOTICED instead, at whichever comes first of the next heartbeat tick
+    and the fallback probe - min(heartbeat_s, STATE_PROBE_S) - which is a
+    clock and not a guarantee, so the latch it turns on is unit-tested above
+    rather than raced here.)
+    """
+    proj = _searchable(tmp_path, tmp_path / "park")
+    gate = str(tmp_path / "free_a")
+    a = _gated_run(proj, gate, "dbcan", "--serial")
+
+    b = proj.run("--only", "pfam", "--force-unlock", "--force-unlock-live",
+                 env={"STUB_SLEEP": "0"}, timeout=180)
+    assert "--force-unlock refused" not in b.stderr
+    b_run = _run_record(proj)["run_id"]
+
+    open(gate, "w").close()
+    _out, a_err = a.communicate(timeout=180)
+
+    assert not os.path.exists(proj.rpath("hmm", "dbcan.domtblout")),         "a superseded run put its output into the live run's directory"
+    parked = [f for f in os.listdir(proj.rpath("hmm"))
+              if f.startswith(".superseded.dbcan.")]
+    assert parked, f"the work was not parked: {os.listdir(proj.rpath('hmm'))}"
+    assert "NOT renamed into place" in a_err
+    assert "missing input" in a_err,         "the warning does not say what happens to the rest of that run"
+    assert "dbcan" not in proj.state(),         "the superseded run recorded a stage in the live run's document"
+    assert _run_record(proj)["run_id"] == b_run

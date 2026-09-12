@@ -18,6 +18,7 @@ Three things it asserts that no other test can:
 """
 import ast
 import http.client
+import io
 import json
 import os
 import re
@@ -232,7 +233,16 @@ def test_the_run_key_and_run_record_are_what_the_console_reads(console, ran):
 
 def test_the_stage_record_shapes_are_what_the_table_renders(console, ran):
     """`ok` records carry seconds and finished and NO started — the console
-    shows a duration from `seconds` and refuses to invent a start time."""
+    shows a duration from `seconds` and refuses to invent a start time.
+
+    The exact key set moved once, deliberately, when the state file stopped
+    being written from one process's snapshot: `run_id` says WHICH run wrote
+    the record, which is what makes a document two runs have both written into
+    auditable rather than inferred from timestamps. It is additive, it is read
+    with `.get()` on the console side, and it is not a status — the vocabulary
+    test below is unmoved. The assertion stays EXACT so that the next field
+    cannot arrive without this being read again.
+    """
     contract = console.Contract(describe())
     with open(os.path.join(ran, contract.state_name)) as fh:
         state = json.load(fh)
@@ -241,8 +251,11 @@ def test_the_stage_record_shapes_are_what_the_table_renders(console, ran):
     for rec in done:
         assert rec["status"] in ("running", "ok", "adopted", "failed")
         if rec["status"] == "ok":
-            assert set(rec) == {"signature", "status", "seconds", "finished"}
+            assert set(rec) == {"signature", "status", "seconds", "finished",
+                                "run_id"}
             assert "started" not in rec
+            assert rec["run_id"] == state[contract.run_key]["run_id"], \
+                "a record written by this run has to name this run"
 
 
 def test_the_statuses_the_console_knows_are_the_statuses_the_engine_writes():
@@ -339,6 +352,36 @@ def test_heartbeat_seconds_are_read_from_the_record_not_assumed(console):
     fast = dict(slow, heartbeat_s=1)
     assert console.heartbeat_view(slow, now, None)["band"] == "fresh"
     assert console.heartbeat_view(fast, now, None)["band"] == "long"
+
+
+def test_the_engine_does_not_claim_nobody_reads_heartbeat_s(console):
+    """The scope of a claim is part of the claim.
+
+    metaannot.py's comment on `heartbeat_s` said "nothing in this file reads it
+    back", which was true; correcting a different error in the same comment
+    widened it to "nothing ANYWHERE reads `_run.heartbeat_s` and decides
+    something on it", which is false - the test above is the console doing
+    exactly that, and `0`, the engine's documented way of turning the heartbeat
+    off, gets a band and a sentence of its own.
+
+    So this pins both halves against each other: the console really does decide
+    on the field, and the engine's comment really is scoped to the engine. A
+    reader of that comment who concluded the number is free to change is the
+    person this protects.
+    """
+    now = time.time()
+    rec = {"final_status": "running", "heartbeat_s": 0,
+           "last_seen_epoch": now - 900, "started": "2026-01-01T00:00:00"}
+    off = console.heartbeat_view(rec, now, None)
+    rated = console.heartbeat_view(dict(rec, heartbeat_s=30), now, None)
+    assert off["band"] != rated["band"] and off["verdict"] != rated["verdict"], \
+        "`heartbeat_s: 0` in the record must not read the same as a cadence"
+
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    assert "Nothing IN THIS FILE reads" in src, \
+        "the heartbeat_s comment no longer scopes its claim to this file"
+    assert "Nothing anywhere reads" not in src, \
+        "the heartbeat_s comment claims more than this codebase can check"
 
 
 # ----------------------------------------------------------------------
@@ -789,3 +832,41 @@ def test_describe_emits_every_field_a_stage_dict_carries(ma, tmp_path):
     assert not missing, (
         f"STAGES carries {missing} and describe --json does not emit it, so a "
         f"console reading the contract cannot see it")
+
+
+def test_a_parked_output_is_not_offered_to_the_console_as_work_in_progress(
+        console, ma, tmp_path):
+    """The naming rule behind `_park_superseded`, pinned against the reader it
+    is a rule for.
+
+    A superseded run's finished output is parked beside its target rather than
+    renamed onto it. The console finds work in progress by matching
+    `.<stem>.` in the declared output's own directory, and it consults that
+    for any stage whose record says `running` - which is exactly the stage the
+    REPLACEMENT is now running. A parked file named after the stem would
+    therefore be offered to an operator as the live run's tool writing bytes
+    right now, and, being older than the live temp, would eventually be
+    reported as stalled against a run that is perfectly healthy. So the marker
+    goes in FRONT of the stem, and this is what says the two halves still
+    agree.
+    """
+    out = str(tmp_path / "hmm" / "pfam.tblout")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    open(out, "w", encoding="utf-8").close()
+    state = str(tmp_path / ".metaannot_state.json")
+    rec = ma.RunRecord(state, {}, ["metaannot", "run"], None, 999)
+    ma.update_state(state, {}, (ma.RUN_KEY,), claim=rec.claim)
+    ma._DECLARED_OUTPUTS.add(out)
+    ma.save_state(state, {ma.RUN_KEY: {"run_id": "20260101T000000-9",
+                                       "host": "elsewhere", "pid": 9,
+                                       "started": "2026-01-01T00:00:00"}})
+    ma._STATE_WATCH["seen"] = ma._STATE_WATCH["tried"] = 0.0
+    with ma.atomic_out(out) as tmp:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("the superseded run's result\n")
+
+    parked = [f for f in os.listdir(os.path.dirname(out))
+              if f.startswith(ma.SUPERSEDED_SUFFIX)]
+    assert parked, "nothing was parked, so there is nothing to check here"
+    assert console.newest_part_file(out) is None, \
+        "the console reads a parked output as the live run's work in progress"

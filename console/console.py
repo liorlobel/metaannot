@@ -496,6 +496,25 @@ def tail_log(path, want_off=None, want_ident=None, window=LOG_WINDOW):
                           % human_bytes(len(raw)))
             start = end if cut < 0 else start + cut + 1
             raw = b"" if cut < 0 else raw[cut + 1:]
+        # And a window that ENDS mid-line ends with a fragment nobody can read
+        # either. That is the same defect at the other end, and `off` made it
+        # worse rather than merely cosmetic: it advanced past the fragment, so
+        # the NEXT poll returned the rest of that line as a line of its own and
+        # the reader saw one engine line split into two - the second half
+        # parsed as a continuation, tinted with whatever level was above it.
+        #
+        # Measured, on a log being appended while it was polled: a client
+        # following /api/log received `line 4` and then `2` as separate lines.
+        # Holding the fragment back leaves `off` on the last line break, so the
+        # next poll re-reads that line whole.
+        #
+        # NOT held back when there is no line break in the window at all: `off`
+        # would then never advance and a live log would look frozen. That is
+        # the case the note above is for, and its behaviour is unchanged.
+        tail = raw.rfind(b"\n")
+        if tail >= 0 and tail + 1 < len(raw):
+            end -= len(raw) - (tail + 1)
+            raw = raw[:tail + 1]
         # errors="replace", for the same reason the engine's own opener() uses
         # it: this log carries tool stderr, and a latin-1 byte in an InterPro
         # description has already killed one stage on a real run. A console that
