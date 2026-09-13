@@ -1,7 +1,8 @@
 # metaannot
 
-One file. `metaannot.py` contains the pipeline, the R report, and the config
-template.
+One file for the tool. `metaannot.py` contains the pipeline, the R report, and
+the config template; the optional read-only console is a second stdlib-only
+file, `console/console.py`.
 
 ```bash
 python metaannot.py init                        # write config.yaml
@@ -78,7 +79,7 @@ pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
 A healthy default run on this tree is **1775 passed, 1 skipped, 6 xfailed, 38
-deselected**, in three to five minutes depending on the machine. Those numbers
+deselected**, in seven to eight minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
@@ -162,8 +163,8 @@ Windows failures. That one is gone: v0.4.0 rewrote
 separator-agnostic and passes on both. Stale-lock reclamation is no longer a
 Windows exception either: `_holder_is_alive` asks `OpenProcess`, which answers
 without touching the process, rather than `os.kill(pid, 0)`, which there calls
-`TerminateProcess`. The console's tests are new in this release and have not
-been run on Windows at all, so nothing here can say how they behave.
+`TerminateProcess`. The console's tests have never been run on Windows, so
+nothing here can say how they behave.
 
 Offline, and needs none of the external tools: where a stage shells out to
 hmmsearch, DIAMOND or MMseqs2 the binary is a stub on `PATH` that writes a
@@ -172,24 +173,26 @@ generated from fixed seeds, so nothing binary is committed. The R tests skip
 cleanly when `Rscript` or one of its packages is absent, and knit the real
 report when they are present.
 
-Each test is named for the defect it protects against and carries a one-line
+Tests are named for the defect they protect against, and most carry a one-line
 comment stating the symptom, because most of them exist to stop something
-coming back rather than to describe an intended feature. A handful are
-`xfail(strict)`: those name guards that are still missing, so a fix turns them
-green instead of being forgotten — and because they are strict, a fix that
-lands without removing the marker fails the suite rather than passing quietly.
-Six are open today, over five tests, and they are live defects the tool
-documents rather than hides: an `annotation_pass1.tsv` that is not reproducible
-across a resume; a Unipept lineage truncated at the first blank rank; a
-`pept2lca` file matching nothing dying with a bare `'verdict'`; an
-`emapper.annotations` file with no data rows raising a bare `KeyError` instead
-of the "no `#query` header" message every other malformed file gets (two of the
-six — the same test over an empty file and a header-only one); and a DIAMOND
-database disabled with `""` vanishing without trace, because `resolve_paths()`
-drops empty `db.diamond` entries before `doctor` ever sees them, so nothing
-anywhere records that you turned it off. That last one is a wish rather than a
-regression — the behaviour the tool has today is the one the DIAMOND section
-below describes — and the marker is what keeps the wish from being forgotten.
+coming back rather than to describe an intended feature., because most of them
+exist to stop something coming back rather than to describe an intended
+feature. A handful are `xfail(strict)`: those name guards that are still
+missing, so a fix turns them green instead of being forgotten — and because
+they are strict, a fix that lands without removing the marker fails the suite
+rather than passing quietly. Six are open today, over five tests, and they are
+live defects the tool documents rather than hides: an `annotation_pass1.tsv`
+that is not reproducible across a resume; a Unipept lineage truncated at the
+first blank rank; a `pept2lca` file matching nothing dying with a bare
+`'verdict'`; an `emapper.annotations` file with no data rows raising a bare
+`KeyError` instead of the "no `#query` header" message every other malformed
+file gets (two of the six — the same test over an empty file and a header-only
+one); and a DIAMOND database disabled with `""` vanishing without trace,
+because `resolve_paths()` drops empty `db.diamond` entries before `doctor` ever
+sees them, so nothing anywhere records that you turned it off. That last one is
+a wish rather than a regression — the behaviour the tool has today is the one
+the DIAMOND section below describes — and the marker is what keeps the wish
+from being forgotten.
 
 ## A worked example
 
@@ -218,11 +221,12 @@ renames the quant columns to the manifest's sample names, writes
 `results/quant/design_from_input.tsv`, and derives the pairwise contrasts.
 Nothing else is hand-written.
 
-It tries `experiment_bioreplicate`, then `experiment`, then the file basename
-against the quant columns, and `doctor` reports whether every manifest run
-matched a quant column before a long run rather than failing after one, listing
-up to five unmatched runs and, separately, up to four quant columns that no
-manifest row claims. It does not print the full mapping.
+It tries `experiment_bioreplicate`, then `experiment-bioreplicate`, then
+`experiment`, then the file basename, then the raw-file path as written, and
+`doctor` reports whether every manifest run matched a quant column before a
+long run rather than failing after one, listing up to five unmatched runs and,
+separately, up to four quant columns that no manifest row claims. It does not
+print the full mapping.
 
 The manifest is also the sample list, not just a rename table. A quant column
 that no manifest row claims is **dropped**, so a run left out of the manifest
@@ -249,8 +253,7 @@ or from `analysis.metadata` instead; see
 ### Identifiers
 
 Everything downstream joins on the FASTA id, which is the first whitespace token
-of the header. Two things routinely break that join and both are reported rather
-than absorbed:
+of the header. Three things routinely break that join, and all three are reported rather than absorbed:
 
 - FragPipe fills `Protein ID` with `<id> <description>` for a metagenome
   database, a value that can never match the FASTA. The peptide/ion readers
@@ -261,7 +264,7 @@ than absorbed:
   `emapper_strip_id_prefix: "uhgpSM_"` (a string or a list) and the prefix is
   stripped from the FASTA id when matching. The coverage diagnostic names the
   prefix that would have matched, so you do not have to guess, and the run
-  reports how many rows matched only because of it. It applies to
+  reports how many proteins matched only because of it. It applies to
   `emapper_precomputed` reuse only.
 - **The run stops below `emapper_min_coverage` (default `0.50`)**, rather than
   annotating half a proteome and reporting bins over it. A precomputed eggNOG
@@ -285,7 +288,7 @@ Every identified protein is binned on the evidence that actually exists for it:
 | `2_ko_orphan` | KO, but no specific pathway map |
 | `3_annotated_no_ko` | no KO; informative Pfam (hmmsearch **or** eggNOG's own `PFAMs`) / NCBIfam / InterPro / CAZy / dbCAN / VFDB / MEROPS / CARD / TADB / BAGEL |
 | `3d_duf_only` | no KO; only domain evidence is a DUF |
-| `3s_structure_only` | no KO and no sequence annotation; confident Foldseek hit to a target that is itself described |
+| `3s_structure_only` | no KO and no sequence annotation; confident Foldseek hit to a target whose description is not itself uncharacterised (a target with no description at all still counts) |
 | `3p_profile_only` | no KO, no sequence annotation, no DUF and no fold; only a remote HHblits/jackhmmer profile hit; an HHblits hit is discounted when its target's description is itself uncharacterised, while jackhmmer records no target description, so its hits are never discounted |
 | `4_dark` | no evidence |
 
@@ -299,9 +302,10 @@ protein keeps its `foldseek_*` / `hh_*` columns but stays in `4_dark`, or in
 `3d_duf_only` if it has a DUF. The run logs the count as a single WARN over
 both sources, so quote it next to any 3s/3p number. The demotion itself can
 only shrink the rescue claim, never inflate it. It has one carve-out, which
-works the other way: an **empty** description keeps its evidence, so a bare
-AlphaFold accession is not demoted — on the default AFDB50 target the demotion
-therefore fires rarely, for want of any text to test.
+works the other way: a description that carries none of those words keeps its
+evidence, so a bare AlphaFold accession is not demoted — on the default AFDB50
+target, whose headers are accessions with no protein name, the demotion
+therefore fires rarely.
 
 That is the complete set; `annotation_final.tsv`, `bin_summary.tsv` (plus a
 `TOTAL` row) and the report's factor levels use exactly these seven strings.
@@ -329,8 +333,10 @@ tool produced, for a join reason rather than a biological one.
 Bins 2 to 4 are what KEGG enrichment silently discards. Global KEGG maps
 (01100, 01110, …) are excluded from the pathway test: a protein whose only
 "pathway" is *Metabolic pathways* is not pathway-annotated in any useful sense.
-In real data almost no protein has *only* global maps, so `2_ko_orphan` means
-in practice a KO with no pathway map at all — a module-only or unmapped KO.
+`2_ko_orphan` therefore mixes a KO whose only maps are global with a KO that
+has no map at all; the run does not currently split the two, so read it as "no
+usable pathway map"., so `2_ko_orphan` means in practice a KO with no pathway
+map at all — a module-only or unmapped KO.
 
 ## Stages
 
@@ -350,30 +356,32 @@ and `finalise` have no flag and always run. Everything else is **off** —
 hardware, a licence or a large database that is not ours to make for you.
 
 `--only` and `--from` take **stage** names, not `run:` flag names: `--only
-signalp` works, `--only topology` does not. Naming a stage that its flag has
-disabled runs it anyway, which is the point of the option.
+signalp` works, `--only topology` does not. Naming a stage with `--only` runs
+it even when its flag is off, which is the point of that option; `--from` does
+not override a disabled flag.
 
 So `python metaannot.py all` on a fresh config still needs Pfam-A, the dbCAN
-HMMs, the DIAMOND databases and either eggNOG-mapper or an
-`emapper_precomputed` table. Run `run --dry-run` and read the plan before the
-first real run; `doctor` reports which tools and databases are missing for the
-stages you left enabled.
+HMMs, HMMER, MMseqs2 and either eggNOG-mapper or an `emapper_precomputed`
+table. A missing DIAMOND database is skipped with a warning rather than being
+fatal — only the `diamond` binary is. Run `run --dry-run` and read the plan
+before the first real run; `doctor` reports which tools and databases are
+missing for the stages you left enabled.
 
 ### Added evidence
 
 - **`ncbifam`** — NCBIfam/TIGRFAM HMMs. The stage itself is one more
-`hmmsearch` (`thresholds.ncbifam_cutoff`, default `--cut_tc`), so it is the
-cheapest coverage gain here — but it is not only a coverage gain. `integrate`
-reads each family's `DESC` out of `db.ncbifam_hmm` itself and caches it,
-because `hmmsearch --tblout` records the description of the *target* protein
-and never of the query HMM. A protein whose NCBIfam families **all** describe
-nothing — DUF, UPF, hypothetical, uncharacterised — is marked
-`ncbifam_uninformative`, counts as no sequence annotation, and lands in
-`3d_duf_only` rather than being promoted to an annotated bin — the same test
-the Pfam DUF rule applies. Set `ncbifam_uninformative_test: false` to count
-every hit as annotation. The accession is kept alongside the family name as
-`ncbifam_accs`, which is what makes the call comparable with InterProScan's
-NCBIfam member database.
+  `hmmsearch` (`thresholds.ncbifam_cutoff`, default `--cut_tc`), so it is the
+  cheapest coverage gain here — but it is not only a coverage gain. `integrate`
+  reads each family's `DESC` out of `db.ncbifam_hmm` itself and caches it,
+  because `hmmsearch --tblout` records the description of the *target* protein
+  and never of the query HMM. A protein whose NCBIfam families **all** describe
+  nothing — DUF, UPF, hypothetical, uncharacterised — is marked
+  `ncbifam_uninformative`, counts as no sequence annotation, and lands in
+  `3d_duf_only` rather than being promoted to an annotated bin — the same test
+  the Pfam DUF rule applies. Set `ncbifam_uninformative_test: false` to count
+  every hit as annotation. The accession is kept alongside the family name as
+  `ncbifam_accs`, which is what makes the call comparable with InterProScan's
+  NCBIfam member database.
 - **`kofam`** — KOfamScan. A *control*, not just coverage. eggNOG assigns KOs
   by DIAMOND search; KOfam uses per-family HMMs with adaptive thresholds. The
   run reports how many proteins KOfam rescues from the KO-less bins and how
@@ -386,26 +394,29 @@ NCBIfam member database.
   TMHMM, Phobius, SignalP) are excluded from the "informative" test so they
   cannot promote a protein out of the dark bin on their own.
 - **`hhblits` / `jackhmmer`** — profile-profile and iterative profile search,
-run on the unannotated bins only. This is the real answer to "more sensitive
-than BLAST"; a hit creates the `3p_profile_only` bin. BLASTp is not included.
-Note what that leaves: with the default configuration the DIAMOND stage
-searches only the targeted databases listed under `db.diamond` (VFDB, MEROPS,
-CARD, TADB, BAGEL) with `--max-target-seqs 5`, so it is not a general homology
-search. `db.diamond` is free-form — add a tag and the stage searches it, and
-`integrate` picks it up by globbing `results/diamond/*.tsv` with no code
-change. A tag with no matching `diamond_weights` entry still counts as
-annotation, so it can lift a protein out of `4_dark` while contributing nothing
-to the export score, and the run warns when that happens. The only
-general-reference search here is `jackhmmer` against UniRef50, which is off by
-default and must be enabled explicitly.
+  run on the unannotated bins only. This is the real answer to "more sensitive
+  than BLAST"; a hit creates the `3p_profile_only` bin. BLASTp is not included.
+  Note what that leaves: with the default configuration the DIAMOND stage
+  searches only the targeted databases listed under `db.diamond` (VFDB, MEROPS,
+  CARD, TADB, BAGEL) with `--max-target-seqs 5`, so it is not a general homology
+  search. `db.diamond` is free-form — add a tag and the stage searches it, and
+  `integrate` picks it up by globbing `results/diamond/*.tsv` with no code
+  change. A tag with no matching `diamond_weights` entry still counts as
+  annotation, so it can lift a protein out of `4_dark` while contributing nothing
+  to the export score, and the run warns when that happens. The only
+  general-reference search of the UNANNOTATED set is `jackhmmer` against
+  UniRef50, which is off by default and must be enabled explicitly.
+  (eggNOG-mapper's own DIAMOND search against the eggNOG database is general, but
+  it runs on every protein and assigns orthologues rather than answering "is
+  there any homologue at all".)
 - **`context`** — genomic neighbourhood. Needs a `gff` whose identifiers match
   `proteins_faa` exactly; without it the stage has nothing to work from.
   `context_window` counts neighbours on **each side, in genes**, while
   `immunity_max_gap` is in **base pairs** — different units, adjacent keys.
 - **`smorf`** — smORFinder and Macrel on the assembly, so it needs
-`contigs_fna`. Note the direction: this produces ORFs that must be **added to
-the search database and the MS data re-searched**. Nothing on the annotation
-side recovers peptides that were never in the search space.
+  `contigs_fna`. Note the direction: this produces ORFs that must be **added to
+  the search database and the MS data re-searched**. Nothing on the annotation
+  side recovers peptides that were never in the search space.
 
 Foldseek now searches several targets (`foldseek_extra_targets` — PDB and
 Swiss-Prot carry far better annotation than mostly-unreviewed AFDB50) and
@@ -417,9 +428,13 @@ Both halves run on a **pLDDT-gated subset** of those structures.
 `thresholds.esmfold_min_plddt` (default 70) is applied *before* the search: a
 45-pLDDT model of a short dark ORF matching a fold at TM 0.5 is noise, and a
 hit here is what promotes a protein out of `4_dark` into `3s_structure_only`,
-so low-confidence models are never searched rather than filtered afterwards.
-Survivors are linked into `{results}/foldseek/query_hq` and the log says how
-many of how many passed. On the real UC run that was 993 of 1,821.
+so low-confidence models are not searched at all rather than filtered
+afterwards — unless `plddt.tsv` is missing, in which case the gate cannot be
+applied, every model is searched and the run says so. When some models are
+dropped, the survivors are linked into `{results}/foldseek/query_hq` and the
+log says how many of how many passed; if every model clears the gate the
+structures directory is searched in place and no such line appears. On the real
+UC run that was 993 of 1,821.
 
 The search asks for `qtmscore` and `qlen`, not only `alntmscore`. That matters:
 `alntmscore` is normalised by the *alignment*, so a 40-residue local match
@@ -550,28 +565,30 @@ Every key of the `tmt:` block, with its default:
 | `tmt.drop_empty_channels` | `true` | drop channels the annotation names `<PLEX>_<CHANNEL>`, which is how FragPipe writes an unassigned one. |
 | `tmt.min_purity` | `0` (off) | drop features whose **median** PSM purity is below this. Reads `psm.tsv`, the only table that has purity at all. |
 
-Two keys outside that block behave differently for `fragpipe_tmt`:
+Keys outside that block that behave differently for `fragpipe_tmt` — `manifest` is ignored entirely, and `feature_intensity_suffix` becomes a column PREFIX rather than a suffix:
 
 | key | default | for `fragpipe_tmt` |
 |---|---|---|
-| `analysis.min_plexes` | `1` | the **protein**-level companion to `tmt.min_plexes`, applied in the report beside `min_valid_per_group`. Inert without a per-sample plex, so label-free is untouched. |
+| `analysis.min_plexes` | `1` | the **protein**-level companion to `tmt.min_plexes`, applied in the report beside `min_valid_per_group`. At the default of 1 it is inert without a per-sample plex, so label-free is untouched; set above 1 on a run with no plex column it stops the report rather than passing everything. |
 | `analysis.design_formula` / `analysis.factor_cols` | `"~ 0 + group"` / `"group"` | with two or more plexes the **defaults** become `"~ 0 + group + plex"` and `"group,plex"`. Only the literal defaults are replaced; a formula you wrote is left exactly as written — and `plex` is then added to `factor_cols` only if your formula actually models it, since naming a factor the model never uses stops the knit. |
 
 Each plex is read on its own and the plexes are joined on the feature id — the
 peptide sequence, the modified sequence and the charge at `level: ion`, the
 peptide at `level: peptide` — so the id is comparable across plexes. **A
 feature not identified in a plex is `NA` for every sample of that plex, never
-`0`**: FragPipe's `0` is a real value here (5-16% of reporter cells in a real
-run) and is itself read as missing, so filling one in for "not identified"
-would turn plex-shaped missingness into fold change. Cross-plex overlap is
-low — about 45% of ion keys are shared between two plexes — so the run always
-logs how many features were seen in 1, 2, … n plexes; `min_plexes` filters on
-that count.
+`0`**: FragPipe's `0` is a real value here (5.9-16% of the reporter cells of a
+real plex) and is itself read as missing, so filling one in for "not
+identified" would turn plex-shaped missingness into fold change. Cross-plex
+overlap is low — about 45% of ion keys are shared between two plexes — so the
+run always logs how many features were seen in 1, 2, … n plexes; `min_plexes`
+filters on that count.
 
 Reporter columns are named `Intensity <sample>` after the **annotated sample
-name**, which is what each plex's `<PLEX>_annotation.txt` supplies (FragPipe
-does not write a plain `annotation.txt`). Two things in that file are easy to
-get wrong and are handled explicitly:
+name**, which is what each plex's `<PLEX>_annotation.txt` supplies; a run
+annotated after the fact may instead name them `Intensity <channel>`, which is
+also accepted, and the log says which form was used. (FragPipe does not write a
+plain `annotation.txt`). Two things in that file are easy to get wrong and are
+handled explicitly:
 
 - **The reference channel does not sit at a fixed position.** In a real 8-plex
   design the pool is at `131C` in six plexes and at `131N` in the other two, so
@@ -588,10 +605,10 @@ Every plex is described by its own annotation, and nothing assumes a common
 channel count, a common channel set, or a bridge, so all of these read:
 
 - **Reference-free** — no pool anywhere. Nothing is divided by anything and no
-channel is held back as a denominator; the `plex` term carries the batch. This
-is what you get when neither `tmt.reference_name` nor `tmt.reference_channel`
-is set. A lone channel named `Pool*` is pointed out in the log rather than
-being treated as a reference behind your back.
+  channel is held back as a denominator; the `plex` term carries the batch. This
+  is what you get when neither `tmt.reference_name` nor `tmt.reference_channel`
+  is set. A lone channel named `Pool*` is pointed out in the log rather than
+  being treated as a reference behind your back.
 - **Multi-plex without a bridge** — several plexes with no channel in common.
   Read, and honest as long as each condition appears in more than one plex.
   What links the plexes is then the plex coefficient and the report's median
@@ -938,19 +955,15 @@ where it is true of some warns and carries on, and this is where the
 consequence becomes visible.
 
 Two things it does not cover, and says so rather than leaving them to be
-inferred. Rows the quant reader refused before this stage was handed anything
-— decoys, contaminants, unusable columns — are already gone from its first
-count, which says so; the reader logs them. And every filter the **report**
-applies afterwards (`min_valid_per_group`, `analysis.min_plexes`) runs in R
-over the file this funnel ends at, and is counted there. The join stage says
+inferred. On feature-level input, rows the quant reader refused before this stage was handed anything — decoys, contaminants, unusable columns — are already gone from its first count, which says so; on the protein-level formats the decoy drop happens in this stage and IS a funnel row; the reader logs them. And every filter the **report**
+applies afterwards (`min_valid_per_group`, `analysis.min_plexes`, `analysis.min_features`) runs in R over the file this funnel ends at, and is counted there. The join stage says
 that out loud on the log beside the path, because a funnel that stopped at
 1,282 without saying it would be read as the end of the narrowing when it is
 the middle of it.
 
 **A quant table is read more than once per run, and it now warns once.** The
 join stage reads it, and `peptide_features()` reads it again for each
-taxonomy-ish stage that is on. For `fragpipe_tmt` that is every plex's level
-file, annotation and `psm.tsv` re-read, re-validated and re-warned about: on
+taxonomy-ish stage that is on. For `fragpipe_tmt` that is every plex's level file, annotation and — when `tmt.min_purity` is set — `psm.tsv` re-read, re-validated and re-warned about: on
 the first full real run, 117 WARN lines of which 97 were one block printed
 three times. Those warnings are properties of the plex FILES rather than of
 the read, so the later passes reach the same verdicts. They are printed once
@@ -1027,10 +1040,10 @@ npm install -g unipept-cli     # Node 22+; the Ruby gem is the legacy client
 unipept pept2lca --equate --all -i results/unipept/peptides.txt -o pept2lca.csv
 ```
 
-The current CLI writes `domain_id`/`domain_name` where the old gem wrote
-`superkingdom_id`/`superkingdom_name`, which is what the parser reads. The
-unipept.ugent.be web export is **not** an accepted input: it is name-based and
-lacks the taxid columns entirely.
+The current CLI writes `domain_id` where the old gem wrote `superkingdom_id`;
+the parser accepts either spelling and reads only the `_id` columns, never the
+`_name` ones. The unipept.ugent.be web export is **not** an accepted input: it
+is name-based and lacks the taxid columns entirely.
 
 Set these inside the blocks your config already has — do not paste a second
 top-level `run:` or `db:` key (see above; a duplicate key is refused):
@@ -1059,11 +1072,13 @@ to nothing even after `merged.dmp` (`eggnog_unresolved` — a taxid that merely
 proteins than you expect.
 
 `db.ncbi_taxonomy` is not optional for this, even though it defaults to empty.
-Without a taxdump there is no lineage to compare and every verdict collapses to
-`identical` or `differ_no_lineage`, so `concordant` degrades to exact taxid
-identity and blanks everything else — including the cases it exists to keep,
-such as eggNOG *E. faecalis* against a Unipept LCA of genus *Enterococcus*. The
-run only WARNs. Check the verdict counts in `taxonomy_comparison.tsv`.
+Without a taxdump there is no lineage to compare and every verdict where both
+sides have a taxid collapses to `identical` or `differ_no_lineage` (the
+`eggnog_missing` / `unipept_missing` verdicts are decided before the lineage
+step and are unaffected), so `concordant` degrades to exact taxid identity and
+blanks everything else — including the cases it exists to keep, such as eggNOG
+*E. faecalis* against a Unipept LCA of genus *Enterococcus*. The run only
+WARNs. Check the verdict counts in `taxonomy_comparison.tsv`.
 
 ## Databases
 
@@ -1223,10 +1238,11 @@ MMseqs `family_id` — a sequence cluster, not an organism.
 
 `colData` is read from `results/quant/design_from_input.tsv` and from nothing
 else: the manifest for a label-free FragPipe or DIA-NN run, `Condition` and
-`BioReplicate` off the long table for the MSstats formats, and `sample`, `plex`
-and `channel` for `fragpipe_tmt` — plus `group` only when it could be derived,
-which for TMT usually means it comes from `analysis.metadata` at report time
-rather than from the input.
+`BioReplicate` off an MSstats.csv long table, or `GROUP_ORIGINAL` and
+`SUBJECT_ORIGINAL` off dataProcess() output, and `sample`, `plex` and `channel`
+for `fragpipe_tmt` — plus `group` only when it could be derived, which for TMT
+usually means it comes from `analysis.metadata` at report time rather than from
+the input.
 
 The link between the assays records the assignment metaannot actually made,
 not one re-derived in R, so the shared-peptide decisions stay inspectable
@@ -1278,7 +1294,7 @@ often tracking their organism rather than being regulated — but a small taxon
 reference adds noise of its own, so read the verdict beside `logFC_naive` and
 `logFC_adj` rather than on its own.
 
-The shortlist is not the top of `effector_score`: significant, no KO, and
+The shortlist is not the top of `export_score`: significant, no KO, and
 predicted to reach the host. `surface_or_secreted` gates the list; the score
 only orders it. That gate is the OR of a signal peptide, a beta-barrel, an
 LPxTG motif and an anchor domain — so with `topology` off it narrows to the
@@ -1501,8 +1517,7 @@ than producing a confident answer from inputs that do not exist.
 `--serial` forces one at a time. Parallel and serial runs are verified to
 produce the same output: `tests/test_outputs.py` digests a parallel run against
 a `--serial` run for every `quant_format`, and for the `protein_unique`,
-`taxon_unique` and `razor` assignment modes; `tests/test_scheduler.py` compares
-every file under `results/` byte-for-byte between the two.
+`taxon_unique` and `razor` assignment modes; `tests/test_scheduler.py` compares every result file under `results/` byte-for-byte between the two, excluding the state file, the log and `config.effective.yaml`, which record the run rather than its answers.
 `taxon_or_family_unique` is not in that sweep. The full
 `quant_format` × `peptide_assignment` cross-product carries the `slow` mark and
 is excluded from the default run.
@@ -1515,8 +1530,11 @@ and two at once will thrash. ESMFold is GPU-bound and serial by nature; see
 "The GPU is leased, not shared" below for why it does not run beside `tmbed`.
 
 The scheduler's own overhead is negligible next to the search tools. No
-benchmark script or speed-up measurement ships with this file, so no figure is
-quoted here.
+wall-clock benchmark of parallel against serial execution ships with this
+file, so no speed-up factor is quoted here — what does ship is the
+dispatch-order replay in `tests/test_scheduler.py`, which recomputes the
+makespan of two orderings over published durations and is where the hours in
+the section above come from.
 
 **Peak memory scales with `stage_workers`.** Four hmmsearch jobs against
 Pfam-A alongside InterProScan is the usual squeeze. `doctor` says so.
@@ -1614,16 +1632,18 @@ the tag:
 | `OIDECCNN_00158` | `OIDECCNN_` | `#` |
 | `ampS_AMP10.000_478` | `ampS_` | `AMP#.#_#` |
 
-On the real database that is **four tiers over three key spaces**: `uhgpL_`
-and `uhgpSM_` (and the `ent_` entrapment set) all wrap the same MGnify
-`MGYG…` namespace, 31.8M of the search database's 36.6M records. Two tiers
+On the real database that is **four tiers over three key spaces**: `uhgpL_` and
+`uhgpSM_` (and the `ent_` entrapment set) all wrap the same MGnify `MGYG…`
+namespace — 31.8M of that search database's 36.6M records, counted in the
+database as it was built rather than by anything metaannot does, and not to be
+confused with the 455,571 records of the subset this tool annotated. Two tiers
 sharing a key are one namespace under two labels — the same protein appears
-once per tag, one row of a precomputed annotation table annotates all of
-them, and **every** such tag must be in `emapper_strip_id_prefix` or its tier
-loses that table entirely and reports as unannotated. `tier_coverage.tsv`
-carries `key_shape` and `key_shape_pct` columns, the run names any key shared
-by more than one tier, and `emapper` warns while it can still be fixed if one
-sharing tier is listed and another is not.
+once per tag, one row of a precomputed annotation table annotates all of them,
+and **every** such tag must be in `emapper_strip_id_prefix` or its tier loses
+that table entirely and reports as unannotated. `tier_coverage.tsv` carries
+`key_shape` and `key_shape_pct` columns, the run names any key shared by more
+than one tier, and `emapper` warns while it can still be fixed if one sharing
+tier is listed and another is not.
 
 Digit *runs* are masked rather than digits, because widths vary inside one
 namespace: the Prokka tier runs `OIDECCNN_00001` to `OIDECCNN_1712297` — 5-,
@@ -1711,8 +1731,7 @@ protein escapes that penalty as well as forgoing `tm_beta_barrel`. Its
 `export_score` is not simply lower than it should be — it is uninformed, and
 can land either side of the score it would have had.
 The key is part of the `tmbed` stage's signature, so changing it re-runs that
-stage, and the predictions it writes are an input to `integrate`, so that and
-`finalise` follow. No other stage recomputes.
+stage, and the predictions it writes are an input to `integrate`, so that, `finalise` and `join` follow — and `taxonomy` where it is on, since both read `annotation_final.tsv`. Nothing else recomputes.
 
 ### TMbed writes nothing until it finishes
 
@@ -1823,8 +1842,7 @@ the models into `results/structures/` before rerunning `foldseek`.
 
 **A low cap is a statement about free VRAM, not about the coefficient.** On
 the first full real run the cap came out at 193 aa and excluded 1,462 of 2,000
-sequences, which reads like a badly-guessed constant and is not one: 20200
-reproduces both measured points exactly, and running the estimate backwards,
+sequences, which reads like a badly-guessed constant and is not one: 20200 reproduces the measured point exactly — 478 aa at 4.8 GB free, and running the estimate backwards,
 a 193 aa cap means about **1.2 GB** was free with the weights resident, where
 the 478 aa measurement had 4.8 GB. On a 16 GB card holding an 11.2 GB trunk,
 4.8 GB is what should be left — so roughly 3.6 GB was held by something else,
@@ -1899,8 +1917,7 @@ wrong spacing for the next eighty hours: the first full real run wrote 8,990
 log lines of which 5,086 were heartbeats. So after ten ticks of the same
 command the interval doubles until it reaches `progress_interval_s_max`, which
 turns a two-day stage's several thousand lines into a few hundred while still
-proving liveness four times an hour. The line on which the interval changes
-says `next in 15m00s`, because a heartbeat that quietly slows down looks
+proving liveness four times an hour. Each line on which the interval changes says how long the next gap will be — `next in 2m00s`, then 4m, 8m, and `next in 15m00s` once it reaches the ceiling, because a heartbeat that quietly slows down looks
 exactly like a stage that quietly stopped. The backoff is per command, so two
 stages running at once keep separate cadences and a short stage never inherits
 a long one's ceiling. Set `progress_interval_s_max` equal to
@@ -1979,14 +1996,14 @@ Three limits are worth knowing before relying on it:
   progress lines however long they take, so a silent stretch during those is
   not evidence of a hang either way.
 * **Progress is not a checkpoint.** Watching a stage does not make it
-resumable. `esmfold` and `hhblits` resume, because they work one protein at a
-time and skip what is already on disk (`<id>.pdb`, `<id>.hhr`). Drop `tmbed`
-from the list and say so explicitly: "...InterProScan, KOfamScan, DIAMOND,
-`jackhmmer`, Foldseek, MMseqs2 — starts again from the beginning if it is
-killed at 90%. `tmbed` is the exception among the shell-outs: it is chunked
-(`tmbed_chunk_residues`), each finished chunk is committed, and a rerun adopts
-the chunks already on disk.", and a stage recorded as `running` when the
-process died is always recomputed rather than adopted.
+  resumable. `esmfold` and `hhblits` resume, because they work one protein at a
+  time and skip what is already on disk (`<id>.pdb`, `<id>.hhr`). Drop `tmbed`
+  from the list and say so explicitly: "...InterProScan, KOfamScan, DIAMOND,
+  `jackhmmer`, Foldseek, MMseqs2 — starts again from the beginning if it is
+  killed at 90%. `tmbed` is the exception among the shell-outs: it is chunked
+  (`tmbed_chunk_residues`), each finished chunk is committed, and a rerun adopts
+  the chunks already on disk.", and a stage recorded as `running` when the
+  process died is always recomputed rather than adopted.
 
 `progress_interval_s` is read once, at the start of `run` (and `all`), and
 nothing else reads it, because nothing else calls the wrapper that watches a
@@ -2176,10 +2193,10 @@ that refused every pipe would be removing something that works.
 ### What a results directory says about itself
 
 A results directory now says what produced it and whether that is still
-happening. "`config.effective.yaml` is never read back by metaannot; `_run` is
-read back - by the succession check and by the `--force-unlock` refusal message
-- but neither is in any stage's signature, so neither can make a stage
-recompute."
+happening. `config.effective.yaml` is never read back by metaannot; `_run` is
+read back — by the succession check and by the `--force-unlock` refusal
+message — but neither is in any stage's signature, so neither can make a stage
+recompute.
 
 **`config.effective.yaml`** is the merged configuration the run actually used:
 the built-in defaults, then your config file, then the command line. It is not
@@ -2194,7 +2211,7 @@ underscore, no stage is named that, and `--force` never clears it:
 ```json
 "_run": {
  "run_id": "20260901T144530-31284",
- "version": "0.3.0",
+ "version": "0.7.1",
  "config_path": "/data/projects/gut2/config.yaml",
  "argv": ["<script>", "run", "--config", "config.yaml"],
  "host": "server", "pid": 31284,
@@ -2785,8 +2802,10 @@ is the list that says which of its settings do that.
 
 Half the answer is static and half is a probe of the machine it ran on:
 `default_config`, `stages` and the versions are the same everywhere, while
-`requirements[].ok` is `shutil.which` and `os.path.exists` on `host` at
-`generated`. Read `ok` as a fact about that machine, not about metaannot.
+`requirements[].ok` is `shutil.which`, a filesystem test (`_exists()`, which
+also requires content) and, for the Python-backed items, an import probe — all
+on `host` at `generated`.. Read `ok` as a fact about that machine, not about
+metaannot.
 
 ### `doctor --json`: what this machine can do with this config
 
@@ -2993,9 +3012,7 @@ distribution came to look like no download at all.
 It is versioned the way `describe --json` is: `doctor_version` moves when a key
 is removed or its meaning changes, never when one is added. One clause is
 added, because this document has enums a consumer switches on — **adding a
-value to a closed enum is a meaning change and is a bump**. The closed sets are
-`status`, `remedy`, `fails_reason`, `depth`, the `blocks_commands` vocabulary,
-`found.kind` and `expect.kind` — seven, and the last two joined the list after
+value to a closed enum is a meaning change and is a bump**. The closed sets are `status`, `remedy`, `fails_reason`, `depth`, the `blocks_commands` vocabulary, `found.kind`, `expect.kind`, `found.other_kind` and `section` — nine, and the last two joined the list after
 they were found outside it, which is the difference between a contract and a
 suggestion: this page tells you to switch on `found.kind` rather than compute
 `bytes > 0`, and a `fifo` or an `unreadable` appearing there would not have
@@ -3210,6 +3227,14 @@ protein count: 1,805 folds at or under 478 aa took 1.6 h in total, while the 91
 sequences above that machine's VRAM cliff were projected at 7.4 h on their own.
 See **The length a card can actually fold**.
 
+Note which population each ESMFold figure is over, because two of them differ
+and the difference is not a discrepancy. **1,805 is folds performed** — the
+work this stage did, and what the 1.6 h is the cost of. The **1,821 models**
+quoted under *What has actually been run* is structures on DISK, which the
+stage reports separately for exactly this reason: its summary line is
+`N new, M already present, N+M structures`, and a resumed run adopts what an
+earlier pass left rather than folding it again.
+
 **They do not scale linearly.** On a 455,571-protein run — 11.9× the size —
 the stages came in at **14–66×**, not 12×: tmbed 65×, signalp 61×, kofam 29×,
 diamond 29×, emapper 25×, interpro 20×, pfam 16×, dbcan 15×, ncbifam 14×. The
@@ -3218,7 +3243,9 @@ where the dispatch-order replay takes its durations from, so they can be
 re-derived rather than taken on trust.
 
 An earlier version of this paragraph said 14–30×, and it was not wrong when it
-was written — it was computed over the stages that had finished by then. The ones that finished afterwards were the worst of the set, which is the direction that matters for planning.
+was written — it was computed over the stages that had finished by then. The
+ones that finished afterwards were the worst of the set, which is the direction
+that matters for planning.
 
 The cause is contention rather than size: at 38k a long stage rarely overlaps
 another long stage, and at 455k every one of them overlaps every other for its
@@ -3253,24 +3280,24 @@ export scoring are array operations, not row-wise `apply`, and sequences are
 not retained after the single FASTA pass, so memory scales with protein count
 rather than total residues.
 
-Quant tables are read by `read_delim_table`, which takes the delimiter from the
-header line alone and hands the body to pandas' C parser. The old
+Quant tables are read through `read_delim_table` and `read_named_table`, which take the delimiter from the header line alone and hands the body to pandas' C parser. The old
 delimiter-sniffing path (`sep=None, engine="python"`) is gone from every quant
 read — roughly 18× slower and 4–6× the memory for no benefit, since the first
-line already says which delimiter this is. Replace with: "It survives nowhere:
-the Unipept result reader and `doctor`'s header peek were the last two, and
-both now go through the header-line sniff and the C parser." Reading is no
-longer the dominant cost.
+line already says which delimiter this is. It survives nowhere: the Unipept
+result reader and `doctor`'s header peek were the last two, and both now go
+through the header-line sniff and the C parser. Reading is no longer the
+dominant cost.
 
 Scratch is **partly** cleaned up. The two trees that can reach hundreds of GB
 are removed by the run itself: each Foldseek target search deletes its
 `{results}/foldseek/tmp{i}` when the search returns, and self-clustering
 deletes `{results}/foldseek/tmpc`, so scratch peaks at one target's tree rather
 than the sum over targets — but that peak is real: against AFDB50 budget tens
-to hundreds of GB of free space for the duration of the stage. "A killed
+to hundreds of GB of free space for the duration of the stage. A killed
 Foldseek still leaves the tree it died in; a non-zero exit does not, for the
 target searches — their tree is removed in a `finally`. Self-clustering's
-`tmpc` does leak on a non-zero exit."
+`tmpc` is removed on the success path only, so it does leak on a non-zero
+exit.
 
 What survives a clean run is smaller and fixed in kind: `{results}/kofam/tmp`
 is the largest leftover at 229 MB on a 38k-protein run;
@@ -3298,8 +3325,7 @@ MB, not hundreds of GB.
    into `results/smorf/smorf_proteins.faa`, which you must append to your MS
    search database and search the raw data against again yourself. No
    downstream stage consumes that file.
-2. **Group and taxonomy conflicts.** `group_conflicts.tsv` and
-   `taxonomy_comparison.tsv`. KO-less proteins are strain-specific, so theirs
+2. **Group and taxonomy conflicts.** `group_conflicts.tsv`, and `taxonomy_comparison.tsv` if you turned `unipept` and `taxonomy` on — they are off by default. KO-less proteins are strain-specific, so theirs
    are the least trustworthy.
 3. **Taxon confounding.** `taxon_intensity.tsv` as a covariate, or a protein
    that merely tracks its source organism reads as a regulatory finding.

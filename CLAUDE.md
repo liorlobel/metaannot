@@ -200,9 +200,23 @@ it names; do not force the file through another format.
    `--only` alone reports the stage as cached and skips it, and `--force`
    scoped this way touches only the named stages, so every other stage keeps
    its signature and is still checked properly afterwards. The one thing that
-   may be deleted by hand is scratch the run never records —
-   `results/foldseek/tmp*`, `results/foldseek/tmpc`, `results/cluster/tmp` —
-   which is never cleaned up and can reach hundreds of GB.
+   may be deleted by hand is scratch the run never records, and it is worth
+   knowing which of it actually survives, because an earlier version of this
+   rule said all of it did and that is not true:
+
+   - `results/cluster/tmp`, `results/kofam/tmp` and `results/interpro/tmp`
+     are handed to MMseqs2, KOfamScan and InterProScan as their `--tmp-dir`
+     / `-T` and are **never removed**. These are the ones to delete by hand.
+   - `results/foldseek/tmp*` is removed by the run itself, in a `finally`, as
+     each target search returns — so a non-zero exit cleans up and only a
+     `kill` leaves one behind. `results/foldseek/tmpc` is removed on the
+     success path only, so it leaks on a non-zero exit as well as on a kill.
+
+   The hundreds of GB belong to the Foldseek trees at their PEAK, during the
+   stage, not to what is left afterwards: scratch peaks at one target's tree
+   rather than the sum over targets. Budget the space; do not expect to
+   reclaim it by deleting afterwards, because on an ordinary run there is
+   nothing left to delete.
 
    A dot-prefixed `.part` leftover is **not** in that carve-out, and the
    program will never remove one: it is the part-written (sometimes the

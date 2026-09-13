@@ -2970,7 +2970,8 @@ COUNT_PROSE = {
     "three groups": ("DERIVED", "the dispatch-key groups with more than one "
                                 "stage in them",
                      _tied_dispatch_groups),
-    "two entries": ("DERIVED", "the Unreleased/Fixed entries",
+    "two entries": ("PROSE", "a group heading, counted by the group test"),
+    "three entries": ("DERIVED", "the Unreleased/Fixed entries",
                     lambda ma: sum(n for _h, n
                                    in _unreleased_fixed_groups())),
     # NOT "six groups", which is also the TUTORIAL's sentence about a real
