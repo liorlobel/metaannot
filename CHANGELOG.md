@@ -1,6 +1,57 @@
 # Changelog
 
-## Unreleased
+## v0.7.2 — 2026-09-13
+
+A documentation release, with one code fix that auditing the documentation
+found.
+
+Everything here came out of reading README.md against the code it describes,
+claim by claim — about seven hundred of them. All but one slice of that audit came back carrying false claims, which is the useful result: the prose
+had drifted where nobody had reason to look, and two of the corrections change
+what an operator would actually do.
+
+**The lock section documented Windows behaviour that was fixed two releases
+ago.** It said *every* lock on Windows reads as live and that a crashed
+Windows run needs `--force-unlock` — but liveness there is asked with
+`OpenProcess`/`GetExitCodeProcess`, not `os.kill`, so a lock naming a dead pid
+is reclaimed automatically like any other. The README was sending Windows
+users to the one flag CLAUDE.md's lock rule tells them not to reach for, while
+its own Tests section said the opposite 1,250 lines earlier.
+
+**The scaling guidance under-budgeted a run by about three times.** It gave
+14–30× for 11.9× the proteins and advised doubling the linear estimate. That
+band was honest when written — computed over the stages that had finished by
+then — but the ones that finished afterwards were the worst of the set. The
+measured range is **14–66×**, and tmbed at 65× is 5.5× its linear estimate.
+
+The audit also found a defect in the code rather than in the prose.
+`stage_esmfold` has TWO early returns; v0.7.1 fixed the one taken when nothing
+is pending and left the one taken when `dark.faa` is empty, so a stage that
+ran and skipped nothing wrote neither `not_folded.tsv` nor `not_folded.faa` —
+and their absence still meant two things, which is the whole defect those
+files exist to remove. Both paths write the empty pair now.
+
+And `DOCTOR_VERSION`'s own rule named fewer closed enums than the code
+enforces: `found.other_kind` and `section` are each validated against a fixed
+tuple — `section`'s guard comment calls it "the eighth" — while the versioning
+rule listed neither, so a value could have been added to either without the
+bump that rule exists to require. Both are named in it now. Naming them is not
+itself a bump, by that rule's own text: closing a vocabulary ADDS a promise
+rather than changing a meaning.
+
+TUTORIAL.md and CLAUDE.md were brought into agreement with README and with the
+code, which took correcting all three: a scratch carve-out that said all of it
+survives when two of the trees are removed by the run itself, a GPU hand-off
+that treated `tmbed` and `esmfold` as alike when only one of them depends on
+`integrate`, a claim that the DIAMOND tables bypass `atomic_out` when they do
+not, and two `ResultsLock` docstrings still saying SIGTERM unwinds, which it
+has not since `_release_lock_on_signal` began exiting through `os._exit()`.
+
+`SIGNATURE_VERSION`, `DESCRIBE_VERSION` and `DOCTOR_VERSION` do not move, and
+that was checked rather than assumed: no stage's `keys` list changed, nothing
+was removed from `describe --json`, and every one of `doctor`'s closed enums
+holds the same values it held at v0.7.1. Upgrading recomputes nothing.
+`CONSOLE_VERSION` stays `0.1.2`; the console was not touched.
 
 ### Fixed three entries, in two groups. Each heading carries its own count and
 a test pairs the two.
