@@ -317,6 +317,78 @@ def test_a_sequence_that_will_not_fit_in_vram_is_not_attempted(folding, capsys):
     assert "will NOT be folded" in err
 
 
+def test_the_sequences_the_cap_skipped_are_kept_where_they_can_be_folded(
+        folding, ma):
+    """A count in a log is not a work-list.
+
+    The advice has always been "fold them elsewhere and drop the models in",
+    and it always left the reader to reconstruct WHICH ones from a number: on
+    the first full real run the cap excluded 1,462 of 2,000 and the list
+    existed nowhere at all.
+    """
+    seqs = [("fits", "A" * 60), ("huge", "C" * 900), ("bigger", "D" * 950)]
+    _, p, _ = folding(seqs, free_gb=1.0, total_gb=16.0)
+    rows = [l.split("\t") for l in
+            open(f"{p.structures}/not_folded.tsv", encoding="utf-8")
+            .read().splitlines()]
+    assert rows[0] == ["protein_id", "length", "limit_aa", "limit_from"]
+    assert {r[0] for r in rows[1:]} == {"huge", "bigger"}
+    assert [r[1] for r in rows[1:]] == ["900", "950"]
+    assert {r[3] for r in rows[1:]} == {"the card's free VRAM"}
+    # and the sequences themselves, byte for byte, so the file can go
+    # straight to another card rather than being rebuilt from dark.faa
+    faa = dict(ma.read_fasta(f"{p.structures}/not_folded.faa"))
+    assert faa == {"huge": "C" * 900, "bigger": "D" * 950}
+
+
+def test_nothing_skipped_still_writes_the_list_so_absence_means_one_thing(
+        folding):
+    # An absent file that means either "nothing was skipped" or "this stage
+    # never ran" is the ambiguity esmfold_failed.tsv used to have.
+    seqs = [("a", "A" * 60), ("b", "C" * 70)]
+    _, p, _ = folding(seqs, free_gb=40.0, total_gb=48.0)
+    assert open(f"{p.structures}/not_folded.tsv", encoding="utf-8").read() \
+        == "protein_id\tlength\tlimit_aa\tlimit_from\n"
+    assert os.path.getsize(f"{p.structures}/not_folded.faa") == 0
+
+
+def test_the_skipped_warning_prices_the_vram_the_longest_one_needed(
+        folding, ma, capsys):
+    """A count of skipped proteins is a complaint; a number of GB is a step.
+
+    And it is the datum that settles what this cap actually is: the
+    coefficient reproduces both measured points exactly, so a low cap means
+    the card had little free VRAM, not that the constant is a guess.
+    """
+    seqs = [("fits", "A" * 60), ("huge", "C" * 900)]
+    cfg, _, _ = folding(seqs, free_gb=1.0, total_gb=16.0)
+    need = (900 ** 2 * cfg["esmfold_bytes_per_residue_pair"]
+            + cfg["esmfold_vram_reserve_gb"] * 1024 ** 3) / 1024 ** 3
+    err = capsys.readouterr().err
+    assert f"about {need:.1f} GB free" in err, err
+    assert "not the coefficient that decides this cap" in err
+
+
+def test_max_len_structure_skipping_does_not_price_vram_it_did_not_decide(
+        folding, capsys):
+    seqs = [("fits", "A" * 60), ("huge", "C" * 900)]
+    folding(seqs, free_gb=40.0, total_gb=48.0, max_len_structure=100)
+    err = capsys.readouterr().err
+    assert "will NOT be folded" in err and "max_len_structure" in err
+    assert "GB free with the weights resident" not in err, \
+        "the VRAM had nothing to do with this cap"
+
+
+def test_the_failure_record_is_written_even_when_nothing_failed(folding):
+    # Its absence used to mean either "nothing failed" or "this results
+    # directory predates the record", and the shortfall message had to hedge
+    # across both of those at once. See the have_tbl test in test_binning.py.
+    seqs = [("a", "A" * 60), ("b", "C" * 70)]
+    _, p, _ = folding(seqs)
+    assert open(f"{p.structures}/esmfold_failed.tsv", encoding="utf-8").read() \
+        == "protein_id\tlength\terror\n"
+
+
 def test_the_warning_says_it_is_memory_and_says_what_to_do(folding, capsys):
     seqs = [("fits", "A" * 60), ("huge", "A" * 900)]
     folding(seqs, free_gb=1.0, total_gb=16.0)

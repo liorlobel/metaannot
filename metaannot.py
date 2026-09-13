@@ -6322,7 +6322,12 @@ def structure_shortfall_message(cfg, p, requested_lengths, have_pdb):
         # fold and were never attempted, which is a different thing entirely.
         tried = set()
         fail_tbl = f"{p.structures}/esmfold_failed.tsv"
-        if os.path.exists(fail_tbl):
+        # The FILE, not whether it has rows. The stage now writes it on every
+        # run, so a header-only table is the positive statement "nothing
+        # failed" - and reading `tried` for that statement put a run with no
+        # failures back on the branch that says the record does not exist.
+        have_tbl = os.path.exists(fail_tbl)
+        if have_tbl:
             with contextlib.suppress(OSError):
                 with opener(fail_tbl) as fh:
                     next(fh, None)
@@ -6332,7 +6337,7 @@ def structure_shortfall_message(cfg, p, requested_lengths, have_pdb):
             parts.append(f"{gave_up} were attempted and failed twice, listed "
                          f"with the error in {fail_tbl}")
         never = rest - gave_up
-        if never and tried:
+        if never and have_tbl:
             parts.append(f"{never} are absent from that list, so they were "
                          "added to dark.faa after the last fold and never "
                          "attempted")
@@ -7851,15 +7856,48 @@ def stage_esmfold(cfg, p):
             "refuses the raw sequence and the stage would die on it", "WARN")
     seqs.sort(key=lambda x: len(x[1]))
 
-    over = [(q, len(t)) for q, t in read_fasta(p.dark) if len(t) > cap]
+    # The SEQUENCES, not just their lengths. The advice below has always been
+    # "fold them elsewhere and drop the models in", and it has always left the
+    # reader to reconstruct WHICH ones from a count in a log: on the first
+    # full real run the cap excluded 1,462 of 2,000 and the list existed
+    # nowhere. Both files are written on every run of this stage, empty ones
+    # included, so that their absence means the stage did not run rather than
+    # meaning nothing was skipped.
+    over = [(q, t) for q, t in read_fasta(p.dark) if len(t) > cap]
+    todo_tsv = f"{p.structures}/not_folded.tsv"
+    todo_faa = f"{p.structures}/not_folded.faa"
+    with atomic_out(todo_tsv) as tmp:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("protein_id\tlength\tlimit_aa\tlimit_from\n")
+            for q, t in over:
+                fh.write(f"{q}\t{len(t)}\t{cap}\t{cap_why}\n")
+    with atomic_out(todo_faa) as tmp:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            for q, t in over:
+                fh.write(f">{q}\n{t}\n")
     if over:
-        longest = max(l for _, l in over)
-        log(f"esmfold: {len(over)} sequence(s) are longer than {cap} aa "
-            f"(up to {longest}) and will NOT be folded; the limit came from "
-            f"{cap_why}. They are reported as never attempted, not as "
-            "failures - fold them on a card with more memory, in the cloud, "
-            "or on CPU, and drop the models into "
-            f"{p.structures} before rerunning foldseek", "WARN")
+        longest = max(len(t) for _, t in over)
+        why = ""
+        if cap_why != "max_len_structure":
+            # The inverse of the estimate the cap came from. A count of
+            # skipped proteins is a complaint; the free VRAM that would have
+            # taken the longest of them is something an operator can act on,
+            # and it sits one log line under how much was actually free.
+            per_pair = float(cfg.get("esmfold_bytes_per_residue_pair", 21000))
+            reserve = float(cfg.get("esmfold_vram_reserve_gb", 0.5)) * 1024 ** 3
+            need = (longest ** 2 * per_pair + reserve) / 1024 ** 3
+            why = (f" Folding the longest would need about {need:.1f} GB free "
+                   "with the weights resident; compare that with the free "
+                   "VRAM on the line above, and note that it is free VRAM "
+                   "and not the coefficient that decides this cap.")
+        log(f"esmfold: {len(over)} of {len(over) + len(raw)} sequence(s) are "
+            f"longer than {cap} aa (up to {longest}) and will NOT be folded; "
+            f"the limit came from {cap_why}.{why} They are reported as never "
+            "attempted, not as failures - they are listed with their lengths "
+            f"in {todo_tsv} and as sequences ready to fold in {todo_faa}, so "
+            "fold them on a card with more memory, in the cloud or on CPU "
+            f"and drop the models into {p.structures} before rerunning "
+            "foldseek", "WARN")
     log(f"esmfold: folding {len(seqs)} sequences, shortest first, at "
         f"chunk_size={base_chunk}")
     t_fold = time.time()
@@ -7990,15 +8028,19 @@ def stage_esmfold(cfg, p):
     log(f"esmfold: {done} new, {skipped} already present, "
         f"{done + skipped} structures in {p.structures}")
 
+    # Name the casualties in a file rather than only in the log, so the
+    # shortfall survives into the results directory and can be read back by
+    # whoever asks why a protein has no structure evidence. Written on every
+    # run of this stage, header-only when nothing failed: an absent file used
+    # to mean either "nothing failed" or "this results directory predates the
+    # failure record", and missing_structures_note() had to hedge across both.
+    # It no longer does - see the have_tbl branch there.
+    miss = f"{p.structures}/esmfold_failed.tsv"
+    with open(miss, "w", encoding="utf-8") as fh:
+        fh.write("protein_id\tlength\terror\n")
+        for pid, ln, why in failed:
+            fh.write(f"{pid}\t{ln}\t{why}\n")
     if failed:
-        # Name the casualties in a file rather than only in the log, so the
-        # shortfall survives into the results directory and can be read back
-        # by whoever asks why a protein has no structure evidence.
-        miss = f"{p.structures}/esmfold_failed.tsv"
-        with open(miss, "w", encoding="utf-8") as fh:
-            fh.write("protein_id\tlength\terror\n")
-            for pid, ln, why in failed:
-                fh.write(f"{pid}\t{ln}\t{why}\n")
         log(f"esmfold: {len(failed)} sequence(s) could not be folded; "
             f"listed in {miss}", "WARN")
 

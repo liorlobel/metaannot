@@ -2813,6 +2813,10 @@ COUNT_PROSE = {
     "4 jobs": ("MEASURED", "the same worked example"),
     "four jobs": ("MEASURED", "the README's peak-memory example"),
     "90 chunks": ("MEASURED", "a resumed run's chunk count"),
+    "538 folds": ("MEASURED", "completed folds on the first full real run, "
+                              "reported with the 14 sole rescues they bought"),
+    "14 proteins": ("MEASURED", "proteins on that run whose SOLE evidence was "
+                                "structural, out of the 538 folds"),
     "33 requests": ("MEASURED", "the console's concurrency reproduction"),
     "30 attempts": ("MEASURED", "the SIGTERM race, 8 of 30"),
     "30 tries": ("MEASURED", "the same race, the other sentence about it"),
