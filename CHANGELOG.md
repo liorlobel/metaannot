@@ -4,6 +4,43 @@
 
 ### Added
 
+**The two KEGG-invisibility rates are subtracted instead of left on two
+pages.** This pipeline has computed both for as long as it has had bins — the
+database rate in the finalise stage's log, the quantified rate in the join
+stage's and again in the report — and has never once said that they differ. On
+the first full real run it was 43.6% of what was quantified against 29.4% of
+the database it was searched against, and nothing in 8,990 lines of log or in
+the report put the two numbers within sight of each other. That gap is not a
+detail: it says the KO-less fraction is **over-represented among the proteins
+that were actually expressed and measured**, which is the claim the bins exist
+to support. It was sitting between two numbers nothing subtracted.
+
+The join stage now logs the pair and the ratio in one line, and the report
+prints the database rate on the line under the quantified one. A NOTE — not a
+GATE, because nothing is wrong with a document that says this — carries the
+caveat the ratio needs: the two populations are selected very differently, so
+it is an observation about that run rather than a general rate.
+
+**Two corrections fell out of putting them side by side.** Both rates are now
+scored off `bin`, because `bin == BIN_ORDER[0]` is what
+`kegg_enrichment_visible` IS: one rule over two populations rather than two
+columns that can drift, and `bin` is read as a string on both sides while a
+bool column carrying a NaN comes back as `object`, on which `.astype(bool)`
+turns `"False"` into `True`. And the quantified rate now counts only groups
+that HAVE an annotation row. The `fillna(False)` it replaces scored a group
+with no annotation row as KEGG-invisible, which conflates "this protein is
+outside KEGG" with "this pipeline has never heard of this protein" — harmless
+while the number stood alone, and not harmless in the one line that now
+compares it with a population where that case cannot arise. Those groups are
+named on the line instead, as the report already named them.
+
+The report's own test recomputes the pair from the two tables on disk rather
+than pinning it, but on that fixture every database protein is also quantified,
+so the ratio is 1.00x and passes whichever way round it is divided. The
+direction is pinned by a join-stage test that quantifies only the KO-less half
+of its fixture, and is mutation-checked against an inverted ratio and against a
+database population accidentally taken from the quantified table.
+
 **`quant_funnel.tsv`: where the 455,571 proteins went.** The first full run on
 real data narrowed by two and a half orders of magnitude, down to 1,282 rows,
 and said why across a dozen lines of an 8,990-line log — in three stages, some

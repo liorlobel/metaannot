@@ -730,6 +730,52 @@ def test_the_report_knits_to_html(knitted, ma):
 
 
 @needs_r(*R_CORE, *R_BIOC)
+def test_the_report_states_the_gap_between_the_two_invisibility_rates(knitted):
+    """Both rates have always been computed. The subtraction never was.
+
+    The quantified rate is printed here and the database rate by the finalise
+    stage, and for as long as there have been bins the difference between them
+    was left for a reader to notice across two pages of a 9,000-line log. On
+    the first full real run it was 43.6% against 29.4%.
+
+    Recomputed from the two tables on disk rather than pinned, so this fails
+    if the document ever states a pair it did not measure.
+
+    What it cannot discriminate, and why the join stage has a test of its own:
+    on this fixture every database protein is also quantified, so the two
+    rates are equal and the ratio is 1.00x -- which passes whichever way round
+    it is divided. The direction is pinned by
+    `test_the_join_states_the_gap_between_the_two_invisibility_rates` in
+    tests/test_quant.py, on a project built so the populations differ.
+    """
+    if not knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    txt = open(knitted.rpath("analysis", "analyse_metaannot.html"),
+               encoding="utf-8").read()
+
+    def binned(df):
+        col = "bin" if "bin" in df.columns else "bin_ann"
+        b = df[col].dropna().astype(str)
+        return b[b.ne("") & b.ne("nan")]
+
+    aq = binned(pd.read_csv(knitted.rpath("quant", "annotated_quant.tsv"),
+                            sep="\t", dtype=str))
+    db = binned(pd.read_csv(knitted.rpath("annotation_final.tsv"),
+                            sep="\t", dtype=str))
+    assert len(aq) and len(db)
+    aq_pct = 100 * (aq != "1_ko_pathway").mean()
+    db_pct = 100 * (db != "1_ko_pathway").mean()
+    assert f"{aq_pct:.1f}% of annotated quantified" in txt
+    assert f"{db_pct:.1f}% of the {len(db):,} protein(s) in the search" in txt, \
+        "the database rate is the half that was never stated here"
+    if db_pct > 0:
+        assert f"{aq_pct / db_pct:.2f}x as likely" in txt, \
+            "both rates without the ratio is the two pages this replaces"
+    assert "not a general rate" in txt, \
+        "a ratio of two differently-selected populations needs its caveat"
+
+
+@needs_r(*R_CORE, *R_BIOC)
 def test_the_report_writes_the_tables_the_object_folds_back_in(knitted):
     if not knitted.rendered:
         pytest.skip("the report was not rendered (pandoc or a package is absent)")

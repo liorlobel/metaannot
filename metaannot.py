@@ -11796,13 +11796,52 @@ def stage_join(cfg, p):
                             "in every plex, so the size factors rest on a "
                             "plex-complete reference")
 
-    vis_col = "kegg_enrichment_visible" if "kegg_enrichment_visible" in out.columns \
-        else ("kegg_enrichment_visible_ann" if "kegg_enrichment_visible_ann"
-              in out.columns else None)
-    if vis_col:
-        vis = out[vis_col].fillna(False).astype(bool)
-        log(f"join: {100*(~vis).mean():.1f}% of quantified protein groups are "
-            "invisible to KEGG pathway enrichment")
+    # BOTH rates, and the DIFFERENCE between them, in one line. This pipeline
+    # has printed the database rate from finalise and the quantified rate from
+    # here for as long as it has had bins, on different pages of a 9,000-line
+    # log, and has never once said that they differ. On the first full real
+    # run it was 43.6% of what was quantified against 29.4% of the database it
+    # was searched against, and that gap is not a detail: it says the KO-less
+    # fraction is over-represented among the proteins that were actually
+    # expressed and measured, which is the claim this tool exists to make. It
+    # was sitting between two numbers nothing subtracted.
+    #
+    # Scored off `bin` on both sides, because `bin == BIN_ORDER[0]` is what
+    # kegg_enrichment_visible IS - one rule over two populations, rather than
+    # two columns that can drift - and because `bin` is read as a string on
+    # both sides while a bool column carrying a NaN comes back as object, on
+    # which .astype(bool) turns "False" into True.
+    #
+    # And over rows that HAVE a bin. A quantified group with no annotation row
+    # is not a KEGG-invisible protein, it is one this pipeline knows nothing
+    # about; the fillna(False) this replaces counted it as invisible, which
+    # would put the two rates of a comparison on different footings. It is
+    # named instead, as the report already names it.
+    bin_col = ("bin" if "bin" in out.columns
+               else ("bin_ann" if "bin_ann" in out.columns else None))
+
+    def _binned(series):
+        b = series.dropna().astype(str)
+        return b[b.ne("") & b.ne("nan") & b.ne("None")]
+
+    if bin_col is not None and "bin" in ann.columns:
+        aq_bin, db_bin = _binned(out[bin_col]), _binned(ann["bin"])
+        n_nobin = len(out) - len(aq_bin)
+        if len(aq_bin) and len(db_bin):
+            ko_path = BIN_ORDER[0]
+            aq_pct = 100 * float((aq_bin != ko_path).mean())
+            db_pct = 100 * float((db_bin != ko_path).mean())
+            msg = (f"join: {aq_pct:.1f}% of the {len(aq_bin):,} quantified "
+                   "protein group(s) with an annotation row are invisible to "
+                   f"KEGG pathway enrichment, against {db_pct:.1f}% of the "
+                   f"{len(db_bin):,} protein(s) in the search database")
+            if db_pct > 0:
+                msg += (f"; a quantified protein is {aq_pct / db_pct:.2f}x as "
+                        "likely to be KEGG-invisible as one drawn from the "
+                        "database at large")
+            log(msg + ("." if not n_nobin else
+                       f". {n_nobin:,} quantified group(s) have no annotation "
+                       "row and are in neither rate."))
     log(f"join: wrote {p.quant_dir}/")
 
 
@@ -16156,8 +16195,36 @@ bin_tab
 # contaminants, entrapment sequences) have no bin. Left in the mean, one NA
 # turned the headline number into "NA%", so they are counted separately.
 n_unbinned <- sum(is.na(aq$bin))
+aq_bin <- aq$bin[!is.na(aq$bin)]
+db_bin <- ann$bin[!is.na(ann$bin)]
+aq_pct <- 100 * mean(aq_bin != "1_ko_pathway")
+db_pct <- 100 * mean(db_bin != "1_ko_pathway")
 cat(sprintf("\n%.1f%% of annotated quantified protein groups are invisible to KEGG pathway enrichment.\n",
-            100 * mean(aq$bin[!is.na(aq$bin)] != "1_ko_pathway")))
+            aq_pct))
+# The SUBTRACTION, which no version of this document has ever done. Both
+# rates have been computed by this pipeline for as long as it has had bins -
+# this one here, the database one in the finalise stage's log - and the gap
+# between them was left for the reader to notice across two pages. On the
+# first full real run it was 43.6% against 29.4%: the KO-less fraction is not
+# merely large, it is over-represented among the proteins that were actually
+# expressed and measured, which is the claim this whole document is for.
+if (length(db_bin) && length(aq_bin)) {
+  cat(sprintf(paste("  Against %.1f%% of the %s protein(s) in the search",
+                    "database%s.\n"),
+              db_pct, format(length(db_bin), big.mark = ","),
+              if (db_pct > 0)
+                sprintf(",\n      so a quantified protein is %.2fx as likely to be KEGG-invisible as one drawn from the database at large",
+                        aq_pct / db_pct) else ""))
+  # A NOTE and not a GATE: nothing is wrong with a document that says this,
+  # and a GATE firing on every real run is the line a reader learns to skip.
+  note(paste("those two populations are selected very differently -- the",
+             "database is every predicted ORF, the quantified set is what",
+             "\n      was identified and survived every filter above -- so the",
+             "ratio is an observation about this run and not a general rate.",
+             "\n      It is also the whole reason for the bins: a KEGG-only",
+             "analysis discards that fraction of what you measured without",
+             "saying so."))
+}
 if (n_unbinned)
   note(paste("%d of %d quantified group(s) have no annotation row and no bin",
              "(host, contaminant or entrapment sequences?);\n      they are",

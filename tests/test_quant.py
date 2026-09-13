@@ -134,6 +134,46 @@ def test_a_fractionated_run_produces_the_same_quant_as_an_unfractionated_one(
     pd.testing.assert_frame_equal(a, b)
 
 
+# --- the two invisibility rates, and the subtraction between them --------
+# symptom: the pipeline has printed the database rate (from finalise) and the
+# quantified rate (from the join) for as long as it has had bins, on separate
+# pages of a 9,000-line log, and never once said that they differ. On the
+# first full real run it was 43.6% against 29.4% -- the KO-less fraction is
+# over-represented among the proteins that were actually expressed, which is
+# the claim this tool exists to make.
+
+
+def test_the_join_states_the_gap_between_the_two_invisibility_rates(tmp_path):
+    """Quantify only the KO-less half, so the ratio cannot be read backwards.
+
+    The knitted report's own version of this assertion runs on a fixture where
+    every database protein is also quantified, so the two rates are equal and
+    the ratio is 1.00x -- which passes whichever way round it is divided. Here
+    the populations are made to differ on purpose.
+    """
+    import fixtures as F
+    proj = build_project(tmp_path / "gap")
+    koless = [x for x in proj.proteins if x.expect_bin != "1_ko_pathway"]
+    assert 0 < len(koless) < len(proj.proteins), "the fixture stopped skewing"
+    F.write_peptide_table(proj.path("input", "combined_peptide.tsv"),
+                          koless, proj.samples)
+    err = proj.run().stderr
+
+    ann = pd.read_csv(proj.rpath("annotation_final.tsv"), sep="\t", dtype=str)
+    db = ann["bin"].dropna().astype(str)
+    db_pct = 100 * (db != "1_ko_pathway").mean()
+    line = [l for l in err.splitlines() if "invisible to KEGG" in l and "join:" in l]
+    assert len(line) == 1, line
+    line = line[0]
+    assert "100.0% of the" in line, \
+        f"every quantified protein here is KO-less: {line}"
+    assert f"against {db_pct:.1f}% of the {len(db):,} protein(s) in the " \
+           f"search database" in line, line
+    assert f"{100.0 / db_pct:.2f}x as likely" in line, \
+        f"the ratio is quantified-over-database, not the other way: {line}"
+    assert db_pct < 100.0, "the two rates must differ or this proves nothing"
+
+
 # --- the funnel: 455,571 -> 1,282, in one file rather than a dozen lines ---
 # symptom: the first full real run narrowed by two and a half orders of
 # magnitude and said why across a dozen lines of an 8,990-line log, in three
