@@ -922,14 +922,31 @@ withheld and why — a suppression nobody accounts for is indistinguishable from
 a check that has stopped firing. Deduplication is of *exact* repeats under a
 key, so two different warnings about one table both still get through.
 
-`peptide_evidence.tsv` has one row per protein and nine columns:
+`peptide_evidence.tsv` has one row per protein and twelve columns:
 `protein_id`, `n_features_used`, `n_unique`, `n_taxon_unique`,
-`n_family_unique`, `n_features_dropped`, `taxon_unique_dominated`,
-`rollup_method` and `peptide_assignment`. The last two record how the numbers
-were made, because a `sum` run and a `median_polish` run are otherwise
-indistinguishable once the log is gone. `taxon_unique_dominated` flags proteins
-resting more on shared-but-taxon-unique features than on their own unique ones
-— the ones whose intensity is most sensitive to the assignment rule you chose.
+`n_family_unique`, `n_shared`, `n_shared_unknown_taxon`, `n_features_dropped`,
+`taxon_unique_dominated`, `shared_dominated`, `rollup_method` and
+`peptide_assignment`. The last two record how the numbers were made, because a
+`sum` run and a `median_polish` run are otherwise indistinguishable once the
+log is gone.
+
+Two flags, because they are two findings and the weaker one used to be
+invisible. `taxon_unique_dominated` flags proteins resting more on
+shared-but-taxon-unique features than on their own unique ones — the intensity
+belongs to the taxon, and which MEMBER owns it is an assumption.
+`shared_dominated` flags proteins resting more on features shared **across**
+taxa than on every feature that places them at all, which is strictly weaker
+evidence: there the taxon is an assumption too. Only `peptide_assignment:
+razor` can produce it — every other mode drops those features, so both counts
+are zero and the flag is False, correctly, since a dropped feature is not
+something an intensity rests on.
+
+That is also why the dominance rate under `razor` is a **floor** and says so
+on the log. Nothing is dropped in that mode, so a protein carried entirely by
+cross-taxon features is quantified, sits in the denominator, and can never
+reach the numerator of a predicate about same-taxon sharing. Without the
+clause that line reads exactly like the `taxon_unique` one while meaning
+something weaker.
 
 The file has a row for every razor protein the rule considered, **including
 those whose features were all dropped**. Those rows read `n_features_used = 0`,

@@ -1,5 +1,75 @@
 # Changelog
 
+## Unreleased
+
+### Fixed four entries, in three groups. Each heading carries its own count and
+a test pairs the two, so neither can drift from the other.
+
+#### One gap in the state file's read side
+
+**A state file that is valid JSON but not an object took the run out with a
+`TypeError` (#42).** `[1, 2, 3]` in `.metaannot_state.json` died in
+`_State(json.load(fh))` with `cannot convert dictionary update sequence element
+#0 to a sequence`, BEFORE the run's first log line — no path, no cause, no
+stage. It fell through the enumeration v0.6.0 made explicit: valid JSON, so not
+unparseable; the file exists and reads, so neither missing nor unreadable.
+`_read_state_for_merge()` had already answered this shape on the WRITE side
+("holds `list`, not an object"), so the two halves of one judgement disagreed
+and the read side handed the run a document the write side calls damage. It is
+answered now the way every other kind of damage here is: say what was wrong
+with WHICH file, adopt nothing, recompute. The path is named on every arm,
+where it was named on none — the plausible way to get a list into that file is
+a truncated restore or a `jq` that dropped a level, so it is always someone's
+second disaster.
+
+#### Two checks that had quietly stopped checking
+
+**The dispatch-ordering replay was bounded to the section in flight, so
+shipping it turned it off.** Every hour in that entry's table is replayed
+through the scheduler's own model rather than typed in, which is the whole
+reason the figures are trustworthy — but the scan read `_newest_section()`, so
+the moment v0.7.1's `## Unreleased` opened above it the regex matched nothing
+and the test passed having asserted nothing at all. It reads the whole
+document now. The bound exists to stop a shipped section being EDITED to match
+a later codebase; reading one in order to hold it to its own published numbers
+is the opposite of that. Same shape as the `_newest_section_start()` defect
+v0.7.0 fixed, one layer up.
+
+**Two `COUNT_PROSE` entries shared the phrase `six groups`, and the later one
+silently shadowed the earlier.** A dict literal keeps the last key, so the
+TUTORIAL's sentence about a real run's design — `36 samples in six groups` —
+was being validated against the CHANGELOG's Fixed-group count. It passed only
+because both numbers happened to be six, and it surfaced the instant the group
+count moved. The in-flight counts are keyed on phrases that do not collide,
+and a test now refuses a duplicate key outright, reading the literal out of
+the source with `ast` because the dict has already deduplicated by the time
+anything can look at it.
+
+#### One blind spot under `peptide_assignment: razor`
+
+**A protein carried entirely by cross-taxon peptides could not be flagged
+(#44).** `taxon_unique_dominated` is
+`(n_taxon_unique + n_family_unique) > n_unique`. Every mode except `razor`
+DROPS a feature shared across taxa, so such a protein has no assigned feature
+and v0.7.0 rightly excluded it from the rate. Under `razor` nothing is dropped:
+the protein is quantified, sits in the denominator, and is `(0 + 0) > 0` for
+ever. It was in the denominator and could never be in the numerator, so the
+rate was a floor that read like an estimate.
+
+Three decisions, which #44 asked for rather than assumed. It is a SEPARATE
+column, `shared_dominated`, not a widened `taxon_unique_dominated`: that column
+is read by the report and by `require_taxonomy_concordance`, and one whose
+meaning moves under a config flag is worse than one silent about a case. It is
+a DIFFERENT and strictly weaker finding, so the predicate differs too — above,
+which member of a taxon owns the intensity is an assumption; here the taxon is
+one as well, so the test is against every feature that places the protein at
+all rather than against `n_unique` alone. And the existing line now says it is
+a FLOOR under `razor`, because read without that clause it looks exactly like
+the `taxon_unique` one. `peptide_evidence.tsv` gains `n_shared`,
+`n_shared_unknown_taxon` and `shared_dominated`; the two counts existed nowhere
+before, which is why nothing in the table could say what such a protein rested
+on.
+
 ## v0.7.0 — 2026-09-13
 
 Everything here came out of one run — the first full one on real data, 455,571

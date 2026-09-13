@@ -741,6 +741,103 @@ def test_every_row_flagged_taxon_unique_dominated_rests_more_on_shared_features(
     assert len(empty) == 6 and not bool(empty["taxon_unique_dominated"].any())
 
 
+def test_under_razor_a_protein_carried_only_by_cross_taxon_features_is_seen(
+        ma, tmp_path):
+    """The blind spot #44 reported, and the column that answers it.
+
+    Under `taxon_unique` a cross-taxon feature is DROPPED, so a protein
+    carried entirely by them has no assigned feature, is quantified nowhere,
+    and is excluded from the rate for that reason. Under `razor` nothing is
+    dropped: the same protein is quantified, sits in the denominator, and
+    `taxon_unique_dominated` -- (0 + 0) > 0 -- is False for it for ever. It
+    was in the denominator and could never be in the numerator, so the rate
+    was a floor and read like an estimate.
+
+    `shared_dominated` is that question asked separately, because it is a
+    weaker finding and not the same one: above, which member of a taxon owns
+    the intensity is an assumption; here the taxon is one too.
+    """
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+
+    # taxon_unique: the six are dropped and hold no measurement at all
+    _, ev_tu, _ = ma.rollup_features(feats, int_cols, taxon_of,
+                                     "taxon_unique", 1)
+    unquantified = ev_tu[ev_tu["n_features_used"] == 0]
+    assert len(unquantified) == 6
+    assert not bool(unquantified["shared_dominated"].any()), \
+        "a dropped feature is not something an intensity rests on"
+
+    # razor: the same six are quantified, and now visible
+    _, ev_rz, _ = ma.rollup_features(feats, int_cols, taxon_of, "razor", 1)
+    assert not (ev_rz["n_features_used"] == 0).any(), \
+        "razor drops nothing, so every protein carries a measurement"
+    carried = ev_rz[ev_rz["n_shared"] > 0]
+    assert len(carried) == 6, "the six the other mode threw away"
+    assert (carried["n_unique"] == 0).all()
+    # the old flag cannot see them -- that is the gap, pinned
+    assert not bool(carried["taxon_unique_dominated"].any()), \
+        "the predicate is about SAME-taxon sharing; it is right to be False"
+    # the new one does
+    assert bool(carried["shared_dominated"].all()), \
+        "a protein resting only on cross-taxon features is the whole case"
+    # and it does not fire on proteins their own peptides place
+    clean = ev_rz[ev_rz["n_unique"] > 0]
+    assert not bool(clean["shared_dominated"].any())
+
+
+def test_shared_dominated_is_about_resting_more_on_them_not_having_any(
+        ma, tmp_path):
+    """"Dominated" is a comparison, and a tie is False.
+
+    A protein with a couple of cross-taxon features and more of its own is
+    placed by its own peptides; flagging it would make the column mean "has
+    any shared feature", which is a different and far commoner thing. Built
+    with both directions of the same comparison, so a predicate of
+    `n_shared > 0` fails here while passing every other test in this file.
+    """
+    ps, rows, shared, taxon_of = [], [], [], {}
+    i = 0
+    for pid, n_uniq, n_shar in (("MOSTLY_OWN", 3, 1),
+                                ("TIED", 2, 2),
+                                ("MOSTLY_SHARED", 1, 3)):
+        ps.append(F.Protein(pid, "MKV" * 40)); taxon_of[pid] = "800"
+        for u in range(n_uniq):
+            rows.append({"peptide": f"UQ{pid}{u}AAAAK", "razor": pid,
+                         "candidates": [pid]})
+            i += 1
+        for v in range(n_shar):
+            nb = f"OTHER{pid}{v}"
+            ps.append(F.Protein(nb, "MKV" * 40)); taxon_of[nb] = "999"
+            rows.append({"peptide": f"SH{pid}{v}AAAAK", "razor": pid,
+                         "candidates": [pid]})
+            shared.append((i, [nb])); i += 1
+    path = str(tmp_path / "mixed.tsv")
+    F.write_peptide_table(path, ps, ["S1", "S2"], rows=rows, shared=shared)
+    feats, int_cols, _ = ma.read_feature_table(path, "fragpipe_peptide",
+                                               _cfg(ma))
+    _, ev, _ = ma.rollup_features(feats, int_cols, taxon_of, "razor", 1)
+    got = dict(zip(ev["protein_id"], ev["shared_dominated"]))
+    assert got["MOSTLY_OWN"] is False or not got["MOSTLY_OWN"], \
+        "three of its own against one shared is not dominated by the shared"
+    assert not got["TIED"], "a tie is False, because 'rests MORE on' is strict"
+    assert got["MOSTLY_SHARED"], "one of its own against three shared is"
+
+
+def test_the_razor_dominance_line_says_it_is_a_floor(ma, tmp_path, capsys):
+    # Read without this, the razor line looks exactly like the taxon_unique
+    # one while meaning something weaker.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    ma.rollup_features(feats, int_cols, taxon_of, "razor", 1)
+    err = capsys.readouterr().err
+    assert "is a FLOOR rather than an estimate" in err, err
+    assert "shared_dominated" in err
+    capsys.readouterr()
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    quiet = capsys.readouterr().err
+    assert "FLOOR" not in quiet, \
+        "the caveat belongs to the mode that earns it, not to every run"
+
+
 def test_peptide_evidence_survives_a_run_where_nothing_is_assigned(ma,
                                                                    tmp_path):
     # symptom: with every feature shared across taxa — which a
