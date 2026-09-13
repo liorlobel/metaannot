@@ -2713,8 +2713,14 @@ COUNT_PROSE = {
     "four steps": ("PROSE", "'the four steps' - the sequence the #36 test "
                             "drives, written out in order beside it"),
     "four defects": ("PROSE", "a group heading, counted by the group test"),
-    "six entries": ("DERIVED", "the Unreleased/Fixed entries",
-                    lambda ma: sum(n for _h, n in _unreleased_fixed_groups())),
+    "thirteen entries": ("DERIVED", "the Unreleased/Fixed entries",
+                         lambda ma: sum(n for _h, n
+                                        in _unreleased_fixed_groups())),
+    "three groups": ("DERIVED", "the Unreleased/Fixed groups",
+                     lambda ma: len(_unreleased_fixed_groups())),
+    "seven defects": ("PROSE", "a group heading, counted by the group test"),
+    "2 attempts": ("DERIVED", "the opens of the pre-write state read",
+                   lambda ma: ma.STATE_READ_TRIES),
     "three candidates": ("PROSE", "'Three candidates were driven over real "
                                   "directories' - the three are the bullets "
                                   "immediately under the sentence"),

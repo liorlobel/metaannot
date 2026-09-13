@@ -1208,18 +1208,75 @@ def _write_safely(stream, text):
         stream.write(text.encode(enc, "replace").decode(enc, "replace"))
 
 
+# Whether the log FILE has already been reported as no longer accepting
+# lines. A module flag and not _said_once(): that latch lives in
+# _STATE_WATCH, which is reset per run, while this is about a file handle and
+# a filesystem. It also has to be sayable from inside log(), which holds
+# _LOGLOCK - a plain Lock - so the notice cannot go back through log() at all.
+_LOG_FILE_BROKEN = False
+
+
+def _write_logfile(text):
+    """Put text in the log FILE, where a filesystem that will not take it
+    costs the log line and never the run.
+
+    THE PREREQUISITE FOR EVERY OTHER I/O GUARD IN THIS FILE, rather than a
+    nicety beside them. `p.state` and `p.logfile` are both under the results
+    root, so they share a filesystem, and the ENOSPC that stops a stage record
+    being written stops the line explaining it being written too. update_state
+    says what it declined through log(), so without this the OSError leaves
+    log(), leaves update_state(), leaves finish(), and kills the run at hour
+    thirty from inside the handler written to stop exactly that.
+
+    BOTH HALVES, because the write is buffered and the flush is where the
+    error actually arrives. Driven on a real full filesystem - a small HFS
+    image, filled - where `_write_safely` returned normally and `flush()`
+    raised [Errno 28] on the next line. A guard on the write alone, which is
+    the obvious one to write, would have been decoration.
+
+    STDERR IS DELIBERATELY NOT GUARDED WITH IT. A log file that cannot take a
+    line costs a line in a file nobody is watching live; a stderr that cannot
+    take one is a different fact about a different channel - it is what tmux
+    keeps and what rule 6 sends an operator to - and swallowing it would make
+    a run whose entire output goes nowhere look healthy.
+
+    Later lines are still attempted rather than the handle being dropped: the
+    cost is two failing syscalls per line, and the gain is that a log resumes
+    by itself the moment somebody frees space.
+    """
+    global _LOG_FILE_BROKEN
+    try:
+        _write_safely(_LOGFH, text)
+        _LOGFH.flush()
+    except OSError as e:
+        if _LOG_FILE_BROKEN:
+            return
+        _LOG_FILE_BROKEN = True
+        _write_safely(
+            sys.stderr,
+            f"[{time.time()-_START:7.1f}s] WARN  the log file "
+            f"{getattr(_LOGFH, 'name', None) or '?'} is not accepting lines "
+            f"({e}), so the rest of this run's log is on stderr only. The run "
+            "itself is not affected and nothing has been deleted. Lines are "
+            "still attempted, so the log resumes by itself if the filesystem "
+            "does.\n")
+
+
 def log(msg, level="INFO"):
     tag = getattr(_CTX, "stage", "")
     prefix = f"[{time.time()-_START:7.1f}s] {level:5s} " + (f"{tag:>10s} | " if tag else "")
     with _LOGLOCK:
+        lines = []
         for i, part in enumerate(str(msg).split("\n")):
             line = prefix + part if i == 0 else " " * len(prefix) + part
             _write_safely(sys.stderr, line + "\n")
-            if _LOGFH:
-                _write_safely(_LOGFH, line + "\n")
+            lines.append(line + "\n")
         sys.stderr.flush()
         if _LOGFH:
-            _LOGFH.flush()
+            # One write and one flush for the whole message rather than one
+            # per line: the same bytes reach the file, and both calls are
+            # inside the one guard that has to cover them.
+            _write_logfile("".join(lines))
 
 
 class StageError(RuntimeError):
@@ -12017,9 +12074,33 @@ def save_state(path, state):
         tmp = os.path.join(
             d, f".{stem.lstrip('.')}.{os.getpid()}."
                f"{threading.get_ident()}{ATOMIC_SUFFIX}{ext}")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, path)
+        except OSError:
+            # The temp this call minted microseconds ago, and nothing else.
+            # Nothing under a results directory may be deleted (CLAUDE.md
+            # rule 5), and this is inside that rule because the name is one
+            # no other writer can produce - it carries this pid and this
+            # thread - because the lock that serialises writers is already
+            # held here, and because `path` itself is never touched.
+            #
+            # THE REASON IS THE BLOCKS, not the clutter. On a full disk a
+            # half-written temp is holding the space the next attempt needs,
+            # so leaving it makes the next write fail for a reason this one
+            # caused. Driven, and the clutter argument is measurably wrong:
+            # five failed writes from one thread left ONE file, because the
+            # name is per (pid, tid) and is rewritten rather than accumulated.
+            #
+            # The docstring's `find results -name '.*.part.*'` claim stays
+            # true: it is about a writer KILLED mid-update, and no except
+            # clause runs for that.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return payload
 
 
@@ -12044,6 +12125,32 @@ HEARTBEAT_GIVE_UP = 5
 # processes writing in lockstep would keep each other going round for ever.
 # After this many attempts the last write stands and says so in the log.
 STATE_WRITE_TRIES = 3
+
+# How many times _read_state_for_merge() may OPEN the file before it reports
+# that it could not be read. Its own budget rather than a share of
+# STATE_WRITE_TRIES, because that constant is the anti-clobber budget - how
+# many times a write may find the file changed under it and redo its merge -
+# and spending its attempts on I/O retries would leave fewer for the job it
+# was sized for.
+#
+# Not 1: the commonest read failure on the filesystems this runs on is an NFS
+# ESTALE, which is a handle the client must revalidate, and the next open()
+# does exactly that; on Windows it is a sharing violation from an indexer, a
+# backup agent or antivirus holding the file for a few milliseconds, where an
+# immediate retry is the documented remedy. Costing one record for either is
+# the cheapest thing this whole change fixes.
+#
+# NO SLEEP, and that is deliberate rather than an omission. There is nothing
+# to wait for that a second open() does not do, and a sleep here would run
+# inside _STATELOCK - where it would stall every other writer in the process -
+# and on the rename path, which is a probe that must never slow a stage down.
+# An error that genuinely needs TIME is not retried at all: it is declined,
+# ledgered and reported.
+#
+# Not more than 2 either: a second failed open is already evidence about the
+# filesystem rather than about this instant, and the answer to that is to
+# decline and say so, not to ask again.
+STATE_READ_TRIES = 2
 
 # A floor on how often the RENAME path may read the state file to ask whether
 # this run still owns the directory. atomic_out() is called once per declared
@@ -12091,6 +12198,30 @@ _STATE_WATCH = {
     "said": set(),          # what has already been said once
 }
 
+# The keys whose write this run could not MAKE, and the I/O error it could not
+# make it for. A separate dict from _STATE_WATCH on purpose: that one is all
+# one fact - ownership - and this is another, an account of what this run's own
+# filesystem refused. Reset by _watch_state() with the rest, so a test session
+# inherits the isolation the autouse fixture already provides.
+#
+# IT IS A LEDGER AND NEVER A WORK QUEUE, and that distinction is the whole
+# reason this shape was chosen over the pending set that was written and taken
+# out again (issue #37). Nothing reads it to decide what to WRITE. A record
+# carried forward is a claim about work, and its truth decays - it would be
+# written under a later ownership answer than the one it was decided under,
+# which is the shape of the defect the missing/unparseable arm of
+# update_state() sets out at length. A key NAME carried forward is a claim
+# about this run's own I/O, and it stays true for ever. So an entry here buys
+# exactly two things: the heartbeat's give-up counter, and the account this
+# run gives of itself before it exits.
+#
+# An entry is cleared the instant a write of that key lands, which is what
+# makes it a CONSECUTIVE count rather than a total: a stage whose
+# mark_running() was declined and whose `ok` record landed does not appear
+# here at all, and `_run`'s entry is exactly "no `_run` write has landed
+# since".
+_STATE_LOSSES = {}
+
 # The declared outputs of the stages of this run, for the parking rule in
 # atomic_out(). Filled in by cmd_run once Paths exists; empty everywhere else,
 # which means "park nothing, leave the .part", the conservative answer.
@@ -12135,6 +12266,10 @@ def _watch_state(path, record, claim):
                         claim=frozenset(x for x in claim if x),
                         lost=None, seen=time.time(), parsed=False,
                         tried=0.0, said=set())
+    # The I/O account is reset with the ownership watch and by nothing else:
+    # it describes one run's writes, exactly as the `said` set does, and a
+    # test session runs hundreds of runs in one interpreter.
+    _STATE_LOSSES.clear()
 
 
 def _said_once(key, message, level="WARN"):
@@ -12144,6 +12279,149 @@ def _said_once(key, message, level="WARN"):
         return
     _STATE_WATCH["said"].add(key)
     log(message, level)
+
+
+def _state_io_note(key):
+    """The error that stopped this key's last state write, or None once one of
+    its writes has landed.
+
+    The heartbeat's give-up counter reads this, and it is the reason the
+    counter can tell an I/O decline from every other reason a write is
+    declined: RunRecord._save() also returns False on a superseded run, on a
+    lock somebody else holds, on a VACANT lock, and on a tick that cannot get
+    the scheduler's lock inside five seconds. Not one of those is an I/O
+    failure, not one of them puts anything here, and counting any of them
+    would put a warning about this filesystem in front of an operator who
+    caused none.
+    """
+    entry = _STATE_LOSSES.get(key)
+    return entry["error"] if entry else None
+
+
+def _state_write_declined(keys, path, why):
+    """Ledger the keys a write could not be made for, and name each one once.
+
+    Once per KEY rather than once per write, on the mechanism that is already
+    reset per run: a run whose filesystem is refusing writes declines one per
+    stage record and one per heartbeat tick, so a line per write would be a
+    line every thirty seconds for three days. Bounded at one line per stage
+    plus one for `_run`.
+
+    SAID WHEN IT HAPPENS, and not only in the account at the end, because the
+    account is not reachable on every exit. A Ctrl-C IS covered - main()'s
+    KeyboardInterrupt handler calls stamp_run("interrupted"), and the account
+    lives inside stamp_run() - so the exits that get no account are the two
+    that never unwind: a `kill`, which reaches _release_lock_on_signal() and
+    os._exit()s from a handler that may not format a string or take a lock,
+    and a SIGKILL, which runs nothing at all. Those are exactly the two the
+    README and the account itself name. For them these lines are the only
+    record of what was lost, so the identity of each loss has to be out loud
+    at the moment of the loss rather than saved up for a summary that will
+    not run.
+
+    `_run` is deliberately not named here. It is the one key that already has
+    its own two lines - _beat()'s stale-stamp warning and its give-up warning,
+    both of which say `last_seen` is frozen and both of which are now armed by
+    this ledger - and a third sentence at the same instant saying the same
+    thing is noise. It is still ledgered, and the account at the end still
+    names it.
+
+    AND IT DOES NOT SAY THE STAGE SUCCEEDED, which the first draft of this
+    line did. finish() writes a record for a stage that FAILED too, and a
+    declined write of that record would then have printed "the stage itself
+    finished" about a stage whose failure is in the same log. What is true of
+    both is the only thing worth saying: the run is not affected, and nothing
+    was deleted.
+    """
+    for k in keys:
+        # `at` so the account can quote the error of the write that failed
+        # LAST rather than of whichever key happens to be last in insertion
+        # order: re-declining a key already in here does not move it, so the
+        # newest error is often on the oldest name.
+        _STATE_LOSSES[k] = {"error": why, "path": path, "at": time.time()}
+        if k == RUN_KEY:
+            continue
+        _said_once(
+            f"lost:{k}",
+            f"the record for '{k}' did not reach {path} ({why}), so that file "
+            "says nothing about what this run did with that stage. THE RUN "
+            "IS NOT AFFECTED: a stage that finished has its output on disk "
+            "and is missing only the note saying so, and a stage that failed "
+            "was reported by name when it failed. Nothing has been deleted, "
+            "nothing is retried and nothing is held for a later write - this "
+            "run names every record that never got there, and what the next "
+            "run will do with it, before it exits.")
+
+
+def report_state_losses():
+    """Say, once, which of this run's records never reached the state file,
+    and what the next run does about each kind.
+
+    Called from stamp_run(), which is the one funnel every orderly ending
+    already goes through - cmd_run's "ok" and "failed", main()'s "failed" for
+    a die(), main()'s "interrupted" for Ctrl-C or SIGTERM - and called AFTER
+    the final stamp, because that stamp is itself a merged write and is the
+    last write of the run that can fail.
+
+    WHAT THE NEXT RUN DOES is the whole point of the wording, and "a record
+    was lost" is not that sentence. The operator cannot act on a record count;
+    they can act on "the next run will adopt this output as work done
+    somewhere else". Both residues are states that exist today and neither is
+    new:
+
+      the stage's `running` record landed and its `ok` record did not, which
+      is the COMMON ordering because mark_running() writes before the stage
+      starts and finish() writes hours later -> the next run recomputes it.
+      Safe, and for the wrong reason.
+
+      nothing landed at all -> the next run finds an output with no record and
+      ADOPTS it, with the warning that says outright it cannot tell a finished
+      file from an interrupted one.
+
+    It does not read the document to say which of the two each stage is in.
+    The document is the thing this run could not read or write, and a report
+    that needs one more successful read to be printed is the report that is
+    missing on the failure it exists for.
+    """
+    # ONE snapshot, taken with dict() because that is a single operation
+    # rather than a loop this thread can be interrupted in the middle of: a
+    # heartbeat tick already past its wait() can still be inside a declined
+    # write while the final stamp reaches this line, and iterating the live
+    # dict would then raise "changed size during iteration" from the report
+    # that exists to explain a filesystem problem.
+    losses = dict(_STATE_LOSSES)
+    if not losses:
+        return
+    stages = sorted(k for k in losses if k != RUN_KEY)
+    last = max(losses.values(), key=lambda e: e["at"])
+    path = last["path"]
+    why = last["error"]
+    lost_run = RUN_KEY in losses
+    what = ", ".join(stages) if stages else "none"
+    _said_once(
+        "losses",
+        f"{len(losses)} record(s) this run produced never reached "
+        f"{path}. The last state write failed with {why}."
+        + (f"\n    stage records: {what}." if stages else "")
+        + ("\n    `_run`: this run's final status, so that file still says "
+           "`final_status: \"running\"` and a console reads it as a run that "
+           "never ended." if lost_run else "")
+        + ("\nNOT ONE OF THOSE STAGES WAS FAILED BY THIS. A stage that has "
+           "already succeeded is never failed by bookkeeping, and where one "
+           "of them really did fail it was reported by name when it failed "
+           "and is in this run's summary. Nothing has been deleted either: "
+           "every output is where its stage put it, and what is missing is "
+           "the RECORD of what made it. WHAT THE NEXT RUN DOES with a stage "
+           "that finished: where this run had already recorded it `running` "
+           "- which it does before the stage starts - the next run "
+           "RECOMPUTES it and says so; where no record of it reached the file "
+           "at all, the next run ADOPTS the output, warning that it cannot "
+           "tell a finished file from an interrupted one. The second is the "
+           "one to look at, because those outputs were produced while this "
+           "filesystem was refusing writes. `--force --only <stage>` redoes "
+           "one deliberately and `--no-adopt` refuses the adoptions "
+           "wholesale; there is no supported way to write a record by hand."
+           if stages else ""))
 
 
 def _own_run_id():
@@ -12181,31 +12459,64 @@ def _read_state_for_merge(path):
     between a document that DEMONSTRABLY holds nothing we can use and a
     document we simply failed to look at. Neither of the middle two licenses
     writing anything a caller did not name: see update_state().
+
+    Returns (document, how, why), where `why` is the text of the error on the
+    `unreadable` arm and "" everywhere else. It is returned rather than left
+    in a module global because update_state() has to name that error in the
+    line it says and in the account at the end, and a second place for it to
+    be is a second place for it to be stale.
+
+    THE OPEN IS RETRIED, STATE_READ_TRIES times, with no sleep - see the
+    constant for why an immediate second open is the whole of the remedy for
+    the two failures that dominate here, and why an error that needs TIME is
+    declined instead of waited on. The retry is here rather than in
+    update_state()'s loop for two reasons: that loop's budget is sized for a
+    different job, and the rename path's probe in _directory_still_ours()
+    reads through this function too and gets the same second open for free.
+
+    AND THE MESSAGE IS SAID AFTER THE BUDGET IS OUT, not on the first failed
+    open. _said_once() consumes its key for the life of the run, so saying it
+    on the first failure would spend the one line this run gets on a blip the
+    second open cleared - and would then have nothing left to say when the
+    filesystem went permanently bad an hour later. Its wording is about what
+    happened to THIS write for the same reason: the sentence it replaced
+    ("nothing is written to it until a read succeeds") was a standing policy
+    that the next successful write made false.
     """
-    try:
-        with open(path, encoding="utf-8") as fh:
-            raw = fh.read()
-    except FileNotFoundError:
-        return {}, "missing"
-    except UnicodeDecodeError as e:
-        # A ValueError, not an OSError, so it needs its own arm exactly as it
-        # does in is_still_ours(): a torn write cutting a multi-byte
-        # character, or a page of nulls where a payload should be.
-        _said_once("decode", f"the state file {path} holds bytes that are not "
-                             f"text ({e}); the next write replaces it with a "
-                             "document holding only the keys that write "
-                             "names, and any record another run put there is "
-                             "not in it")
-        return {}, "unparseable"
-    except OSError as e:
-        _said_once("read", f"the state file {path} could not be read ({e}), "
-                           "so nothing is written to it until a read "
-                           "succeeds: writing without knowing what is already "
-                           "in it would delete every record this run has no "
-                           "view of. The run itself is not affected; the "
-                           "worst this costs is a finished stage recomputed "
-                           "by the next run.")
-        return {}, "unreadable"
+    for attempt in range(STATE_READ_TRIES):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read()
+            break
+        except FileNotFoundError:
+            return {}, "missing", ""
+        except UnicodeDecodeError as e:
+            # A ValueError, not an OSError, so it needs its own arm exactly as
+            # it does in is_still_ours(): a torn write cutting a multi-byte
+            # character, or a page of nulls where a payload should be. Not
+            # retried, and not ledgered as an I/O failure either: undecodable
+            # content is damage, which is a different answer - replace it,
+            # keeping only the keys the write names.
+            _said_once("decode", f"the state file {path} holds bytes that are "
+                                 f"not text ({e}); the next write replaces it "
+                                 "with a document holding only the keys that "
+                                 "write names, and any record another run put "
+                                 "there is not in it")
+            return {}, "unparseable", ""
+        except OSError as e:
+            if attempt + 1 < STATE_READ_TRIES:
+                continue
+            _said_once("read",
+                       f"the state file {path} could not be read ({e}) on "
+                       f"any of {STATE_READ_TRIES} attempts, so this write "
+                       "was not made: writing without knowing what is already "
+                       "in it would delete every record this run has no view "
+                       "of. Nothing is held for a later write; this run names "
+                       "the records that never reached the file before it "
+                       "exits. The run itself is not affected, and the worst "
+                       "this costs is a finished stage recomputed by the next "
+                       "run.")
+            return {}, "unreadable", f"{e}"
     try:
         doc = json.loads(raw)
     except ValueError as e:
@@ -12213,16 +12524,16 @@ def _read_state_for_merge(path):
                             "next write replaces it with a document holding "
                             "only the keys that write names, and any record "
                             "another run put there is not in it")
-        return {}, "unparseable"
+        return {}, "unparseable", ""
     if not isinstance(doc, dict):
         _said_once("shape", f"the state file {path} holds "
                             f"{type(doc).__name__}, not an object; the next "
                             "write replaces it with a document holding only "
                             "the keys that write names, and any record "
                             "another run put there is not in it")
-        return {}, "unparseable"
+        return {}, "unparseable", ""
     _STATE_WATCH["parsed"] = True
-    return doc, "parsed"
+    return doc, "parsed", ""
 
 
 def _judge_ownership(doc, path):
@@ -12379,6 +12690,18 @@ def update_state(path, state, keys, claim=None, drop=()):
     empty one is describe(), or a test writing a document nobody has claimed,
     where there is no run to supersede and nothing to refuse.
 
+    NEITHER HALF OF THE I/O RAISES OUT OF HERE, and that is new. A read that
+    fails is declined on the `unreadable` arm; a write that fails is retried
+    through the loop and then declined too. So a caller's bookkeeping can
+    never be what kills a run, and - in the drain loop, where finish() sits
+    inside an `except BaseException` - can never be what reports a stage that
+    SUCCEEDED as the stage that failed. What it costs is that a declined write
+    is silent to the caller except through the return value, which is why each
+    one is ledgered in _STATE_LOSSES and named twice: once at the moment of
+    the loss, and once in the account report_state_losses() gives before the
+    run exits. NOTHING IS HELD FOR A LATER WRITE - a name may be carried and a
+    record may not, and the ledger's own comment says why.
+
     Nothing here gates `_run`. A gate that declined only the write which
     would CREATE the document stood in this function and was deleted: a run's
     own stage record creates the document one call earlier, so for every run
@@ -12417,7 +12740,7 @@ def update_state(path, state, keys, claim=None, drop=()):
         return False
     with _STATELOCK:
         for _attempt in range(STATE_WRITE_TRIES):
-            base, how = _read_state_for_merge(path)
+            base, how, why = _read_state_for_merge(path)
             if how == "unreadable":
                 # Not written BLIND, which is the only thing this branch is
                 # for. We know nothing about what the document holds, so
@@ -12428,7 +12751,11 @@ def update_state(path, state, keys, claim=None, drop=()):
                 # costs at most one record that never reaches the file, which
                 # decide() then reads as an output with no record: adopt or
                 # recompute, never corruption. _read_state_for_merge has
-                # already said so once in the log.
+                # already opened the file twice and already said so once in
+                # the log; what is added here is the account, so that the run
+                # can name this record at the end instead of leaving the
+                # operator to discover it at the start of the next one.
+                _state_write_declined(keys, path, why)
                 return False
             if how == "parsed":
                 if not _judge_ownership(base, path):
@@ -12530,7 +12857,61 @@ def update_state(path, state, keys, claim=None, drop=()):
             # Resolved through the module global on purpose, so that a test
             # which replaces save_state to inject ENOSPC or EIO still injects
             # into the write this function makes.
-            payload = save_state(path, merged)
+            try:
+                payload = save_state(path, merged)
+            except OSError as e:
+                # THE WRITE HALF, which had no guard at all and is where the
+                # errno this whole change is about actually lands. A read needs
+                # no blocks, so a full disk never reaches the `unreadable` arm
+                # above: it reaches open(tmp,"w"), fh.write, the implicit
+                # close, or os.replace. Driven, on a real full filesystem
+                # filled to zero free blocks and on a real read-only
+                # directory: the OSError left update_state(), left finish(),
+                # and from the dispatch loop took the run - at hour thirty,
+                # with the stage's output already complete on disk. From the
+                # DRAIN loop it was worse than a traceback, because finish()
+                # sits inside an `except BaseException` there: the stage that
+                # had SUCCEEDED was reported as the stage that failed and the
+                # run exited 1. That is standing rule 1 inverted, so this arm
+                # is the fix and the rest of this change is what makes it
+                # honest.
+                #
+                # Retried through the loop that is already here, which is the
+                # cheapest correct thing: each attempt goes back through
+                # _read_state_for_merge() and, on a parse, _judge_ownership()
+                # on the bytes it has just read, so a write that lands on the
+                # last attempt lands under the ownership answer derived from
+                # the read that preceded it - never under the first one's.
+                # That is why no key ever outlives this call, and it is the
+                # whole of this change's answer to #23: there is no deferred
+                # write whose ownership has to be judged later.
+                #
+                # WHAT THE RETRY COSTS, since the docstring above is careful
+                # about this: each attempt is another read-modify-rename, so a
+                # write that hits a transient opens up to STATE_WRITE_TRIES of
+                # the lost-update windows described above instead of one. That
+                # window's width is UNMEASURED rather than small, so this is
+                # an unmeasured increase in an unmeasured risk - taken because
+                # the alternative is losing the record outright, and bounded
+                # by the same constant that already bounds the same loop for
+                # the same reason.
+                #
+                # `except OSError`, never `except Exception`: a TypeError or
+                # ValueError out of json.dumps is a record this program should
+                # not have built, and filing that as "a record was lost to
+                # I/O" would hide a bug behind a disk warning. It is the same
+                # reasoning as the TypeError raised above for a `drop` passed
+                # as a collection of names.
+                if _attempt + 1 < STATE_WRITE_TRIES:
+                    continue
+                _state_write_declined(keys, path, f"{e}")
+                return False
+            # The write landed, so whatever these keys were owed is paid and
+            # the account of them is closed. Cleared here rather than after
+            # the read-back, because the read-back is about a RACE and not
+            # about whether our own bytes reached the file.
+            for k in keys:
+                _STATE_LOSSES.pop(k, None)
             if payload is None:
                 # A patched save_state with nothing to compare against.
                 return True
@@ -12637,7 +13018,7 @@ def _directory_still_ours():
     if now - _STATE_WATCH["tried"] < STATE_PROBE_S:
         return True
     _STATE_WATCH["tried"] = now
-    doc, how = _read_state_for_merge(path)
+    doc, how, _why = _read_state_for_merge(path)
     if how == "parsed":
         _judge_ownership(doc, path)
     return not _superseded()
@@ -13062,10 +13443,13 @@ class RunRecord:
         # up to a whole interval for this thread to notice it should stop.
         misses = 0
         while not self._stop.wait(self.interval):
+            # Why this tick's stamp did not reach the file, or None if it did.
+            # ONE variable for two kinds of failure, because they have one
+            # consequence and the operator reads one sentence about it.
+            why = None
             try:
                 if not self._tick():
                     return
-                misses = 0
             except Exception as e:                        # noqa: BLE001
                 # One bad write must not end the signal. Before this guard a
                 # single transient OSError killed the thread, and last_seen
@@ -13076,30 +13460,67 @@ class RunRecord:
                 # load-bearing: the worst a skipped tick costs is one stale
                 # line on a display. run_cmd's pump thread swallows its own
                 # errors for the same reason.
-                misses += 1
-                if misses == 1:
-                    log(f"could not stamp the run heartbeat ({e}); "
-                        "`_run.last_seen` will be stale until a write "
-                        "succeeds. The run itself is not affected.", "WARN")
-                if misses >= HEARTBEAT_GIVE_UP:
-                    # Said out loud, once, rather than going quiet: a display
-                    # that simply stops updating reads as a dead run, which is
-                    # the one conclusion this must not invite.
-                    # `_written`, not rec["last_seen"]: _tick advances the
-                    # record in memory and only then attempts the write that
-                    # would carry it, so after HEARTBEAT_GIVE_UP failures the
-                    # in-memory value is up to HEARTBEAT_GIVE_UP x heartbeat_s
-                    # AHEAD of anything in the file. Quoting it told an
-                    # operator the run had last been seen at a timestamp that
-                    # appears nowhere in the state file they were about to
-                    # open - and the whole point of this line is to send them
-                    # to that file.
-                    log(f"the run heartbeat failed {misses} times running and "
-                        f"is giving up; `_run.last_seen` is frozen in the "
-                        f"state file at {self._written} and from here on says "
-                        "NOTHING about whether this run is alive. The run "
-                        "itself continues.", "WARN")
-                    return
+                why = f"{e}"
+            else:
+                # AND THE DECLINES, WHICH COUNTING EXCEPTIONS ALONE MISSED.
+                # update_state() no longer raises an OSError from either half
+                # of its I/O, so the write error that used to arrive here as
+                # an exception now arrives as False - and _tick() returns
+                # `not self.superseded`, which made a declined write
+                # indistinguishable from one that wrote perfectly well. Left
+                # that way, this warning would have gone silent on the exact
+                # failure its own constant names ("a single ENOSPC, an NFS
+                # blip or an ESTALE"): `last_seen` would freeze for the rest
+                # of a three-day run and the one line that tells an operator
+                # so would never fire. That was already true of a READ-side
+                # decline before this change; the write-side guard would have
+                # made it true of every I/O failure there is.
+                #
+                # ONLY AN I/O DECLINE ARMS IT. _save() also returns False for
+                # a superseded run, for a lock somebody else now holds, for a
+                # VACANT lock, and for a tick that cannot get the scheduler's
+                # lock inside five seconds - every one of them legitimate and
+                # not one of them about this filesystem, and counting them
+                # would put an I/O warning in front of an operator whose
+                # tmp-reaper removed a lock. That is the same mistake _save() documents
+                # at length for collapsing `False` and `None`, and the ledger
+                # is what keeps the two apart here: the REASON lives there,
+                # not in a return value.
+                #
+                # The question it really asks is "has a `_run` write LANDED
+                # since", because an entry is cleared by a write that lands.
+                # That is exactly what the give-up line below is about - a
+                # `last_seen` frozen in the FILE - so a tick that wrote
+                # nothing because the scheduler's lock never came counts too,
+                # and says the same true thing.
+                why = _state_io_note(RUN_KEY)
+            if why is None:
+                misses = 0
+                continue
+            misses += 1
+            if misses == 1:
+                log(f"could not stamp the run heartbeat ({why}); "
+                    "`_run.last_seen` will be stale until a write "
+                    "succeeds. The run itself is not affected.", "WARN")
+            if misses >= HEARTBEAT_GIVE_UP:
+                # Said out loud, once, rather than going quiet: a display
+                # that simply stops updating reads as a dead run, which is
+                # the one conclusion this must not invite.
+                # `_written`, not rec["last_seen"]: _tick advances the
+                # record in memory and only then attempts the write that
+                # would carry it, so after HEARTBEAT_GIVE_UP failures the
+                # in-memory value is up to HEARTBEAT_GIVE_UP x heartbeat_s
+                # AHEAD of anything in the file. Quoting it told an
+                # operator the run had last been seen at a timestamp that
+                # appears nowhere in the state file they were about to
+                # open - and the whole point of this line is to send them
+                # to that file.
+                log(f"the run heartbeat failed {misses} times running and "
+                    f"is giving up; `_run.last_seen` is frozen in the "
+                    f"state file at {self._written} and from here on says "
+                    "NOTHING about whether this run is alive. The run "
+                    "itself continues.", "WARN")
+                return
 
     def stamp(self, status):
         """Record how the run ended, and stop the heartbeat.
@@ -13134,6 +13555,26 @@ _RUN = None
 def stamp_run(status):
     if _RUN is not None:
         _RUN.stamp(status)
+    # AFTER the stamp, and here rather than beside cmd_run's other end-of-run
+    # report, for two reasons. The final stamp is itself a merged write, so it
+    # is the last write of the run that can be declined and it has to be able
+    # to appear in the account. And this function is the one funnel every
+    # orderly ending already goes through - cmd_run's "ok"/"failed", main()'s
+    # "failed" for a die(), main()'s "interrupted" for Ctrl-C or SIGTERM -
+    # while cmd_run's return path is reachable by only two of them: main()'s
+    # KeyboardInterrupt handler stamps and exits without ever returning into
+    # cmd_run. Latched, so the second call on an `all` run - the pipeline says
+    # "ok" and a failing report then says "failed" - is silent.
+    #
+    # WHAT IS STILL NOT COVERED, stated beside the promise rather than inside
+    # it: a `kill` on a run reaches _release_lock_on_signal(), which may not
+    # format a string, take a lock or touch buffered I/O, so neither the stamp
+    # nor this account happens there, and on Windows TerminateProcess runs
+    # nothing at all. That is why each loss is ALSO said at the moment it
+    # happens - see _state_write_declined() - and why the README says so
+    # beside the sentence about a killed run going on record as
+    # `final_status: "running"`.
+    report_state_losses()
 
 
 def write_effective_config(path, cfg):
@@ -20868,12 +21309,26 @@ def cmd_run(args):
         outs = st["out"](p)
         prev = state.get(name)
         if prev and prev.get("status") == "running":
-            # finish() never ran, so the writer was killed (OOM, Ctrl-C, a
-            # dropped ssh). What is on disk is as likely to be half a file as
-            # a whole one, and nothing here can tell the difference.
+            # finish() never ran - so EITHER the writer was killed (OOM,
+            # Ctrl-C, a dropped ssh) OR finish() ran and its write was
+            # declined, which is what a full disk or an unreadable state file
+            # does to a stage that finished perfectly well. From here those
+            # are the same bytes, and the message used to assert the first of
+            # them. It is the commoner ordering than it looks:
+            # mark_running() writes `running` before the stage starts and
+            # finish() writes hours later, so a state file that goes bad in
+            # between leaves exactly this record - and the run that left it
+            # said so by name in its own log before it exited.
+            #
+            # THE VERDICT DOES NOT MOVE. What is on disk is as likely to be
+            # half a file as a whole one, nothing here can tell the
+            # difference, and weakening this record is the obvious next idea
+            # and the wrong one: it is what protects against a genuinely
+            # interrupted writer, and under-invalidating is the direction this
+            # file never trades in.
             log(f"{name}: the previous run was interrupted while this stage "
-                "was writing, so its output may be truncated; recomputing",
-                "WARN")
+                "was writing, or could not write the stage's record, so its "
+                "output may be truncated; recomputing", "WARN")
             return "RUN"
         if prev and prev.get("signature") == signature(st, cfg, p) \
                 and exists_all(outs):

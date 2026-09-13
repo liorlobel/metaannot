@@ -93,10 +93,38 @@ further. A `--dry-run` writes nothing, so it cannot take that measurement, and
 it says the question went unasked rather than leaving a reader to infer it was
 asked and answered no.
 
+**A run now names every record that never reached the state file, and says
+what the next run will do with it.** A declined state write used to be silent
+to everything but the return value nobody reads: the record was gone, the
+outputs were on disk, and the operator found out at the start of the next run.
+Each declined write is now ledgered by key and named twice — once at the moment
+of the loss, and once in an account `stamp_run()` gives before the run exits,
+which names the stage records that never landed, quotes the error verbatim, and
+says which of the two residues the next run will act on: a stage this run had
+already recorded `running` is RECOMPUTED, a stage with no record at all is
+ADOPTED with the warning that says outright it cannot tell a finished file from
+an interrupted one. The ledger is a ledger and never a work queue — nothing
+reads it to decide what to write, which is the whole difference between it and
+the deferral this replaced. A key name carried forward is a claim about this
+run's own I/O and stays true; a RECORD carried forward would be written under a
+later answer about who owns the directory than the one it was decided under,
+which is the shape of the defect the missing/unparseable arm of
+`update_state()` was written against.
+
+**The account is said twice because one of the two exits cannot be covered.**
+`stamp_run()` is the funnel every orderly ending goes through — `cmd_run`'s
+"ok" and "failed", `main()`'s "failed" for a `die()`, `main()`'s "interrupted"
+for Ctrl-C or SIGTERM — and the final stamp is itself a merged write, so it can
+be the last thing to fail and has to be able to appear in its own account. A
+`kill` reaches `_release_lock_on_signal()`, which may not format a string, take
+a lock or touch buffered I/O, and `TerminateProcess` on Windows runs nothing at
+all: there is no stamp and no account on those paths, which is why the identity
+of each loss is also said when it happens rather than only at the end.
+
 ### Fixed
 
-six entries, in two groups. Each heading carries its own count and a test
-counts the entries under it.
+thirteen entries, in three groups. Each heading carries its own count and a
+test counts the entries under it.
 
 #### Four defects in the check this change set added
 
@@ -152,6 +180,93 @@ exactly the case that needs catching. The record is named rather than passed
 over in silence, because a stage that went unjudged must not look like one that
 dated cleanly. `_stamp_epoch()` is left as it was, since it is what the adoption
 paths have always read.
+
+#### Seven defects in the state file's I/O error handling
+
+**A state write that cannot be made no longer kills the run, and no longer
+reports the stage that SUCCEEDED as the one that failed.** `update_state()` had
+exactly one `try` in it and it was around the read-back; `payload =
+save_state(path, merged)` was bare. A read needs no blocks, so ENOSPC — the
+errno this is about — could never reach the `unreadable` arm that declines
+politely: it arrives at `open(tmp,"w")`, at `fh.write`, at the implicit
+`close`, or at `os.replace`. Driven without mocks, twice: a real ram-disk
+filesystem with no free blocks, and a real read-only results directory. The
+OSError left `update_state`, left `finish()`, and from the dispatch loop took
+the run — at hour thirty, for an InterProScan whose output was already complete
+on disk. From the DRAIN loop it was worse than a traceback: `finish()` sits
+inside an `except BaseException` there, so the bookkeeping error of a stage
+that had succeeded was logged as `stage 'X' failed` and the run exited 1 — the
+standing rule that a succeeded stage is never failed by bookkeeping, inverted
+in shipped code. Both halves of the I/O decline now, and the guard is
+`except OSError` and never `except Exception`: a `TypeError` out of
+`json.dumps` is a record this program should not have built and still comes out
+loud at the call site.
+
+**A log file that cannot take a line costs the line and not the run.**
+`_write_safely()` caught only `UnicodeEncodeError` and the `_LOGFH.flush()`
+beside it was bare, while `p.state` and `p.logfile` are both under the results
+root and share a filesystem. So the ENOSPC that stopped a record being written
+also stopped the line explaining it — and since `update_state()` says what it
+declined through `log()`, the state guard above would have been decoration
+without this one. Driven on the same full filesystem, and the measurement
+decided the shape: the buffered `write()` returned normally and the `flush()`
+that followed it raised, so a guard on the write alone — the obvious one to
+write — would have caught nothing. Lines are still attempted afterwards rather
+than the handle being dropped, so a log resumes by itself once space is freed,
+and the notice is said once. stderr is deliberately left raising: a log file
+nobody is watching live and the channel `tmux` keeps are different facts.
+
+**The pre-write read is opened twice before it is called unreadable.** One
+`STATE_READ_TRIES`-bounded retry, with no sleep, inside
+`_read_state_for_merge()`. An NFS `ESTALE` is a handle the client revalidates
+on the next `open()`, and a Windows sharing violation is an indexer or a backup
+agent holding the file for a few milliseconds; costing a record for either was
+the cheapest thing here to stop. It has its own budget rather than a share of
+`STATE_WRITE_TRIES`, whose comment defines it as the anti-clobber budget, and
+it sits in the reader so that the rename path's ownership probe gets the second
+open too. No sleep, because there is nothing to wait for that a second
+`open()` does not do and because a sleep there would run inside `_STATELOCK`;
+an error that genuinely needs time is declined, ledgered and reported instead.
+
+**The heartbeat's give-up warning is armed again, and only by I/O.** `_beat()`
+counted exceptions, `_tick()` returned `not self.superseded`, and a `_save()`
+that returned False therefore reset the counter to zero — so on a read-side
+`EACCES` or `EIO` the warning had never been able to fire, and guarding the
+write half would have made that true of every I/O failure there is.
+`_run.last_seen` would then freeze in the file for the rest of a three-day run
+with nothing said, which is the one conclusion a live run must not invite. The
+counter reads the ledger now, so only an I/O decline arms it: a superseded run,
+a lock somebody else holds, a VACANT lock and a tick that cannot get the
+scheduler's lock all still decline without putting a disk warning in front of
+an operator who caused none.
+
+**A state write that fails leaves no temp behind.** `save_state()` unlinks the
+`.part` it minted microseconds earlier, on the failure path, inside the lock it
+already holds, and never touches the state file itself. The reason is the
+BLOCKS and not the clutter: on a full disk a half-written temp holds the space
+the next attempt needs. The clutter reading was measured and is wrong — the
+name carries the pid and the thread, so five failed writes from one thread left
+ONE file — and the docstring's `find results -name '.*.part.*'` sweep still
+says what it always said, because it is about a writer KILLED mid-update and no
+`except` clause runs for that.
+
+**A `running` record is no longer reported as an interrupted writer without
+qualification.** `mark_running()` writes `running` before the stage starts and
+`finish()` writes the real record hours later, so a state file that goes bad in
+between leaves exactly that record for a stage that finished perfectly well —
+and `decide()` said flatly that "the previous run was interrupted while this
+stage was writing". From the next run's position those are the same bytes, and
+the sentence now names both readings. The VERDICT does not move: what is on
+disk is as likely to be half a file as a whole one, and weakening that record
+is the obvious next idea and the wrong one.
+
+**The line about an unreadable state file no longer states a policy that the
+next write falsifies.** It said "nothing is written to it until a read
+succeeds", which stopped being true at the next successful write, and it was
+said on the FIRST failed open — where `_said_once()` consumes its key for the
+life of the run, so a single blip spent the one line a filesystem going
+permanently bad an hour later would need. It is said after the read budget is
+out, and it describes the write it declined.
 
 #### Two places that measured the wrong thing
 
