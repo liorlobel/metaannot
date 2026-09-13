@@ -7816,7 +7816,10 @@ def _write_not_folded(p, cap, why):
     Empty files are written rather than skipped, so that their ABSENCE means
     the stage did not run rather than meaning there was nothing to skip.
     """
-    over = [(q, t) for q, t in read_fasta(p.dark) if len(t) > cap]
+    # nonempty() first: this is called on the path taken when dark.faa is
+    # missing or empty, where read_fasta has nothing to open.
+    over = ([(q, t) for q, t in read_fasta(p.dark) if len(t) > cap]
+            if nonempty(p.dark) else [])
     with atomic_out(f"{p.structures}/not_folded.tsv") as tmp:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("protein_id\tlength\tlimit_aa\tlimit_from\n")
@@ -7833,6 +7836,14 @@ def stage_esmfold(cfg, p):
     os.makedirs(p.structures, exist_ok=True)
     if not nonempty(p.dark):
         log("no unannotated proteins to fold, skipping")
+        # The empty pair, on this path too. v0.7.1 fixed the OTHER early
+        # return -- the one taken when nothing is pending -- and left this
+        # one, so a stage that ran and skipped nothing still wrote no list
+        # and its absence still meant two things. Auditing the README found
+        # it: the sentence promising "every run of the stage" was true of
+        # one of the two ways out.
+        _write_not_folded(p, int(cfg["max_len_structure"]),
+                          "max_len_structure")
         open(p.struct_done, "w", encoding="utf-8").close()
         return
 
@@ -19440,8 +19451,8 @@ DOCTOR_DEPTH_ORDER = ("config", "existence", "kind", "header", "parsed")
 DOCTOR_FOUND_KINDS = ("file", "empty_file", "dir", "empty_dir",
                       "symlink_broken", "absent", "unset", "other",
                       "unreadable")
-# WHAT `other` REALLY IS, because `other` is three things and the document was
-# publishing one of them for all three. `_raises_promptly()` was
+# WHAT `other` REALLY IS, because `other` is four things and the document was
+# publishing one of them for all four. `_raises_promptly()` was
 # `kind != "other"`, so every sentence derived from it - the verb, the "not
 # refused on sight" paragraph, the wait - was written for a FIFO and then
 # printed over a UNIX socket and a device node, where it is false: driven, a

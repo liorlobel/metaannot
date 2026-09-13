@@ -376,6 +376,23 @@ def test_a_work_list_entirely_over_the_cap_still_writes_the_list(
         {"long1": "C" * 900, "long2": "D" * 950}
 
 
+def test_an_empty_dark_set_still_writes_the_pair(folding, ma):
+    """The OTHER early return. v0.7.1 fixed one of the two.
+
+    With nothing unannotated there is nothing to fold and nothing to skip, so
+    both files are empty -- but they have to EXIST, because the rule these
+    files state is that their absence means the stage did not run. A stage
+    that ran and wrote neither made the absence mean two things again, which
+    is the whole defect. Found by auditing the README sentence that promised
+    "every run of the stage", which was true of one way out of two.
+    """
+    _, p, model = folding([])
+    assert not model.attempts
+    assert open(f"{p.structures}/not_folded.tsv", encoding="utf-8").read() \
+        == "protein_id\tlength\tlimit_aa\tlimit_from\n"
+    assert os.path.getsize(f"{p.structures}/not_folded.faa") == 0
+
+
 def test_a_resumed_run_with_nothing_to_do_keeps_the_failures_it_recorded(
         folding):
     """Creating the failure table must not mean truncating it.

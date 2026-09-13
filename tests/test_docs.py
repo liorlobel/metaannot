@@ -2967,19 +2967,17 @@ COUNT_PROSE = {
     # to remove them rather than to widen the scan. A shipped section is a
     # RECORD: it is never edited to match a later codebase, so a rule held
     # over it could only ever demand that it be.
-    "one gap": ("PROSE", "a group heading, counted by the group test"),
-    "seven fixes": ("PROSE", "a group heading, counted by the group test"),
     "three groups": ("DERIVED", "the dispatch-key groups with more than one "
                                 "stage in them",
                      _tied_dispatch_groups),
-    "twelve entries": ("DERIVED", "the Unreleased/Fixed entries",
+    "two entries": ("DERIVED", "the Unreleased/Fixed entries",
                     lambda ma: sum(n for _h, n
                                    in _unreleased_fixed_groups())),
     # NOT "six groups", which is also the TUTORIAL's sentence about a real
     # run's design. Two registry entries under one phrase is a silent
     # shadowing -- the later key wins and the earlier rule is never applied --
     # and it went unnoticed only because both counts happened to be six.
-    "five groups": ("DERIVED", "the Unreleased/Fixed groups",
+    "two groups": ("DERIVED", "the Unreleased/Fixed groups",
                    lambda ma: len(_unreleased_fixed_groups())),
     "2 attempts": ("DERIVED", "the opens of the pre-write state read",
                    lambda ma: ma.STATE_READ_TRIES),

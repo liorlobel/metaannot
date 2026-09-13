@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Fixed two entries, in two groups. Each heading carries its own count and
+a test pairs the two.
+
+#### One defect the README audit found in the code
+
+**`stage_esmfold` had a second early return that wrote no skipped list.**
+v0.7.1 fixed the one taken when nothing is pending and left the one taken when
+`dark.faa` is empty, so a stage that ran and skipped nothing still wrote
+neither `not_folded.tsv` nor `not_folded.faa` — and their absence still meant
+two things, which is the whole defect those files exist to remove. Both paths
+write the empty pair now. Found by auditing the README sentence that promised
+"every run of the stage", which was true of one way out of two.
+
+#### One document audited against the code it describes
+
+**README.md, claim by claim.** Every claim in it checked against the
+code; the corrections that matter to someone running this tool:
+
+- **The lock section described Windows behaviour that was fixed two releases
+  ago.** It said *every* lock on Windows reads as live and that a crashed
+  Windows run needs `--force-unlock` — but liveness there is asked with
+  `OpenProcess`/`GetExitCodeProcess`, not `os.kill`, so a lock naming a dead
+  pid is reclaimed automatically like any other. The README was sending
+  Windows users to a flag CLAUDE.md's standing rule on
+  locks tells them not to reach for.
+- **The scaling guidance under-budgeted a run by about three times.** It gave
+  14–30× for 11.9× the proteins and advised doubling the linear estimate. That
+  band was computed over the stages that had finished when it was written; the
+  ones that finished afterwards were the worst of the set. The measured range
+  is **14–66×**, and tmbed at 65× is 5.5× its linear estimate, not 2×.
+- **Scale said three stages of the 455,571-protein run were unfinished and
+  "deliberately not quoted".** All three finished, the figures are in
+  `MEASURED_455K`, and the README quoted one of them — rounded differently —
+  1,300 lines earlier.
+- **`interpro` was "the longest stage by an order of magnitude".** It is 1.8×
+  the next longest on the 38,204-protein run and 1.02× on the 455,571-protein
+  one. The point that paragraph needs is the tie, not a gap.
+- **Four config keys that change what a run does were never mentioned**:
+  `intensity_columns` and `intensity_regex` (which columns are samples — the
+  run's own WARN tells the operator to set one of them), `max_dark_structures`
+  (the GPU-hours budget on the fold work-list), and `emapper_min_coverage`
+  (a `die()` threshold, carrying CLAUDE.md's warning against raising it).
+- **`other` is four things, not three** — in the README and in two code
+  comments, each of which listed all four in the same sentence.
+
 ## v0.7.1 — 2026-09-13
 
 A patch release, and all of it is things v0.7.0 knew about. Two were filed
