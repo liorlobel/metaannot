@@ -13300,18 +13300,48 @@ class _State(dict):
 
 
 def load_state(path):
+    """The run's ONE start-of-run read of the state file.
+
+    Damage is answered the same way whatever shape it takes: say what was
+    wrong with WHICH file, adopt nothing, and recompute. The three ways this
+    can go wrong are an unreadable file, bytes that are not a document, and a
+    document that is not an object -- and the last one used to escape.
+    `[1, 2, 3]` is valid JSON, so it raised nothing json.load() catches, and
+    `dict()` then died on it with `TypeError: cannot convert dictionary update
+    sequence element #0 to a sequence` BEFORE the first log line of the run:
+    no path, no cause, no stage. The plausible way to get a list in there is a
+    truncated restore, a `jq` that dropped a level, or an editor that saved an
+    array -- so it is always someone's SECOND disaster, and a traceback is the
+    worst thing to hand them.
+
+    `_read_state_for_merge()` already enumerated this case on the write side
+    (see its "holds {type}, not an object" arm); this is the read side of the
+    same judgement, and the two now agree that a document of the wrong shape
+    is damage rather than a rival's payload.
+
+    The path is named on every arm. It was on none of them, which is the other
+    half of what made the original failure unreadable.
+    """
     if not os.path.exists(path):
         return _State()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return _State(json.load(fh))
-    except (OSError, ValueError) as e:
-        log(f"state file unreadable ({e}); every stage will be recomputed, "
-            "and no existing output will be adopted, because there is no "
-            "record of how it was made", "WARN")
+
+    def damaged(why):
+        log(f"{why}; every stage will be recomputed, and no existing output "
+            "will be adopted, because there is no record of how it was made",
+            "WARN")
         st = _State()
         st.unreadable = True
         return st
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as e:
+        return damaged(f"the state file {path} is unreadable ({e})")
+    if not isinstance(doc, dict):
+        return damaged(f"the state file {path} holds "
+                       f"{type(doc).__name__}, not an object")
+    return _State(doc)
 
 
 def _mtime(path):
