@@ -3245,7 +3245,7 @@ def _tool_process(argv, **kw):
             proc.finish_group = None
 
 
-def run_cmd(cmd, cwd=None, env=None):
+def run_cmd(cmd, cwd=None, env=None, progress=None):
     """Run a command, raising with the tail of stderr on failure.
 
     stdout goes to /dev/null: InterProScan and friends emit tens of MB of
@@ -3272,6 +3272,17 @@ def run_cmd(cmd, cwd=None, env=None):
     launched, which is all proc.kill() ever reached. It also means a tool no
     longer sits in the terminal's foreground process group, so the tty's own
     Ctrl-C no longer arrives for free: see the block above _tool_process.
+
+    `progress` is an optional zero-argument callable a stage supplies when
+    it has a way of telling how far its tool has got that the tool's own
+    stderr does not carry. It is asked once per heartbeat tick and whatever
+    it returns is put on that line; returning "" leaves the line exactly as
+    it was. It is called from the waiting thread, between two `proc.wait`
+    timeouts, so it is charged against the heartbeat interval and must be
+    cheap. A probe that RAISES is dropped for the rest of the command and
+    said once: it is reading a directory the tool is concurrently writing,
+    where a file vanishing between the readdir and the stat is ordinary, and
+    an annotation is never worth the stage.
 
     Return value ("") and failure behaviour (RuntimeError quoting the tail)
     are deliberately unchanged: every stage depends on both.
@@ -3338,7 +3349,18 @@ def run_cmd(cmd, cwd=None, env=None):
                     break
                 except subprocess.TimeoutExpired:
                     newest = newest_line()
+                    note = ""
+                    if progress is not None:
+                        try:
+                            note = _progress_line(str(progress() or ""),
+                                                  width=80)
+                        except Exception as exc:
+                            log(f"the progress probe for {name} raised; the "
+                                f"heartbeat carries on without it: "
+                                f"{exc.__class__.__name__}: {exc}", "WARN")
+                            progress = None
                     log(f"{name} running {_elapsed_str(time.time() - started)}"
+                        + (f" | {note}" if note else "")
                         + (f" | {newest}" if newest else
                            " | no output yet on stderr"))
             # HERE, AND NOT IN THE HELPER'S `finally` FIVE SECONDS FROM NOW.
@@ -5512,13 +5534,128 @@ def sanitise_faa(src, dst):
     return n, n_fixed
 
 
+# What InterProScan leaves beside each chunk under its -T directory: a
+# `.fasta` when it splits the chunk out, a `.raw` when that chunk has been
+# analysed. Read off an observed run, not off the source, and treated as an
+# observation everywhere below.
+_IPS_WORK_EXT = ".fasta"
+_IPS_DONE_EXT = ".raw"
+# Consecutive probes the chunk COUNT must hold still before an ETA is
+# offered. Three, so at the default interval the denominator has been
+# unchanged for three minutes of a stage that runs for days.
+_IPS_ETA_STABLE_TICKS = 3
+# Directory entries a single census will walk before it gives up and reports
+# nothing. A truncated count is a wrong count, and this runs every minute for
+# the length of the longest stage in the pipeline.
+_IPS_SCAN_CAP = 200_000
+
+
+class _InterProProgress:
+    """Chunk counts for the stage that otherwise runs blind for days.
+
+    InterProScan's stderr says nothing about how far through it is. On the
+    455,571-protein run it went 57 hours with everything between the command
+    and its exit being JVM chatter, so the only way to get an ETA was to
+    count files under the -T directory by hand. This does that counting on
+    the heartbeat instead. It is the stage the scheduler entry above has
+    nothing left to give: once the dispatch order is right, what remains of
+    a run's wall clock is stage_workers and InterProScan itself, and this at
+    least makes the waiting legible.
+
+    Four things it deliberately does not claim:
+
+    - The unit is CHUNKS. Not sequences, not percent-of-stage. InterProScan
+      chose the slices, they are not equal, and the merge-and-write that
+      follows the last chunk is not counted at all - so the line reads
+      `chunk 312/380` and reaches 380/380 with real work left. Do not
+      relabel it as a percentage and do not compute one from it.
+    - The denominator GROWS while InterProScan is still splitting, so an ETA
+      taken during that phase is measured against a number about to move. No
+      ETA is offered until the created count has held still for
+      _IPS_ETA_STABLE_TICKS consecutive probes, and the rate is anchored at
+      the moment it settled rather than at the start of the stage. The rate
+      is therefore a long-run average and lags a machine that slows down
+      later; on a stage measured in days that is the trade worth taking.
+    - `.raw` beside `.fasta` is the LAYOUT OF ONE OBSERVED RUN. No
+      InterProScan was available to the author to check it against. A build
+      that writes a different tree reports nothing rather than something
+      wrong, and `seen_any` is False at the end of the stage so the run can
+      say the probe never engaged - silence from a mechanism that did not
+      fire must not read as a mechanism that fired and found no progress.
+    - It never blocks and never writes. It is a read of a directory its own
+      run owns, on the heartbeat thread, and run_cmd drops it permanently if
+      it raises.
+    """
+
+    def __init__(self, root, interval_s):
+        self.root = root
+        self.interval_s = max(1.0, float(interval_s or 60))
+        self.created = 0
+        self.stable = 0
+        self.anchor = None          # (t, done) from when the denominator set
+        self.probes = 0
+        self.seen_any = False
+
+    def census(self):
+        """(chunks split out, chunks analysed), or None if it cannot say.
+
+        os.walk rather than a glob of a guessed depth: the job directories
+        are the tool's business and nesting is not something to hard-code
+        when the layout itself is an observation.
+        """
+        created = done = seen = 0
+        for _, _, filenames in os.walk(self.root):
+            for fn in filenames:
+                seen += 1
+                if seen > _IPS_SCAN_CAP:
+                    return None
+                if fn.endswith(_IPS_WORK_EXT):
+                    created += 1
+                elif fn.endswith(_IPS_DONE_EXT):
+                    done += 1
+        return created, done
+
+    def __call__(self):
+        self.probes += 1
+        counted = self.census()
+        if counted is None:
+            return ""
+        created, done = counted
+        if not created and not done:
+            return ""
+        self.seen_any = True
+        if done > created:
+            # The `.raw` outlived its `.fasta`, so the pair this counts in
+            # is not a pair here. Report the half that is still a fact.
+            return f"{done:,} chunk(s) analysed"
+        if created != self.created:
+            self.created, self.stable, self.anchor = created, 0, None
+        else:
+            self.stable += 1
+        return f"chunk {done:,}/{created:,}" + self._eta(done)
+
+    def _eta(self, done):
+        if self.stable < _IPS_ETA_STABLE_TICKS or not 0 < done < self.created:
+            return ""
+        now = time.time()
+        if self.anchor is None:
+            self.anchor = (now, done)
+            return ""
+        t0, d0 = self.anchor
+        if done <= d0 or now <= t0:
+            return ""
+        rate = (done - d0) / (now - t0)
+        return f", ~{_elapsed_str((self.created - done) / rate)} left"
+
+
 def stage_interpro(cfg, p):
     exe = cfg["db"].get("interproscan_sh") or "interproscan.sh"
     if not (os.path.exists(exe) or have(exe)):
         die(f"InterProScan not found at '{exe}'; set db.interproscan_sh or "
             "run.interpro: false")
     apps = cfg.get("interpro_applications", "")
-    os.makedirs(f"{p.R}/interpro/tmp", exist_ok=True)
+    tmp = f"{p.R}/interpro/tmp"
+    os.makedirs(tmp, exist_ok=True)
     query = f"{p.R}/interpro/query.faa"
     n, n_fixed = sanitise_faa(cfg["proteins_faa"], query)
     if n_fixed:
@@ -5529,7 +5666,7 @@ def stage_interpro(cfg, p):
     with atomic_out(p.interpro) as out_tmp:
         cmd = [exe, "-i", query, "-f", "TSV", "-o", out_tmp,
                "-cpu", cfg["threads"], "-iprlookup", "-goterms", "-dp",
-               "-T", f"{p.R}/interpro/tmp"]
+               "-T", tmp]
         if apps:
             cmd += ["-appl", apps]
         ram = cfg.get("ram_gb") or 0
@@ -5542,7 +5679,17 @@ def stage_interpro(cfg, p):
                 env.get("_JAVA_OPTIONS", "") + " " + heap).strip()
             env["JAVA_OPTS"] = (env.get("JAVA_OPTS", "") + " " + heap).strip()
             log(f"JVM heap {heap} from a {ram} GB budget")
-        run_cmd(cmd + tool_args(cfg, "interproscan"), env=env)
+        # The probe reads the -T tree this run just made. It is the only
+        # thing in the pipeline that can say how far the longest stage has
+        # got, because nothing InterProScan puts on stderr can.
+        probe = _InterProProgress(tmp, _PROGRESS_INTERVAL)
+        run_cmd(cmd + tool_args(cfg, "interproscan"), env=env, progress=probe)
+    if probe.probes and not probe.seen_any:
+        log(f"the heartbeat never found a chunk file under {tmp}, so this "
+            f"run reported no InterProScan progress. It counts a "
+            f"'{_IPS_WORK_EXT}' per chunk and a '{_IPS_DONE_EXT}' beside it "
+            f"when that chunk is done, which is the layout of one observed "
+            f"run; this build writes a different one.", "WARN")
 
 
 def _count_fasta(path):

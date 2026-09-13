@@ -787,6 +787,150 @@ def test_the_progress_interval_comes_from_the_config(ma, monkeypatch):
     assert ma._PROGRESS_INTERVAL == 0.0
 
 
+# --- the longest stage in the pipeline, and the only signal it gives ----
+# symptom: InterProScan ran 57 hours on the reference dataset with nothing on
+# stderr that said how far it had got, so an operator wanting an ETA had to
+# write a chunk-counting script against its -T tree by hand. The heartbeat can
+# count the same files.
+
+
+def _ips_tree(ma, root, created, done):
+    """A -T tree shaped like the one the reference run left behind.
+
+    The extensions come from the module rather than from this file: they are
+    the observation the whole mechanism rests on, and a test that spelt them
+    out again would agree with itself after someone corrected them there.
+    """
+    job = os.path.join(root, "acme01_20260101_120000", "job7")
+    os.makedirs(job, exist_ok=True)
+    for i in range(created):
+        open(os.path.join(job, f"chunk{i}{ma._IPS_WORK_EXT}"), "w").close()
+    for i in range(done):
+        open(os.path.join(job, f"chunk{i}{ma._IPS_DONE_EXT}"), "w").close()
+    return job
+
+
+def test_the_interpro_heartbeat_counts_the_chunks_the_tool_leaves_behind(
+        ma, tmp_path):
+    root = str(tmp_path / "tmp")
+    os.makedirs(root)
+    probe = ma._InterProProgress(root, 60)
+    assert probe() == "", "nothing on disk yet is not a number"
+    assert not probe.seen_any
+    _ips_tree(ma, root, created=9, done=4)
+    assert probe() == "chunk 4/9"
+    assert probe.seen_any, \
+        "the stage asks this afterwards to tell silence from a dead probe"
+
+
+def test_no_eta_is_offered_while_interproscan_is_still_splitting(
+        ma, tmp_path, monkeypatch):
+    # The denominator GROWS during the split phase, so a remaining-time taken
+    # then is measured against a number about to move — and chunks ARE
+    # completing while it moves, so the rate is perfectly computable and
+    # perfectly wrong. A fake clock, because the whole claim is about time.
+    clock = [1_000.0]
+    monkeypatch.setattr(ma.time, "time", lambda: clock[0])
+    root = str(tmp_path / "tmp")
+    job = _ips_tree(ma, root, created=4, done=1)
+    probe = ma._InterProProgress(root, 60)
+    for i in range(6):
+        line = probe()
+        assert "left" not in line, \
+            f"an ETA against a denominator that is still moving: {line}"
+        clock[0] += 600.0
+        open(os.path.join(job, f"chunk{4 + i}{ma._IPS_WORK_EXT}"), "w").close()
+        open(os.path.join(job, f"chunk{1 + i}{ma._IPS_DONE_EXT}"), "w").close()
+    # Splitting stops at 10. The count must then hold still for
+    # _IPS_ETA_STABLE_TICKS probes AND a chunk must finish after the anchor,
+    # so there is a measured rate rather than an extrapolated one.
+    for _ in range(ma._IPS_ETA_STABLE_TICKS + 1):
+        assert "left" not in probe()
+        clock[0] += 600.0
+    open(os.path.join(job, f"chunk7{ma._IPS_DONE_EXT}"), "w").close()
+    # one chunk in the 600 s since the anchor, two left -> twenty minutes
+    assert probe() == "chunk 8/10, ~20m00s left"
+    # and a fresh slice withdraws it rather than quoting a stale denominator
+    for i in range(10, 14):
+        open(os.path.join(job, f"chunk{i}{ma._IPS_WORK_EXT}"), "w").close()
+    assert probe() == "chunk 8/14"
+
+
+def test_a_layout_this_does_not_recognise_reports_nothing_not_a_wrong_number(
+        ma, tmp_path):
+    # The .fasta/.raw pair is the layout of ONE observed run, and no
+    # InterProScan was available to check it against. A build that writes a
+    # different tree must produce silence, which the stage then reports.
+    root = str(tmp_path / "tmp")
+    os.makedirs(os.path.join(root, "run1", "job2"))
+    for name in ("chunk0.xml", "chunk0.out", "summary.log"):
+        open(os.path.join(root, "run1", "job2", name), "w").close()
+    probe = ma._InterProProgress(root, 60)
+    assert probe() == ""
+    assert not probe.seen_any
+
+
+def test_a_census_too_big_to_finish_says_nothing_rather_than_a_partial_count(
+        ma, tmp_path, monkeypatch):
+    root = str(tmp_path / "tmp")
+    _ips_tree(ma, root, created=6, done=3)
+    monkeypatch.setattr(ma, "_IPS_SCAN_CAP", 4)
+    assert ma._InterProProgress(root, 60)() == "", \
+        "a truncated count is a wrong count, and this runs every minute"
+
+
+def test_a_raw_that_outlived_its_chunk_drops_the_denominator_not_the_count(
+        ma, tmp_path):
+    root = str(tmp_path / "tmp")
+    _ips_tree(ma, root, created=0, done=5)
+    assert ma._InterProProgress(root, 60)() == "5 chunk(s) analysed"
+
+
+def test_the_interpro_probe_watches_the_directory_the_stage_gave_the_tool(
+        ma, tmp_path, paths_for, monkeypatch):
+    # Both halves come out of the one call: if -T moves and the probe does
+    # not, it counts a directory nothing is writing and reports nothing
+    # forever, which is the failure this whole mechanism replaces.
+    cfg, p = paths_for("ips_probe")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        F.protein_set()[:2])
+    cfg["db"]["interproscan_sh"] = sys.executable      # an exe that exists
+    seen = {}
+
+    def fake_run_cmd(cmd, cwd=None, env=None, progress=None):
+        seen["cmd"] = [str(c) for c in cmd]
+        seen["probe"] = progress
+        open(seen["cmd"][seen["cmd"].index("-o") + 1], "w").close()
+        return ""
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run_cmd)
+    ma.stage_interpro(cfg, p)
+    probe = seen["probe"]
+    assert isinstance(probe, ma._InterProProgress), \
+        "the stage that runs blind for days is the one that supplies a probe"
+    assert probe.root == seen["cmd"][seen["cmd"].index("-T") + 1]
+
+
+def test_a_progress_probe_that_raises_costs_its_line_and_not_the_stage(
+        ma, monkeypatch, capsys):
+    # It reads a directory the tool is concurrently writing, where a file
+    # vanishing between the readdir and the stat is ordinary.
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0.15)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise OSError(2, "No such file or directory")
+
+    assert ma.run_cmd([sys.executable, "-c", _TQDM_LIKE], progress=boom) == ""
+    assert len(calls) == 1, \
+        "a probe that raised once is dropped, not retried every interval"
+    err = capsys.readouterr().err
+    assert err.count("progress probe") == 1, "said once, not every minute"
+    assert [l for l in err.splitlines() if " running " in l], \
+        "the heartbeat itself survives the probe that failed"
+
+
 # --- logging must not be what kills a multi-hour run -------------------
 # symptom: tool output is decoded with errors="replace", so descriptions carry
 # U+FFFD; printing one to a cp1252 console raises UnicodeEncodeError, and the

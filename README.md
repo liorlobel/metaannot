@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1732 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1739 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 71 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1661 passed and 72
+absent, so on a machine with no R the same run reports 1668 passed and 72
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1709,6 +1709,45 @@ and the only way to tell either apart from a hang was to watch its CPU ticks
 accumulate in `/proc`. Tools that write a `tqdm` bar (tmbed, InterProScan,
 ESMFold's own loop) are the ones this shows; a tool that writes nothing still
 gets `no output yet on stderr` on the same schedule, which is the heartbeat.
+
+#### How far through InterProScan is
+
+InterProScan is the exception that paragraph does not cover. It is the longest
+stage in the pipeline — 57 h of the 455,571-protein run — and what reaches
+stderr from it says that it is alive without ever saying how far through it
+is. What it does leave is a trail under the `-T` directory this tool hands it:
+a `.fasta` per chunk it splits out, and a `.raw` beside that chunk once the
+chunk has been analysed. The heartbeat counts them:
+
+```
+[31840.7s] INFO    interpro | interproscan.sh running 8h50m | chunk 312/380, ~2h08m left | ...
+```
+
+What that line does not claim, deliberately:
+
+- The unit is **chunks**, not sequences and not a percentage of the stage.
+  InterProScan chose the slices, they are not equal, and the merge and write
+  that follow the last one are not counted at all — so it reaches `380/380`
+  with real work still to do. Do not turn it into a percentage.
+- **No remaining time is offered while the denominator is still moving.**
+  InterProScan goes on splitting while it analyses, so a rate taken then is
+  measured against a number that is about to grow — and it is perfectly
+  computable and perfectly wrong, because chunks really are completing. The
+  count has to hold still for `_IPS_ETA_STABLE_TICKS` consecutive heartbeats
+  before a rate is anchored, and the rate is then a long-run average from that
+  anchor rather than an instantaneous one: it lags a machine that slows down
+  later, which on a stage measured in days is the trade worth taking.
+- **`.raw` beside `.fasta` is the layout of one observed run.** No
+  InterProScan was available where this was written to check it against, so a
+  build that writes a different tree gets no progress on the line at all
+  rather than a wrong one — and the stage says so once when it finishes:
+  `the heartbeat never found a chunk file under …`. Silence from a probe that
+  never engaged must not be read as a stage that made no progress. The same
+  goes for a census too large to walk: it reports nothing rather than a
+  partial count.
+
+Any stage can pass `run_cmd` a probe of its own the same way; InterProScan is
+simply the one where the tool's own output leaves the most unsaid.
 
 Log lines cannot themselves kill a run. Tool output is decoded with
 `errors="replace"`, so a description can carry U+FFFD, and printing one to a

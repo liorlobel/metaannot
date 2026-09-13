@@ -4,6 +4,57 @@
 
 ### Added
 
+**The heartbeat now says how far through InterProScan is.** It is the longest
+stage in the pipeline — 57 h of the 455,571-protein run — and it went all of
+that blind. Its stderr says it is alive and never says how far through it is,
+so the only way to get an ETA was to write a chunk-counting script against its
+`-T` tree by hand while the run was going. The signal was there the whole
+time: InterProScan leaves a `.fasta` per chunk it splits out and a `.raw`
+beside that chunk once it has been analysed, both under the temp directory
+this tool already gives it. `run_cmd` now takes an optional probe a stage can
+supply when it knows something the tool's own output does not carry, and
+`stage_interpro` supplies one that counts those files:
+
+```
+[31840.7s] INFO    interpro | interproscan.sh running 8h50m | chunk 312/380, ~2h08m left | ...
+```
+
+The scheduler entry above ends by saying that once the dispatch order is
+right, what is left of a run's wall clock is `stage_workers` and InterProScan
+itself. This does not make that stage shorter. It makes it legible, which on
+two and a half days of waiting is the difference between watching a log and
+watching `/proc`.
+
+**What the line refuses to say is most of the change.** Each refusal is
+there because the obvious stronger claim is one the files cannot support:
+
+- The unit is CHUNKS. Not sequences, not a percentage. InterProScan chose the
+  slices, they are not equal, and the merge and write after the last one are
+  not counted at all — so the line reaches `380/380` with real work left, and
+  a percentage computed off it would read 100% during that tail.
+- No remaining time is offered while the denominator is still moving.
+  InterProScan splits while it analyses, so a rate measured then is measured
+  against a number about to grow; it is perfectly computable and perfectly
+  wrong. The count must hold still for `_IPS_ETA_STABLE_TICKS` consecutive
+  heartbeats before a rate is anchored. The test for that is a fake clock over
+  a tree where chunks are finishing AND being created, because a test where
+  only the denominator moves passes whether or not the gate exists — which the
+  first version of it did.
+- `.raw` beside `.fasta` is THE LAYOUT OF ONE OBSERVED RUN, read off a real
+  `-T` tree rather than out of InterProScan's source, and no InterProScan was
+  available here to check it against. So every branch that cannot be sure
+  reports nothing rather than something wrong: an unrecognised tree, a tree
+  too large to walk within `_IPS_SCAN_CAP` entries, a `.raw` that outlived its
+  `.fasta` (which drops the denominator and keeps the count). A probe that
+  never engaged is then reported at the END of the stage, where whether it
+  ever saw a chunk file is settled, rather than guessed at from a timeout
+  while the tool may simply still be splitting.
+
+A probe that RAISES is dropped for the rest of that command and said once. It
+reads a directory the tool is concurrently writing, where a file vanishing
+between the readdir and the stat is ordinary, and an annotation is never worth
+a stage — nor worth a WARN per minute for two days.
+
 **The report now says what `analysis.min_plexes` bought, whichever way the run
 set it.** The first full run on real data was filtered at 2 and the document
 never said what that decided: it printed how many protein groups the filter
