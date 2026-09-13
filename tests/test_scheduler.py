@@ -95,17 +95,30 @@ def test_a_second_run_on_one_results_directory_refuses(tmp_path, stub_bin):
 def test_two_simultaneous_runs_do_not_both_proceed(tmp_path, stub_bin):
     # the race the O_EXCL open exists for: two runs launched in the same
     # second both used to see no lock and both proceed.
+    #
+    # THE WINNER IS HELD OPEN ON A GATE rather than raced against a sleep.
+    # Two Popens and STUB_SLEEP=1.5 assumed the second process would start
+    # inside the first one's 1.5 seconds, which is an assumption about the
+    # box: stagger the second start past the first run's completion and both
+    # exit 0 and the assertion fails, having found nothing wrong with the
+    # lock. Every other concurrency test in this file parks its run on a
+    # gate for exactly this reason. The second run is launched only once the
+    # first has PROVABLY taken the lock, so the overlap is a fact rather than
+    # a hope, and the gate is opened in the `finally`.
     proj = _searchable(tmp_path, tmp_path / "p")
-    env = dict(os.environ, STUB_SLEEP="1.5")
-    procs = [subprocess.Popen(
-        [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-        cwd=proj.root) for _ in range(2)]
-    outs = [p.communicate() for p in procs]
-    codes = [p.returncode for p in procs]
+    gate = str(tmp_path / "gate_two_runs")
+    first = _gated_run(proj, gate)
+    try:
+        assert _wait_for(lambda: os.path.exists(proj.rpath(".metaannot.lock")),
+                         timeout=60), "the first run never took the lock"
+        second = proj.run(expect=1)
+        assert "another metaannot is already running here" in second.stderr
+    finally:
+        open(gate, "w", encoding="utf-8").close()
+        first.communicate(timeout=60)
+    codes = [first.returncode, second.returncode]
     assert sorted(codes) == [0, 1], f"exactly one run must win, got {codes}"
-    losing = [o[1] for o, c in zip(outs, codes) if c == 1][0]
-    assert "another metaannot is already running here" in losing
+    assert "another metaannot is already running here" in second.stderr
 
 
 def test_a_lock_from_a_dead_process_is_reclaimed(tmp_path, stub_bin):
@@ -4795,8 +4808,18 @@ def test_a_heartbeat_whose_reads_are_refused_gives_up_instead_of_freezing_silent
     capsys.readouterr()
     rec.watch(threading.Lock())
     try:
-        assert not _wait_for(lambda: "giving up" in capsys.readouterr().err,
-                             timeout=2.0), \
+        # ACCUMULATED, not polled-and-discarded. readouterr() empties the
+        # buffer, so polling it in a lambda throws away everything that
+        # arrived between two polls - and because this is an `assert not`, a
+        # line lost that way is a SILENT PASS rather than a failure. log()
+        # issues one sys.stderr.write per line with a single flush at the end,
+        # so a multi-line warning can straddle two reads. The three positive
+        # assertions elsewhere in this file already accumulate; this is the
+        # one that did not, and it is the one where losing a line is invisible.
+        said = []
+        _wait_for(lambda: said.append(capsys.readouterr().err) or
+                  "giving up" in "".join(said), timeout=2.0)
+        assert "giving up" not in "".join(said), \
             "a vacant lock armed the I/O give-up counter"
         assert any(t.name == "metaannot-heartbeat"
                    for t in threading.enumerate()), \
@@ -5111,8 +5134,29 @@ def _stub_pids(pidfile, roles=("tool", "child"), want=(), timeout=20.0):
     deadline = time.time() + timeout
     while True:
         out = _read_stub_pids(pidfile, roles)
-        if all(r in out for r in want) or time.time() >= deadline:
+        if all(r in out for r in want):
             return out
+        if time.time() >= deadline:
+            # SUCCESS AND EXPIRY USED TO RETURN THROUGH THE SAME STATEMENT, so
+            # "the stub never forked" - a real defect - and "the fork was
+            # slow" - an artefact - both reached the caller as a partial dict
+            # and surfaced as a bare `KeyError: 'child'` with no pidfile, no
+            # contents and no sign that anything had waited. Resolving one
+            # instance of that took an eleven-PR debugging effort and a
+            # sleep-injection experiment; that is the evidence the exception
+            # did not carry its own finding. It still FAILS, so nothing this
+            # helper guards is weakened.
+            missing = [r for r in want if r not in out]
+            try:
+                body = io.open(pidfile, encoding="utf-8").read()
+                seen = f"{len(body.splitlines())} line(s): {body!r}"
+            except OSError as e:
+                seen = f"unreadable ({e})"
+            raise AssertionError(
+                f"the stub did not record {missing} within {timeout:.0f}s. "
+                f"{pidfile} holds {seen}; roles that did arrive: "
+                f"{sorted(out)}. Either the stub never got that far, or it is "
+                "still starting - and those are different findings.")
         time.sleep(0.05)
 
 
@@ -5123,7 +5167,16 @@ def _read_stub_pids(pidfile, roles):
             for line in fh:
                 bits = line.split()
                 if len(bits) == 2 and bits[0] in roles:
-                    out.setdefault(bits[0], []).append(int(bits[1]))
+                    # ValueError as well as OSError. This runs from
+                    # _reap_stub_pids inside every `finally` in this family,
+                    # and an int() raising there would REPLACE the test's real
+                    # exception with a parse error - a masking path in code
+                    # whose own docstring says it is "a cleanup and NOT part
+                    # of any assertion".
+                    try:
+                        out.setdefault(bits[0], []).append(int(bits[1]))
+                    except ValueError:
+                        continue
     except OSError:
         pass
     return out
@@ -5137,11 +5190,40 @@ def _reap_stub_pids(pidfile):
     when one of them has already failed - or when the test is the one that
     asserts a SIGKILL leaves orphans behind, which is the case the census
     exists for and which this is the reason the suite can afford to test.
+
+        NARROWED, NEVER PROVEN. A recorded pid names a process that is usually
+    already dead by the time this runs - test_a_tool_that_exits_zero... asserts
+    the pid is gone and then this `finally` SIGKILLs that exact number - and a
+    dead pid is a number the kernel may have handed to somebody else. That is
+    precisely the hazard metaannot.py refuses to take in the leftover census
+    ("a probe taken five seconds after the reap is a probe of whatever the pid
+    has become since"), and a test helper has no licence the product denies
+    itself. Exposure is longest where STUB_CHILD_SLEEP expires before the tool
+    does, and a Mac's PID_MAX is 99998 across an eight-minute suite.
+
+    So the command line is read first and the signal is sent only to something
+    still running OUR interpreter. That is a narrowing and not an identity
+    proof - no such proof exists from a pid - but it can only ever kill less,
+    and the cost of killing less is a stray that expires on its own.
     """
     for pids in _stub_pids(pidfile).values():
         for pid in pids:
+            if not _looks_like_our_stub(pid):
+                continue
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
+
+
+def _looks_like_our_stub(pid):
+    """Whether `pid` still names a process running this interpreter."""
+    if os.name == "nt":
+        return True                       # no cheap ps here; nothing recycles
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return sys.executable in out.stdout
 
 
 def _run_with_children(proj, pidfile, gate, *extra, **env):
@@ -5157,8 +5239,15 @@ def _run_with_children(proj, pidfile, gate, *extra, **env):
     # would make that test pass whether anything killed it or not, which is
     # the way a test like this rots; the `finally` is what stops it leaking.
     e.update(STUB_WAIT_FOR=gate, STUB_SLEEP="0", STUB_PIDFILE=pidfile,
-             STUB_FORK_CHILD="1", STUB_CHILD_SLEEP="120",
-             STUB_GATE_MAX_S="150", PYTHONHASHSEED="0")
+             # The backstop outlasts the timeouts its callers declare. At
+             # 150 it was SHORTER than the kill-9 test's own waits before the
+             # second run even starts (60 + 60 + 60), so a slow box fired the
+             # stub's backstop, the `.part` file stopped growing, and the
+             # failure surfaced as an assertion about the leftover census
+             # rather than about the stub that had given up. A backstop that
+             # expires first turns every test around it into a liar.
+             STUB_FORK_CHILD="1", STUB_CHILD_SLEEP="420",
+             STUB_GATE_MAX_S="400", PYTHONHASHSEED="0")
     e.update(env)
     proc = subprocess.Popen(
         [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path,
@@ -5337,7 +5426,9 @@ def test_a_killed_run_takes_its_tool_and_the_tools_own_child_with_it(
         assert _pid_alive(tool) and _pid_alive(child)
 
         proc.send_signal(sig)
+        t0 = time.time()
         _out, err = proc.communicate(timeout=60)
+        took = time.time() - t0
 
         # The tool dies, and so does the tool's own child. Given a moment:
         # SIGKILL is delivered by the kernel and the corpses are reaped by
@@ -5352,9 +5443,20 @@ def test_a_killed_run_takes_its_tool_and_the_tools_own_child_with_it(
         assert f"stopping on {signame}: releasing the results lock" in err
         assert not os.path.exists(proj.rpath(".metaannot.lock")), \
             "the lock survived the signal it exists to be released by"
-        # The gate was never opened, so the run cannot have waited for its
-        # stage: it was gone long before the stub's own backstop.
-        assert not os.path.exists(gate)
+        # THE TIME, not the gate. `assert not os.path.exists(gate)` stood here
+        # and could not fail: nothing in the suite or in metaannot ever
+        # creates that path -- it is only ever passed to the stub as
+        # STUB_WAIT_FOR -- so the assertion was true before the run started
+        # and would have been true had the run hung for ever. The conclusion
+        # above it is real and worth holding; this is the evidence for it,
+        # the same one the Ctrl-C test below already used. The stub's own
+        # backstop is STUB_GATE_MAX_S, so finishing well inside that is proof
+        # the run did not sit through the stage it was stopping.
+        assert took < 60, \
+            f"the signal waited {took:.0f}s for the stage it was stopping"
+        assert not os.path.exists(gate), \
+            "nothing should have opened the gate; if this fails the test " \
+            "fixture has changed, not the engine"
     finally:
         _reap_stub_pids(pidfile)
 
@@ -5428,9 +5530,14 @@ def test_a_tool_that_exits_zero_leaving_a_child_behind_does_not_leak_it(
     # so that the ordinary leaf tool costs one syscall and no signal at all.
     proj = _searchable(tmp_path, tmp_path / "zero")
     pidfile = str(tmp_path / "pids_zero")
-    # 120s, and the assertion waits 20: a child that expires on its own
-    # inside the window would make this pass with the sweep removed, which is
-    # exactly what it happened to do the first time it was written.
+    # 240s, against the RUN's timeout plus the assertion's wait -- not against
+    # the assertion's wait alone, which is what the figure used to be argued
+    # from. The real exposure is grandchild spawn -> end of proj.run(
+    # timeout=180) -> +20s of _wait_for, so any run over 120s made the child
+    # expire on its own and the test pass with the sweep removed: the exact
+    # rot this comment exists to guard against, sized against the wrong
+    # quantity. A child that expires by itself inside the window is a green
+    # test that has checked nothing.
     #
     # This test's NON-VACUITY rests on something invisible from here: the stub
     # does not exit until its grandchild has written its own pidfile line, so
@@ -5440,7 +5547,7 @@ def test_a_tool_that_exits_zero_leaving_a_child_behind_does_not_leak_it(
     # what it did on some CI Pythons and not others, run to run, until the
     # stub was fixed. Do not remove that wait as dead weight.
     e = {"STUB_PIDFILE": pidfile, "STUB_FORK_CHILD": "1",
-         "STUB_CHILD_SLEEP": "120", "STUB_SLEEP": "0"}
+         "STUB_CHILD_SLEEP": "240", "STUB_SLEEP": "0"}
     try:
         proc = proj.run("--only", "pfam", env=e, timeout=180)
         assert "done:" in proc.stderr
@@ -6024,24 +6131,29 @@ def test_the_tool_registry_is_big_enough_for_the_shipped_config(ma):
         "a slot that is not a plain int makes the handler's read allocate"
 
 
-def _an_appender(path, seconds=20):
+def _an_appender(path):
     """A real process appending to `path`, standing in for an orphaned tool.
 
     Real, and not a monkeypatched stat: what the census refuses on is a second
-    WRITER, and the only honest way to assert that is to have one. It writes
-    on a short interval and stops on its own, so a failure here cannot leave
-    anything running for long, and the caller kills it either way.
+    WRITER, and the only honest way to assert that is to have one.
+
+    IT DOES NOT STOP ITSELF. It used to run for twenty seconds while the run
+    it has to outlive was allowed a hundred and eighty, so a slow start meant
+    the file stopped growing before the census looked at it and the evidence
+    the test is about simply vanished - a green-or-red decided by the box
+    rather than by the code. `_foreign_growing_part` alongside it already had
+    this right: `while True`, and the caller kills it in a `finally`, which
+    every caller of this does too.
     """
     return subprocess.Popen(
         [sys.executable, "-c",
          "import sys, time\n"
-         "end = time.time() + float(sys.argv[2])\n"
-         "while time.time() < end:\n"
+         "while True:\n"
          "    fh = open(sys.argv[1], 'a')\n"
          "    fh.write('x' * 4096)\n"
          "    fh.close()\n"
          "    time.sleep(0.05)\n",
-         path, str(seconds)],
+         path],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
