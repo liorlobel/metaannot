@@ -33,7 +33,7 @@ Requires: python3, pandas, pyyaml. External tools are needed only by the
 stages that use them; `doctor` reports which are missing.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Bumped only when the MEANING of a stage's output changes, so that existing
 # results become genuinely invalid. It is deliberately not __version__: tying
@@ -7803,6 +7803,32 @@ def folded_already(path):
     return False
 
 
+def _write_not_folded(p, cap, why):
+    """The sequences a length cap excluded, as a table and as a FASTA.
+
+    -> [(id, seq)] so the caller can report on them, and written on EVERY path
+    through the stage that can skip something -- the fold loop AND the early
+    return taken when nothing is pending. That second path is the one this
+    exists for: a work-list where every sequence is over the cap reaches it
+    with nothing to fold, so the run that skipped the most used to write no
+    list at all, which is the exact inverse of the rule these files state.
+
+    Empty files are written rather than skipped, so that their ABSENCE means
+    the stage did not run rather than meaning there was nothing to skip.
+    """
+    over = [(q, t) for q, t in read_fasta(p.dark) if len(t) > cap]
+    with atomic_out(f"{p.structures}/not_folded.tsv") as tmp:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("protein_id\tlength\tlimit_aa\tlimit_from\n")
+            for q, t in over:
+                fh.write(f"{q}\t{len(t)}\t{cap}\t{why}\n")
+    with atomic_out(f"{p.structures}/not_folded.faa") as tmp:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            for q, t in over:
+                fh.write(f">{q}\n{t}\n")
+    return over
+
+
 def stage_esmfold(cfg, p):
     os.makedirs(p.structures, exist_ok=True)
     if not nonempty(p.dark):
@@ -7828,6 +7854,22 @@ def stage_esmfold(cfg, p):
         log(f"esmfold: every sequence at or under max_len_structure="
             f"{static_cap} is already folded ({n_have} model(s) on disk), so "
             "the GPU is not touched at all")
+        # The skipped list is written HERE too, and this is the path that
+        # needs it most: a work-list where EVERY sequence is over the cap
+        # reaches this return with nothing pending, so the run that skipped
+        # the most wrote no list at all. The static cap is the only limit that
+        # applied -- the weights were never loaded, so free VRAM constrained
+        # nothing -- and the rows say so.
+        _write_not_folded(p, static_cap, "max_len_structure")
+        # NOT truncated here, only created. A resumed run that finds nothing
+        # to do must not erase what an earlier run recorded it gave up on;
+        # creating it when absent is what keeps "no file" meaning "this stage
+        # has not run" without destroying a record to say it.
+        miss = f"{p.structures}/esmfold_failed.tsv"
+        if not os.path.exists(miss):
+            with atomic_out(miss) as tmp:
+                with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("protein_id\tlength\terror\n")
         open(p.struct_done, "w", encoding="utf-8").close()
         return
     # CUDA_VISIBLE_DEVICES is read once, when the CUDA runtime initialises.
@@ -7965,18 +8007,9 @@ def stage_esmfold(cfg, p):
     # nowhere. Both files are written on every run of this stage, empty ones
     # included, so that their absence means the stage did not run rather than
     # meaning nothing was skipped.
-    over = [(q, t) for q, t in read_fasta(p.dark) if len(t) > cap]
+    over = _write_not_folded(p, cap, cap_why)
     todo_tsv = f"{p.structures}/not_folded.tsv"
     todo_faa = f"{p.structures}/not_folded.faa"
-    with atomic_out(todo_tsv) as tmp:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("protein_id\tlength\tlimit_aa\tlimit_from\n")
-            for q, t in over:
-                fh.write(f"{q}\t{len(t)}\t{cap}\t{cap_why}\n")
-    with atomic_out(todo_faa) as tmp:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            for q, t in over:
-                fh.write(f">{q}\n{t}\n")
     if over:
         longest = max(len(t) for _, t in over)
         why = ""

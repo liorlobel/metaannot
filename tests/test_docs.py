@@ -1652,9 +1652,17 @@ def _newest_section_start(txt):
     NEWEST section is in scope, whichever of the two it is.
     """
     txt_ = txt
-    i = txt_.find("## Unreleased")
-    if i != -1:
-        return i
+    # AT THE START OF A LINE, not anywhere in the document. A plain find()
+    # is hijacked by any prose that MENTIONS the heading -- and this section
+    # contains exactly that, in the entry recording the previous version of
+    # this same bug: "Cutting v0.6.0 left an `## Unreleased` holding only
+    # `### Added`". Cutting v0.7.0 removed the real heading, the find landed
+    # on that backticked mention several hundred lines inside the section it
+    # was supposed to delimit, and three tests went green against the wrong
+    # release. The heading is a heading; anchor on the line.
+    m = re.search(r"^## Unreleased", txt_, re.M)
+    if m:
+        return m.start()
     m = re.search(r"^## v\d+\.\d+\.\d+", txt_, re.M)
     assert m, "the CHANGELOG has neither an Unreleased nor a released section"
     return m.start()
@@ -2117,7 +2125,7 @@ def _phrase_re(key):
                       + r"[ \-]+(?:(?!(?:" + "|".join(sorted(_UNITS))
                       # {1,14}, not {2,14}: `_count_head` steps over a
                       # one-letter adjective and this has to reach the same
-                      # phrase, or "the 71 R tests" is a count the scan finds
+                      # phrase, or "the 72 R tests" is a count the scan finds
                       # and the table cannot locate.
                       + r")[ \-])[a-z]{1,14}[ \-]+)?"
                       + re.escape(noun).replace("\\ ", r"[ \-]+") + r"\b",
@@ -2835,7 +2843,7 @@ COUNT_PROSE = {
                                  "test_the_readme_names_every_signal_test_"
                                  "windows_really_skips"),
     "five tests": ("MEASURED", "the tests the open xfail markers sit on"),
-    "71 tests": ("MEASURED", "the R selection, counted exactly by "
+    "72 tests": ("MEASURED", "the R selection, counted exactly by "
                              "test_the_readme_test_counts_are_the_counts_"
                              "this_suite_really_has"),
     "seven strings": ("MEASURED", "the class names three outputs share"),
@@ -2927,7 +2935,7 @@ COUNT_PROSE = {
                             "drives, written out in order beside it"),
     "four defects": ("PROSE", "a group heading, counted by the group test"),
     "six defects": ("PROSE", "a group heading, counted by the group test"),
-    "twenty-four entries": ("DERIVED", "the Unreleased/Fixed entries",
+    "twenty-five entries": ("DERIVED", "the Unreleased/Fixed entries",
                              lambda ma: sum(n for _h, n
                                             in _unreleased_fixed_groups())),
     "six groups": ("DERIVED", "the Unreleased/Fixed groups",

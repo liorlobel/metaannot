@@ -1,6 +1,55 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 — 2026-09-13
+
+Everything here came out of one run — the first full one on real data, 455,571
+proteins — and out of reading afterwards what it had written down. **The run
+had the numbers and did not do the arithmetic.**
+
+It went from 455,571 proteins to 1,282 rows and said why across a dozen lines
+of an 8,990-line log, in three stages, some of them counting features and some
+counting proteins. It computed two KEGG-invisible fractions — 43.6% of what was
+quantified against 29.4% of the database it was searched against — printed them
+in three places on different pages and never once subtracted them, though that
+gap is the claim the bins exist to support. And it denominated its most quoted
+number, the taxon-unique dominance rate, over 8,238 rows of which 5,039 could
+never reach the numerator: the same 1,749 proteins read **21.2%** there and
+**54.7%** over the rows the assignment rule actually decided something about.
+The per-protein classifier does not move for that. One summary line does, and
+on that run it more than doubles.
+
+The run was also unreadable while it was happening. 5,086 of its 8,990 lines
+were heartbeats at one a minute; the heartbeat now backs off to a ceiling.
+InterProScan ran 57.9 h of it blind — its stderr says it is alive and never
+says how far through it is — and now counts the chunks it has analysed.
+ESMFold's length cap skipped 1,462 of 2,000 sequences and kept only the count;
+the list is written down now, beside the models, on every path through that
+stage that can skip something.
+
+The order it ran in cost it hours. Eleven stages declare `cost` 3, so
+longest-first had nothing to discriminate inside the class that owns the wall
+clock, and InterProScan did not start until hour **27.1**. Replayed over the
+measured 455,571-protein durations at that run's own `stage_workers: 3`, the
+shipped order comes out at **86.6 h** and the new `(cost, order_s)` key at
+**72.9 h** — replayed rather than asserted, because a hand-written expected
+makespan could agree with a wrong implementation.
+
+Under **Fixed**, twenty-five entries in six groups. The largest is what a
+multi-day run does when the filesystem refuses a write it cannot avoid making:
+`update_state()` had one `try` and it was around the read-back, so an ENOSPC at
+the write killed the run from the dispatch loop and, from the drain loop,
+reported a stage that had SUCCEEDED as the one that failed. Six more are what a
+`kill` does to the tools a run launched — the price of getting that wrong is on
+the record from this run as three concurrent `hmmsearch --cpu 7` against the
+same 455,571 proteins from 13:03 to 20:04. And four are what an audit of the
+two changes above them found, which is the group this release would least like
+to need and most wants to keep having.
+
+`SIGNATURE_VERSION`, `DESCRIBE_VERSION` and `DOCTOR_VERSION` do not move, and
+that was checked rather than assumed: no stage's `keys` list changed,
+`describe --json` only ADDS `order_s`, and all seven of `doctor`'s closed enums
+are unchanged. `CONSOLE_VERSION` is `0.1.2`, bumped in flight for the
+dispatch-order change.
 
 ### Added
 
@@ -34,46 +83,49 @@ reading suggests -- but that line, written from inside the grandchild's own
 interpreter, is the suite's only proof the grandchild ever reached Python.
 Record it parent-side and a grandchild that dies of anything else (OOM on a
 small runner, a CI image that cannot start the interpreter) becomes a SILENT
-GREEN PASS in the one test that pins the safety property, at the same rate on
-the same machines that produce today's loud failure. It would also have gutted
-the readiness gate four other tests depend on. Waiting keeps the evidence and
-makes the claim honest: what is left in the group is now a process that
-provably reached Python, not a pid killed mid-exec.
+GREEN PASS in the test that pins the safety property most directly, at the same
+rate on the same machines that produce today's loud failure. It would also have
+gutted the readiness gate five other tests depend on. Waiting keeps the
+evidence and makes the claim honest: what is left in the group is now a process
+that provably reached Python, not a pid killed mid-exec.
 
 Verified both ways. Under the forced race it passes where it failed; with the
 reaped-leader arm of `_end_tool_group` removed it fails by its own named
 assertion rather than by `KeyError`, which is the regression it exists to
 catch. Nine further latent flakes in the same test family, and two assertions
-that can never fail, are filed rather than fixed here.
+that can never fail, are filed as issue #51 rather than fixed here.
 
 **The heartbeat backs off instead of writing a line a minute for two days.**
-One line a minute is the right spacing for the first ten minutes of a stage
-and the wrong spacing for the next eighty hours: the first full real run wrote
+One line a minute is the right spacing for the first ten minutes of a stage and
+the wrong spacing for the next eighty hours: the first full real run wrote
 8,990 log lines of which 5,086 were heartbeats, and the twenty that mattered
 were somewhere in them. After `_PROGRESS_STEADY_TICKS` ticks of the same
-command the interval doubles until it reaches the new
-`progress_interval_s_max` (900 s), which on that run's longest stage is a few
-hundred lines instead of several thousand while still proving liveness four
-times an hour. The line on which the interval changes says `next in 15m00s`,
-because a heartbeat that quietly slows down looks exactly like a stage that
-quietly stopped — which is the one thing the line exists to rule out. Per
-command, so two stages running at once keep separate cadences; set the ceiling
-equal to `progress_interval_s` for the old fixed cadence, and a ceiling UNDER
-the interval is ignored rather than used to speed the heartbeat up, because
-the knob that sets the cadence is the other one.
+command the interval doubles until it reaches the new `progress_interval_s_max`
+(900 s), which on that run's longest stage is a few hundred lines instead of
+several thousand while still proving liveness four times an hour. The line on
+which the interval changes says what the new spacing is — `next in 2m00s`, and
+`next in 15m00s` once it reaches the ceiling — because a heartbeat that quietly
+slows down looks exactly like a stage that quietly stopped — which is the one
+thing the line exists to rule out. Per command, so two stages running at once
+keep separate cadences; set the ceiling equal to `progress_interval_s` for the
+old fixed cadence, and a ceiling UNDER the interval is ignored rather than used
+to speed the heartbeat up, because the knob that sets the cadence is the other
+one.
 
 **A quant table read three times warned three times.** 117 WARN lines on that
 run, of which 97 were one block printed in triplicate: `stage_join` reads the
 quant table, and `peptide_features()` reads it again for each taxonomy-ish
 stage that is on, and for `fragpipe_tmt` that is every plex's level file,
-annotation and `psm.tsv` re-read and re-validated. Those warnings describe the
-FILES, so the later passes reach the same verdicts. `log()` takes an optional
-`once=` key now, the TMT reader passes the table it is reading, and the later
-passes are silent — except for one line saying how many they withheld and why.
-That line is the point: a suppression nobody accounts for is indistinguishable
-from a check that has stopped firing. The count is the delta for that pass and
-not a running total, and deduplication is of EXACT repeats under a key, so two
-different warnings about one table both still get through.
+annotation and, when `tmt.min_purity` is set, `psm.tsv` re-read and
+re-validated. Those warnings describe the FILES, so the later passes reach the
+same verdicts. `log()` takes an optional `once=` key now, the TMT reader passes
+the table it is reading, and the later passes are silent — except for one line
+saying how many they withheld and why, and the `use_reference_ratios` loss
+line, which is a property of the read rather than of the files. That line is
+the point: a suppression nobody accounts for is indistinguishable from a check
+that has stopped firing. The count is the delta for that pass and not a running
+total, and deduplication is of EXACT repeats under a key, so two different
+warnings about one table both still get through.
 
 **tmbed was the hole in the CPU split.** SignalP takes
 `--torch_num_threads`; tmbed has no equivalent flag, so torch took every core
@@ -92,30 +144,36 @@ the models in", and it has always given a COUNT — on the first full real run,
 stage now writes `structures/not_folded.tsv` (`protein_id`, `length`,
 `limit_aa`, `limit_from`) and `structures/not_folded.faa` (the same sequences,
 ready to hand to another card). Both are written even when nothing was
-skipped, so that their absence means the stage did not run rather than meaning
-there was nothing to skip.
+skipped, and on the early return taken when nothing is pending, so that their
+absence means the stage did not run rather than meaning there was nothing to
+skip. That early return is the path that needed them most and was the one
+auditing these notes caught missing them: a work-list where EVERY sequence is
+over the cap reaches it with nothing to fold, so the run that skipped the most
+wrote no list at all.
 
 **A low cap is a statement about free VRAM, and the log now says so.** A cap
 of 193 aa that excluded 1,462 of the 2,000 sequences on the work-list reads
-like a badly-guessed constant and is not one: 20200 reproduces both measured points exactly, and run
+like a badly-guessed constant and is not one: `esmfold_bytes_per_residue_pair`
+= 20200 reproduces the measured 478 aa / 4.8 GB point exactly, and run
 backwards, a 193 aa cap means about 1.2 GB was free with the weights resident
 where the 478 aa measurement had 4.8 GB. On a 16 GB card holding an 11.2 GB
 trunk, 4.8 GB is what should be left, so about 3.6 GB was held by something
-else — and that is what to go and look at, not the coefficient. The warning
-now prints the free VRAM the longest skipped sequence would have needed, one
-line under how much was actually free, and says in as many words that it is
-the free VRAM and not the coefficient that decides the cap. It prints that
-clause only when the VRAM is what decided it; `max_len_structure` skipping
-prices nothing, because the memory had nothing to do with it.
+else — and that is what to go and look at, not the coefficient. The warning now
+prints the free VRAM the longest skipped sequence would have needed, one line
+under how much was actually free, and says in as many words that it is the free
+VRAM and not the coefficient that decides the cap. It prints that clause only
+when the VRAM is what decided it; `max_len_structure` skipping prices nothing,
+because the memory had nothing to do with it.
 
-**`esmfold_failed.tsv` is written on every run too, and one branch stops
-lying.** Its absence used to mean either "nothing failed" or "this results
-directory predates the failure record", and `structure_shortfall_message` had
-to hedge across both. It is now header-only when nothing failed — but making
-that change alone would have been worse than leaving it: the consumer decided
-which sentence to print by asking whether the table had ROWS, so a clean run
-would have been told its directory predates a record it had just written. That
-branch now keys on the FILE, and both sentences are tested.
+**`esmfold_failed.tsv` is written on every run too — created, never truncated,
+where a resumed run has nothing to do — and one branch stops lying.** Its
+absence used to mean either "nothing failed" or "this results directory
+predates the failure record", and `structure_shortfall_message` had to hedge
+across both. It is now header-only when nothing failed — but making that change
+alone would have been worse than leaving it: the consumer decided which
+sentence to print by asking whether the table had ROWS, so a clean run would
+have been told its directory predates a record it had just written. That branch
+now keys on the FILE, and both sentences are tested.
 
 **The two KEGG-invisibility rates are subtracted instead of left on two
 pages.** This pipeline has computed both for as long as it has had bins — the
@@ -179,28 +237,32 @@ raise it.
 
 **What it refuses to cover is in the file.** Rows the quant reader refused
 before this stage was handed anything are already gone from its first count,
-which says so. And every filter the REPORT applies afterwards
-(`min_valid_per_group`, `analysis.min_plexes`) runs in R over the file this
-funnel ends at and is counted there; the stage says so on the log beside the
-path, because a funnel that stopped at 1,282 in silence would be read as the
-end of the narrowing when it is the middle of it. A NEGATIVE `dropped` is not
-an arithmetic bug either: it means a step's population is not a subset of the
-one above it, which has one cause here — ids the quant table names that
-`annotation_final.tsv` does not — and that run has already been warned about
-it separately.
+which says so. And the filters the REPORT applies afterwards —
+`min_valid_per_group`, `analysis.min_plexes`, `analysis.min_features` — run in
+R over the file this funnel ends at and is counted there; the stage says so on
+the log beside the path, because a funnel that stopped at 1,282 in silence
+would be read as the end of the narrowing when it is the middle of it. A
+NEGATIVE `dropped` is not an arithmetic bug either: it means a step's
+population is not a subset of the one above it, which has two causes here — ids
+the quant table names that `annotation_final.tsv` does not, and a duplicate key
+on the right-hand side of one of the left joins that build
+`annotated_quant.tsv` — and that run has already been warned about it
+separately.
 
 Five tests, and what they cannot discriminate is written in them rather than
 left to be assumed: the last row counts `out` and not `q` because the merges
 above are left joins and a duplicate key ADDS rows, but on a fixture where
 nothing duplicates the two are equal, so swapping them passes. The reconciling
 test is mutation-checked against a `last()` that reads the row above instead of
-the unit's own chain, and against a `dropped` computed the wrong way round; a
-second fixture sets `min_features_per_protein: 99` so that at least one step in
-the file really removes something, since a funnel of zeros reconciles whatever
-pair it subtracted.
+the unit's own chain. A `dropped` computed the wrong way round survives it,
+because the fixture drops nothing anywhere and a funnel of zeros reconciles
+whichever pair it subtracted — so a second fixture sets
+`min_features_per_protein: 99` so that at least one step in the file really
+removes something, since a funnel of zeros reconciles whatever pair it
+subtracted.
 
 **The heartbeat now says how far through InterProScan is.** It is the longest
-stage in the pipeline — 57 h of the 455,571-protein run — and it went all of
+stage in the pipeline — 57.9 h of the 455,571-protein run — and it went all of
 that blind. Its stderr says it is alive and never says how far through it is,
 so the only way to get an ETA was to write a chunk-counting script against its
 `-T` tree by hand while the run was going. The signal was there the whole
@@ -214,7 +276,7 @@ supply when it knows something the tool's own output does not carry, and
 [31840.7s] INFO    interpro | interproscan.sh running 8h50m | chunk 312/380, ~2h08m left | ...
 ```
 
-The scheduler entry above ends by saying that once the dispatch order is
+The scheduler entry below says that once the dispatch order is
 right, what is left of a run's wall clock is `stage_workers` and InterProScan
 itself. This does not make that stage shorter. It makes it legible, which on
 two and a half days of waiting is the difference between watching a log and
@@ -353,12 +415,13 @@ seventh of it. On the 455,571-protein run InterProScan STARTED at **27.1 h**,
 the figure TUTORIAL's own start table publishes, and it finished last — so
 every one of those 27.1 hours was an hour the longest stage in the pipeline
 spent waiting for a worker, and an hour on the wall. (The run's total and
-InterProScan's own duration are quoted elsewhere in this entry from the
-replay; they are not repeated here, because 57.9 and 84.2 do not subtract to
-27.1 and the start time is the one this paragraph is about.) The same tie stands in front of
-all eight configs in `examples/server-run-plan`, each of which annotates a
-cohort in its own results directory and therefore starts cold, and each of
-which lists interpro LAST in its own hours class rather than seventh.
+InterProScan's own duration are quoted elsewhere in this entry from the replay;
+they are not repeated here, because 57.9 and the table's 86.6 do not subtract
+to 27.1 and the start time is the one this paragraph is about.) The same tie
+stands in front of all eight configs in `examples/server-run-plan`, each of
+which annotates a cohort in its own results directory and therefore starts
+cold, and each of which lists interpro LAST in its own hours class rather than
+seventh.
 
 **Each stage now carries `order_s`, the seconds it took on the release's
 reference run, and the sort key is the pair.** `stage_priority()` returns
@@ -397,7 +460,8 @@ left for a cleverer priority rule to collect, and what remains is
 pipeline at `stage_workers: 3` — is bounded by the work rather than by the
 graph.
 **Note which floor is quoted.** `sum(durations) / stage_workers` is the
-independent-jobs bound and it sits BELOW the critical path here, because
+independent-jobs bound and on three of the four rows above it sits BELOW the
+critical path, because
 `integrate` is a barrier all of its feeders must clear and `integrate → esmfold
 → foldseek → finalise → taxonomy → join` runs out on one worker at the end;
 quoting it would have promised hours that cannot be collected.
@@ -421,19 +485,22 @@ monotone rescalings, in
 `test_the_order_survives_any_rescaling_of_the_reference_seconds`. A machine
 four times faster and a dataset an order of magnitude larger therefore schedule
 the same way, and the repository's own evidence agrees: its two documented runs
-are 11.9× apart in protein count and 8×–66× apart per stage, and they order
-every stage both of them timed identically. So the numbers are not normalised,
-averaged or fitted, the comment at `STAGE_ORDER_S` says which rows are
-measurements and which are placements for the stages that run never enabled,
-and it says in full sentences why nobody should "fix" them into a constant per
-rank: a constant is not a rescaling, it is the ordinal again.
+are 11.9× apart in protein count and 8×–66× apart per stage, and inside every
+cost rank they order the stages both of them timed the same way — cluster and
+diamond swap between the runs, but they sit in different ranks and the rank
+leads. So the numbers are not normalised, averaged or fitted, the comment at
+`STAGE_ORDER_S` says which rows are measurements and which are placements for
+the stages that run never enabled, and it says in full sentences why nobody
+should "fix" them into a constant per rank: a constant is not a rescaling, it
+is the ordinal again.
 
 **The placed rows are the one part of this that argues with itself, so their
 sensitivity is measured too.** jackhmmer, hhblits, unipept, context, smorf and
 taxonomy have never been enabled on a run this repository publishes durations
-for, so they carry a placement below every measured stage of their own rank on
-a stated argument — the hours-class ones query the dark set, a few percent of a
-proteome, rather than all of it.
+for, so they carry a placement below every measured stage of their own rank
+except emapper's three-second reuse, on a stated argument — jackhmmer and
+hhblits query the dark set, a few percent of a proteome, rather than all of it,
+and unipept is a rate-limited service call over the quant table.
 `test_the_saving_does_not_rest_on_the_stages_no_run_has_timed` scales those
 placed rows in both directions and reports what happens: down, nothing changes
 direction; up by ten, so that stages nothing has ever timed become the longest
@@ -481,20 +548,20 @@ cannot tell apart keep table order.
 `describe --json`.** Until now the within-rank order could be predicted by
 reading `STAGES` top to bottom; it now comes from the seconds beside each
 `cost`, so the run names the order it is taking before its first dispatch —
-once, not per stage, because `stage_priority()` is a total order over stage
-names and the order of any round's ready set is that order restricted to it. No
-durations in that line: they are this release's figures for another dataset and
-printed beside a stage about to start they would read as an estimate of the run
-in hand, which is exactly what the resource guide tells an operator not to do.
-`describe --json` grows `order_s` beside `cost` instead, so a front end can
-reproduce the dispatch order from the release alone, and `--dry-run` prints
-the order it would really take — which it can do exactly, and could not do at
-all if the order depended on a results directory it is forbidden to write to
-and may never have read. `DESCRIBE_VERSION` does
-NOT move: the rule at the constant is that it moves when a key is removed or
-its meaning changes, and `cost` still means the rank. What changed is that
-`cost` is no longer SUFFICIENT to reproduce the order, and the honest answer to
-that is the new key beside it rather than a bump no consumer gates on.
+once, not per stage, because `stage_priority()` orders every stage name and the
+sort is stable and the order of any round's ready set is that order restricted
+to it. No durations in that line: they are this release's figures for another
+dataset and printed beside a stage about to start they would read as an
+estimate of the run in hand, which is exactly what the resource guide tells an
+operator not to do. `describe --json` grows `order_s` beside `cost` instead, so
+a front end can reproduce the dispatch order from the release alone, and
+`--dry-run` prints the order it would really take — which it can do exactly,
+and could not do at all if the order depended on a results directory it is
+forbidden to write to and may never have read. `DESCRIBE_VERSION` does NOT
+move: the rule at the constant is that it moves when a key is removed or its
+meaning changes, and `cost` still means the rank. What changed is that `cost`
+is no longer SUFFICIENT to reproduce the order, and the honest answer to that
+is the new key beside it rather than a bump no consumer gates on.
 
 **The console had to move with it, and it is a companion change rather than a
 consequence left lying.** `console.rank_ready()` ranked a NEXT row by `cost`
@@ -542,9 +609,10 @@ back closes a loop in which the scheduler's past decision is its present input.
 It remains a defensible refinement LATER, and it needs this table anyway as the
 per-stage fallback, which is strictly more information than the class median or
 the "unknown means longest" sentinel a bare state-file key has to invent. Also
-turned down: longest-remaining-path-first, which on this graph is the same
-order — `integrate` is the single confluence, so every feeder's remaining path
-is its own duration plus one shared constant, and
+turned down: longest-remaining-path-first, which over the stages that feed
+`integrate` is the same order — `integrate` is the single confluence, so every
+feeder's remaining path is its own duration plus one of two constants that
+differ by `context`'s ten seconds, and
 `test_remaining_path_length_would_order_this_graph_the_same_way` records that
 precondition so the day it stops holding the question is asked again rather
 than assumed away. And a WARN where a stage's measured duration contradicts its
@@ -559,7 +627,7 @@ stamp of the record that describes it. Every output written more than
 `OUTPUT_STAMP_SLACK_S` after its own record goes into ONE WARN for the whole
 run, naming each stage, each file, when it was last written and the run whose
 record it is — a report whose length grows with the number of late stages and
-whose line count does not. The verdict does not move: every one of them is
+whose WARN count does not. The verdict does not move: every one of them is
 still reused, no record is rewritten and nothing is deleted.
 
 **The gap it reports is the one the concurrency fix left open and could not
@@ -671,7 +739,7 @@ of each loss is also said when it happens rather than only at the end.
 
 ### Fixed
 
-twenty-four entries, in six groups. Each heading carries its own count and a
+twenty-five entries, in six groups. Each heading carries its own count and a
 test counts the entries under it.
 
 #### Four defects in the check this change set added
@@ -692,18 +760,19 @@ the `--force --only` and one line after it, and
 record, which is what the test that stood there did and is why it could not see
 this.
 
-**Two `ok` records is two records.** `--only pfam dbcan` leaves the minimum any
-`--only` run leaves, and overwriting both outputs is the shape this check
-exists for — a superseded run renaming inside `min(heartbeat_s, STATE_PROBE_S)`.
-The suppression answered it with the directory-wide sentence about a directory
-"copied, extracted or restored": neither stage named and a cause asserted that
-nothing could know. Both are named now. The cause is not claimed at all,
-because three candidate ways to claim it were driven over real directories and
-none of them works — the mtimes of the late outputs cluster just as tightly for
-two overwrites as for a `cp -r`; the state file's own mtime is rewritten by
-every run, including the `--force --only` above; and a broken dependency order
-is what a single replaced input produces by definition, so suppressing on it
-swallows the case the check is for. The three are written out at the check.
+**Two `ok` records is two records.** `--only pfam dbcan` is the smallest
+`--only` run that leaves two records, and overwriting both outputs is the shape
+this check exists for — a superseded run renaming inside `min(heartbeat_s,
+STATE_PROBE_S)`. The suppression answered it with the directory-wide sentence
+about a directory "copied, extracted or restored": neither stage named and a
+cause asserted that nothing could know. Both are named now. The cause is not
+claimed at all, because three candidate ways to claim it were driven over real
+directories and none of them works — the mtimes of the late outputs cluster
+just as tightly for two overwrites as for a `cp -r`; the state file's own mtime
+is rewritten by every run, including the `--force --only` above; and a broken
+dependency order is what a single replaced input produces by definition, so
+suppressing on it swallows the case the check is for. The three are written out
+at the check.
 
 **A `--dry-run` cannot measure the filesystem's clock, and now says so.**
 `_fs_clock_ahead()` is taken on a file the run has just written, a dry run
@@ -816,20 +885,21 @@ life of the run, so a single blip spent the one line a filesystem going
 permanently bad an hour later would need. It is said after the read budget is
 out, and it describes the write it declined.
 
-#### Two places that measured the wrong thing
+#### Three places that measured the wrong thing
 
 **`_unreleased_fixed_groups()` read a shipped release.** Cutting v0.6.0 left an
 `## Unreleased` holding only `### Added`, and `txt.index("### Fixed", start)`
-walked past that section and landed under `## v0.6.0` — every group of a shipped
-release read out as though it were in flight. The three tests built on it went
-on passing, because a shipped section agrees with its own prose for ever and
-will keep doing so, which is the worst way for a scan to be wrong: they had
-stopped checking the section in flight and said nothing about it. `_newest_section()`
-and `_fixed_groups()` take the bound in their arguments now, a test pins the
-boundary on a document built to have the trap in it, and each consumer asserts
-the PAIRING — groups without the sentence that counts them, or that sentence
-without the groups, both fail — so a section with nothing to correct asserts
-that it counts nothing rather than asserting nothing at all.
+walked past that section and landed under `## v0.6.0` — every group of a
+shipped release read out as though it were in flight. The three tests built on
+it went on passing, because a shipped section agrees with its own prose for
+ever and will keep doing so, which is the worst way for a scan to be wrong:
+they had stopped checking the section in flight and said nothing about it.
+`_newest_section()` and `_fixed_groups()` take the bound in their arguments
+now, a test pins the boundary on a document built to have the trap in it, and
+each consumer asserts the PAIRING — groups without the sentence that counts
+them, or that sentence without the groups, both fail — so a section with
+nothing to correct asserts that it counts nothing rather than asserting nothing
+at all.
 
 **The README's test counts were a release behind.** The Tests section quoted a
 passing count from before this change set added its tests. The band in `_near()`
@@ -838,17 +908,37 @@ reason to leave a counted number wrong: the README's own claim about those
 numbers is that they are counted rather than estimated. Re-counted, with the
 no-R pair re-derived from them.
 
+**And `_newest_section_start()` was hijacked by prose that MENTIONS the
+heading.** It located the section with a plain `txt.find("## Unreleased")`,
+which matches anywhere in the document rather than at the start of a line — and
+the entry two above this one contains the string, in backticks, several hundred
+lines inside the very section the helper delimits. While an `## Unreleased`
+heading existed the find hit the real one first and nothing showed. Cutting
+v0.7.0 removed it, the find landed on the backticked mention, and three tests
+began reading a shipped release as though it were in flight: the replay table
+came back with zero rows it could read, the Fixed section "no longer said how
+many entries it has", and the count scanner compared this release's prose
+against v0.6.0's groups. Found by cutting the release, which is the only thing
+that could have found it, and fixed by anchoring the search to a line start —
+the same correction the entry two above made to the same helper, one line
+further up. The tests fail again the moment the plain `find` is put back.
+
 #### Six defects in what a stop does to the tools a run launched
 
 **A `kill` of a run now stops the tools it launched, and it stops them before
 it lets go of the lock.** The signal handler exits through `os._exit()`, which
 runs no `finally` and no `except BaseException`, so `run_cmd`'s own cleanup was
 never reached and *every* child of a killed run survived — documented
-behaviour with an uncosted price. On the first full run on real data that price
-was three concurrent `hmmsearch --cpu 7` against the same 455,571 proteins from
-13:03 to 20:04, the box 1.6x oversubscribed during `pfam`, and two of the three
-finished results discarded because a dot-prefixed `.part` file is something
-no stage can adopt.
+behaviour with an uncosted price. What that price LOOKS like is on the record
+from the first full run on real data: three concurrent `hmmsearch --cpu 7`
+against the same 455,571 proteins from 13:03 to 20:04, the box 1.6x
+oversubscribed during `pfam`, and two of the three finished results discarded
+because a dot-prefixed `.part` file is something no stage can adopt. That
+particular death ran no handler at all, so this fix could not have prevented
+that incident and is not claimed to have — the entry below on the leftover
+census is the one that addresses it. It is quoted here for the shape and the
+scale of what orphaned tools cost, which is what makes the hole worth closing
+for the deaths that DO run a handler.
 
 Each tool is now launched through one helper with `start_new_session=True`, so
 it is a session and process-group leader (`pgid == pid`, no extra syscall) and
@@ -915,10 +1005,10 @@ the `hmmsearch` that was writing it; it carries no host, and it can have been
 recycled. The census therefore asks the process table exactly one question, and
 it is `== os.getpid()`. The 237 MB tblout from the incident is still in
 `results/hmm/` and stays there: rule 5, and because it is the only artefact
-showing three hmmsearches ran, because an `unlink` would not free the space while
-the writer holds the inode — it would only hide the bytes from `du` and destroy
-`lsof <path>`, the one handle from the file back to the process — and because
-a complete tblout may be real work.
+showing three hmmsearches ran, because an `unlink` would not free the space
+while the writer holds the inode — it would only hide the bytes from `du` and
+destroy `lsof <path>`, the one handle from the file back to the process — and
+because a complete tblout may be real work.
 
 **What this does not cover, stated so nobody reads silence as health.** No
 handler runs for `SIGKILL`, an OOM kill or a host reset, and nothing in a
@@ -985,8 +1075,9 @@ flag's only case, every time. Measured: run A live inside `pfam` with a growing
 the census, and dispatched nothing, with no escape anywhere. It took the
 documented handover with it, since `another run holds this results directory`
 and the whole `_park_superseded` apparatus the TUTORIAL describes then named a
-state nothing could reach. The suite missed it because the handover tests use
-stubs that have already exited.
+state nothing could reach. The suite missed it because no handover test had a
+tool writing at the moment of the handover: the end-to-end one blocks its stub
+on a gate before it opens its output, and the rest launch no process at all.
 
 What tells the cases apart is the only thing a leftover's NAME carries: the pid
 that MINTED it, which is metaannot's own and therefore names a RUN. Where that
@@ -1038,21 +1129,22 @@ old spawn site, which is what the one beside it never did.
 counted in it, and reported a majority finding as a minor caveat.** `ev` is
 built by an OUTER join of the per-protein counts of KEPT features with the
 per-protein counts of DROPPED ones, so a razor protein whose every feature was
-dropped arrives as a row whose `n_features_used`, `n_unique`,
-`n_taxon_unique` and `n_family_unique` are all 0. The flag is
-`(n_taxon_unique + n_family_unique) > n_unique`, and `(0 + 0) > 0` is False,
-so such a row can never reach the numerator while still swelling the
-denominator — and those rows hold no measurement at all: they have a row in
-`peptide_evidence.tsv`, which is where this change's new INFO line counts them,
-and no number in the quant matrix and no place in any report table. On the first full run on real data 5,039 of the
-8,238 rows were such rows, and the line read **1,749/8,238 — 21.2%**. Over the
-proteins the assignment rule actually decided something about it
-reads **1,749/3,199 — 54.7%**, which is the same numerator and the same
+dropped arrives as a row whose `n_features_used`, `n_unique`, `n_taxon_unique`
+and `n_family_unique` are all 0. The flag is `(n_taxon_unique +
+n_family_unique) > n_unique`, and `(0 + 0) > 0` is False, so such a row can
+never reach the numerator while still swelling the denominator — and those rows
+hold no measurement at all: they have a row in `peptide_evidence.tsv`, which is
+where this change's new INFO line counts them, and no number in the quant
+matrix and no place in any report table. On the first full run on real data
+5,039 of the 8,238 rows were such rows, and the line read **1,749/8,238 —
+21.2%**. Over the proteins the assignment rule actually decided something about
+it reads **1,749/3,199 — 54.7%**, which is the same numerator and the same
 `peptide_evidence.tsv`, byte for byte: any archived run can be recomputed both
 ways from the file it already wrote. The denominator is not a new invention —
-`before` in the `min_features_per_protein` WARN two lines below is `len(quant)`,
-i.e. exactly this count, so that line already reported `1,282/3,199` beside the
-old line's 8,238 with nothing saying they were different populations.
+`before` in the `min_features_per_protein` WARN two lines below is
+`len(quant)`, i.e. exactly this count, so that line already reported
+`1,282/3,199` beside the old line's 8,238 with nothing saying they were
+different populations.
 
 The per-protein flag is unchanged, and that is the point: it was never wrong.
 `taxon_unique_dominated` is true of exactly the rows whose taxon- plus

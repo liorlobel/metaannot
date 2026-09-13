@@ -352,6 +352,52 @@ def test_nothing_skipped_still_writes_the_list_so_absence_means_one_thing(
     assert os.path.getsize(f"{p.structures}/not_folded.faa") == 0
 
 
+def test_a_work_list_entirely_over_the_cap_still_writes_the_list(
+        folding, ma):
+    """The path that skips the most used to write nothing at all.
+
+    Where every sequence is over max_len_structure there is nothing pending,
+    so the stage returns before it touches the GPU -- and before the writes at
+    the end of the fold loop. That is the exact inverse of the rule these
+    files state: the run with the longest list of skipped proteins was the one
+    that recorded none of them. Found by auditing this release's own notes,
+    which claimed the opposite.
+    """
+    seqs = [("long1", "C" * 900), ("long2", "D" * 950)]
+    _, p, model = folding(seqs, max_len_structure=100)
+    assert not model.attempts, "nothing was foldable, so nothing was folded"
+    rows = open(f"{p.structures}/not_folded.tsv", encoding="utf-8").read()
+    assert rows.splitlines()[0].split("\t") == \
+        ["protein_id", "length", "limit_aa", "limit_from"]
+    assert {l.split("\t")[0] for l in rows.splitlines()[1:]} == {"long1", "long2"}
+    assert {l.split("\t")[3] for l in rows.splitlines()[1:]} == \
+        {"max_len_structure"}, "the weights never loaded; VRAM capped nothing"
+    assert dict(ma.read_fasta(f"{p.structures}/not_folded.faa")) == \
+        {"long1": "C" * 900, "long2": "D" * 950}
+
+
+def test_a_resumed_run_with_nothing_to_do_keeps_the_failures_it_recorded(
+        folding):
+    """Creating the failure table must not mean truncating it.
+
+    A resumed run that finds every foldable sequence already folded returns
+    early. It still has to leave `esmfold_failed.tsv` there -- absence means
+    the stage never ran -- but erasing an earlier run's record of what it gave
+    up on, in order to say "nothing failed this time", would lose the only
+    account of why those proteins have no structure.
+    """
+    seqs = [("a", "A" * 60)]
+    cfg, p, _ = folding(seqs)
+    miss = f"{p.structures}/esmfold_failed.tsv"
+    with open(miss, "w", encoding="utf-8") as fh:
+        fh.write("protein_id\tlength\terror\nP_old\t120\tCUDA out of memory\n")
+    # rerun over the same directory: everything is folded, so it returns early
+    _, _, model2 = folding(seqs, reuse=(cfg, p))
+    assert not model2.attempts, "the resumed run folded nothing"
+    assert "P_old" in open(miss, encoding="utf-8").read(), \
+        "the resumed run erased the earlier run's failure record"
+
+
 def test_the_skipped_warning_prices_the_vram_the_longest_one_needed(
         folding, ma, capsys):
     """A count of skipped proteins is a complaint; a number of GB is a step.
