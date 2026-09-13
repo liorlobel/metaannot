@@ -1,5 +1,180 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+**A `cached` stage now says when the record it is being reused on is no longer
+about the file that is there.** On the `cached` branch, and for an `ok` record
+only, `decide()` compares each declared output's mtime against the `finished`
+stamp of the record that describes it. Every output written more than
+`OUTPUT_STAMP_SLACK_S` after its own record goes into ONE WARN for the whole
+run, naming each stage, each file, when it was last written and the run whose
+record it is — a report whose length grows with the number of late stages and
+whose line count does not. The verdict does not move: every one of them is
+still reused, no record is rewritten and nothing is deleted.
+
+**The gap it reports is the one the concurrency fix left open and could not
+close.** A run `SIGKILL`ed between `atomic_out`'s rename and `finish()`'s record
+is *not* it — `mark_running` wrote a `"running"` record before the stage
+started, and the next run recomputes on that. What is left is the case where the
+record that survives belongs to a different run than the bytes do: A marks a
+stage running, the operator `--force-unlock`s, B recomputes that stage and
+records it `ok`, A's rename lands on top of B's file inside
+`min(heartbeat_s, STATE_PROBE_S)`, and A is killed without writing anything at
+all. `signature()` hashes inputs and config and never an output, so nothing else
+in the program is capable of noticing. The same shape needs no kill whatever: a
+table put there by hand, a parked `.superseded.*` moved back, an over-broad copy
+back from the GPU box.
+
+**Nothing in the state file moved for it.** The exact key-set assertion on an
+`ok` record in `tests/test_console_contract.py` is unchanged, deliberately: the
+check is built out of `finished`, which every `ok` record has always carried, so
+a results directory written by an earlier build needs no migration and a record
+this build cannot date is compared against nothing. The console is untouched
+too — it already stats every declared output and shows both the file and the
+`finished` stamp on the row, and the engine, which knows the signature it has
+just matched, is what says the sentence.
+
+**It is evidence and not protection**, and the limits are in the message itself
+rather than only in the README. An output that is *not* newer proves nothing at
+all: an overwrite that landed before the record, or one that kept the file's
+timestamp, leaves no trace here. Only DECLARED outputs are compared, so for
+`diamond`, `hhblits` and `esmfold`, whose declared output is a `.done` sentinel,
+a sentinel that dates cleanly says nothing about the per-database tables, the
+per-query `.hhr` files, `plddt.tsv`, `esmfold_failed.tsv` or the per-protein
+PDBs beside it. (Those tables and those PDBs go through `atomic_out` and *are*
+covered by the ownership gate; they are outside this check because they are not
+declared.) And `emapper`'s live branch writes its annotations file with no temp
+and no rename, which makes it the one declared output a kill can genuinely
+truncate — a timestamp says nothing about truncation, and this does not claim
+to.
+
+**Weighed and turned down: recording each output's SIZE in its record instead.**
+A size survives a copy where an mtime does not, but it is blind in the very
+window this exists for — A and B ran the same stage over the same inputs, so
+byte-identical output is the expected case there, not a coincidence — and it
+would have moved a pinned record shape, put a key no reader acts on into a
+published document, and left a permanent warning on a legitimately re-`rsync`ed
+adopted output with no supported way to silence it. The size-shaped hole is
+named in the README instead: a substitution that preserves a timestamp is
+invisible here.
+
+**One case does report itself on every run, and nothing silences it.** A stage
+this box ran and recorded `ok`, over which the operator later `rsync`s a newer
+output from the GPU box, is a record that really is no longer about the file
+that is there. It is reported, correctly, and nothing re-records it — and the
+remedy the message names, `--force --only <stage>`, would recompute a GPU stage
+on the wrong machine. Re-recording a stage without recomputing it would answer
+it and is deliberately not in this change.
+
+**Where several stages are late at once the cause is not named, because it
+cannot be had from a timestamp.** A directory copied with `cp -r`, unpacked from
+an archive or restored from a backup has every mtime in it rewritten at one
+moment, and so do that many separate replacements: measured on this project's
+own results directory, a `cp -r` puts every late output inside twenty
+milliseconds of every other, and so does overwriting the two outputs a
+`--only pfam dbcan` run leaves. The report offers both readings, asserts
+neither, and says that rebuilding stage by stage would spend hours of compute
+for nothing if it is the first.
+
+**The false warnings are pinned as hard as the true one.** `--force --only`
+compares nothing, having already decided to recompute. An `adopted` record is
+never dated against its file, because `finished` there is when this box noticed
+it and `rsync -a` preserves the source mtime — dating it would report the
+documented GPU hand-off on every run for ever. A `finished` stamp that names no
+single instant is declined rather than dated, and the run says which record. An
+ordinary resume of a whole directory reports nothing. And there is one
+suppression, because it is the only one that is a MEASUREMENT: a filesystem
+whose clock leads this machine's, taken on a file the run has just written,
+makes every output look newer than its record, and two clocks compared against
+each other say nothing at all — so the run says that once and compares nothing
+further. A `--dry-run` writes nothing, so it cannot take that measurement, and
+it says the question went unasked rather than leaving a reader to infer it was
+asked and answered no.
+
+### Fixed
+
+six entries, in two groups. Each heading carries its own count and a test
+counts the entries under it.
+
+#### Four defects in the check this change set added
+
+**The report is one WARN for the run, because suppressing a per-stage one was
+all-or-nothing and the remedy it recommends destroyed it.** The first build
+logged a line per late stage and suppressed the lot whenever EVERY `ok` record
+in the document was late, reading that as a copy rather than a replaced file.
+Driven with ordinary commands: run a project to completion, wait past the
+slack, `cp -r` it, and the copy says one line; then `--force --only pfam` — the
+action every one of those lines names — re-records one stage, "every record is
+late" stops holding, and every run after that says the per-stage sentence about
+each of the stages left, for ever, with nothing that silences them. That is
+exactly the failure `OUTPUT_STAMP_SLACK_S`'s own comment claims to prevent,
+reached by following the advice. The count is now the property: one line before
+the `--force --only` and one line after it, and
+`tests/test_scheduler.py` drives all four steps rather than backdating every
+record, which is what the test that stood there did and is why it could not see
+this.
+
+**Two `ok` records is two records.** `--only pfam dbcan` leaves the minimum any
+`--only` run leaves, and overwriting both outputs is the shape this check
+exists for — a superseded run renaming inside `min(heartbeat_s, STATE_PROBE_S)`.
+The suppression answered it with the directory-wide sentence about a directory
+"copied, extracted or restored": neither stage named and a cause asserted that
+nothing could know. Both are named now. The cause is not claimed at all,
+because three candidate ways to claim it were driven over real directories and
+none of them works — the mtimes of the late outputs cluster just as tightly for
+two overwrites as for a `cp -r`; the state file's own mtime is rewritten by
+every run, including the `--force --only` above; and a broken dependency order
+is what a single replaced input produces by definition, so suppressing on it
+swallows the case the check is for. The three are written out at the check.
+
+**A `--dry-run` cannot measure the filesystem's clock, and now says so.**
+`_fs_clock_ahead()` is taken on a file the run has just written, a dry run
+writes nothing on purpose, and the skew branch was therefore unreachable there:
+with a throwaway engine reporting a lead of a thousand seconds over a directory
+holding one late output, a real run read no mtime as evidence and a `--dry-run`
+reported the stage. Neither the message nor the README said the question had
+gone unasked; the README called a dry run an audit and left it there. The dry
+run's report now names the gap, and the README says it plainly.
+
+**A stage recorded in the hour a zone repeats is declined rather than reported
+for ever.** `_stamp_epoch()` is `time.mktime(time.strptime(...))` on a naive
+local time and cannot resolve a repeated local hour: with `TZ=America/New_York`
+the second 01:30 of 2026-11-01 is epoch 1793514600, `strftime` writes
+`2026-11-01T01:30:00`, and reading that back gives 1793511000 — an hour early,
+twelve hundred times the slack. `_stamp_instant()` asks PEP 495's `fold`
+instead, which answers for the skipped hour and for half-hour shifts too, and
+returns nothing where the text names two moments or none. Round-tripping the
+text through `localtime` was tried first and does not work: the earlier reading
+of a repeated hour formats back to the same text, so the round trip succeeds on
+exactly the case that needs catching. The record is named rather than passed
+over in silence, because a stage that went unjudged must not look like one that
+dated cleanly. `_stamp_epoch()` is left as it was, since it is what the adoption
+paths have always read.
+
+#### Two places that measured the wrong thing
+
+**`_unreleased_fixed_groups()` read a shipped release.** Cutting v0.6.0 left an
+`## Unreleased` holding only `### Added`, and `txt.index("### Fixed", start)`
+walked past that section and landed under `## v0.6.0` — every group of a shipped
+release read out as though it were in flight. The three tests built on it went
+on passing, because a shipped section agrees with its own prose for ever and
+will keep doing so, which is the worst way for a scan to be wrong: they had
+stopped checking the section in flight and said nothing about it. `_newest_section()`
+and `_fixed_groups()` take the bound in their arguments now, a test pins the
+boundary on a document built to have the trap in it, and each consumer asserts
+the PAIRING — groups without the sentence that counts them, or that sentence
+without the groups, both fail — so a section with nothing to correct asserts
+that it counts nothing rather than asserting nothing at all.
+
+**The README's test counts were a release behind.** The Tests section quoted a
+passing count from before this change set added its tests. The band in `_near()`
+is wide enough that nothing failed, which is the point of the band and not a
+reason to leave a counted number wrong: the README's own claim about those
+numbers is that they are counted rather than estimated. Re-counted, with the
+no-R pair re-derived from them.
+
 ## v0.6.0 — 2026-09-12
 
 Everything here came out of one question — what can a program, rather than a

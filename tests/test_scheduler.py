@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -15,7 +16,7 @@ import time
 import pytest
 
 import fixtures as F
-from conftest import METAANNOT_PY, build_project, run_metaannot
+from conftest import METAANNOT_PY, ROOT, build_project, run_metaannot
 from test_stages import _searchable
 
 
@@ -3158,3 +3159,685 @@ def test_a_superseded_run_does_not_rename_a_later_stage_into_the_directory(
     assert "missing input" in a_err,         "the warning does not say what happens to the rest of that run"
     assert "dbcan" not in proj.state(),         "the superseded run recorded a stage in the live run's document"
     assert _run_record(proj)["run_id"] == b_run
+
+
+# --- #36: the record, and whether it still describes the file -----------
+#
+# The whole group drives ONE property: a `cached` verdict whose declared
+# output was written after the record that describes it says so, and which
+# reuses the stage anyway. The ones that must stay SILENT are here beside it,
+# because a check like this is worth nothing if the false ones are not pinned
+# as hard as the true one.
+#
+# And several of them are about the SIZE and the HONESTY of the report
+# rather than about whether it fires, because that is where the first build
+# of this was wrong. A report whose line count grows with the directory is
+# a report
+# that gets turned off; a report that names a cause it cannot know teaches a
+# reader to disbelieve the part it can. So the properties pinned are: one WARN
+# per run whatever the directory holds, a count that does not move when the
+# remedy is taken on one stage, every late stage named, and no cause asserted
+# where more than one of them is late.
+
+_SUPERSEDED_RUN = '''
+"""A real run whose every state write is refused, paused at the one write that
+would have recorded the stage it has just renamed into place.
+
+That is not a contrivance, it is what a superseded run IS: update_state()
+returns False on either ownership latch, while atomic_out() goes on renaming,
+because _directory_still_ours() is a clock and not an exclusion. The same
+refusal reaches a run that never lost anything, on a single unreadable read of
+the state file at dispatch. Either way the record that survives in the
+document belongs to a different run than the bytes on disk do, and the pause
+is where the parent SIGKILLs this one: between the rename and the record,
+which is the corruption path no ownership check can reach.
+"""
+import importlib.util
+import os
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("metaannot", os.environ["MA_PY"])
+ma = importlib.util.module_from_spec(spec)
+sys.modules["metaannot"] = ma
+spec.loader.exec_module(ma)
+
+STAGE, MARKER = os.environ["MA_STAGE"], os.environ["MA_MARKER"]
+
+
+def refused(path, state, keys, *args, **kw):
+    rec = state.get(STAGE)
+    if STAGE in keys and isinstance(rec, dict) and rec.get("status") == "ok":
+        with open(MARKER, "w", encoding="utf-8") as fh:
+            fh.write("renamed, not recorded")
+        time.sleep(600)
+    return False
+
+
+ma.update_state = refused
+sys.exit(ma.main())
+'''
+
+LATE = "no longer about the file that is there"
+SKEWED = "not being read as evidence of anything"
+UNDATED = "names no single instant"
+
+
+def _warn_block(stderr, needle):
+    """One whole WARN, continuation lines and all.
+
+    log() writes a multi-line message as its tagged first line plus
+    continuations padded out to the width of that tag, so a test that takes
+    only the line the phrase sits on reads a HEADING and calls it the message.
+    This check's message is a heading, a list of stages and then a paragraph,
+    and the paragraph is where every limitation it states lives - so the
+    vocabulary rule at the bottom of this file, asserted against the first
+    line alone, would have been asserted against the one part of the message
+    that cannot break it.
+    """
+    lines = stderr.splitlines()
+    at = next((i for i, l in enumerate(lines) if needle in l), None)
+    assert at is not None, f"{needle!r} is not in this output:\n{stderr}"
+    out = [lines[at]]
+    for line in lines[at + 1:]:
+        # A new log() call starts with the elapsed-time tag; a continuation of
+        # this one cannot, because it is indented to that tag's width.
+        if re.match(r"^\[\s*[\d.]+s\]", line):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _stages_of(proj):
+    return sorted(k for k in proj.state() if not k.startswith("_"))
+
+
+def _backdate(proj, *stages, by=3600):
+    """Move a record's `finished` stamp back, leaving everything else alone.
+
+    The same fact as writing the output later, and the cheap half of it: the
+    check compares one against the other, and only the tests that have to
+    drive a RENAME or a COPY need real time to pass. `signature` does not read
+    `finished`, so the stage is still cached afterwards.
+    """
+    path = proj.rpath(".metaannot_state.json")
+    with open(path, encoding="utf-8") as fh:
+        st = json.load(fh)
+    for name in (stages or [k for k in st if not k.startswith("_")]):
+        rec = st.get(name)
+        if not isinstance(rec, dict) or "finished" not in rec:
+            continue
+        when = time.mktime(time.strptime(rec["finished"], "%Y-%m-%dT%H:%M:%S"))
+        rec["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                        time.localtime(when - by))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1)
+    return st
+
+
+def _set_finished(proj, stage, stamp):
+    """Write a literal `finished` stamp, which is the only way to reach a
+    local time this machine is not in right now."""
+    path = proj.rpath(".metaannot_state.json")
+    with open(path, encoding="utf-8") as fh:
+        st = json.load(fh)
+    st[stage]["finished"] = stamp
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="there is no SIGKILL to send")
+def test_an_output_renamed_after_its_own_record_is_reported_and_still_cached(
+        tmp_path, stub_bin, ma):
+    """The corruption path no ownership check can reach, driven end to end.
+
+    Run one records `pfam` ok. Run two rewrites `pfam.tblout` and is SIGKILLed
+    between atomic_out's rename and finish()'s record, with every state write
+    of its own refused - so the document still holds run one's record and the
+    file under it is run two's. The signature still agrees and every output
+    still exists, so run three reports `cached`: correct, and until this check
+    existed, silent.
+
+    It stays `cached` afterwards. Nothing is recomputed, nothing is deleted
+    and the record is not touched - the run says what it can see and hands the
+    decision to whoever knows whether this directory was --force-unlocked.
+
+    ONE stage, which is the half of the message that may name a remedy: with
+    a single record in the report there is nothing to read it two ways, so
+    `--force --only` is the answer and the line says so. The several-stage
+    half is the test below.
+    """
+    proj = _searchable(tmp_path, tmp_path / "window")
+    proj.run()
+    recorded = proj.state()["pfam"]
+    assert recorded["status"] == "ok"
+
+    # Real elapsed time, and one of the two places this group spends any: the
+    # slack is what separates a healthy stage - renamed a moment BEFORE its
+    # own record - from this one, so a rename landing inside it proves nothing
+    # and the test must not ask it to.
+    time.sleep(ma.OUTPUT_STAMP_SLACK_S + 1.0)
+
+    driver = tmp_path / "superseded_run.py"
+    driver.write_text(_SUPERSEDED_RUN, encoding="utf-8")
+    marker = tmp_path / "renamed-not-recorded"
+    killed = subprocess.Popen(
+        [sys.executable, str(driver), "run", "--config", proj.config_path,
+         "--force", "--only", "pfam"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=proj.root,
+        env=dict(os.environ, MA_PY=METAANNOT_PY, MA_STAGE="pfam",
+                 MA_MARKER=str(marker), STUB_SLEEP="0", PYTHONHASHSEED="0"))
+    try:
+        reached = _wait_for(marker.exists, timeout=120)
+    finally:
+        killed.kill()
+        killed.communicate(timeout=60)       # never leave one behind running
+    assert reached, "the run never got between its rename and its record"
+    assert proj.state()["pfam"] == recorded, \
+        "the killed run wrote a record of its own, so this is not the window"
+
+    proc = proj.run("--only", "pfam")
+    said = _warn_block(proc.stderr, LATE)
+    assert "[pfam]" in said
+    assert proj.rpath("hmm", "pfam.tblout") in said
+    assert recorded["run_id"] in said, \
+        "the warning does not name the run whose record it is about"
+    assert "ONE DIRECTION ONLY" in said
+    assert "SEVERAL STAGES AT ONCE" not in said, \
+        "one late record is not read two ways"
+    assert "--force --only" in said, "one late record is told how to rebuild it"
+    assert proj.state()["pfam"] == recorded, \
+        "a warning invalidated, recomputed or re-recorded the stage"
+
+
+def test_a_copied_directory_says_one_line_before_a_force_only_and_one_after(
+        tmp_path, stub_bin, ma):
+    """The four steps that took the first build of this check apart, in order,
+    with ordinary commands and no state file edited by hand.
+
+    WHY THE FOUR STEPS AND NOT A BACKDATED DOCUMENT. The test that stood here
+    backdated EVERY record and asserted that the run said one thing about the
+    directory rather than one thing per stage. That pinned the all-stale case
+    and structurally could not see the case that matters: the first build
+    suppressed the whole report when every `ok` record was late, so
+    `--force --only pfam` - the action the report itself recommends - left one
+    fresh record, the suppression stopped holding, and every run after that
+    said the per-stage sentence about each of the stages left, for ever, each
+    one recommending a recompute of a real InterProScan or ESMFold stage on
+    evidence that is nothing but the copy's restamp. A test that backdates
+    every record can never take the third step.
+
+    So the third step is the point of this test, and the property is a COUNT
+    that does not move across it: one line before, one line after. The report
+    is one WARN per run whose length grows with the number of late stages and
+    whose count does not, so there is no cliff for the remedy to fall off.
+
+    `cp -r` and real elapsed time, because the fact under test is what a copy
+    does to mtimes and what it does NOT do to the stamps inside the document -
+    and the interval between the two is exactly what has to exceed the slack.
+    (`rsync -a` preserves mtimes and is why the documented two-machine
+    workflow never reaches any of this.)
+    """
+    proj = _searchable(tmp_path, tmp_path / "orig")
+    proj.run()
+    stages = _stages_of(proj)
+    assert len(stages) > 2, "a copy of one stage is not the case under test"
+
+    time.sleep(ma.OUTPUT_STAMP_SLACK_S + 1.0)
+    copied = str(tmp_path / "copied")
+    subprocess.run(["cp", "-r", proj.root, copied], check=True, timeout=300)
+
+    def run_copy(*args):
+        return run_metaannot(
+            "run", "--config", os.path.join(copied, "config.yaml"), *args,
+            cwd=copied, timeout=600)
+
+    before = run_copy()
+    assert before.stderr.count(LATE) == 1, \
+        "a copied directory says this once per run, not once per stage"
+    said = _warn_block(before.stderr, LATE)
+    for name in stages:
+        assert f"[{name}]" in said, f"{name} is late and is not named"
+    assert "SEVERAL STAGES AT ONCE" in said, \
+        "several stages at once is read two ways or it asserts a cause"
+    assert "copied, extracted or restored" in said
+    assert "rather than what a replaced file looks like" not in said, \
+        "the report claims to know which of the two readings it is"
+    assert SKEWED not in said, "nothing here measured a skewed clock"
+
+    # Step three: the remedy the report names, on one stage. It recomputes
+    # first, so it compares nothing and says nothing.
+    forced = run_copy("--force", "--only", "pfam")
+    assert LATE not in forced.stderr
+    assert forced.stderr.count("WARN") >= 0      # --force is silent here
+
+    # Steps four and five: twice, because "the same seven on every run after
+    # that" was the shape of the defect and once cannot see it.
+    for attempt in (4, 5):
+        after = run_copy()
+        assert after.stderr.count(LATE) == 1, \
+            f"run {attempt} after the --force says this more than once"
+        blk = _warn_block(after.stderr, LATE)
+        assert "[pfam]" not in blk, \
+            "the stage that was rebuilt is still being reported"
+        for name in [n for n in stages if n != "pfam"]:
+            assert f"[{name}]" in blk, \
+                f"run {attempt} stopped naming {name} after one re-record"
+
+
+def test_two_late_records_are_two_records_and_both_stages_are_named(
+        tmp_path, stub_bin, ma):
+    """Two `ok` records is the MINIMUM any `--only` run leaves, and a
+    superseded run renaming two outputs inside
+    min(heartbeat_s, STATE_PROBE_S) is exactly the shape this check exists
+    for. The first build answered it with the directory-wide sentence about a
+    directory "copied, extracted or restored": neither stage named, and a
+    cause asserted that it had no way to know - "a single record is not a
+    pattern" had become "two is one".
+
+    Both stages are named now, and the cause is offered as one of two readings
+    and asserted as neither, because it cannot be had from timestamps at all:
+    a `cp -r` of this project's results directory puts every late output
+    inside twenty milliseconds of every other, and so does this test.
+    """
+    proj = _searchable(tmp_path, tmp_path / "pair")
+    proj.run("--only", "pfam", "dbcan")
+    assert _stages_of(proj) == ["dbcan", "pfam"]
+
+    time.sleep(ma.OUTPUT_STAMP_SLACK_S + 1.0)
+    outs = [proj.rpath("hmm", "pfam.tblout"),
+            proj.rpath("hmm", "dbcan.domtblout")]
+    for path in outs:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with open(path, "wb") as fh:                # same bytes, new mtime
+            fh.write(data)
+
+    proc = proj.run("--only", "pfam", "dbcan")
+    said = _warn_block(proc.stderr, LATE)
+    for name in ("pfam", "dbcan"):
+        assert f"[{name}]" in said, f"{name} is late and is not named"
+    for path in outs:
+        assert path in said, "the file that was overwritten is not named"
+    assert "CANNOT TELL YOU WHICH OF TWO THINGS IT IS" in said
+    assert "rather than what a replaced file looks like" not in said
+    assert SKEWED not in said
+    assert all(v["status"] == "ok" for k, v in proj.state().items()
+               if not k.startswith("_"))
+
+
+def test_an_ordinary_resume_reports_a_late_write_on_none_of_its_stages(
+        tmp_path, stub_bin):
+    """The guard that matters more than the warning does.
+
+    Every cached stage of every resume goes through this comparison, so a rule
+    a shade too strict is a warning on a healthy directory - and a warning
+    that fires on everything is turned off within a week, taking the real one
+    with it. Driven over a whole directory rather than one record, because a
+    stamp truncated to the whole second makes every healthy stage look a
+    fraction late and a single-record test can miss which way it went.
+    """
+    proj = _searchable(tmp_path, tmp_path / "resume")
+    proj.run()
+    assert len(_stages_of(proj)) > 1
+    proc = proj.run()
+    assert LATE not in proc.stderr
+    assert SKEWED not in proc.stderr
+    assert UNDATED not in proc.stderr
+
+
+def test_force_only_compares_no_timestamps_because_it_recomputes_first(
+        tmp_path, stub_bin):
+    """--force is a statement that the record is not to be trusted, and
+    answering it with a complaint about that record is noise. It is also the
+    action this check's own message recommends, so it must not then complain
+    about itself."""
+    proj = _searchable(tmp_path, tmp_path / "forced")
+    proj.run()
+    _backdate(proj, "pfam")
+    proc = proj.run("--force", "--only", "pfam")
+    assert LATE not in proc.stderr
+    assert proj.state()["pfam"]["status"] == "ok"
+
+
+def test_an_adopted_record_is_never_dated_against_the_file_it_adopted(
+        tmp_path, stub_bin):
+    """`finished` on an `adopted` record is when THIS box noticed the file,
+    not when the box that made it wrote it, and `rsync -a` preserves the
+    source mtime. The two numbers are neither on one clock nor about one
+    event, so the GPU hand-off is never reported - which is the restriction
+    that keeps this quiet on the documented two-machine workflow."""
+    proj = _searchable(tmp_path, tmp_path / "adopted")
+    os.makedirs(proj.rpath("hmm"), exist_ok=True)
+    F.write_tblout(proj.rpath("hmm", "pfam.tblout"),
+                   [("P_dark1", "Peptidase_S8", "PF00082.1")])
+    proj.run()
+    assert proj.state()["pfam"]["status"] == "adopted"
+    _backdate(proj, "pfam")
+    proc = proj.run("--only", "pfam")
+    assert LATE not in proc.stderr
+    assert proj.state()["pfam"]["status"] == "adopted"
+
+
+def test_a_record_whose_stamp_cannot_be_read_is_compared_against_nothing(
+        tmp_path, stub_bin):
+    """A record this build cannot PARSE is absence of evidence, and it is met
+    by comparing nothing and saying nothing. The alternative fires on every
+    stage of every directory whose stamps this build cannot read, for ever -
+    and no build of this tool has ever written such a stamp, so the silence
+    costs nothing that was ever going to happen.
+
+    That is a different case from a stamp this build reads and declines to
+    DATE, which is said out loud two tests below: there the text is one this
+    tool wrote, and the operator is owed the reason the stage went unjudged.
+    """
+    proj = _searchable(tmp_path, tmp_path / "undated")
+    proj.run()
+    path = proj.rpath(".metaannot_state.json")
+    with open(path, encoding="utf-8") as fh:
+        st = json.load(fh)
+    before = dict(st["pfam"], finished="a while back")
+    st["pfam"] = before
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1)
+    proc = proj.run("--only", "pfam")
+    assert LATE not in proc.stderr
+    assert SKEWED not in proc.stderr
+    assert UNDATED not in proc.stderr
+    assert proj.state()["pfam"] == before, "an undatable record was acted on"
+
+
+def test_a_sentinel_stage_reports_a_done_file_written_after_its_record(
+        tmp_path, stub_bin):
+    """diamond, hhblits and esmfold declare a zero-byte `.done` sentinel, and
+    a superseded run re-touches one with a plain open().close() that no
+    ownership gate covers. That makes the sentinel the only witness anywhere
+    for the per-database tables, the per-query .hhr files and the per-protein
+    PDBs beside it - and the message has to say, in the same breath, that a
+    sentinel it can date says nothing whatever about those files."""
+    proj = _searchable(tmp_path, tmp_path / "sentinel")
+    proj.run()
+    _backdate(proj, "diamond")
+    proc = proj.run("--only", "diamond")
+    said = _warn_block(proc.stderr, LATE)
+    assert "[diamond]" in said
+    assert proj.rpath("diamond", ".done") in said
+    assert "sentinel and says nothing about" in said
+    assert proj.state()["diamond"]["status"] == "ok"
+
+
+_CLOCK_AHEAD_RUN = '''
+"""A real run over a real directory, on a filesystem whose clock leads this
+machine's.
+
+There is no portable way to skew a mount under a test, and the skew is the one
+suppression this check still has - so the measurement is what is replaced,
+and nothing else. _fs_clock_ahead() is the whole of how the run learns the
+number; everything downstream of it, including the decision not to read any
+mtime as evidence, runs exactly as it does in production.
+"""
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("metaannot", os.environ["MA_PY"])
+ma = importlib.util.module_from_spec(spec)
+sys.modules["metaannot"] = ma
+spec.loader.exec_module(ma)
+
+ma._fs_clock_ahead = lambda path: float(os.environ["MA_AHEAD"])
+sys.exit(ma.main())
+'''
+
+
+def test_a_filesystem_whose_clock_leads_this_one_is_read_as_no_evidence(
+        tmp_path, stub_bin):
+    """The one suppression left, and the only one that is a MEASUREMENT rather
+    than a reading of a pattern.
+
+    A `finished` stamp is the recording machine's wall clock and an mtime is
+    the filesystem's; on an NFS or SMB results directory those are two clocks,
+    and one that runs ahead makes every output look newer than the record
+    describing it for as long as the mount is skewed. There is nothing to
+    conclude from comparing two clocks, so the run says that instead, once,
+    and reads no mtime as evidence about any stage.
+    """
+    proj = _searchable(tmp_path, tmp_path / "skewed")
+    proj.run()
+    _backdate(proj, "pfam")
+    driver = tmp_path / "clock_ahead_run.py"
+    driver.write_text(_CLOCK_AHEAD_RUN, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(driver), "run", "--config", proj.config_path,
+         "--only", "pfam"],
+        capture_output=True, text=True, cwd=proj.root, timeout=600,
+        env=dict(os.environ, MA_PY=METAANNOT_PY, MA_AHEAD="1000",
+                 PYTHONHASHSEED="0"))
+    assert proc.returncode == 0, proc.stderr
+    assert SKEWED in proc.stderr
+    assert "1000 s ahead" in proc.stderr
+    assert LATE not in proc.stderr, \
+        "an mtime was read as evidence against a clock it is not on"
+    assert proj.state()["pfam"]["status"] == "ok"
+
+
+def test_a_run_that_ends_in_a_failure_still_says_what_it_found(
+        tmp_path, stub_bin):
+    """The report is emitted before BOTH end-of-run summaries and inside
+    neither, so it is not lost on the path that matters most.
+
+    A run that dies is the run whose operator is about to go looking at the
+    directory by hand, and the stages it reused were reused whatever happened
+    to the ones that ran. Pinned because the placement is a one-line decision
+    that reads as arbitrary and would be the first thing a later edit moved.
+    """
+    proj = _searchable(tmp_path, tmp_path / "failing")
+    proj.run("--only", "pfam", "dbcan")     # nothing downstream exists yet
+    _backdate(proj, "pfam")
+    # pfam is cached and late; finalise has to RUN and its dependencies were
+    # left out of the selection, which is the ordinary way a run fails at
+    # dispatch.
+    proc = proj.run("--only", "pfam", "finalise", expect=1)
+    assert "cannot run:" in proc.stderr, "this run did not fail at dispatch"
+    said = _warn_block(proc.stderr, LATE)
+    assert "[pfam]" in said
+    assert proj.state()["pfam"]["status"] == "ok"
+
+
+def test_a_dry_run_reports_the_directory_and_says_what_it_cannot_measure(
+        tmp_path, stub_bin):
+    """A dry run calls decide() for every stage, so it is the one command that
+    can report a whole directory without running anything - an audit, and the
+    one place where that report is the point rather than a surprise.
+
+    And it is the one place the skew measurement is NOT available: it is taken
+    on a file the run has just written, a dry run writes nothing on purpose,
+    and a plan check that created files in order to measure them would stop
+    being a plan check. So the report says that the question was not asked
+    rather than leaving a reader to infer it was asked and answered no. The
+    first build said neither, and the README claimed it did.
+    """
+    proj = _searchable(tmp_path, tmp_path / "audit")
+    proj.run()
+    _backdate(proj, "pfam")
+    dry = proj.run("--dry-run")
+    said = _warn_block(dry.stderr, LATE)
+    assert "[pfam]" in said
+    assert "has not been asked at all" in said, \
+        "a dry run does not say that it could not measure the clock skew"
+    live = proj.run("--only", "pfam")
+    assert LATE in live.stderr
+    assert "has not been asked at all" not in live.stderr, \
+        "a real run measured the skew and still says it did not"
+
+
+_AMBIGUOUS_TZ = "America/New_York"
+# The hour this zone repeats leaving summer time, in the PAST, so an output
+# written now really is newer than the text and the comparison is reached.
+_AMBIGUOUS_STAMP = "2025-11-02T01:30:00"
+_SKIPPED_STAMP = "2026-03-08T02:30:00"      # the hour it skips entering it
+
+
+def _names_two_instants(stamp, tz=_AMBIGUOUS_TZ):
+    """Whether THIS machine's tz database really makes `stamp` ambiguous.
+
+    Asked with `time` alone and never through the code under test, which is
+    the whole point of it being a function: a guard that reads
+    `_stamp_instant()` would SKIP on a build that had stopped declining
+    ambiguous stamps instead of failing on it, which is the one outcome a test
+    for a silent defect may not have. Measured the first time this was
+    reverted, where exactly that happened.
+    """
+    if not hasattr(time, "tzset"):
+        return False
+    old_tz, fmt = os.environ.get("TZ"), "%Y-%m-%dT%H:%M:%S"
+    os.environ["TZ"] = tz
+    time.tzset()
+    try:
+        e = time.mktime(time.strptime(stamp, fmt))
+        return (time.strftime(fmt, time.localtime(e)) == stamp
+                and time.strftime(fmt, time.localtime(e + 3600)) == stamp)
+    finally:
+        if old_tz is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
+
+
+@pytest.mark.skipif(not _names_two_instants(_AMBIGUOUS_STAMP),
+                    reason="no America/New_York rules in this tz database")
+def test_a_local_stamp_in_a_repeated_or_skipped_hour_names_no_instant(ma):
+    """`_stamp_epoch` is time.mktime(time.strptime(...)) on a naive local
+    stamp and cannot resolve the local hour that a zone repeats when it leaves
+    summer time. It answers anyway, an hour early, which is twelve hundred
+    times OUTPUT_STAMP_SLACK_S - so a stage recorded `ok` in that hour would
+    be reported on every run for ever, and because only SOME stages of a run
+    that straddles the hour are affected nothing in the comparison could
+    absorb it.
+
+    Asserted against the zone's own rules rather than against a written-down
+    epoch: the test first shows that this text really does name two instants
+    here, and only then that `_stamp_instant` declines to pick one.
+    """
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = _AMBIGUOUS_TZ
+    time.tzset()
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        # Two instants an hour apart carry that one text - asserted by the
+        # skipif above, through `time` and not through the code under test -
+        # and _stamp_epoch returns the earlier of them without a word.
+        first = ma._stamp_epoch(_AMBIGUOUS_STAMP)
+        assert time.strftime(fmt, time.localtime(first)) == _AMBIGUOUS_STAMP
+        assert (time.strftime(fmt, time.localtime(first + 3600))
+                == _AMBIGUOUS_STAMP)
+        assert ma._stamp_instant(_AMBIGUOUS_STAMP) is None
+        # The hour a zone SKIPS entering summer time is no instant at all.
+        assert ma._stamp_instant(_SKIPPED_STAMP) is None
+        # Everything else is unchanged, to the second.
+        for plain in ("2026-06-01T12:00:00", "2026-11-01T05:30:00"):
+            assert ma._stamp_instant(plain) == ma._stamp_epoch(plain)
+        assert ma._stamp_instant("not a stamp") is None
+        assert ma._stamp_instant(None) is None
+    finally:
+        if old_tz is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
+
+
+@pytest.mark.skipif(not _names_two_instants(_AMBIGUOUS_STAMP),
+                    reason="no America/New_York rules in this tz database")
+def test_a_stage_recorded_in_the_repeated_hour_is_declined_and_said_so(
+        tmp_path, stub_bin):
+    """The same fact through a whole run, because the unit test above cannot
+    show what the operator sees.
+
+    A record in that hour is DECLINED rather than judged, and the run says
+    which record and why - a stage that goes unjudged in silence is a stage
+    nobody can tell from one that was judged sound, and this check's whole
+    claim is that it reads in one direction.
+    """
+    proj = _searchable(tmp_path, tmp_path / "dst")
+    proj.run()
+    _set_finished(proj, "pfam", _AMBIGUOUS_STAMP)
+    said = proj.run("--only", "pfam", env={"TZ": _AMBIGUOUS_TZ}).stderr
+    assert UNDATED in said, \
+        "a record in the repeated hour was dated instead of declined"
+    assert f"pfam says {_AMBIGUOUS_STAMP}" in said, \
+        "the record that went unjudged is not named"
+    assert LATE not in said, "an ambiguous stamp was dated anyway"
+    assert proj.state()["pfam"]["status"] == "ok"
+
+    # The control, one hour later: one instant, and reported as late. Without
+    # it this test would pass on a build that declined every stamp.
+    _set_finished(proj, "pfam", "2025-11-02T03:30:00")
+    said = proj.run("--only", "pfam", env={"TZ": _AMBIGUOUS_TZ}).stderr
+    assert LATE in said, "the decline is about ambiguity, not about the date"
+    assert UNDATED not in said
+
+
+def test_dating_an_output_can_never_fail_a_stage_that_has_already_finished(
+        tmp_path, ma):
+    """The one way this change could be worse than not making it: a stat that
+    raises on the cached path of a resume would be a traceback out of decide()
+    on a run that was about to reuse work which took hours."""
+    missing = str(tmp_path / "nothing here")
+    assert ma._outputs_written_late([missing], time.time() - 10_000) == []
+    assert ma._outputs_written_late([missing], None) == []
+    assert ma._outputs_written_late([str(tmp_path)], None) == []
+    assert ma._stamp_epoch("not a stamp") is None
+    assert ma._stamp_instant("not a stamp") is None
+    assert ma._outputs_written_late([str(tmp_path)],
+                                    ma._stamp_epoch(None)) == []
+    assert ma._outputs_written_late([str(tmp_path)],
+                                    ma._stamp_instant(None)) == []
+    assert ma._fs_clock_ahead(missing) is None
+
+
+# The vocabulary this check may never use, in the message OR in the prose about
+# it. A stamp in agreement proves nothing whatever, so a word that reads as a
+# clean bill of health turns one-directional evidence into a claim the check
+# cannot support - and the operator reads the message at 2am, not the README.
+_NEVER = ("verif", "match", "confirm", "intact", "corrupt")
+
+
+def test_neither_the_message_nor_the_readme_reads_as_a_clean_bill_of_health(
+        tmp_path, stub_bin):
+    """Both halves in one test, because they make ONE claim and drift apart
+    the moment they are pinned separately.
+
+    The message half reads the WHOLE WARN and not its first line. The message
+    is a heading, a list of stages and a paragraph; every limitation it states
+    is in the paragraph, so scanning the heading alone would have been
+    scanning the one part that cannot break this rule.
+
+    The README half also holds the sentinel limitation to NAMING the stages
+    rather than counting them: `tests/test_docs.py` already classifies the
+    phrase "three stages" as a measurement of something else entirely, and a
+    new sentence riding on that entry is how a registry starts lying.
+    """
+    proj = _searchable(tmp_path, tmp_path / "vocabulary")
+    proj.run()
+    _backdate(proj, "pfam")
+    said = proj.run("--only", "pfam").stderr
+    warned = _warn_block(said, LATE).lower()
+    for word in _NEVER:
+        assert word not in warned, \
+            f"the message says {word!r}, which reads as a verdict on the file"
+
+    readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    start = readme.index("**So the file is dated against its own record")
+    para = readme[start:readme.index("\n### ", start)]
+    for word in _NEVER:
+        assert word not in para.lower(), \
+            f"the README paragraph says {word!r} about a check that cannot " \
+            "tell anyone their output is sound"
+    assert "proves nothing" in para
+    for stage in ("diamond", "hhblits", "esmfold"):
+        assert stage in para, \
+            "the sentinel limitation names the stages rather than counting them"
+    assert "three stages" not in para
