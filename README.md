@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1739 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1744 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 71 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1668 passed and 72
+absent, so on a machine with no R the same run reports 1673 passed and 72
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -867,6 +867,48 @@ database, so `peptide_assignment` is explicit:
   `shared` and are dropped.
 - `razor` — FragPipe's own behaviour. Arbitrary here; useful for measuring how
   much it changes the answer.
+
+#### `quant_funnel.tsv` — where the proteins went
+
+The first full real run narrowed from 455,571 proteins to 1,282 rows, and said
+why across a dozen lines of an 8,990-line log, in three stages, some of them
+counting features and some counting proteins. The join stage now writes those
+steps down as it takes them, beside the table they produce:
+
+| step | unit | before | after | dropped |
+|---|---|---|---|---|
+| proteins in the annotation table | protein | | 455,571 | |
+| proteins named by at least one quantified feature | protein | 455,571 | … | … |
+| features read from the quant table | feature | | … | |
+| `peptide_assignment=taxon_unique` | feature | … | … | … |
+| proteins carrying at least one assigned feature | protein | … | … | … |
+| `min_features_per_protein=1` | protein | … | … | 0 |
+| rows written to `annotated_quant.tsv` | protein | … | 1,282 | … |
+
+**The `unit` column is the load-bearing one.** A funnel that chained a feature
+count straight into a protein count would read as one number shrinking while
+being a different claim at every step. So a row's `before` is the last `after`
+recorded *for its own unit* — the protein chain steps over the feature rows in
+the middle of the stage rather than restarting after them — and the first row
+of each unit has no `before` at all. A `why` column carries the reason in
+words; a filter that removes nothing is still listed, priced at zero, because a
+funnel silent about a filter reads as a funnel with no such filter.
+
+A **negative** `dropped` is not an arithmetic bug: it means a step's
+population is not a subset of the one above it, which here has exactly one
+cause — protein ids the quant table names that `annotation_final.tsv` does
+not. A run where that is true of most ids dies; a run where it is true of some
+warns and carries on, and this is where the consequence becomes visible.
+
+Two things it does not cover, and says so rather than leaving them to be
+inferred. Rows the quant reader refused before this stage was handed anything
+— decoys, contaminants, unusable columns — are already gone from its first
+count, which says so; the reader logs them. And every filter the **report**
+applies afterwards (`min_valid_per_group`, `analysis.min_plexes`) runs in R
+over the file this funnel ends at, and is counted there. The join stage says
+that out loud on the log beside the path, because a funnel that stopped at
+1,282 without saying it would be read as the end of the narrowing when it is
+the middle of it.
 
 `peptide_evidence.tsv` has one row per protein and nine columns:
 `protein_id`, `n_features_used`, `n_unique`, `n_taxon_unique`,

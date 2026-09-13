@@ -4,6 +4,51 @@
 
 ### Added
 
+**`quant_funnel.tsv`: where the 455,571 proteins went.** The first full run on
+real data narrowed by two and a half orders of magnitude, down to 1,282 rows,
+and said why across a dozen lines of an 8,990-line log — in three stages, some
+of them counting features and some counting proteins, so reading the arithmetic
+meant knowing which was which and finding all dozen. The join stage now records
+each narrowing as it takes it and writes them beside the table they produce.
+
+**The `unit` column is the load-bearing one.** A funnel that chained a feature
+count straight into a protein count would read as one number shrinking while
+being a different claim at every step. A row's `before` is therefore the last
+`after` recorded FOR ITS OWN UNIT — the protein chain steps over the feature
+rows in the middle of the stage rather than restarting after them, which is
+what made the largest narrowing in the whole pipeline visible: a search
+database is mostly proteins the run never identified, and no log line had ever
+stated that count. It is taken over the features' CANDIDATE lists rather than
+over `razor_protein`, which would have counted only the proteins something was
+assigned to and folded that step into the next one.
+
+A filter that removes nothing is still listed and priced at zero, because a
+funnel silent about a filter reads as a funnel with no such filter — and
+`min_features_per_protein` is the one a reader most wants priced before they
+raise it.
+
+**What it refuses to cover is in the file.** Rows the quant reader refused
+before this stage was handed anything are already gone from its first count,
+which says so. And every filter the REPORT applies afterwards
+(`min_valid_per_group`, `analysis.min_plexes`) runs in R over the file this
+funnel ends at and is counted there; the stage says so on the log beside the
+path, because a funnel that stopped at 1,282 in silence would be read as the
+end of the narrowing when it is the middle of it. A NEGATIVE `dropped` is not
+an arithmetic bug either: it means a step's population is not a subset of the
+one above it, which has one cause here — ids the quant table names that
+`annotation_final.tsv` does not — and that run has already been warned about
+it separately.
+
+Five tests, and what they cannot discriminate is written in them rather than
+left to be assumed: the last row counts `out` and not `q` because the merges
+above are left joins and a duplicate key ADDS rows, but on a fixture where
+nothing duplicates the two are equal, so swapping them passes. The reconciling
+test is mutation-checked against a `last()` that reads the row above instead of
+the unit's own chain, and against a `dropped` computed the wrong way round; a
+second fixture sets `min_features_per_protein: 99` so that at least one step in
+the file really removes something, since a funnel of zeros reconciles whatever
+pair it subtracted.
+
 **The heartbeat now says how far through InterProScan is.** It is the longest
 stage in the pipeline — 57 h of the 455,571-protein run — and it went all of
 that blind. Its stderr says it is alive and never says how far through it is,

@@ -134,6 +134,118 @@ def test_a_fractionated_run_produces_the_same_quant_as_an_unfractionated_one(
     pd.testing.assert_frame_equal(a, b)
 
 
+# --- the funnel: 455,571 -> 1,282, in one file rather than a dozen lines ---
+# symptom: the first full real run narrowed by two and a half orders of
+# magnitude and said why across a dozen lines of an 8,990-line log, in three
+# stages, some of them counting features and some counting proteins.
+
+
+def _funnel(proj):
+    return pd.read_csv(proj.rpath("quant", "quant_funnel.tsv"), sep="\t",
+                       dtype=str).fillna("")
+
+
+def test_the_quant_funnel_is_written_beside_the_table_it_explains(
+        ma, tmp_path):
+    proj = build_project(tmp_path / "funnel", fractions=1)
+    proj.run()
+    f = _funnel(proj)
+    assert list(f.columns) == list(ma._QuantFunnel.COLUMNS)
+    rows = len(pd.read_csv(proj.rpath("quant", "annotated_quant.tsv"),
+                           sep="\t"))
+    assert f["step"].iloc[-1] == "rows written to annotated_quant.tsv"
+    assert int(f["after"].iloc[-1]) == rows, \
+        "the funnel's last count is the file it sits next to, or it is fiction"
+    # What this cannot discriminate, said rather than implied: the last row
+    # counts `out` and not `q` because the merges above are left joins and a
+    # duplicate key on a right-hand side ADDS rows. On this fixture nothing
+    # duplicates, so the two are equal and swapping them passes here. The
+    # assertion is still the right one — it fails on any run where they do
+    # differ — but it is not evidence that the right count was chosen.
+
+
+def test_the_quant_funnel_reconciles_within_a_unit_and_never_across_one(
+        tmp_path):
+    """The arithmetic, and the place the arithmetic is not allowed to run.
+
+    A funnel that chained a feature count straight into a protein count would
+    read as one number shrinking while being a different claim at every step.
+    So a row's `before` is the last `after` recorded FOR ITS OWN UNIT, not the
+    row above it — this stage interrupts the protein chain with the feature
+    rows in the middle of it — and the first row of each unit has no `before`
+    at all.
+    """
+    proj = build_project(tmp_path / "reconcile", fractions=1)
+    proj.run()
+    f = _funnel(proj)
+    assert len(f) >= 4, f.to_string()
+    last, starts = {}, 0
+    for _, r in f.iterrows():
+        unit = r["unit"]
+        if r["before"] == "":
+            starts += 1
+            assert unit not in last, \
+                f"a second chain for {unit!r} silently breaks the first: {dict(r)}"
+            assert r["dropped"] == "", \
+                f"a row with no `before` cannot have dropped anything: {dict(r)}"
+        else:
+            assert int(r["before"]) == last[unit], \
+                f"{dict(r)} does not start where this unit was left ({last[unit]})"
+            assert (int(r["dropped"])
+                    == int(r["before"]) - int(r["after"])), dict(r)
+        last[unit] = int(r["after"])
+    assert starts == len(set(f["unit"])) == 2, \
+        "one chain start per unit, and this fixture counts proteins and features"
+    # the interruption is the point: the protein chain has to step OVER the
+    # feature rows rather than restart after them
+    units = list(f["unit"])
+    assert units.index("feature") > 0 and units[-1] == "protein"
+    assert units.count("protein") >= 4 and "feature" in units[1:-1]
+
+
+def test_the_funnel_prices_a_filter_that_really_removes_something(tmp_path):
+    # The fixture drops nothing anywhere, so every count above reconciles at
+    # zero and would reconcile at zero against a funnel that had subtracted
+    # the wrong pair. min_features_per_protein is the one filter a config can
+    # make bite without a second fixture.
+    proj = build_project(tmp_path / "bites", fractions=1)
+    proj.write_config(min_features_per_protein=99)
+    proj.run()
+    f = _funnel(proj)
+    row = f[f["step"] == "min_features_per_protein=99"].iloc[0]
+    assert int(row["dropped"]) == int(row["before"]) - int(row["after"])
+    assert int(row["dropped"]) > 0, \
+        "a threshold of 99 features per protein removed nothing at all"
+    assert int(row["after"]) == 0
+    assert "absent from" in row["why"]
+    # and the row after it still starts where this one left the chain
+    nxt = f.iloc[f.index.get_loc(row.name) + 1]
+    assert int(nxt["before"]) == int(row["after"])
+
+
+def test_the_funnel_prices_min_features_per_protein_even_at_the_default(
+        tmp_path):
+    # A funnel silent about a filter is read as a funnel with no such filter,
+    # and this is the one a reader most wants priced before they raise it.
+    proj = build_project(tmp_path / "priced", fractions=1)
+    proj.run()
+    f = _funnel(proj)
+    hit = f[f["step"].str.startswith("min_features_per_protein=")]
+    assert len(hit) == 1, f["step"].tolist()
+    assert "removes nothing" in hit["why"].iloc[0]
+    assert int(hit["dropped"].iloc[0]) == 0
+
+
+def test_the_funnel_says_that_the_report_narrows_again_after_it(tmp_path):
+    # It ends at annotated_quant.tsv, which is the middle of the narrowing and
+    # not the end of it: min_valid_per_group and analysis.min_plexes run in R
+    # over that file. A funnel that stopped without saying so would be read as
+    # the whole story.
+    proj = build_project(tmp_path / "downstream", fractions=1)
+    err = proj.run().stderr
+    assert "min_valid_per_group" in err and "quant_funnel.tsv" in err
+
+
 def test_the_written_quant_table_carries_the_dominance_column_the_report_reads(
         ma, tmp_path):
     """The column the report's dominance line is computed from, on disk.

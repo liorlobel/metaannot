@@ -10653,8 +10653,93 @@ def rollup_median_polish(use, int_cols):
     return out
 
 
+class _QuantFunnel:
+    """Every narrowing between the search database and annotated_quant.tsv.
+
+    The first full real run went from 455,571 proteins to 1,282 rows and said
+    why across a dozen lines of a 8,990-line log, in three stages, some
+    counting features and some counting proteins. Reconstructing the
+    arithmetic meant knowing which was which. This writes the steps down as
+    they are taken, next to the table they produced.
+
+    THE UNIT COLUMN IS THE LOAD-BEARING ONE. A funnel that chains a feature
+    count straight into a protein count reads as one number shrinking while
+    being a different claim at every step. So each row carries what it
+    counted; `before` is the previous row's `after` only within a run of rows
+    sharing a unit; and a row that changes the unit has no `before` at all and
+    says what it was built from. `test_the_quant_funnel_reconciles_within_a
+    _unit_and_never_across_one` holds both halves.
+
+    A NEGATIVE `dropped` is not an arithmetic bug. It means a step's
+    population is not a subset of the one above it, which here has one cause:
+    protein ids the quant table names that `annotation_final.tsv` does not
+    have. A run where that is true of most ids dies; a run where it is true of
+    some WARNs and carries on, and this is where the consequence shows up.
+
+    What it does NOT cover is in the file, not left to be inferred. Rows the
+    quant reader refused before this stage was handed anything - decoys,
+    contaminants, unusable columns - are logged by the reader and are already
+    gone from its first count, which says so. And every filter the REPORT
+    applies afterwards (`min_valid_per_group`, `analysis.min_plexes`) runs in
+    R over the file this funnel ends at, and is counted there; a funnel that
+    stopped at 1,282 without saying that would be read as the end of the
+    narrowing when it is the middle.
+    """
+
+    COLUMNS = ("step", "unit", "before", "after", "dropped", "why")
+
+    def __init__(self):
+        self.rows = []
+
+    def last(self, unit):
+        """What this unit's chain stood at, or None if it has not begun."""
+        for r in reversed(self.rows):
+            if r["unit"] == unit:
+                return r["after"]
+        return None
+
+    def start(self, step, unit, n, why=""):
+        """A population this stage did not narrow: where a chain begins."""
+        self.rows.append({"step": step, "unit": unit, "before": "",
+                          "after": int(n), "dropped": "", "why": why})
+
+    def narrow(self, step, unit, after, why):
+        """One step along a chain already begun, wherever it was left.
+
+        `before` is looked up rather than passed, and looked up by UNIT rather
+        than from the row above: this stage interrupts the protein chain with
+        the feature rows in the middle of it, and a caller passing its own
+        `before` is a second place for the same number to be got wrong.
+        """
+        before = self.last(unit)
+        if before is None:
+            return self.start(step, unit, after, why)
+        self.rows.append({"step": step, "unit": unit, "before": int(before),
+                          "after": int(after),
+                          "dropped": int(before) - int(after), "why": why})
+
+    @staticmethod
+    def _cell(v):
+        # A tab or a newline inside a `why` would silently add a column or a
+        # row to a file whose whole job is to be added up. Nothing here writes
+        # one today; the writer is where that stays true.
+        return " ".join(str(v).split())
+
+    def write(self, path):
+        # Written by hand rather than through pandas: a DataFrame turns an int
+        # column holding "" for the chain-starting rows into a float one, and
+        # prints every count in it as `1282.0`.
+        with atomic_out(path) as tmp:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\t".join(self.COLUMNS) + "\n")
+                for r in self.rows:
+                    fh.write("\t".join(self._cell(r[c])
+                                      for c in self.COLUMNS) + "\n")
+        log(f"join: how {self.rows[-1]['after']:,} was arrived at -> {path}")
+
+
 def rollup_features(feats, int_cols, taxon_of, mode, min_features,
-                    family_of=None, rollup_method="sum"):
+                    family_of=None, rollup_method="sum", funnel=None):
     """Peptide/ion -> protein, with an explicit rule for shared features.
 
     protein_unique   keep only features matching exactly one protein
@@ -10671,6 +10756,11 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
     rollup_method decides how the kept features become a number: "sum" (the
     default, and what every previously published metaannot number was computed
     with) or "median_polish" (log-space, ratio-preserving).
+
+    `funnel`, when given, collects the two narrowings this function performs -
+    the assignment rule and min_features_per_protein - as rows of
+    quant/quant_funnel.tsv. It is written by the caller, which owns the steps
+    on either side of these.
     """
     if mode not in ASSIGNMENT_MODES:
         die(f"peptide_assignment must be one of {list(ASSIGNMENT_MODES)}, "
@@ -10731,6 +10821,15 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
         + ", ".join(f"{k.replace('_', '-')} "
                     f"{int((feats['_class'] == k).sum())}"
                     for k in ASSIGNMENT_CLASSES) + ")")
+    if funnel is not None:
+        funnel.start("features read from the quant table", "feature", n,
+                     "already past the reader's own decoy and contaminant "
+                     "removal, which it logs separately")
+        funnel.narrow(f"peptide_assignment={mode}", "feature",
+                      int(kept.sum()),
+                      ", ".join(f"{k.replace('_', '-')} "
+                                f"{int((feats['_class'] == k).sum())}"
+                                for k in ASSIGNMENT_CLASSES))
     if mode == "taxon_or_family_unique":
         log(f"peptide_assignment=taxon_or_family_unique: {n_fam} feature(s) "
             "kept because their candidates share an MMseqs family_id rather "
@@ -10871,6 +10970,13 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
             f"under '{mode}': they have a row in peptide_evidence.tsv, no "
             "number in annotated_quant.tsv, and appear in no report table")
 
+    if funnel is not None:
+        funnel.narrow("proteins carrying at least one assigned feature",
+                      "protein", len(quant),
+                      "the assigned features above roll up onto these; the "
+                      f"other {n_none:,} row(s) of peptide_evidence.tsv had "
+                      "every feature dropped and are quantified nowhere")
+
     # Said out loud whatever the threshold is: most proteins <= 100 aa are
     # single-peptide by nature, so this number is the size of the population
     # min_features_per_protein would remove.
@@ -10878,9 +10984,9 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
     if single:
         log(f"{single:,} protein(s) rest on a single assigned feature "
             f"(min_features_per_protein = {min_features})")
+    before = len(quant)
     if min_features > 1:
         enough = ev.loc[ev["n_features_used"].fillna(0) >= min_features, "protein_id"]
-        before = len(quant)
         quant = quant.loc[quant.index.isin(set(enough))]
         # Thousands separators, as the dominance line above uses: `before` is
         # that line's denominator too, and one funnel printing the same
@@ -10890,6 +10996,17 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
             f">= {min_features} assigned features; the "
             f"{before - len(quant):,} dropped are absent from "
             "annotated_quant.tsv and from every report table", "WARN")
+    # Recorded whatever the threshold is, including the default that removes
+    # nothing: a funnel silent about a filter is read as a funnel that has no
+    # such filter, and min_features_per_protein is the one a reader most wants
+    # to see priced before they raise it.
+    if funnel is not None:
+        funnel.narrow(f"min_features_per_protein={min_features}", "protein",
+                      len(quant),
+                      "the dropped proteins are absent from "
+                      "annotated_quant.tsv and from every report table"
+                      if before != len(quant) else
+                      "at 1, the default, this filter removes nothing")
     return (quant.reset_index().rename(columns={"_assigned": "group_id"}),
             ev, feats)
 
@@ -11154,6 +11271,18 @@ def stage_join(cfg, p):
             "run. Delete it and rerun the finalise stage.")
     ann["protein_id"] = ann["protein_id"].astype(str)
     ann = ann[~ann["protein_id"].duplicated(keep="first")]
+    # Built here rather than at its second use below, because the funnel asks
+    # the same question of it one branch earlier. One set, two questions.
+    known = set(ann["protein_id"])
+
+    # Every narrowing from here to annotated_quant.tsv, collected as it
+    # happens and written beside that table. See _QuantFunnel: the log has
+    # always carried these counts, in a dozen lines across three stages and
+    # in two different units.
+    funnel = _QuantFunnel()
+    funnel.start("proteins in the annotation table", "protein", len(ann),
+                 "one row per record of the search database, from "
+                 f"{os.path.basename(p.final)}")
 
     # One taxonomy, resolved once: computing it twice logged its summary
     # twice and invited the two uses to drift apart.
@@ -11163,6 +11292,16 @@ def stage_join(cfg, p):
     evidence = None
     if fmt in FEATURE_FORMATS:
         feats, int_cols_f, design = read_feature_table(qpath, fmt, cfg)
+        # The largest narrowing in the whole pipeline, and the one no log line
+        # ever stated: a search database is mostly proteins the run never
+        # identified. Over candidates rather than razor_protein, which would
+        # count only the proteins some feature was ASSIGNED to and so fold
+        # this step into the next one.
+        named = {c for cands in feats["candidates"] for c in cands if c}
+        funnel.narrow("proteins named by at least one quantified feature",
+                      "protein", len(named & known),
+                      "the rest are in the search database and were "
+                      "identified by nothing in the quant table")
         taxon_of = eff_taxonomy
         mode = cfg.get("peptide_assignment", "taxon_unique")
         # Only built when the user asked for it: family_of is what turns a
@@ -11211,7 +11350,7 @@ def stage_join(cfg, p):
         q, evidence, feat_class = rollup_features(
             feats, int_cols_f, taxon_of, mode,
             cfg.get("min_features_per_protein", 1),
-            family_of=family_of, rollup_method=rollup_method)
+            family_of=family_of, rollup_method=rollup_method, funnel=funnel)
         # Recorded per protein, not only in the log: a table on disk must say
         # how its numbers were made, or a median_polish run and a sum run are
         # indistinguishable once the log is gone.
@@ -11324,6 +11463,11 @@ def stage_join(cfg, p):
         meta = [c for c in FRAGPIPE_META if c in q.columns]
     if id_col not in q.columns:
         die(f"{qpath}: expected column '{id_col}' not found")
+    if fmt not in FEATURE_FORMATS:
+        # No feature chain to start from: the search engine did the roll-up,
+        # so the first thing this stage can count is its rows.
+        funnel.start("rows in the quant table", "row", len(q),
+                     f"{fmt} is already rolled up to protein groups")
 
     if fmt in ("diann", "fragpipe"):
         # Same rule as the feature tables: a decoy or a bovine contaminant is
@@ -11342,6 +11486,9 @@ def stage_join(cfg, p):
                 f"{qpath} (exclude_id_prefixes {list(pref)} or an "
                 "'Is Decoy'/'Is Contaminant' flag)", "WARN")
             q = q.loc[~drop_rows].reset_index(drop=True)
+            funnel.narrow("decoy/contaminant rows", "row", len(q),
+                          f"exclude_id_prefixes {list(pref)} or an "
+                          "'Is Decoy'/'Is Contaminant' flag")
 
     # Detection is only needed for wide protein tables. The feature-level and
     # ProteinLevelData branches already know exactly which columns are samples,
@@ -11424,7 +11571,6 @@ def stage_join(cfg, p):
 
     # A join that matches nothing used to end in "N wholly unannotated" and
     # exit 0, which reads like a biology result rather than a broken id space.
-    known = set(ann["protein_id"])
     ids = long["protein_id"].drop_duplicates()
     if len(ids):
         absent = ids[~ids.isin(known)]
@@ -11527,6 +11673,17 @@ def stage_join(cfg, p):
     out["taxonomy_source"] = cfg.get("taxonomy_source", "eggnog")
     with atomic_out(f"{p.quant_dir}/annotated_quant.tsv") as tmp:
         out.to_csv(tmp, sep="\t", index=False)
+    # before = len(q), not len(out): the merges above are LEFT joins, so a
+    # duplicate key on a right-hand side ADDS rows, and a funnel that assumed
+    # they could not would report the inflation as no change at all.
+    funnel.narrow("rows written to annotated_quant.tsv",
+                  "protein" if fmt in FEATURE_FORMATS else "row", len(out),
+                  "the annotation, the group-conflict flags and the taxonomy "
+                  "comparison are merged on; every one of them is a left join")
+    funnel.write(f"{p.quant_dir}/quant_funnel.tsv")
+    log("the report narrows further: min_valid_per_group and, on TMT, "
+        "analysis.min_plexes run in R over annotated_quant.tsv and are "
+        "counted in the report itself, not in quant_funnel.tsv")
 
     # Which columns of that table are samples, written down rather than left
     # to be re-derived. The report and build_object.R both read this file
