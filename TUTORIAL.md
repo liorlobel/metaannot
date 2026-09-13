@@ -230,8 +230,9 @@ Read the coverage line. Three outcomes:
 | < 50% | aborts | **stop.** Wrong eggNOG file, or the FASTA is from a different assembly. Do not raise `emapper_min_coverage`. |
 
 `emapper_strip_id_prefix` applies to `emapper_precomputed` reuse only; the log
-says so if you set it without one. When it fires, the run reports how many rows
-matched only because of it — quote that number, it is the size of the bridge.
+says so if you set it without one. When it fires, the run reports how many
+**fasta ids** were matched only because of it — that is the log's own unit,
+and it is the size of the bridge; quote it.
 
 **CHECK.** Coverage ≥ 90%, or a clear reason why not. Report the number.
 
@@ -650,11 +651,15 @@ handover happened relative to the stage:
   a second is caught by nothing. Lower `heartbeat_s` to narrow the window.
   Once it *is* noticed, a **declared** output is parked beside its target as
   `.superseded.<stem>.<run_id><ext>`, the log names the path, and nothing is
-  deleted. Anything a stage writes outside `atomic_out` is not parked and not
-  covered — `diamond/vfdb.tsv`, `diamond/merops.tsv` and the per-protein
-  `structures/*.pdb` are the ones to know, because for those stages the
-  declared entry is the `.done` sentinel and not the file you care about. Expect a later stage of that dying run to fail on the missing
-  input; the run that holds the directory is unaffected.
+  deleted. Two different filters decide those two things, and this page used
+  to run them together. **`atomic_out` decides COVERAGE; being a declared
+  output decides PARKING.** `diamond/vfdb.tsv`, `diamond/merops.tsv` and the
+  per-protein `structures/*.pdb` all go through `atomic_out`, so they are
+  covered — but for those stages the declared entry is the `.done` sentinel
+  rather than the file you care about, so they are not parked: they are left
+  as the `.part` they were written as. Expect a later stage of that dying run
+  to fail on the missing input; the run that holds the directory is
+  unaffected.
 * Some files are **not covered at all**, because the check lives in
   `atomic_out` and these do not go through it: `hhblits`' per-query
   `<id>.hhr`, `esmfold`'s `plddt.tsv` and `esmfold_failed.tsv`, and the
@@ -809,17 +814,25 @@ On the laptop:
 rsync -av server:$PROJ/input/ ./input/
 rsync -av server:$PROJ/config.yaml ./
 rsync -av server:$PROJ/results/dark.faa \
+         server:$PROJ/results/dark_all.faa \
          server:$PROJ/results/annotation_pass1.tsv ./results/   # after phase 5
+rsync -av server:$PROJ/<your proteins.faa> ./                   # tmbed reads this
 pip install tmbed transformers && tmbed download   # or fair-esm[esmfold]
 
 python metaannot.py run --config config.yaml --only tmbed --serial
 python metaannot.py run --config config.yaml --only esmfold --serial --ram 16
 ```
 
-`annotation_pass1.tsv` has to come across as well. `esmfold` and `tmbed` read
-only `dark.faa`, but the dependency check requires **every** output of the
-`integrate` stage to be present before it lets the stage run, and refuses
-otherwise.
+The two stages are not alike here, and this page used to treat them as one.
+**`tmbed` reads `proteins_faa` and has no stage dependency at all** — it is
+not an unannotated-set stage, it predicts topology for every protein, so it
+needs the FASTA and nothing from `integrate`. **`esmfold` reads `dark.faa` and
+depends on `integrate`**, and the dependency check requires every declared
+output of that stage to be present before it will run — `annotation_pass1.tsv`,
+`dark.faa` and `dark_all.faa` — which is why `annotation_pass1.tsv` has to come
+across even though nothing on the GPU box reads it. `hhblits` and `jackhmmer`
+take `dark_all.faa` rather than `dark.faa`, so bring that too if you are
+running them here.
 
 Phase 2 turned `topology` and `structure` off. Naming a stage with `--only`
 overrides its run flag — the two commands above therefore work as written and
@@ -1234,7 +1247,7 @@ than trusted.
 
 ## What has actually been run
 
-**Two real datasets, end to end.**
+**One real dataset end to end, and a second in progress.**
 
 A label-free FragPipe run — 38,204 proteins, 122,278 features, 36 samples in six
 groups — went through fifteen of the twenty-one stages: `emapper` (reuse),
@@ -1245,9 +1258,11 @@ R 4.6.1, not from synthetic data. Final bins were 47.6 / 28.2 / 19.0 / 1.0 /
 0.4 / 3.8%, and the dark bin fell from 11,106 proteins on eggNOG alone to
 1,462 — 9,644 rescued.
 
-A FragPipe **TMT** run followed on a second dataset — 8 plexes, 88 channels, 75
-biological samples, 455,571 proteins — so `quant_format: fragpipe_tmt` is not a
-paper path either.
+A FragPipe **TMT** run is in progress on a second dataset — 8 plexes, 88
+channels, 75 biological samples, 455,571 proteins — and a 3-plex subset of it
+has completed end to end including the report, so `quant_format: fragpipe_tmt`
+is not a paper path either. The full 8-plex run has not finished; README and
+CLAUDE.md say the same, and this page used to say it had.
 
 **What still has not run on real data:** `smorf`, `context`, `hhblits`,
 `jackhmmer`, `unipept` and `taxonomy`, all off by default. So the remote-profile

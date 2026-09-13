@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Fixed two entries, in two groups. Each heading carries its own count and
+### Fixed three entries, in two groups. Each heading carries its own count and
 a test pairs the two.
 
 #### One defect the README audit found in the code
@@ -15,7 +15,7 @@ two things, which is the whole defect those files exist to remove. Both paths
 write the empty pair now. Found by auditing the README sentence that promised
 "every run of the stage", which was true of one way out of two.
 
-#### One document audited against the code it describes
+#### Two entries covering the documents audited against the code
 
 **README.md, claim by claim.** Every claim in it checked against the
 code; the corrections that matter to someone running this tool:
@@ -46,6 +46,46 @@ code; the corrections that matter to someone running this tool:
   (a `die()` threshold, carrying CLAUDE.md's warning against raising it).
 - **`other` is four things, not three** — in the README and in two code
   comments, each of which listed all four in the same sentence.
+
+**The remainder of that audit**, and the documents brought into
+agreement with each other and with the code:
+
+- **`DOCTOR_VERSION`'s own rule named fewer closed enums than the code
+  enforces.** `found.other_kind` and `section` are both validated
+  against a fixed tuple — `section`'s guard comment even calls it "the
+  eighth" — but the versioning rule did not list them, so a value could have
+  been added to either without the bump that rule exists to require. Named in
+  the constant and in the README.
+- **CLAUDE.md's scratch carve-out said all of it survives; the two Foldseek
+  trees do not.** `foldseek/tmp*` is removed in a `finally` as each target
+  search returns, and `foldseek/tmpc` on the success path — so the hundreds
+  of GB are a PEAK during the stage, not something to reclaim afterwards.
+  `cluster/tmp`, `kofam/tmp` and `interpro/tmp` are the ones really left
+  behind.
+- **TUTORIAL said two datasets had gone end to end; README and CLAUDE.md say
+  one, with a 3-plex subset of the second.** TUTORIAL was the outlier.
+- **TUTORIAL's GPU hand-off treated `tmbed` and `esmfold` as alike.** `tmbed`
+  reads `proteins_faa` and has no stage dependency at all; only `esmfold`
+  reads `dark.faa` and requires every declared output of `integrate`. The
+  rsync list was missing the FASTA that `tmbed` actually needs.
+- **TUTORIAL said the DIAMOND tables and the per-protein PDBs are written
+  outside `atomic_out`.** They are not: both go through it. `atomic_out`
+  decides COVERAGE and being a declared output decides PARKING, and running
+  the two together is what made a covered file read as an uncovered one.
+- **Two `ResultsLock` docstrings still said SIGTERM unwinds.** It has not
+  since `_release_lock_on_signal` took over with `os._exit(128 + N)`, which
+  runs no `finally` and no atexit hook — the README said so and the code said
+  the opposite. The hazard those gates exist for needs no signal at all: a run
+  that is still alive and has lost the directory.
+- **Two ESMFold figures looked irreconcilable and are not.** 1,805 is folds
+  performed; 1,821 is models on disk. The stage reports them separately for
+  exactly that reason — `N new, M already present, N+M structures` — and a
+  resumed run adopts rather than refolds. The README now says which is which.
+- Plus the smaller ones: a stale `"version": "0.3.0"` in a `_run` example, a
+  shortlist described as the top of `effector_score` rather than
+  `export_score`, `psm.tsv` said to be re-read unconditionally when
+  `tmt.min_purity` gates it, a heartbeat backoff line quoted only at its
+  ceiling, and a benchmark sentence that predated the dispatch-order replay.
 
 ## v0.7.1 — 2026-09-13
 

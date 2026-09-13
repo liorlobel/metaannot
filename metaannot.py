@@ -57,7 +57,13 @@ DESCRIBE_VERSION = 1
 # this document has closed enums a consumer switches on: ADDING A VALUE TO A
 # CLOSED ENUM IS A MEANING CHANGE AND IS A BUMP. The closed sets are
 # DOCTOR_STATUSES, DOCTOR_REMEDIES, DOCTOR_FAIL_REASONS, DOCTOR_DEPTHS,
-# DOCTOR_COMMANDS, DOCTOR_FOUND_KINDS and DOCTOR_EXPECT_KINDS. Everything else
+# DOCTOR_COMMANDS, DOCTOR_FOUND_KINDS, DOCTOR_EXPECT_KINDS,
+# DOCTOR_OTHER_KINDS and DOCTOR_SECTIONS -- NINE, and the last two were
+# missing from this list while being enforced everywhere else, which is the
+# one shape this rule cannot afford: a vocabulary closed by a guard and open
+# by the versioning rule can grow a value with nothing to notice, which is
+# precisely what closing `found.kind` and `expect.kind` was for. Everything
+# else
 # is an OPEN vocabulary - `finding`, the stage names in `blocks`, every
 # `detail` and every `caveat` - and a consumer that meets an unfamiliar value
 # there keeps `status` and renders `detail`, so growing one of those is not a
@@ -13194,12 +13200,21 @@ class ResultsLock:
         notices first and stops for good either way. Neither authorises
         anything; both only ever decline.
 
-        This one exists because a killed run now UNWINDS - SIGTERM raises
-        KeyboardInterrupt instead of terminating the process where it stands -
-        and unwinding WRITES. The sequence those
-        writes have to survive is an operator's: run A is killed, A unwinds
-        slowly, the operator sees it hang and --force-unlocks the directory,
-        run B starts, and A's tail then lands on top of B. Both callers are
+        This one exists because a run that has lost the directory can still
+        be RUNNING, and a running run WRITES. Not because a killed one
+        unwinds: an earlier version of this docstring said SIGTERM raises
+        KeyboardInterrupt instead of terminating where it stands, and that
+        stopped being true when _release_lock_on_signal took over -- it
+        exits through os._exit(128 + N), which runs no `finally` and no
+        `except`, so a SIGTERMed run writes nothing further at all. README
+        says so and this said the opposite, which left a reader reconciling
+        the two with no way to tell which was current.
+
+        The sequence these writes have to survive is an operator's, and it
+        does not need a kill at all: run A is going, the operator decides it
+        is stuck, --force-unlock-live takes the directory, run B starts, and
+        A -- still alive, still working -- lands on top of B. A slow unwind
+        after an ordinary Ctrl-C reaches the same place by a shorter route. Both callers are
         here to keep out of B's way - __exit__ must not remove B's lock, and
         RunRecord must not write over B's `_run`.
 
@@ -13335,15 +13350,19 @@ class ResultsLock:
     def __exit__(self, *exc):
         """Release the lock - but only if it is still the lock we took.
 
-        This process can outlive its own lock. SIGTERM now unwinds instead of
-        terminating, so a run being killed can still be deep in a stage's
-        cleanup when an operator, seeing it hang, --force-unlocks the
+        This process can outlive its own lock. A run can still be deep in a
+        stage when an operator, seeing it hang, --force-unlock-lives the
         directory and starts a replacement; the file at this path is then the
         REPLACEMENT's lock by the time our atexit hook runs. Removing it let a
         third run join the second one in the same results directory - two live
         writers, which is the exact corruption this class exists to prevent,
-        and it was reproduced end to end. Unconditional removal was safe only
-        while SIGTERM killed the process outright.
+        and it was reproduced end to end.
+
+        NOT because SIGTERM unwinds, which an earlier version of this
+        docstring gave as the reason: _release_lock_on_signal exits through
+        os._exit(128 + N), so a SIGTERMed run runs no atexit hook and reaches
+        none of this. The hazard is a run that is still ALIVE and has lost
+        the directory, which needs no signal at all.
         """
         if not self.held:
             return False
