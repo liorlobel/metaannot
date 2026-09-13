@@ -1015,6 +1015,19 @@ def _near(documented, real, what):
         "Rerun the numbers in the Tests section and write down what you saw.")
 
 
+def _exact(documented, real, what):
+    """Assert a documented count IS the real one.
+
+    For the quantities the band above was never argued for: ones that change
+    only when somebody deliberately marks a test, so pinning them exactly
+    costs a line in a commit that was already touching the suite's shape.
+    """
+    assert documented == real, (
+        f"the README says {documented} {what}; this suite has exactly {real}. "
+        "This one is pinned exactly rather than to a band, because it moves "
+        "only when a marker is added or removed.")
+
+
 def test_the_readme_test_counts_are_the_counts_this_suite_really_has():
     """The Tests section's numbers, against a real collection of this suite.
 
@@ -1037,13 +1050,24 @@ def test_the_readme_test_counts_are_the_counts_this_suite_really_has():
     passed, skipped, xfailed, deselected = (int(g) for g in m.groups())
 
     selected, really_deselected = _collected()
+    # A BAND for the total, and EXACTNESS for the two selections, because the
+    # band's own argument does not reach them. It is there so that a commit
+    # adding one test is not a two-file commit for ever -- true of the running
+    # total, which moves with almost every commit. It is not true of the
+    # `slow` marker or the R selection, which move only when somebody
+    # deliberately marks a test, a handful of times a release. Held to a band
+    # they were the one place a wrong number could sit unchallenged, and one
+    # did: for a whole release the README's R count was one short of the real
+    # one, inside the ten percent and therefore invisible here. It was caught by the count
+    # scanner, by hand, while cutting v0.7.0 -- which is not a place to be
+    # finding out.
     _near(passed + skipped + xfailed, selected, "tests in the default run")
-    _near(deselected, really_deselected, "deselected (the `slow` marker)")
+    _exact(deselected, really_deselected, "deselected (the `slow` marker)")
 
     r = re.search(r"selects the (\d+) R tests", txt)
     assert r, "the README no longer says how many R tests there are"
     r_selected, _ = _collected("-m", "R")
-    _near(int(r.group(1)), r_selected, "R tests")
+    _exact(int(r.group(1)), r_selected, "R tests")
 
     no_r = re.search(r"reports (\d+) passed and (\d+) skipped", txt)
     assert no_r, "the README no longer gives the counts on a machine with no R"
@@ -2944,14 +2968,18 @@ COUNT_PROSE = {
     # RECORD: it is never edited to match a later codebase, so a rule held
     # over it could only ever demand that it be.
     "one gap": ("PROSE", "a group heading, counted by the group test"),
-    "four entries": ("DERIVED", "the Unreleased/Fixed entries",
+    "seven fixes": ("PROSE", "a group heading, counted by the group test"),
+    "three groups": ("DERIVED", "the dispatch-key groups with more than one "
+                                "stage in them",
+                     _tied_dispatch_groups),
+    "twelve entries": ("DERIVED", "the Unreleased/Fixed entries",
                     lambda ma: sum(n for _h, n
                                    in _unreleased_fixed_groups())),
     # NOT "six groups", which is also the TUTORIAL's sentence about a real
     # run's design. Two registry entries under one phrase is a silent
     # shadowing -- the later key wins and the earlier rule is never applied --
     # and it went unnoticed only because both counts happened to be six.
-    "three groups": ("DERIVED", "the Unreleased/Fixed groups",
+    "five groups": ("DERIVED", "the Unreleased/Fixed groups",
                    lambda ma: len(_unreleased_fixed_groups())),
     "2 attempts": ("DERIVED", "the opens of the pre-write state read",
                    lambda ma: ma.STATE_READ_TRIES),

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Fixed four entries, in three groups. Each heading carries its own count and
+### Fixed twelve entries, in five groups. Each heading carries its own count and
 a test pairs the two, so neither can drift from the other.
 
 #### One gap in the state file's read side
@@ -21,6 +21,77 @@ with WHICH file, adopt nothing, recompute. The path is named on every arm,
 where it was named on none — the plausible way to get a list into that file is
 a truncated restore or a `jq` that dropped a level, so it is always someone's
 second disaster.
+
+#### Seven fixes to the scheduler test family (#51)
+
+All in `tests/`, none in `metaannot.py`, and all found by the review that
+diagnosed the `KeyError: 'child'` failure v0.7.0 fixed.
+
+**Two assertions that could never fail.** The SIGTERM/SIGHUP and Ctrl-C tests
+both ended `assert not os.path.exists(gate)` over a path nothing in the suite
+or in the engine ever creates — it is only ever handed to the stub as
+`STUB_WAIT_FOR` — so each was true before its run started and would have been
+true had the run hung for ever. The conclusion above them ("the run cannot
+have waited for its stage") is worth holding; it now rests on the elapsed
+time, which is the evidence the Ctrl-C test already used and the other one had
+no equivalent of.
+
+**`_stub_pids` could not tell success from expiry.** Both returned through one
+statement, so "the stub never forked" and "the fork was slow" reached the
+caller as the same partial dict and surfaced as a bare `KeyError` with no
+pidfile, no contents, and no sign anything had waited. It raises at the
+deadline now, naming the missing roles, the timeout, the file's contents and
+the roles that did arrive. It still fails, so nothing it guards is weakened.
+
+**`_reap_stub_pids` signalled a bare pid.** It SIGKILLed every recorded pid
+with no check at all — including, in the leak test, the exact pid the
+assertion three lines above had just proved dead, which is a number the kernel
+may have since handed to someone else. That is the hazard `metaannot.py`
+refuses to take in the leftover census, and a test helper has no licence the
+product denies itself. It reads the command line first and signals only
+something still running this interpreter: a narrowing, not an identity proof,
+which can only ever kill less.
+
+**Budgets sized against the wrong quantity.** `STUB_CHILD_SLEEP` was
+argued from the assertion's 20 s wait when the real exposure is the run's
+180 s timeout plus that wait, so any slow run let the child expire on its own
+and the test pass with the sweep removed — the exact rot its comment existed
+to prevent. `STUB_GATE_MAX_S` was shorter than the timeouts its own callers
+declare, so a slow box fired the stub's backstop and the failure surfaced as
+an assertion about the leftover census rather than about the stub that had
+given up. And `_an_appender` stopped itself after 20 s while the run it must
+outlive was allowed 180; it runs until killed now, as its sibling already did.
+
+**An `int()` that could mask a real failure.** `_read_stub_pids` catches
+`OSError` but not `ValueError`, and it runs from `_reap_stub_pids` inside
+every `finally` in this family — so a malformed pidfile line would replace the
+test's actual exception with a parse error, in code whose docstring says it is
+"a cleanup and NOT part of any assertion".
+
+**A negative assertion that discarded its own evidence.** It polled
+`capsys.readouterr().err` without accumulating, and `readouterr()` empties the
+buffer — so a line arriving between two polls was lost, and because the
+assertion is an `assert not`, losing a line is a silent PASS. `log()` writes
+one line per call with a single flush at the end, so a multi-line warning can
+straddle two reads.
+
+**A concurrency test with nothing forcing the concurrency.**
+`test_two_simultaneous_runs_do_not_both_proceed` launched two processes back
+to back and relied on the second starting inside the first's 1.5 s sleep,
+which is an assumption about the box rather than about the lock. The first run
+now parks on a gate and the second is launched only once the lock provably
+exists.
+
+#### One tolerance band that let a pinned count drift
+
+**`_near()` was applied to counts its own argument does not reach.** The band
+exists so that a commit adding one test is not a two-file commit for ever —
+true of the running total, which moves constantly. It is not true of the
+`slow` marker or the R selection, which move only when somebody deliberately
+marks a test. Held to ten percent, those were the one place a wrong number
+could sit unchallenged, and one did for a whole release: the README's R count
+was a test short, invisible to this check and caught by hand while cutting
+v0.7.0. Both are pinned exactly now; the total keeps its band.
 
 #### Two checks that had quietly stopped checking
 
