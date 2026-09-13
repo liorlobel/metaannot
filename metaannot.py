@@ -16295,6 +16295,12 @@ keep_plex <- if (is.null(pbatch)) rep(TRUE, nrow(X)) else
 cat(sprintf("min_valid_per_group >= %d in every level of %s: removes %d of %d\n",
             params$min_valid_per_group, params$group_col_for_filtering,
             sum(!keep_valid), nrow(X)))
+# Hoisted above the branch below so the sentence that prices min_plexes can
+# quote sum(keep) ITSELF rather than a number that merely ought to equal it.
+# The one number in that sentence a reader can check against the rest of the
+# document is the count printed three lines down, and the two are now the same
+# expression rather than two expressions that agree today.
+keep <- keep_valid & keep_plex
 if (is.null(pbatch)) {
   cat(sprintf("min_plexes: not applied (no per-sample plex%s)\n",
               if (IS_ISOBARIC) "" else "; this is not an isobaric run"))
@@ -16302,18 +16308,144 @@ if (is.null(pbatch)) {
   cat(sprintf("min_plexes >= %d: removes %d of %d, %d of which min_valid_per_group would have kept\n",
               params$min_plexes, sum(!keep_plex), nrow(X),
               sum(!keep_plex & keep_valid)))
-  cat("\nproteins by number of plexes they are quantified in:\n")
+  # The caption says what the table is OVER, because the obvious way to read a
+  # counterfactual off this document is to cumulate it and that is wrong twice
+  # over. n_plex is computed for every row of X, so these counts are one filter
+  # early; and `keep` is keep_valid & keep_plex, so the two filters INTERACT
+  # and "the proteins with n_plex >= 3" is not the set min_plexes: 3 leaves.
+  # The suite's wide fixture exists to show that gap: a protein quantified in
+  # every plex can still fail min_valid_per_group, so cumulating the histogram
+  # at the top threshold answers something larger than the filters leave, and
+  # test_the_counterfactual_is_not_the_printed_histogram_cumulated asserts both
+  # numbers off one run. The sentence below asks the same question against both
+  # filters at once, which is the only form of it that is exact.
+  cat("\nproteins by number of plexes they are quantified in (every quantified",
+      "row,\nbefore min_valid_per_group - not what another min_plexes would",
+      "keep):\n")
   print(table(plexes = n_plex))
-  # The number that says whether the filter is worth setting, printed whether
-  # or not it is set: with min_plexes at 1 these proteins passed on a sample
-  # count that one batch supplied on its own.
-  confined <- sum(n_plex <= 1 & keep_valid & keep_plex)
-  if (params$min_plexes < 2 && length(unique(pbatch)) > 1 && confined > 0)
-    gate(paste("%d protein(s) pass min_valid_per_group but are quantified in a",
-               "single plex — their group difference is inside one batch.",
-               "Set analysis.min_plexes: 2 to drop them"), confined)
+  # WHAT THE SETTING BOUGHT - the half of this filter the report never said.
+  #
+  # Both branches below price the knob with the SAME PAIR OF COUNTS: how many
+  # protein groups this document is about, and how many min_valid_per_group
+  # passed. Whichever way the run is configured the reader sees one against
+  # the other and knows which setting produced which.
+  #
+  # ONE COMPARISON, AND NOT A LADDER. Printing what 1, 2, 3 ... would each
+  # leave is the same quiet table the histogram already is, with better
+  # labels: a row of counts, no claim, and the reader still has to decide
+  # which cell is the finding. It invites a reading the code cannot support -
+  # every point past `keep` is non-linear (drop_zero_variance runs after the
+  # subset, and eBayes moderates across whatever rows survive), so a ladder
+  # implies a smoothness that stops being true the moment anyone asks how many
+  # HITS a different setting would give. One comparison, stated as a
+  # conclusion, is what the data supports exactly.
+  #
+  # AND THE COMPARISON IS AGAINST 1, not against the notch above or below. 1
+  # is not a point on a ladder, it is the ABSENCE of a choice: the shipped
+  # default, the run the user would have had if they had never touched the
+  # key. It is also the only comparison this chunk can make without a new
+  # statistic - `keep_valid` and `n_plex` are both in hand, neither depends on
+  # the setting, and the count it needs is the one already printed above as
+  # "N of which min_valid_per_group would have kept". At 2 - the only value
+  # anyone sets in practice - "off" is also the next step down, so the two
+  # framings coincide exactly where it matters. The direction matters too: the
+  # proteins a step UP would remove are all still on the page, and these are
+  # the invisible ones, in no table below. A report owes a number for what it
+  # is not showing.
+  #
+  # "keeps", never "tested": `keep` is exact, and TESTED is not, because
+  # drop_zero_variance runs after this subset. The word is the one the line
+  # below prints, so the sentence and that line quote the same population.
+  #
+  # The denominator is named INSIDE the sentence because the line ten rows
+  # above denominates over nrow(X), and two unlabelled denominators next to
+  # each other is the defect the coverage escalation was written to fix.
+  #
+  # sum(keep) + plex_lost == sum(keep_valid) at every setting, so the three
+  # counts close, and a reader can check the tier the report chose against the
+  # sentence's own numbers. (The "at 1 every one of them would" clause presumes
+  # min_valid_per_group >= 1. Under min_valid_per_group: 0 a row with no finite
+  # value anywhere has n_plex 0, keep_valid TRUE and keep_plex FALSE, so it is
+  # counted in plex_lost and the clause overstates what returning to 1 would
+  # bring back - driven: 8 all-NA rows of 20, the sentence says every one of
+  # them would return when none would. It was dismissed here as unreachable
+  # "because such a config cannot reach limma with a usable matrix", and that
+  # is simply false: the rows that are not all-NA go to limma perfectly
+  # usably, and in that measurement most of them were. What makes
+  # it unreachable in practice is upstream - the join stage keeps an all-NA
+  # protein out of annotated_quant.tsv, so no such row is in `aq` to begin
+  # with - and there is no validator forbidding the setting, so this stays a
+  # stated limit rather than a guarantee.)
+  confined  <- sum(n_plex <= 1 & keep_valid & keep_plex)
+  plex_lost <- sum(keep_valid & !keep_plex)
+  said_plex <- FALSE
+  if (params$min_plexes < 2) {
+    # The number that says whether the filter is worth setting, printed whether
+    # or not it is set: with min_plexes at 1 these proteins passed on a sample
+    # count that one batch supplied on its own. sum(keep) - confined is exactly
+    # sum(keep_valid & n_plex >= 2) here, because at this setting keep_plex
+    # excludes only rows with no finite value at all - so the advice now
+    # carries its price rather than naming a setting and stopping.
+    if (length(unique(pbatch)) > 1 && confined > 0) {
+      gate(paste("%d protein(s) pass min_valid_per_group but are quantified in a",
+                 "single plex — their group difference is inside one batch.\n     ",
+                 "Set analysis.min_plexes: 2 to drop them, leaving %d of the %d",
+                 "retained here"), confined, sum(keep) - confined, sum(keep))
+      said_plex <- TRUE
+    }
+  } else if (plex_lost > 0) {
+    # Two tiers on the same sentence, escalated by DENOMINATOR the way every
+    # other coverage claim in this document is. A filter that removed at least
+    # as much as it kept has redefined the experiment rather than trimmed it,
+    # which is a GATE - but "it removed more than it kept" over a handful of
+    # proteins is an anecdote, and the report's loudest sentence is not
+    # spendable on one, so COVERAGE_MIN_N gates the loud tier and the quiet
+    # tier says the same thing. Silent at plex_lost == 0: the setting took
+    # nothing min_valid_per_group would have kept, and the line directly above
+    # already carries that in its "0 of which min_valid_per_group would have
+    # kept" clause - the removal count on that line can be any number, so it is
+    # the clause and not the count that says it. Nothing is added where another
+    # line already says it.
+    say <- if (plex_lost >= sum(keep) && sum(keep_valid) >= COVERAGE_MIN_N)
+      gate else note
+    # "in no DA, enrichment or shortlist table" and not "in no table below":
+    # the retention-by-bin table three output lines down is built over all of
+    # `aq` rather than over `keep` (see cov_tab), so every one of these groups
+    # is counted in its `n` column, and the NOTE under it calls them
+    # "quantified and then filtered out" - present, and correctly so. A
+    # sentence contradicted by the next table printed is worse than a vaguer
+    # one, and this is the loudest sentence the filter has.
+    say(paste("analysis.min_plexes: %d keeps %d of the %d protein group(s)\n     ",
+              "min_valid_per_group passed; the other %d reach no differential\n     ",
+              "abundance, enrichment or shortlist table below, and at 1 - the\n     ",
+              "default, where this filter does nothing - every one of them\n     ",
+              "would."),
+        params$min_plexes, sum(keep), sum(keep_valid), plex_lost)
+    said_plex <- TRUE
+  }
+  # tmt.min_plexes SHARES THE NAME AND IS A DIFFERENT FILTER, and the sentence
+  # above must not be read as covering it. It filtered FEATURES, in the reader,
+  # before the roll-up, so every count in this chunk is already after it and
+  # what it cost in PROTEINS is not derivable from this document at all - only
+  # from a re-run. Said only where the confusion is possible: at the default of
+  # 1 nothing was filtered before the roll-up, the protein counts are complete,
+  # and there is nothing to disclaim. The value is read out of design_notes.txt
+  # the same way the reference treatment is, and an absent or unparseable line
+  # means no NOTE rather than a guess - the failure mode of that coupling is a
+  # missing sentence, never a wrong number.
+  feat_line <- if (IS_ISOBARIC && file.exists(DESIGN_NOTES))
+    grep("^feature min_plexes:", readLines(DESIGN_NOTES, warn = FALSE),
+         value = TRUE) else character(0)
+  feat_minp <- if (length(feat_line)) suppressWarnings(as.integer(
+    sub("^feature min_plexes:[^0-9]*([0-9]+).*$", "\\1", feat_line[1])))
+    else NA_integer_
+  if (said_plex && !is.na(feat_minp) && feat_minp > 1)
+    note(paste("that is analysis.min_plexes alone. tmt.min_plexes is %d, and it",
+               "is\n      the FEATURE-level filter, applied in the reader before",
+               "the roll-up:\n      every count above is already after it, and",
+               "what it cost in PROTEINS\n      is not derivable from this",
+               "document - only from a re-run."), feat_minp)
 }
-keep <- keep_valid & keep_plex
 cat(sprintf("%d/%d groups retained by both filters\n", sum(keep), nrow(X)))
 X   <- X[keep, , drop = FALSE]
 aqk <- aq[keep, , drop = FALSE]

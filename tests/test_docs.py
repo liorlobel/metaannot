@@ -2117,7 +2117,7 @@ def _phrase_re(key):
                       + r"[ \-]+(?:(?!(?:" + "|".join(sorted(_UNITS))
                       # {1,14}, not {2,14}: `_count_head` steps over a
                       # one-letter adjective and this has to reach the same
-                      # phrase, or "the 60 R tests" is a count the scan finds
+                      # phrase, or "the 71 R tests" is a count the scan finds
                       # and the table cannot locate.
                       + r")[ \-])[a-z]{1,14}[ \-]+)?"
                       + re.escape(noun).replace("\\ ", r"[ \-]+") + r"\b",
@@ -2793,6 +2793,9 @@ COUNT_PROSE = {
     "36 samples": ("MEASURED", "a worked example of the centring problem"),
     "75 samples": ("MEASURED", "the second real dataset"),
     "four samples": ("MEASURED", "the TMT fixture's design"),
+    "three plexes": ("MEASURED", "the wide two-filter fixture, built so that "
+                                 "min_plexes 1, 2 and 3 leave three different "
+                                 "protein sets over one matrix"),
     "8 plexes": ("MEASURED", "the real 8-plex TMT run"),
     "six plexes": ("MEASURED", "where the pool sat in the real 8-plex run"),
     "88 channels": ("MEASURED", "the same run, 11 channels x 8 plexes"),
@@ -2826,7 +2829,7 @@ COUNT_PROSE = {
                                  "test_the_readme_names_every_signal_test_"
                                  "windows_really_skips"),
     "five tests": ("MEASURED", "the tests the open xfail markers sit on"),
-    "60 tests": ("MEASURED", "the R selection, counted exactly by "
+    "71 tests": ("MEASURED", "the R selection, counted exactly by "
                              "test_the_readme_test_counts_are_the_counts_"
                              "this_suite_really_has"),
     "seven strings": ("MEASURED", "the class names three outputs share"),

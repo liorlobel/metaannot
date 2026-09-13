@@ -1183,12 +1183,19 @@ def test_the_report_identifies_samples_from_the_recorded_list(knitted):
 
 # --- phase 3: the two filters, the printed design, ratio compression --
 def _prep_filter_source(ma):
-    """The report's own two-filter block, lifted out so a test can run it."""
+    """The report's own two-filter block, lifted out so a test can run it.
+
+    COVERAGE_MIN_N comes with it, lifted from the same template rather than
+    written down here: the block escalates on that constant, and a copy in
+    this file would go on passing after the constant had moved.
+    """
     code = _chunk(ma, "prep")
     m = re.search(r"^keep_valid <- apply.*?^cat\(sprintf\(\"%d/%d groups "
                   r"retained by both filters.*?\n", code, re.S | re.M)
     assert m, "the prep chunk no longer contains the two-filter block"
-    return m.group(0)
+    c = re.search(r"^COVERAGE_MIN_N <- \d+$", ma.RMD_TEMPLATE, re.M)
+    assert c, "the report no longer defines COVERAGE_MIN_N"
+    return c.group(0) + "\n" + m.group(0)
 
 
 FILTER_PREAMBLE = """
@@ -1200,6 +1207,9 @@ params <- list(min_valid_per_group = as.integer(a[1]),
                group_col_for_filtering = "group")
 design_path0 <- "design_from_input.tsv"
 IS_ISOBARIC <- as.logical(a[3])
+# the report defines this in an earlier chunk; here it names a file that does
+# not exist, which is the run whose reader never filtered features at all.
+DESIGN_NOTES <- "no-such-design_notes.txt"
 # four samples per plex, two plexes, two conditions crossed over both
 X <- matrix(NA_real_, nrow = 4, ncol = 8,
             dimnames = list(paste0("P", 1:4), paste0("s", 1:8)))
@@ -1269,6 +1279,233 @@ def test_min_plexes_without_a_plex_stops_instead_of_passing_everything(
                       2, 2, "FALSE")
     out = r.stdout + r.stderr
     assert "min_plexes is 2" in out and "not isobaric" in out
+
+
+# A matrix shaped like the real run rather than like a unit test: three plexes,
+# four samples in each, the condition crossed over all of them, and four
+# populations of protein whose sizes the caller gives. Two things about the
+# shape are load-bearing. analysis.min_plexes 1, 2 and 3 leave three DIFFERENT
+# protein sets over the same matrix, because a counterfactual cannot be tested
+# against a fixture where every threshold gives the same answer. And the last
+# population is quantified in EVERY plex and still fails min_valid_per_group,
+# which is the interaction that makes the printed histogram unreadable as a
+# counterfactual: cumulating it counts those proteins in, and the filters do
+# not.
+WIDE_PREAMBLE = """
+gate <- function(fmt, ...) cat("GATE:", sprintf(fmt, ...), "\\n")
+note <- function(fmt, ...) cat("NOTE:", sprintf(fmt, ...), "\\n")
+a <- commandArgs(TRUE)
+params <- list(min_valid_per_group = 2L, min_plexes = as.integer(a[1]),
+               group_col_for_filtering = "group")
+design_path0 <- "design_from_input.tsv"
+IS_ISOBARIC <- TRUE
+DESIGN_NOTES <- if (nzchar(a[6])) a[6] else "no-such-design_notes.txt"
+n1 <- as.integer(a[2]); n2 <- as.integer(a[3]); n3 <- as.integer(a[4])
+nf <- as.integer(a[5])
+n  <- n1 + n2 + n3 + nf
+X <- matrix(NA_real_, nrow = n, ncol = 12,
+            dimnames = list(sprintf("P%03d", seq_len(n)), paste0("s", 1:12)))
+PLEX_OF <- setNames(rep(c("TMT1", "TMT2", "TMT3"), each = 4), colnames(X))
+if (a[7] == "oneplex") PLEX_OF <- setNames(rep("TMT1", 12), colnames(X))
+fgrp <- factor(rep(c("a", "a", "b", "b"), 3))
+r <- 0
+for (i in seq_len(n1)) { r <- r + 1; X[r, 1:4]  <- 1:4  }    # one plex only
+for (i in seq_len(n2)) { r <- r + 1; X[r, 1:8]  <- 1:8  }    # two of three
+for (i in seq_len(n3)) { r <- r + 1; X[r, 1:12] <- 1:12 }    # all three
+# group 'b' is empty in every plex, so these are quantified in every plex
+# and fail min_valid_per_group anyway.
+for (i in seq_len(nf)) { r <- r + 1; X[r, c(1, 2, 5, 6, 9, 10)] <- 1:6 }
+"""
+
+
+def _wide(ma, tmp_path, mp, n1, n2, n3, nf=5, notes="", plexes="three"):
+    """The two-filter block over the wide fixture, at one setting."""
+    return _rscript_file(tmp_path, WIDE_PREAMBLE + _prep_filter_source(ma),
+                         mp, n1, n2, n3, nf, notes, plexes)
+
+
+@needs_r()
+def test_min_plexes_says_what_the_document_kept_and_not_only_what_it_removed(
+        ma, tmp_path):
+    # symptom, from the first full run on real data: analysis.min_plexes
+    # decided which proteins the report is about, and the report never said
+    # so. It printed how many the filter removed, in a clause subordinate to a
+    # sentence about removal, and left the reader to work out what was left,
+    # against what, and what the other setting would have given.
+    n1, n2, n3, nf = 30, 12, 8, 5
+    base, kept, lost = n1 + n2 + n3, n2 + n3, n1
+    r = _wide(ma, tmp_path, 2, n1, n2, n3, nf)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    # whitespace-flattened, because the report wraps its own long lines and
+    # where it wraps them is not the behaviour this test is about
+    flat = " ".join(out.split())
+    assert (f"GATE: analysis.min_plexes: 2 keeps {kept} of the {base} protein "
+            f"group(s) min_valid_per_group passed; the other {lost} reach no "
+            "differential abundance, enrichment or shortlist table below, and "
+            "at 1 - the default, where this filter does nothing - every one of "
+            "them would.") in flat, out
+    # The tables are NAMED because "no table below" was false: the
+    # retention-by-bin table is built over all of `aq`, so these groups are in
+    # its `n` column, and the note under it calls them "quantified and then
+    # filtered out" - a sentence the next table contradicts is worse than a
+    # longer one, and this is the loudest sentence the filter has.
+    assert "appear in no table below" not in flat, out
+    # the loud tier, because the filter removed more than it kept over a base
+    # above the coverage floor; and the sentence's first number is the count
+    # the line below prints, which is what makes it checkable at all
+    assert f"{kept}/{n1 + n2 + n3 + nf} groups retained by both filters" in out
+
+
+@needs_r()
+def test_the_advice_to_set_min_plexes_now_says_what_setting_it_leaves(
+        ma, tmp_path):
+    # the other half of the same finding: at the default the report named a
+    # setting to change and stopped, so the one thing it asked the reader to
+    # decide was the one thing it priced nothing for.
+    n1, n2, n3, nf = 30, 12, 8, 5
+    r = _wide(ma, tmp_path, 1, n1, n2, n3, nf)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (f"Set analysis.min_plexes: 2 to drop them, leaving {n2 + n3} of "
+            f"the {n1 + n2 + n3} retained here") in " ".join(out.split()), out
+
+
+@needs_r()
+def test_the_counterfactual_is_not_the_printed_histogram_cumulated(
+        ma, tmp_path):
+    # the reason a sentence is owed at all. The only counterfactual a reader
+    # could build from this document was to cumulate the per-N-plex histogram,
+    # and that number is wrong: n_plex is computed for every row of X, so the
+    # table is one filter early. The proteins this fixture puts in every plex
+    # include the ones that fail min_valid_per_group, so the histogram's top
+    # cell and the set the filters really leave are different numbers - and
+    # both are asserted below, off one run.
+    n1, n2, n3, nf = 30, 12, 8, 5
+    r = _wide(ma, tmp_path, 3, n1, n2, n3, nf)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert re.search(r"^%d\s+%d\s+%d\s*$" % (n1, n2, n3 + nf), out, re.M), out
+    assert f"keeps {n3} of the {n1 + n2 + n3} protein group(s)" in out, out
+    assert f"{n3}/{n1 + n2 + n3 + nf} groups retained by both filters" in out
+
+
+@needs_r()
+def test_an_inert_min_plexes_says_nothing_because_the_line_above_already_did(
+        ma, tmp_path):
+    # every protein spans every plex, so the setting cannot move the document
+    # at any value. The run is not left uninformed - the line directly above
+    # says "removes 0 of 35" - and nothing is added where another line already
+    # carries it.
+    r = _wide(ma, tmp_path, 2, 0, 0, 30, 5)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "min_plexes >= 2: removes 0 of 35" in out
+    assert "GATE:" not in out and "NOTE:" not in out, out
+
+
+@needs_r()
+def test_a_handful_of_proteins_gets_the_quiet_tier_and_not_the_loud_one(
+        ma, tmp_path):
+    # the same floor every other coverage claim in this document uses:
+    # "this filter removed more than it kept" over a base this small is an
+    # anecdote, and the report's loudest sentence is not spendable on one.
+    r = _wide(ma, tmp_path, 2, 3, 1, 1, 0)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "NOTE: analysis.min_plexes: 2 keeps 2 of the 5 protein group(s)" in out
+    assert "GATE:" not in out, out
+
+
+@needs_r()
+def test_a_label_free_run_is_told_nothing_about_min_plexes(ma, tmp_path):
+    # silent structurally and not by a test: pbatch is NULL, so the whole
+    # block lives in the other branch and the run keeps exactly the line it
+    # prints today.
+    r = _rscript_file(tmp_path, FILTER_PREAMBLE + _prep_filter_source(ma),
+                      2, 1, "FALSE")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("min_plexes: not applied (no per-sample plex; this is not an "
+            "isobaric run)") in out
+    assert "analysis.min_plexes" not in out and "GATE:" not in out, out
+
+
+@needs_r()
+def test_one_plex_is_not_advised_to_raise_min_plexes(ma, tmp_path):
+    # with one plex every protein is confined to it by definition: "their
+    # group difference is inside one batch" is not a finding, and the advice
+    # would be to delete the experiment. The existing guard already says so
+    # and the price clause inherits it rather than adding a second rule.
+    r = _wide(ma, tmp_path, 1, 30, 12, 8, 5, plexes="oneplex")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "GATE:" not in out and "NOTE:" not in out, out
+    assert "50/55 groups retained by both filters" in out
+
+
+@needs_r()
+def test_one_plex_with_min_plexes_set_says_the_document_is_empty(ma, tmp_path):
+    # deliberately NOT silent, and the asymmetry is the point: at 1 a single
+    # plex makes the advice absurd, at 2 it makes the loss total, and this is
+    # the one run where the sentence is the most useful thing on the page -
+    # the report goes on to hand limma a 0-row matrix.
+    r = _wide(ma, tmp_path, 2, 30, 12, 8, 5, plexes="oneplex")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "GATE: analysis.min_plexes: 2 keeps 0 of the 50 protein group(s)" in out
+    assert "0/55 groups retained by both filters" in out
+
+
+@needs_r()
+@pytest.mark.parametrize("feat,priced", [(1, False), (2, True)])
+def test_the_report_does_not_price_the_feature_level_knob_it_cannot_see(
+        ma, tmp_path, feat, priced):
+    # tmt.min_plexes shares the name and is a different filter: it removed
+    # FEATURES before the roll-up, so every count in this chunk is already
+    # after it and what it cost in PROTEINS is not derivable here at all. Said
+    # where the confusion is possible and nowhere else - at the default of 1
+    # nothing was filtered before the roll-up and there is nothing to
+    # disclaim.
+    notes = tmp_path / "design_notes.txt"
+    notes.write_text(f"reference:        covariate\nfeature min_plexes: {feat} "
+                     "(feature level, before the roll-up)\n", encoding="utf-8")
+    r = _wide(ma, tmp_path, 2, 30, 12, 8, 5, notes=str(notes))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (f"tmt.min_plexes is {feat}" in out) is priced, out
+    if priced:
+        assert "not derivable from this document" in out
+
+
+def test_the_feature_min_plexes_line_the_reader_writes_is_the_line_the_report_reads(
+        ma):
+    # the one new coupling this change introduces, and the only thing in it
+    # that can rot silently: the report parses a PROSE line out of
+    # design_notes.txt. Both sides are lifted here and run against each other,
+    # so renaming either one fails this test instead of quietly costing the
+    # NOTE. The failure mode if it ever did rot is a missing sentence, never a
+    # wrong number.
+    src = open(ma.__file__, encoding="utf-8").read()
+    written = re.search(r'notes\.append\(f"(feature min_plexes: )', src)
+    assert written, "the isobaric reader no longer writes a feature min_plexes line"
+    grepped = re.search(r'grep\("(\^feature min_plexes:)"', ma.RMD_TEMPLATE)
+    assert grepped, "the report no longer looks for that line"
+    pulled = re.search(r'sub\("(\^feature min_plexes:[^"]+)", "\\\\1"',
+                       ma.RMD_TEMPLATE)
+    assert pulled, "the report no longer pulls the value out of that line"
+    line = written.group(1) + "7 (feature level, before the roll-up)"
+    assert re.match(grepped.group(1), line), line
+    assert re.sub(pulled.group(1), r"\1", line) == "7", line
+
+
+def test_pricing_min_plexes_moved_no_default(ma):
+    # it is a sentence about the settings, not a change to them. Both keys
+    # still default to 1, so no run loses a protein to a filter it did not ask
+    # for, and the report still filters on three valid values per group.
+    assert ma.DEFAULT_CONFIG["analysis"]["min_plexes"] == 1
+    assert ma.DEFAULT_CONFIG["tmt"]["min_plexes"] == 1
+    assert ma.DEFAULT_CONFIG["analysis"]["min_valid_per_group"] == 3
 
 
 def test_the_report_prints_the_design_it_used_and_the_reference_treatment(ma):
@@ -1484,6 +1721,51 @@ def test_the_isobaric_run_records_its_choices_beside_the_numbers(tmt_knitted):
     assert "reference:        covariate" in rec
     assert "reference channel: TMT1=131C/Pool01, TMT2=131N/Pool02" in rec
     assert "min_plexes:     2 (protein level, counted across plexes)" in rec
+    # design_notes.txt goes into this file verbatim, so the prose line the
+    # report parses the FEATURE-level filter out of is pinned here against a
+    # real run rather than against a string in a test.
+    assert re.search(r"^feature min_plexes: 1 \(feature level, before the "
+                     r"roll-up\)$", rec, re.M), rec
+
+
+@needs_r(*R_CORE)
+def test_the_knitted_isobaric_report_prices_min_plexes_against_the_default(
+        tmt_knitted):
+    # the whole sentence, end to end, through a real knit - numbers from the
+    # pipeline and not from a preamble. The arithmetic is the FIXTURE's rule
+    # ("every fifth protein is missing from TMT2"), worked here rather than
+    # transcribed from what the report printed, so a report that printed the
+    # wrong numbers would fail this instead of confirming itself.
+    if not tmt_knitted.rendered:
+        pytest.skip("the report was not rendered (pandoc or a package is absent)")
+    txt = open(tmt_knitted.rpath("analysis", "analyse_metaannot.html"),
+               encoding="utf-8").read()
+    m = re.search(r"min_valid_per_group &gt;= 2 in every level of group: "
+                  r"removes 0 of (\d+)", txt)
+    assert m, "the knitted report no longer prints the min_valid_per_group line"
+    total = int(m.group(1))
+    confined = len(range(0, total, 5))       # the fixture's `k % 5 == 0`
+    # knitr prefixes every output line with "##" and the report wraps its own
+    # long lines, so the sentence arrives broken up; neither of those is
+    # what this test is about, and both are normalised away before it is read.
+    flat = " ".join(re.sub(r"(?m)^##\s*", "", txt).split())
+    assert (f"analysis.min_plexes: 2 keeps {total - confined} of the {total} "
+            f"protein group(s) min_valid_per_group passed; the other "
+            f"{confined} reach no differential abundance, enrichment or "
+            "shortlist table below, and at 1 - the default, where this filter "
+            "does nothing - every one of them would.") in flat
+    # NOT "appear in no table below", which the retention-by-bin table three
+    # output lines later falsifies: that table is built over all of `aq`, so
+    # every one of these groups is counted in its `n` column and the note
+    # under it calls them "quantified and then filtered out".
+    assert "appear in no table below" not in flat
+    # and the caption that stops the histogram being read as this number
+    assert "before min_valid_per_group - not what another min_plexes" in txt
+    # tmt.min_plexes is at its default on this run, so nothing was filtered
+    # before the roll-up and the report says nothing about it. The digit is
+    # load-bearing: code_folding echoes the chunk source into the page, where
+    # the same sentence sits with its %d unresolved.
+    assert "tmt.min_plexes is 1" not in txt
 
 
 # --- phase 4: the planted effect, and the reference in the object ------
