@@ -4,6 +4,217 @@
 
 ### Added
 
+**Longest-first dispatch now discriminates inside the hours class, which is the
+only place it ever mattered.** `stage_priority(name)` returned
+`STAGE_COSTS[name]` and nothing else — a three-level ordinal, 3 = hours, 2 =
+minutes, 1 = seconds. Eleven stages declare cost 3 and the durations measured
+inside that one rank run from seconds to more than two days, so the ordering
+that v0.4.0 added to stop InterProScan queueing behind a ten-minute stage left
+it queueing behind its own rank instead: Python's sort is stable, the eleven
+tied, and the whole hours class was dispatched in TABLE ORDER with `interpro`
+seventh of it. On the 455,571-protein run InterProScan STARTED at **27.1 h**,
+the figure TUTORIAL's own start table publishes, and it finished last — so
+every one of those 27.1 hours was an hour the longest stage in the pipeline
+spent waiting for a worker, and an hour on the wall. (The run's total and
+InterProScan's own duration are quoted elsewhere in this entry from the
+replay; they are not repeated here, because 57.9 and 84.2 do not subtract to
+27.1 and the start time is the one this paragraph is about.) The same tie stands in front of
+all eight configs in `examples/server-run-plan`, each of which annotates a
+cohort in its own results directory and therefore starts cold, and each of
+which lists interpro LAST in its own hours class rather than seventh.
+
+**Each stage now carries `order_s`, the seconds it took on the release's
+reference run, and the sort key is the pair.** `stage_priority()` returns
+`(STAGE_COSTS[name], STAGE_ORDER_S[name])`; `run_now.sort(key=stage_priority,
+reverse=True)` is unchanged, character for character. The rank leads, and that
+is the containment rather than a convenience: no figure in the table — and no
+figure a later refinement might read from somewhere else — can promote a
+seconds-class stage past an hours-class one, so
+`test_a_short_stage_never_outranks_a_long_one_wherever_the_table_puts_it` and
+the orphan rule beside it hold for every possible duration and not just for the
+numbers in the table today. What the seconds can do is break the tie, and that
+is the whole of the defect.
+
+**What it is worth, replayed rather than asserted.** The dispatch loop is
+replayed over the real stage graph on this repository's own published
+durations, once under the key v0.4.0 shipped and once under this one. The
+replay is `test_the_measured_durations_replay_to_a_shorter_run` in
+`tests/test_scheduler.py`, which asserts the COMPARISON and never a remembered
+figure; every number in the table below is then recomputed from that same
+replay and checked against this text by
+`test_the_changelog_ordering_figures_are_a_replay_not_a_recollection` in
+`tests/test_docs.py`, so neither this entry nor those tests can drift from the
+other:
+
+| durations | selection | `stage_workers` | cost rank alone | with the tie broken |
+|---|---|---|---|---|
+| 455,571 proteins | the whole pipeline | 3 | 86.6 h | 72.9 h |
+| 455,571 proteins | the whole pipeline | 4 (the default) | 66.7 h | 59.5 h |
+| 455,571 proteins | the eight cohort configs' selection | 3 | 63.5 h | 57.9 h |
+| 38,204 proteins | the whole pipeline | 4 (the default) | 4.9 h | 4.5 h |
+
+Three of the rows above land exactly on the dependency graph's critical path,
+which is the shortest any ordering of the same work can be: there is nothing
+left for a cleverer priority rule to collect, and what remains is
+`stage_workers` and InterProScan itself. The remaining row — the whole
+pipeline at `stage_workers: 3` — is bounded by the work rather than by the
+graph.
+**Note which floor is quoted.** `sum(durations) / stage_workers` is the
+independent-jobs bound and it sits BELOW the critical path here, because
+`integrate` is a barrier all of its feeders must clear and `integrate → esmfold
+→ foldseek → finalise → taxonomy → join` runs out on one worker at the end;
+quoting it would have promised hours that cannot be collected.
+
+**The row that carries the result is `interpro`'s, and the eight configs in
+`examples/server-run-plan` are why the table ships in the source rather than
+being learned from a results directory.** Those configs run with `topology:
+false` and `structure: false`, so their hours class is a different set —
+emapper, pfam, ncbifam, kofam, interpro, with interpro LAST in the stage table
+— and each is a first run in its own results directory. A self-calibrating key
+would have saved them nothing, because a stage whose record matches is `cached`
+and never reaches the sort at all; a table that ships with the release is right
+on the first run, on a fresh clone, on a read-only directory and under
+`--force` alike.
+
+**Only the ORDER of those numbers is claimed, which is what makes one run's
+measurements a fair table for every run.** List scheduling reads the order of
+its priority list and never the magnitudes, so any monotone rescaling of
+`STAGE_ORDER_S` produces a byte-identical schedule — checked, under several
+monotone rescalings, in
+`test_the_order_survives_any_rescaling_of_the_reference_seconds`. A machine
+four times faster and a dataset an order of magnitude larger therefore schedule
+the same way, and the repository's own evidence agrees: its two documented runs
+are 11.9× apart in protein count and 8×–66× apart per stage, and they order
+every stage both of them timed identically. So the numbers are not normalised,
+averaged or fitted, the comment at `STAGE_ORDER_S` says which rows are
+measurements and which are placements for the stages that run never enabled,
+and it says in full sentences why nobody should "fix" them into a constant per
+rank: a constant is not a rescaling, it is the ordinal again.
+
+**The placed rows are the one part of this that argues with itself, so their
+sensitivity is measured too.** jackhmmer, hhblits, unipept, context, smorf and
+taxonomy have never been enabled on a run this repository publishes durations
+for, so they carry a placement below every measured stage of their own rank on
+a stated argument — the hours-class ones query the dark set, a few percent of a
+proteome, rather than all of it.
+`test_the_saving_does_not_rest_on_the_stages_no_run_has_timed` scales those
+placed rows in both directions and reports what happens: down, nothing changes
+direction; up by ten, so that stages nothing has ever timed become the longest
+things in their rank while still being dispatched near the bottom of it, the
+new key loses a little on the smaller dataset and nothing at all on the larger
+one. That is the real cost of a placement being wrong about ORDER, it is
+bounded by the length of the one misplaced stage, and it is bounded at all only
+because the rank leads.
+
+**The cost rank survives untouched, and #30's division of the machine is
+bit-for-bit what it was.** `stage_cost()` is split out for the two callers that
+want a CLASS rather than an order — `share()`, which weights the CPU and RAM
+cut, and the WARN about a stage that cannot grow into freed CPU — because a
+rank is a RATIO of a machine where the seconds are only an ORDER of dispatch.
+Weighting the box by durations would have given InterProScan 21 of 22 cores and
+left each of its round-mates one, for the life of the run, since a tool's
+thread count is fixed when it is launched. Within a rank the weights are equal,
+so reordering two same-rank stages moves only which of them takes the remainder
+of a division of equals; mixed rounds are unchanged. Handing either caller the
+pair raises instead of dividing by a duration, and
+`test_the_dispatch_key_is_not_a_quantity_the_machine_can_be_divided_by` pins
+that. Neither number reaches a cache signature or any `keys` list — scheduling
+order cannot change a stage's output — and both accessors still index rather
+than default, so a stage added without a cost or without a duration raises
+instead of being ranked as trivial or sorted last in silence.
+
+**The two tests that were meant to prove the ordering worked had pinned the
+half of it that did not.** `test_equal_cost_stages_keep_table_order` asserted
+the tie order as though table order were a neutral tiebreak — it is not a
+neutral one, it is a specifically bad one — and
+`test_the_first_wave_no_longer_goes_to_the_shortest_stages_in_table_order`
+asserted a first wave of `emapper, pfam, signalp, tmbed`: a first wave with the
+longest stage in the pipeline ABSENT, pinned as correct. The mechanism was
+tested and the discrimination never was, which is why a green suite could guard
+a feature that did nothing. Both are rewritten to say what they now pin, the
+first as `test_interpro_is_dispatched_before_every_measurably_shorter_stage`,
+which fails against the ordinal-only key rather than passing beside it. Worth
+recording: the old tie test had already become vacuous the moment the key
+became a pair, because `stage_priority(n) == 3` is false for every stage and it
+compared two empty lists. Stability is still required and is still pinned,
+narrowed to the claim it can honestly make — two stages the reference run
+cannot tell apart keep table order.
+
+**The order is disclosed once per run, on the log, and published per stage in
+`describe --json`.** Until now the within-rank order could be predicted by
+reading `STAGES` top to bottom; it now comes from the seconds beside each
+`cost`, so the run names the order it is taking before its first dispatch —
+once, not per stage, because `stage_priority()` is a total order over stage
+names and the order of any round's ready set is that order restricted to it. No
+durations in that line: they are this release's figures for another dataset and
+printed beside a stage about to start they would read as an estimate of the run
+in hand, which is exactly what the resource guide tells an operator not to do.
+`describe --json` grows `order_s` beside `cost` instead, so a front end can
+reproduce the dispatch order from the release alone, and `--dry-run` prints
+the order it would really take — which it can do exactly, and could not do at
+all if the order depended on a results directory it is forbidden to write to
+and may never have read. `DESCRIBE_VERSION` does
+NOT move: the rule at the constant is that it moves when a key is removed or
+its meaning changes, and `cost` still means the rank. What changed is that
+`cost` is no longer SUFFICIENT to reproduce the order, and the honest answer to
+that is the new key beside it rather than a bump no consumer gates on.
+
+**The console had to move with it, and it is a companion change rather than a
+consequence left lying.** `console.rank_ready()` ranked a NEXT row by `cost`
+alone, which annotated the hours class in the console's own table order over a
+queue the engine takes by duration — the page would have said the engine ranked
+six of the ready stages ahead of InterProScan when it ranked none ahead of it,
+inside exactly the eleven stages an operator watches, and `next_detail()`'s own
+docstring records what that class of drift cost the last time (the page listed
+dbcan NEXT above ncbifam NEXT, the engine dispatched ncbifam, and dbcan waited
+27 hours). That is why the second key is in `describe --json` rather than only
+in the engine: the console reads both fields and sorts by the pair, and
+`ready_rows()` declines to rank at all when either is missing rather than
+inventing one. No new xfail was taken anywhere for this — an engine-created
+console defect recorded as a permanent expected failure would have been a worse
+trade than fixing the page — and the contract test asserts the whole order
+again, stage for stage, with the between-rank half kept beside it because that
+half must hold even when a duration is wrong.
+
+**The prose that advertised the feature had the defect written into it, and is
+corrected.** README's scheduler section said of the ordering: "The order is a
+starting order, not a schedule: it makes nothing faster, and InterProScan still
+paces a large run." The first clause is true, and the second was the symptom
+stated as if it were the design — a sentence written by people who had no
+reason to believe the ordering mattered, in the paragraph that sells it.
+TUTORIAL's sizing section had the same shape from the other end: it credited
+v0.4.0 with the half that worked, that dbcan waits now, and said nothing about
+the half that did not. Both now say which half v0.4.0 fixed and which half this
+change fixes; README's Scale table says that its own figures ARE the order
+table and which stages carry a placement instead; and CLAUDE.md's "things that
+are deliberate, do not fix them" list gains a bullet on what not to "fix" here
+— not the magnitudes, not the accessor split, and not into a reader of the
+state file. The pinned suite counts in README's Tests section are re-derived
+from a real run rather than adjusted by hand.
+
+**Weighed and turned down.** Reading each stage's own `seconds` out of
+`.metaannot_state.json` and sorting by that: it would make scheduling a
+consumer of a document v0.6.0 and #39 have just finished making honest about
+being missing, unparseable or written by another run, it pays nothing on
+exactly the runs that need it most (a first run, a fresh cohort directory, the
+GPU box whose other stages arrive as `adopt` and carry no duration at all), and
+`seconds` is not a property of a stage but of the stage, the dataset, the box
+and the CPU cut `share()` happened to give it — InterProScan's own figure was
+measured at `-cpu 7` because signalp and tmbed were beside it — so feeding it
+back closes a loop in which the scheduler's past decision is its present input.
+It remains a defensible refinement LATER, and it needs this table anyway as the
+per-stage fallback, which is strictly more information than the class median or
+the "unknown means longest" sentinel a bare state-file key has to invent. Also
+turned down: longest-remaining-path-first, which on this graph is the same
+order — `integrate` is the single confluence, so every feeder's remaining path
+is its own duration plus one shared constant, and
+`test_remaining_path_length_would_order_this_graph_the_same_way` records that
+precondition so the day it stops holding the question is asked again rather
+than assumed away. And a WARN where a stage's measured duration contradicts its
+declared rank: a good idea, and a separate change, because one of the
+hours-class stages would fire it immediately and legitimately and a new WARN on
+every run does not belong in the same commit as a scheduling change.
+
 **A `cached` stage now says when the record it is being reused on is no longer
 about the file that is there.** On the `cached` branch, and for an `ok` record
 only, `decide()` compares each declared output's mtime against the `finished`

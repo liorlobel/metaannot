@@ -160,7 +160,10 @@ model. The UI generates itself from the engine's own definitions.
 > (`DESCRIBE_VERSION`) so a console can say "I do not understand this shape"
 > rather than guess, and it carries more than this section anticipated: the
 > config vocabulary (`path_keys`, `db_path_keys`, `replace_blocks`,
-> `freeform_keys`, `retired_keys`), each stage's `cost`, and `paths` — the
+> `freeform_keys`, `retired_keys`), the two keys the scheduler sorts each
+> round's ready set by (`cost`, then `order_s` — the stage's seconds on the
+> release's reference run, which breaks the eleven-way tie the rank alone
+> leaves), and `paths` — the
 > files a watcher polls, named rather than reconstructed, so the day one of
 > them moves the watcher moves with it.
 

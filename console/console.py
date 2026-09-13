@@ -53,7 +53,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-CONSOLE_VERSION = "0.1.1"
+CONSOLE_VERSION = "0.1.2"
 
 # The log tail is read by seeking to (size - window), never by reading the file:
 # these logs run for days and reach hundreds of megabytes. 256 KB is far more
@@ -231,6 +231,24 @@ class Contract:
                 # not order. Nothing here does arithmetic on a cost, so the
                 # float it hands back is only ever a sort key.
                 "cost": finite(st.get("cost")),
+                # The engine's TIE-BREAK inside a cost rank: the seconds that
+                # stage took on the release's reference run, a static property
+                # of the release rather than of any results directory, which
+                # is the whole reason `describe --json` can publish it at all.
+                #
+                # It is emitted for the same stated reason `cost` is, and
+                # dropping it left the same defect one level down: eleven
+                # stages declare cost 3, so `cost` alone orders none of them
+                # and the page annotated the hours class in table order over a
+                # queue the engine takes by duration - interpro first, at
+                # 10224 s, where the page put six ready stages ahead of it.
+                #
+                # Same finite() treatment as the cost and for the same
+                # reasons, and None the same way: an engine older than the
+                # field gives it for every stage, a stage added to a newer
+                # engine without one gives it for itself, and ready_rows()
+                # declines to rank at all rather than invent a number.
+                "order_s": finite(st.get("order_s")),
             })
         self.stage_names = [s["name"] for s in self.stages]
         self.version = doc.get("metaannot_version", "?")
@@ -1168,15 +1186,24 @@ def ready_rows(rows):
     agree about it: a table that ranks its NEXT rows and a note that does not
     explain the ranking, or the other way round, is worse than neither.
 
-    Empty when any ready row has no cost - which is what an engine older than
-    the field gives for every stage, and what a stage added to a newer engine
-    without one would give for itself. A partial sort over a missing key would
-    rank a stage by a number this file made up, and the whole point of taking
-    the order from `describe --json` is that it is the engine's order and not
-    this file's guess.
+    Empty when any ready row is missing EITHER of the two numbers the engine
+    sorts by - the cost rank or the reference-run seconds that break a tie
+    inside it. That is what an engine older than a field gives for every
+    stage, and what a stage added to a newer engine without one gives for
+    itself. A partial sort over a missing key would rank a stage by a number
+    this file made up, and the whole point of taking the order from
+    `describe --json` is that it is the engine's order and not this file's
+    guess.
+
+    Both, not just the cost: with `order_s` missing the console could still
+    order the RANKS correctly and would then present a within-rank order that
+    is this file's table order rather than the engine's - which is exactly the
+    drift `next_detail()` records the cost of, and it would be presented with
+    the same confidence as a correct one.
     """
     ready = [r for r in rows if r["state"] == "next"]
-    return [] if any(r["cost"] is None for r in ready) else ready
+    return [] if any(r["cost"] is None or r["order_s"] is None
+                     for r in ready) else ready
 
 
 def next_detail(ahead):
@@ -1215,22 +1242,39 @@ def rank_ready(rows):
     """Fill in which ready stages the engine ranks ahead of which.
 
     v0.4.0 made the scheduler dispatch each round's ready set longest-first -
-    `run_now.sort(key=stage_priority, reverse=True)`, over cost 3 hours, 2
-    minutes, 1 seconds - and describe --json emits `cost` for exactly this,
-    "so a front end can order or annotate the table the same way". This file
-    dropped the field, so the table went on listing its NEXT rows in stage
-    order over a queue the engine was taking in a different one.
+    `run_now.sort(key=stage_priority, reverse=True)` - and the release that
+    added `order_s` made `stage_priority` return `(cost, order_s)` rather than
+    the cost alone,
+    because the cost is a three-level ordinal (3 hours, 2 minutes, 1 seconds)
+    on which eleven stages tie. describe --json emits BOTH fields for exactly
+    this, "so a front end can order or annotate the table the same way". This
+    file dropped `cost` first and then `order_s`, and each time the table went
+    on listing its NEXT rows in stage order over a queue the engine was taking
+    in a different one.
 
     The rows are annotated rather than reordered. The table is in the engine's
     own stage order - the strip on the index reads the same way, and a
     dependency graph read out of order is harder, not easier - so the order
     goes into the sentence instead.
 
-    Stable, like the engine's own sort, and over the same sequence: stages of
-    equal cost keep table order there, so they keep it here.
+    TWO KEYS, in the engine's order, because the rank alone does not order
+    anything. `stage_priority` returns `(cost, order_s)`: the cost rank leads,
+    so no duration can move a stage out of its class, and the reference-run
+    seconds break the tie inside it. Eleven stages declare cost 3 - the hours
+    class, and the eleven an operator actually watches - so a sort on the rank
+    alone left every one of them in this file's table order. The page said the
+    engine ranked six ready stages ahead of interpro when the engine ranked
+    none ahead of it.
+
+    Stable, and `reverse=True` rather than a negated key so that it is the
+    same expression the engine uses: a stable sort with `reverse=True` does
+    not reverse the order of equal keys, so two stages that tie on BOTH
+    numbers keep table order here exactly as they do there.
     """
     ahead = []
-    for r in sorted(ready_rows(rows), key=lambda row: -row["cost"]):
+    for r in sorted(ready_rows(rows),
+                    key=lambda row: (row["cost"], row["order_s"]),
+                    reverse=True):
         r["ahead"] = list(ahead)
         r["detail"] = next_detail(r["ahead"])
         ahead.append(r["name"])
@@ -1311,10 +1355,12 @@ def stage_rows(contract, state, cfg_run, now, with_outputs, project_path,
                "state": "none", "label": "—", "took": "—", "detail": "",
                "carried": None, "era": None, "outputs": [], "part": None,
                "started": None, "error": None, "finished": None,
-               # The scheduler's own rank, and which ready stages it puts
-               # ahead of this one. rank_ready() fills `ahead` in after the
-               # loop, when it is known which rows ended up ready at all.
-               "cost": st["cost"], "ahead": []}
+               # The scheduler's own sort key - the cost rank, then the
+               # reference-run seconds that break a tie inside it - and which
+               # ready stages it puts ahead of this one. rank_ready() fills
+               # `ahead` in after the loop, when it is known which rows ended
+               # up ready at all.
+               "cost": st["cost"], "order_s": st["order_s"], "ahead": []}
         status = rec.get("status") if rec else None
         if name in odd:
             row.update(state="bad", label="?",

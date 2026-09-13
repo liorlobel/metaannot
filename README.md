@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1687 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1701 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 57 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1630 passed and 58
+absent, so on a machine with no R the same run reports 1644 passed and 58
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1171,16 +1171,40 @@ it writes.
 
 Concurrency is capped by `stage_workers`, so the first wave is a queue rather
 than a stampede: with the default 4, twelve ready stages compete for four
-slots. The scheduler orders that queue longest-first. Every stage carries a
-coarse cost rank — hours, minutes, or seconds, measured on real runs — and the
-hours-class stages claim the workers while the seconds-class ones fill in
-behind them as slots free. Dispatching in table order instead, as it did
-before v0.4.0, gave the first wave to `dbcan` (10 min) and `diamond` (5 min)
-while `signalp` and `tmbed` (about an hour each) queued.
+slots. The scheduler orders that queue longest-first, by two numbers per
+stage. The first is a coarse cost rank — hours, minutes, or seconds, measured
+on real runs — and it is also the ratio the machine is divided by, which is
+why it stays coarse. The second is what that stage took on the release's
+reference run, and it exists to break the ties in the first: eleven stages
+are hours-class, so the rank on its own left all of them in table order, and
+`interpro` — the longest stage in the pipeline by an order of magnitude, and
+the stage the ordering was written for — was dispatched seventh of them.
+Dispatching in pure table order instead, as it did before v0.4.0, gave the
+first wave to `dbcan` (10 min) and `diamond` (5 min) while `signalp` and
+`tmbed` (about an hour each) queued.
 
-The order is a starting order, not a schedule: it makes nothing faster, and
-InterProScan still paces a large run. See
-[Sizing your run](TUTORIAL.md#sizing-your-run) for what to do about that.
+Both numbers are published per stage in `describe --json`, as `cost` and
+`order_s`, so the dispatch order is reproducible from the release alone —
+without reading anybody's results directory, and identically on a first run, a
+fresh clone and a `--force`. Only their ORDER is used: list scheduling never
+reads the magnitudes, so the same table orders a faster machine and a dataset
+an order of magnitude larger the same way, which is what makes one run's
+measurements a fair table for every run. The run's log names the order it
+took, once, before the first dispatch.
+
+The order is a starting order and not a schedule — nothing in it decides when a
+stage finishes — but the sentence that used to stand here, "it makes nothing
+faster", was wrong, and it was wrong in the same way the code was: on every
+selection this repository has published durations for, dispatching `interpro`
+first instead of seventh takes hours off the run, and at the default
+`stage_workers: 4` it lands the whole pipeline exactly on the dependency
+graph's critical path — the shortest that any ordering of the same work can
+make it. THE SLOT COUNT IS PART OF THAT CLAIM AND NOT A DETAIL: at
+`stage_workers: 3`, which is what the 455,571-protein run used, the same
+reordering saves 13.7 h and is still 13.4 h above the critical path, because
+there the run is bounded by the work rather than by the graph. What is left
+after that is `stage_workers` and InterProScan itself.
+See [Sizing your run](TUTORIAL.md#sizing-your-run) for both.
 
 ```yaml
 threads: 32
@@ -2681,10 +2705,24 @@ stdlib-only file — Python 3.9 or newer, nothing to install, deployable by `scp
 — and it serves one page: a list of the directories it watches, and per
 directory a stage table read out of `.metaannot_state.json`, a log tail, the
 lock, and what the run record says about itself. It is `CONSOLE_VERSION`
-`0.1.1`, and that number is deliberately not `__version__`: the console and the
+`0.1.2`, and that number is deliberately not `__version__`: the console and the
 engine ship in one repository but they are two programs with two audiences, and
 tying their versions together would mean either lying about one of them or
 bumping a number nobody asked about.
+
+**The NEXT rows carry the engine's dispatch order, taken from the engine.**
+A stage with no record and no unmet dependency is ready, and several are ready
+at once; which one actually starts is `stage_priority`, the cost rank and then
+the stage's seconds on the release's reference run, both of which
+`describe --json` publishes for exactly this purpose. The console reads both
+and says which ready stages are ranked ahead of which — it does not reorder the
+table, because a dependency graph read out of order is harder rather than
+easier. It says nothing about how many workers are free or whether a GPU stage
+will be deferred, because it cannot know either; the note under the table
+carries those two unknowns once. Reading only the rank was not enough and the
+page was wrong for a while because of it: eleven stages declare the same rank,
+so the page annotated the hours class in its own table order and told an
+operator that several ready stages were ahead of InterProScan when none were.
 
 **It never writes a byte into a results directory.** Not a lockfile, not a
 cache, not a temp file, not a log line. That is not politeness, it is the
@@ -2838,7 +2876,11 @@ stage that is *adopted* or *skipped* on a resume records none.
 
 One label-free run, 38,204 proteins, on a single workstation, with stages
 running concurrently, so these are shares of a parallel run rather than
-single-stage benchmarks:
+single-stage benchmarks. This is also the run the scheduler's dispatch order
+comes from: each figure below is that stage's `order_s` in `describe --json`,
+where it is used for its ORDER alone and never as a prediction of your run.
+The stages this run did not enable carry a placement rather than a measurement
+and the comment at `STAGE_ORDER_S` says which is which:
 
 | stage | wall time |
 | --- | --- |

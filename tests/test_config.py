@@ -1112,8 +1112,22 @@ DESCRIBE_TOP_LEVEL = {
 # test_describe_emits_every_field_a_stage_dict_carries exists to catch, and did
 # catch. This is the decision that tripwire asks for, taken deliberately:
 # DESCRIBE_VERSION does NOT move, because nothing was removed or redefined.
+#
+# `order_s` joined with the two-element dispatch key: what each stage took on
+# the release's reference
+# run, which is the SECOND key the scheduler sorts a round's ready set by and
+# the one that breaks the ties in `cost`. THE DECISION, taken here rather than
+# left to be noticed: DESCRIBE_VERSION does not move for it either. The rule
+# at the constant is that the version moves when a key is REMOVED or its
+# MEANING changes, and `cost` means exactly what it meant - the rank, 1
+# seconds / 2 minutes / 3 hours, and what the machine is divided by. What
+# changed is that `cost` is no longer SUFFICIENT to reproduce the dispatch
+# order, and the honest answer to that is the new key beside it, not a version
+# bump that no consumer gates on: the console displays `describe_version` and
+# never compares it, so a bump would have announced the change to nobody and
+# the field says it to everybody.
 DESCRIBE_PER_STAGE = {"name", "enabled", "deps", "keys", "gpu", "empty_ok",
-                      "outputs", "cost", "requires", "degraded_by"}
+                      "outputs", "cost", "order_s", "requires", "degraded_by"}
 
 
 def test_describe_version_pins_the_shape_it_versions(ma, project):

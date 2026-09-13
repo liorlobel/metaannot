@@ -310,34 +310,110 @@ def test_the_log_prefix_the_console_parses_is_the_prefix_the_engine_writes(
     assert lines[2].get("cont") is True    # the continuation keeps the level
 
 
-def test_the_cost_the_console_ranks_by_is_the_one_the_scheduler_sorts_by(
+def test_the_cost_the_console_ranks_by_is_the_rank_the_scheduler_leads_with(
         console, ma):
     """The console annotates its NEXT rows with the engine's dispatch order,
-    and it takes that order from `cost` in `describe --json` - the field the
-    engine emits "so a front end can order or annotate the table the same way".
+    and it takes that order from `describe --json` - the fields the engine
+    emits "so a front end can order or annotate the table the same way".
 
-    Pinned against stage_priority() itself rather than against the numbers,
-    because the coupling is the point: the day a stage's cost changes, or the
-    day the scheduler stops sorting by it, the console must move with it and
-    not carry on annotating a queue that is no longer there.
+    THE COUPLING IS EXACT, and it is asserted as a whole order rather than as
+    invariants about it. `stage_priority` returns `(cost, order_s)` - the cost
+    rank, then the stage's seconds on the release's reference run - because
+    the rank alone is a three-level ordinal on which ELEVEN stages tie, so it
+    orders none of the hours class and a sort on it falls back to table order.
+    A console reading only the rank could still order the ranks correctly and
+    then present a within-rank order that was its own, with the same
+    confidence as a correct one: it would say the engine ranked several ready
+    stages ahead of interpro when the engine ranked none.
+
+    The console reads both fields now, so the whole order is comparable again
+    and is compared: the page's order over a ready set is
+    `sorted(ready, key=stage_priority, reverse=True)`, stage for stage. That
+    is the assertion this test carried originally, and the reason it carried
+    it is unchanged - the day a stage's cost or its reference seconds change,
+    or the day the scheduler stops sorting by them, the console must move with
+    it rather than carry on annotating a queue that is no longer there.
+
+    The between-rank invariant is kept beside it rather than dropped, because
+    it is the half that must hold even when a duration is wrong: no seconds,
+    however stale or however hand-edited in a fork, may move a stage out of
+    its class.
     """
     contract = console.Contract(describe())
     cost = {st["name"]: st["cost"] for st in contract.stages}
+    order_s = {st["name"]: st["order_s"] for st in contract.stages}
     for name, value in cost.items():
         assert value == ma.STAGE_COSTS[name], name
-    # every stage, so the ranking is never a partial sort over a missing key
-    assert all(value is not None for value in cost.values())
-    # and the console's order over one ready set is the engine's own
+        assert order_s[name] == ma.STAGE_ORDER_S[name], name
+    # every stage, for both keys, so the ranking is never a partial sort over
+    # a missing one
+    assert all(v is not None for v in cost.values())
+    assert all(v is not None for v in order_s.values())
+
     ready = ["dbcan", "diamond", "cluster", "ncbifam", "kofam", "interpro"]
     rows = [{"name": n, "state": "next", "detail": "", "ahead": [],
-             "cost": cost[n]} for n in ready]
+             "cost": cost[n], "order_s": order_s[n]} for n in ready]
     console.rank_ready(rows)
     # `ahead` IS the rank: the stage with none ahead of it is dispatched first.
     console_order = [r["name"]
                      for r in sorted(rows, key=lambda r: len(r["ahead"]))]
-    engine_order = list(ready)
-    engine_order.sort(key=ma.stage_priority, reverse=True)
-    assert console_order == engine_order
+    engine_order = sorted(ready, key=ma.stage_priority, reverse=True)
+
+    # THE WHOLE ORDER, stage for stage. This is the assertion that was split
+    # out while the console read one key, and it is the point of the change
+    # that put it back.
+    assert console_order == engine_order, (console_order, engine_order)
+    # and it really is interpro first out of this set, which is the case the
+    # rank alone could not produce: interpro sits behind other cost-3 stages
+    # in table order, so a sort on the rank alone leaves it behind them.
+    assert console_order[0] == "interpro", console_order
+
+    # The between-rank invariant, kept because it must hold even when a
+    # duration is wrong: no seconds may move a stage out of its class.
+    for a in ready:
+        for b in ready:
+            if ma.stage_cost(a) > ma.stage_cost(b):
+                assert console_order.index(a) < console_order.index(b), (a, b)
+    assert [cost[n] for n in console_order] == \
+        sorted([cost[n] for n in console_order], reverse=True)
+
+
+def test_the_contract_carries_the_tie_break_without_reading_a_results_dir(
+        console, ma):
+    """`order_s` is in `describe --json`, and that is why the console can agree.
+
+    The engine's within-rank order is a static property of the release - the
+    seconds beside each `cost` in STAGES - which is the whole reason it can be
+    published in this document at all. A per-directory figure could not be:
+    `describe()` takes a config and a Paths and NO state, and its two halves
+    are documented as static-per-release and true-of-this-machine-right-now,
+    so a scheduler that ranked by what some results directory recorded would
+    have nothing to publish here. The console could still reach that order -
+    it already reads `seconds` off each record in stage_rows(), which holds
+    the state document - but only by re-deriving the engine's trust rules
+    about which records to believe, in a second place. A release-static order
+    needs none of that: read two fields and sort.
+
+    So this pins the contract rather than the console: both fields are there,
+    for every stage, with the engine's own values, and a reader that sorts by
+    the pair reproduces the engine's dispatch order from the document alone.
+    The test above pins that the console in this repository does exactly that;
+    this one stays separate because the CONTRACT has to carry the order for
+    any front end, including the ones not in this tree.
+    """
+    doc = describe()
+    contract = console.Contract(doc)
+    order_s = {st["name"]: st["order_s"] for st in doc["stages"]}
+    assert order_s == dict(ma.STAGE_ORDER_S)
+    assert all(isinstance(v, int) and v > 0 for v in order_s.values())
+    # a reader with nothing but this document, and the order it produces:
+    # exactly the engine's, ties and all
+    ready = ["dbcan", "diamond", "cluster", "ncbifam", "kofam", "interpro"]
+    cost = {st["name"]: st["cost"] for st in contract.stages}
+    taught = sorted(ready, key=lambda n: (cost[n], order_s[n]), reverse=True)
+    engine = sorted(ready, key=ma.stage_priority, reverse=True)
+    assert taught == engine
+    assert taught[0] == "interpro", taught
 
 
 def test_a_running_record_carries_a_start_and_never_a_finish():

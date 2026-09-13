@@ -1286,6 +1286,92 @@ def test_the_design_doc_no_longer_says_the_console_does_not_exist():
     assert "Not in v0.5.0" in txt
 
 
+def test_the_dispatch_order_table_is_the_published_measurements(ma):
+    """STAGE_ORDER_S's measured rows against README's Scale table, row by row.
+
+    The provenance claim in the comment at STAGE_ORDER_S is specific: every
+    figure in it for a stage the reference run actually ran is that table's,
+    converted to seconds. A comment cannot enforce that, and the failure it
+    invites is silent — somebody edits a duration in the source to change a
+    dispatch order, the published table goes on saying something else, and the
+    number that is supposed to be a measurement has quietly become a
+    preference. So the two are compared here.
+
+    The tolerance is one hundredth of an hour, which is the resolution the
+    README's own column prints: `foldseek` is `0.02 h` there and 57 s in
+    TUTORIAL's finer table, and `dbcan` is `0.01 h` against 41 s. Comparing to
+    the printed decimal rather than to the finer figure would fail on the
+    rounding and teach the next reader to widen it, which is the opposite of
+    what a pin is for.
+    """
+    rows = re.findall(r"^\| `(\w+)` \| ([\d.]+) h \|$", _text(README),
+                      flags=re.M)
+    assert len(rows) >= 8, rows
+    for name, hours in rows:
+        assert name in ma.STAGE_ORDER_S, name
+        printed = float(hours) * 3600
+        assert abs(ma.STAGE_ORDER_S[name] - printed) <= 36, (
+            f"{name}: the order table says {ma.STAGE_ORDER_S[name]} s and the "
+            f"README's Scale table says {hours} h ({printed:.0f} s)")
+
+
+def test_the_changelog_ordering_figures_are_a_replay_not_a_recollection(ma):
+    """Every hour in the dispatch-ordering entry's table, recomputed.
+
+    The entry claims what the two-element dispatch key is worth, in hours, on
+    two datasets and at two worker counts. Those are exactly the numbers that
+    rot: a figure typed into a CHANGELOG from a scratch script is unfalsifiable
+    the moment the script is deleted, and the standing rule in this repository
+    is that a number in prose is derived, pinned, or explicitly exempt. So the
+    table is parsed and every cell of it is replayed here, through the same
+    model of the dispatch loop and the same published measurements the
+    scheduler tests use — one copy of both, imported rather than retyped, so
+    the entry cannot agree with a test that has itself drifted.
+
+    THE SLOT COUNT IS PART OF EACH CLAIM, which is why the table has a column
+    for it: the saving at `stage_workers: 3` is not the saving at the default
+    4, and an hours-saved sentence with no worker count in it cannot be
+    checked against anything.
+    """
+    from test_scheduler import (COHORT_SELECTION, MEASURED_38K, MEASURED_455K,
+                                _critical_path, _ordinal_only, _replay)
+    durations = {"38,204": MEASURED_38K, "455,571": MEASURED_455K}
+    selections = {"the whole pipeline": None,
+                  "the eight cohort configs' selection": COHORT_SELECTION}
+
+    section = _newest_section(_text(CHANGELOG))
+    rows = re.findall(r"^\| (38,204|455,571) proteins \| ([^|]+?) \| (\d)"
+                      r"[^|]*\| ([\d.]+) h \| ([\d.]+) h \|$",
+                      section, flags=re.M)
+    assert len(rows) == 4, \
+        f"the ordering entry's replay table has {len(rows)} rows this can read"
+
+    optimal = 0
+    for size, selection, slots, said_was, said_now in rows:
+        assert selection.strip() in selections, selection
+        sel = selections[selection.strip()]
+        dur, slots = durations[size], int(slots)
+        was, _ = _replay(ma, dur, _ordinal_only(ma), slots, sel)
+        now, _ = _replay(ma, dur, ma.stage_priority, slots, sel)
+        assert round(was / 3600, 1) == float(said_was), (
+            f"{size} proteins, {selection.strip()}, {slots} workers: the "
+            f"CHANGELOG says the cost rank alone gives {said_was} h and a "
+            f"replay gives {was / 3600:.1f} h")
+        assert round(now / 3600, 1) == float(said_now), (
+            f"{size} proteins, {selection.strip()}, {slots} workers: the "
+            f"CHANGELOG says the two-element key gives {said_now} h and a "
+            f"replay gives {now / 3600:.1f} h")
+        optimal += now == _critical_path(ma, dur, sel)
+
+    # ...and the sentence under the table, which is a count of those rows
+    said = re.search(r"(\w+) of the rows above land exactly on the dependency "
+                     r"graph's critical path", section)
+    assert said, "the entry no longer says how many rows reach the floor"
+    assert _count_value(said.group(1)) == optimal, \
+        f"the entry says {said.group(1)} rows reach the critical path and " \
+        f"{optimal} of them do"
+
+
 def test_the_changelog_says_which_console_milestone_shipped(ma):
     # symptom risk: "the console shipped" reads as "the console is finished".
     # M1 is a watcher; the preflight checklist, the directory picker and
@@ -2308,6 +2394,36 @@ def _describe_per_stage_keys():
     raise AssertionError("describe() no longer builds its stage dicts inline")
 
 
+def _cost3_before_interpro(ma):
+    """How many hours-class stages the stage table lists before interpro.
+
+    The number the tie cost: with the cost rank as the whole sort key these
+    stages all tied with interpro and kept their table positions ahead of it,
+    which is why the longest stage in the pipeline was dispatched seventh of
+    its own rank.
+    """
+    names = [st["name"] for st in ma.STAGES]
+    return sum(1 for st in ma.STAGES[:names.index("interpro")]
+               if st["cost"] == 3)
+
+
+def _context_deps(ma):
+    """The first-wave stages whose remaining path runs through `context`."""
+    return len(next(st for st in ma.STAGES
+                    if st["name"] == "context")["deps"])
+
+
+def _tied_dispatch_groups(ma):
+    """Dispatch keys shared by more than one stage.
+
+    What is left of the tie after the reference seconds break it, and the
+    reason the stability claim is not vacuous: these are the groups that still
+    keep table order.
+    """
+    keys = [ma.stage_priority(n) for n in ma.STAGE_NAMES]
+    return sum(1 for k in set(keys) if keys.count(k) > 1)
+
+
 def _suite_tuple_len(module, name):
     """How many entries a module-level tuple in a test module has.
 
@@ -2407,8 +2523,36 @@ COUNT_PROSE = {
     # ---- DERIVED, added by the FIFTH reading, when the scan grew -----
     # Digits, tests/ and the wider emitted document all arrived together, and
     # these are the counts that only became visible because of it.
-    "ten keys": ("DERIVED", "the per-stage dict describe() emits",
-                 lambda ma: len(_describe_per_stage_keys())),
+    "eleven keys": ("DERIVED", "the per-stage dict describe() emits",
+                    lambda ma: len(_describe_per_stage_keys())),
+
+    # ---- DERIVED, added with the two-element dispatch key -----------
+    # The cost rank stopped being the whole sort key, and the sentences that
+    # explain why are full of counts OF the rank: how many stages tie on it,
+    # how many levels it has, and where interpro sat in the tie. Every one of
+    # them is a fact about STAGES and is recomputed from it here, because a
+    # hand-typed "eleven" is exactly the kind of number this scan exists for -
+    # the eleven becomes a twelve the day a twenty-second stage is added as
+    # hours-class, and the sentence would go on saying eleven in four files.
+    "eleven stages": ("DERIVED", "the stages that declare cost 3",
+                      lambda ma: sum(1 for c in ma.STAGE_COSTS.values()
+                                     if c == 3)),
+    "ten stages": ("DERIVED", "the cost-3 stages interpro ties with",
+                   lambda ma: sum(1 for c in ma.STAGE_COSTS.values()
+                                  if c == 3) - 1),
+    "three ranks": ("DERIVED", "the distinct cost ranks",
+                    lambda ma: len(set(ma.STAGE_COSTS.values()))),
+    "three level": ("DERIVED", "the distinct cost ranks",
+                    lambda ma: len(set(ma.STAGE_COSTS.values()))),
+    "six them": ("DERIVED", "the cost-3 stages the table lists before "
+                            "interpro, which is where the tie put it",
+                 _cost3_before_interpro),
+    "four them": ("DERIVED", "context's dependencies - the first-wave stages "
+                             "whose remaining path runs through it",
+                  _context_deps),
+    "three groups": ("DERIVED", "the dispatch-key groups with more than one "
+                                "stage in them",
+                     _tied_dispatch_groups),
     "200,000 records": ("DERIVED", "DMND_FASTA_RECORD_CAP",
                         lambda ma: ma.DMND_FASTA_RECORD_CAP),
     "200 deflines": ("DERIVED", "DMND_DEFLINE_CAP",
