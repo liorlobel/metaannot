@@ -384,7 +384,9 @@ def test_an_unreadable_state_file_stops_adoption(tmp_path, stub_bin):
     with open(proj.rpath(".metaannot_state.json"), "w", encoding="utf-8") as fh:
         fh.write("{ not json")
     proc = proj.run()
-    assert "state file unreadable" in proc.stderr
+    assert "is unreadable" in proc.stderr
+    assert proj.rpath(".metaannot_state.json") in proc.stderr, \
+        "the message has to name WHICH file, or it is a traceback with words"
     assert "recomputing instead of adopting" in proc.stderr
 
 
@@ -1917,7 +1919,48 @@ def test_the_other_readers_of_the_lock_and_the_state_take_the_same_bytes(
     capsys.readouterr()
     got = ma.load_state(str(st))
     assert got.unreadable and dict(got) == {}
-    assert "state file unreadable" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "is unreadable" in err and str(st) in err
+
+
+@pytest.mark.parametrize("doc, kind", [("[1, 2, 3]", "list"),
+                                       ('"a string"', "str"),
+                                       ("7", "int"),
+                                       ("null", "NoneType")])
+def test_a_state_file_that_is_valid_json_but_not_an_object_is_damage(
+        ma, tmp_path, capsys, doc, kind):
+    """The case the enumeration in `_read_state_for_merge` fell through.
+
+    `[1, 2, 3]` is valid JSON, so it is not unparseable; the file exists and
+    reads, so it is neither missing nor unreadable. It went to `dict()` and
+    died with `TypeError: cannot convert dictionary update sequence element #0
+    to a sequence` BEFORE the run's first log line -- no path, no cause, no
+    stage. The write side already answered this shape; this is the read side
+    agreeing with it.
+    """
+    st = tmp_path / ".metaannot_state.json"
+    st.write_text(doc, encoding="utf-8")
+    capsys.readouterr()
+    got = ma.load_state(str(st))
+    assert got.unreadable and dict(got) == {}, \
+        "damage must stop adoption, not be adopted as an empty record"
+    err = capsys.readouterr().err
+    assert f"holds {kind}, not an object" in err, err
+    assert str(st) in err, "the path is the whole point of the message"
+
+
+def test_the_two_sides_of_the_state_file_agree_about_a_bad_shape(ma, tmp_path):
+    """load_state and _read_state_for_merge are one judgement, not two.
+
+    The write side has enumerated this since #37; the read side had not, and
+    a document the writer calls damage must not be a document the reader
+    hands to the run as a record.
+    """
+    st = tmp_path / ".metaannot_state.json"
+    st.write_text("[1, 2, 3]", encoding="utf-8")
+    doc, how, _why = ma._read_state_for_merge(str(st))
+    assert (doc, how) == ({}, "unparseable"), "the write side's verdict"
+    assert ma.load_state(str(st)).unreadable, "the read side's, and it agrees"
 
 
 def test_a_run_whose_lock_vanishes_loses_its_verdict_and_says_so(ma, tmp_path,

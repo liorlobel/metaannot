@@ -24,3 +24,6 @@ __pycache__/
 .venv/
 .Rhistory
 .DS_Store
+
+# Workflow agents get their own git worktrees under here; they are scratch.
+.claude/
