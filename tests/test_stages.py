@@ -629,6 +629,37 @@ def test_tmbed_reports_progress_like_every_other_long_running_tool(
     assert os.path.exists(p.tmbed), "the predictions are still adopted"
 
 
+def test_tmbed_is_capped_at_its_share_of_the_cpu_like_signalp_is(
+        ma, tmp_path, paths_for, monkeypatch):
+    # symptom: tmbed has no --torch_num_threads of its own -- signalp's is the
+    # only thread cap in the topology pair -- so torch took every core it
+    # could see. On a CPU fallback that is the whole box, while share() has
+    # told the other stages running beside it that they own most of it.
+    cfg, p = paths_for("tmbed_threads")
+    cfg["proteins_faa"] = F.write_fasta(str(tmp_path / "p.faa"),
+                                        F.protein_set()[:2])
+    cfg["threads"] = 3
+    seen = {}
+
+    def fake_run_cmd(cmd, cwd=None, env=None, progress=None):
+        seen["env"] = env
+        open(str(cmd[cmd.index("-p") + 1]), "w").close()
+        return ""
+
+    monkeypatch.setattr(ma, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(ma, "have", lambda *a, **k: True)
+    monkeypatch.setattr(ma, "cuda_probe", lambda: (False, "no CUDA here"))
+    try:
+        ma.stage_tmbed(cfg, p)
+    except ma.StageError:
+        pass                    # the stub writes no real prediction table
+    env = seen.get("env") or {}
+    assert env.get("OMP_NUM_THREADS") == "3", env.get("OMP_NUM_THREADS")
+    assert env.get("MKL_NUM_THREADS") == "3", env.get("MKL_NUM_THREADS")
+    assert env.get("CUDA_VISIBLE_DEVICES") is not None, \
+        "the device pin was the only thing this env carried; keep it"
+
+
 def test_tmbed_is_launched_by_the_path_that_was_resolved_for_it(
         ma, tmp_path, paths_for, monkeypatch):
     # symptom: every tool is meant to be launched by the absolute path PATH
@@ -777,6 +808,82 @@ def test_a_progress_bar_becomes_one_sensible_line(ma, raw, want):
 
 def test_a_very_long_progress_line_is_truncated(ma):
     assert len(ma._progress_line("x" * 5000)) == 160
+
+
+# --- the heartbeat that wrote 5,086 of 8,990 lines ---------------------
+# symptom: one line a minute is the right spacing for the first ten minutes of
+# a stage and the wrong spacing for the next eighty hours. The first full real
+# run wrote 8,990 log lines of which 5,086 were heartbeats, and the twenty
+# that mattered were somewhere in them.
+
+
+def _heartbeat_waits(ma, n):
+    """The first `n` waits a single command's heartbeat would use."""
+    wait, out = ma._PROGRESS_INTERVAL, []
+    for tick in range(1, n + 1):
+        out.append(wait)
+        wait = ma._next_progress_interval(wait, tick)
+    return out
+
+
+def test_the_heartbeat_keeps_its_cadence_while_anyone_is_still_watching(ma):
+    # The first ten minutes of a default run are spaced exactly as before:
+    # that is the window in which a stage is either working or is not.
+    ma.set_progress_interval(60, 900)
+    waits = _heartbeat_waits(ma, ma._PROGRESS_STEADY_TICKS)
+    assert waits == [60.0] * ma._PROGRESS_STEADY_TICKS
+
+
+def test_the_heartbeat_backs_off_instead_of_a_line_a_minute_for_two_days(ma):
+    ma.set_progress_interval(60, 900)
+    # doubling, then flat at the ceiling
+    assert _heartbeat_waits(ma, 15)[-5:] == [120.0, 240.0, 480.0, 900.0, 900.0]
+    # and what that is worth on the run this came from
+    total, lines, wait, tick = 0.0, 0, ma._PROGRESS_INTERVAL, 0
+    while total < 86 * 3600:
+        total += wait
+        lines += 1
+        tick += 1
+        wait = ma._next_progress_interval(wait, tick)
+    flat = int(86 * 3600 / 60)
+    assert lines < flat / 10, \
+        f"{lines} lines for an 86 h stage against {flat} at a flat minute"
+    # still proving liveness several times an hour, which is the whole job
+    assert ma._PROGRESS_INTERVAL_MAX <= 3600
+
+
+def test_a_ceiling_under_the_interval_does_not_speed_the_heartbeat_up(ma):
+    # Two knobs that disagree: the one that sets the cadence wins, rather
+    # than the ceiling quietly becoming a floor.
+    ma.set_progress_interval(60, 10)
+    assert ma._PROGRESS_INTERVAL_MAX == 60.0
+    assert _heartbeat_waits(ma, 15) == [60.0] * 15
+
+
+def test_the_backoff_is_off_when_the_ceiling_equals_the_interval(ma):
+    ma.set_progress_interval(60, 60)
+    assert _heartbeat_waits(ma, 20) == [60.0] * 20
+
+
+def test_a_disabled_heartbeat_stays_disabled(ma):
+    ma.set_progress_interval(0, 900)
+    assert ma._next_progress_interval(0.0, 99) == 0.0
+
+
+def test_the_heartbeat_says_so_on_the_line_where_it_slows_down(
+        ma, monkeypatch, capsys):
+    # A heartbeat that quietly slows down looks like a stage that quietly
+    # stopped, which is the one thing this line exists to rule out.
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL", 0.05)
+    monkeypatch.setattr(ma, "_PROGRESS_INTERVAL_MAX", 0.2)
+    monkeypatch.setattr(ma, "_PROGRESS_STEADY_TICKS", 2)
+    ma.run_cmd([sys.executable, "-c", "import time; time.sleep(1.2)"])
+    said = [l for l in capsys.readouterr().err.splitlines() if " running " in l]
+    assert said, "the heartbeat stopped altogether"
+    slowed = [l for l in said if "next in " in l]
+    assert slowed, f"it backed off without saying so: {said}"
+    assert len(slowed) < len(said), \
+        "it is said when the interval CHANGES, not on every line"
 
 
 def test_the_progress_interval_comes_from_the_config(ma, monkeypatch):

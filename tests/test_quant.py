@@ -134,6 +134,56 @@ def test_a_fractionated_run_produces_the_same_quant_as_an_unfractionated_one(
     pd.testing.assert_frame_equal(a, b)
 
 
+# --- one table, read three times, warned about three times ---------------
+# symptom: the first full real run printed 117 WARN lines of which 97 were ONE
+# block printed three times. A fragpipe_tmt table is read by stage_join and
+# again by peptide_features() for each taxonomy-ish stage that is on, and the
+# reader's warnings are properties of the plex files rather than of the read.
+
+
+def test_a_second_read_of_a_tmt_table_does_not_reprint_its_warnings(
+        ma, tmp_path, capsys):
+    root = _tmt_run(tmp_path)
+    cfg = _tmt_cfg(ma, root)
+    ma.read_fragpipe_tmt(root, cfg)
+    first = [l for l in capsys.readouterr().err.splitlines() if " WARN " in l]
+    assert first, "this fixture is meant to warn; nothing to deduplicate"
+    ma.read_fragpipe_tmt(root, cfg)
+    second = capsys.readouterr().err
+    assert not [l for l in second.splitlines() if " WARN " in l], \
+        "the second read found nothing new and said it all again"
+    # and the silence is ACCOUNTED FOR, because a suppression nobody names is
+    # indistinguishable from a check that stopped firing
+    assert f"{len(first)} warning line(s) about {root} repeated" in second, \
+        second
+
+
+def test_the_repeat_count_is_this_pass_and_not_every_pass_so_far(
+        ma, tmp_path, capsys):
+    root = _tmt_run(tmp_path)
+    cfg = _tmt_cfg(ma, root)
+    ma.read_fragpipe_tmt(root, cfg)
+    n = len([l for l in capsys.readouterr().err.splitlines() if " WARN " in l])
+    ma.read_fragpipe_tmt(root, cfg)
+    capsys.readouterr()
+    ma.read_fragpipe_tmt(root, cfg)
+    third = capsys.readouterr().err
+    assert f"{n} warning line(s)" in third, \
+        f"the third pass reported a running total rather than its own: {third}"
+
+
+def test_two_different_warnings_about_one_table_both_get_through(ma):
+    # The key is (what was passed as `once`, the message), so deduplication is
+    # of EXACT repeats. A second, different warning about the same file is
+    # not a repeat of the first.
+    ma._SAID_ONCE.clear()
+    assert ma._first_time("/some/run", "first thing")
+    assert ma._first_time("/some/run", "a different thing")
+    assert not ma._first_time("/some/run", "first thing")
+    assert ma.suppressed_repeats("/some/run") == 1
+    assert ma.suppressed_repeats("/another/run") == 0
+
+
 # --- the two invisibility rates, and the subtraction between them --------
 # symptom: the pipeline has printed the database rate (from finalise) and the
 # quantified rate (from the join) for as long as it has had bins, on separate

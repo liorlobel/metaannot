@@ -362,6 +362,21 @@ DEFAULT_CONFIG = {
     # difference between a silent process and a progress bar. Nothing is
     # hoarded - see run_cmd.
     "progress_interval_s": 60,
+    # The longest a heartbeat will ever wait, in seconds. A minute is the
+    # right spacing for the first ten minutes of a stage - it is how you tell
+    # a tool that started from one that did not - and it is the wrong spacing
+    # for the next eighty hours: the first full real run wrote 8,990 log
+    # lines of which 5,086 were heartbeats, and a reader looking for the
+    # twenty that mattered had to page through them. So the interval DOUBLES
+    # after _PROGRESS_STEADY_TICKS ticks of the same command until it reaches
+    # this, which turns a two-day stage's several thousand lines into a few
+    # hundred while still proving liveness four times an hour.
+    #
+    # Set it equal to progress_interval_s to get the old fixed cadence back.
+    # It is a ceiling and never a floor: a value under progress_interval_s is
+    # ignored rather than used to speed the heartbeat up, because the knob
+    # that sets the cadence is the other one.
+    "progress_interval_s_max": 900,
     # How often the run stamps `_run.last_seen` into the state file, in
     # seconds. 0 turns it off. It exists so that a console can say "last seen
     # 4h ago" about a run whose process table this machine cannot read - a job
@@ -1262,7 +1277,44 @@ def _write_logfile(text):
             "does.\n")
 
 
-def log(msg, level="INFO"):
+# Lines `once=` has already printed, and how many exact repeats each has
+# withheld since. Keyed on (whatever the caller passed as `once`, the message),
+# so a warning that is a property of a FILE is said once however many times
+# that file is read, while two different warnings about it both get through.
+#
+# The first full real run printed 117 WARN lines of which 97 were ONE block
+# printed three times: a fragpipe_tmt quant table is read by stage_join, and
+# again by peptide_features() for each taxonomy-ish stage that is on, and the
+# reader's warnings are a property of the plex files rather than of the read.
+_SAID_ONCE = {}
+
+
+def _first_time(key, msg):
+    with _LOGLOCK:
+        k = (key, str(msg))
+        if k in _SAID_ONCE:
+            _SAID_ONCE[k] += 1
+            return False
+        _SAID_ONCE[k] = 0
+        return True
+
+
+def suppressed_repeats(key):
+    """Exact repeats `once=key` has withheld. Nothing decides on this.
+
+    It exists so that a caller can SAY what was withheld rather than leave a
+    reader to wonder why a second read of a file was silent. A suppression
+    nobody accounts for is indistinguishable from a warning that stopped
+    firing.
+    """
+    with _LOGLOCK:
+        return sum(n for (k, _), n in _SAID_ONCE.items() if k == key)
+
+
+def log(msg, level="INFO", once=None):
+    """`once` dedupes EXACT repeats under that key; see _SAID_ONCE."""
+    if once is not None and not _first_time(once, msg):
+        return
     tag = getattr(_CTX, "stage", "")
     prefix = f"[{time.time()-_START:7.1f}s] {level:5s} " + (f"{tag:>10s} | " if tag else "")
     with _LOGLOCK:
@@ -2642,6 +2694,12 @@ def resolve_tool(name):
 # from every stage and threading a cfg through all of them would touch code
 # that has nothing to do with logging.
 _PROGRESS_INTERVAL = float(DEFAULT_CONFIG["progress_interval_s"])
+_PROGRESS_INTERVAL_MAX = float(DEFAULT_CONFIG["progress_interval_s_max"])
+# Heartbeats at the configured interval before the backoff starts. Ten, so the
+# first ten minutes of a default run are spaced exactly as they were: that is
+# the window in which a stage is either working or is not, and it is the one a
+# person actually watches.
+_PROGRESS_STEADY_TICKS = 10
 # Stderr lines kept while a command runs. Bounded on purpose: the failure tail
 # has only ever quoted the last 15, and the reason stdout goes to devnull -
 # not buffering tens of MB of chatter - applies here too.
@@ -2650,9 +2708,28 @@ _STDERR_KEEP = 200
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def set_progress_interval(seconds):
-    global _PROGRESS_INTERVAL
+def set_progress_interval(seconds, maximum=None):
+    global _PROGRESS_INTERVAL, _PROGRESS_INTERVAL_MAX
     _PROGRESS_INTERVAL = max(0.0, float(seconds or 0))
+    if maximum is not None:
+        # A ceiling under the interval is not a faster heartbeat, it is a
+        # contradiction between two knobs; the cadence knob wins.
+        _PROGRESS_INTERVAL_MAX = max(_PROGRESS_INTERVAL,
+                                     float(maximum or 0))
+
+
+def _next_progress_interval(current, ticks):
+    """The wait before the NEXT heartbeat of a command that has had `ticks`.
+
+    Doubling rather than a second fixed interval: a stage that finishes in
+    twenty minutes keeps a usable cadence throughout, and one that runs for
+    two days reaches the ceiling inside the first hour and stays there. The
+    ceiling is what bounds the total, and the doubling is only how it gets
+    there.
+    """
+    if not current or ticks < _PROGRESS_STEADY_TICKS:
+        return current
+    return min(_PROGRESS_INTERVAL_MAX, current * 2) or current
 
 
 def _elapsed_str(seconds):
@@ -3343,11 +3420,19 @@ def run_cmd(cmd, cwd=None, env=None, progress=None):
             reader = threading.Thread(target=pump, args=(proc.stderr,),
                                       daemon=True)
             reader.start()
+            # Per COMMAND, not global: two stages running at once each get
+            # their own cadence, and a short stage never inherits a long
+            # one's ceiling.
+            wait, ticks = _PROGRESS_INTERVAL, 0
             while True:
                 try:
-                    proc.wait(timeout=_PROGRESS_INTERVAL or None)
+                    proc.wait(timeout=wait or None)
                     break
                 except subprocess.TimeoutExpired:
+                    ticks += 1
+                    nxt = _next_progress_interval(wait, ticks)
+                    slower = nxt > wait
+                    wait = nxt
                     newest = newest_line()
                     note = ""
                     if progress is not None:
@@ -3362,7 +3447,13 @@ def run_cmd(cmd, cwd=None, env=None, progress=None):
                     log(f"{name} running {_elapsed_str(time.time() - started)}"
                         + (f" | {note}" if note else "")
                         + (f" | {newest}" if newest else
-                           " | no output yet on stderr"))
+                           " | no output yet on stderr")
+                        # Said when it changes, and only then. A heartbeat
+                        # that quietly slows down looks like a stage that
+                        # quietly stopped, which is the one thing this line
+                        # exists to rule out.
+                        + (f" | next in {_elapsed_str(wait)}" if slower
+                           else ""))
             # HERE, AND NOT IN THE HELPER'S `finally` FIVE SECONDS FROM NOW.
             # The wait above is the reap, and the reap is the moment the
             # kernel stops reserving this tool's pgid: from here on the
@@ -5160,7 +5251,18 @@ TMBED_GPU_MODES = {
 def stage_tmbed(cfg, p):
     if not have("tmbed"):
         die("tmbed not found (pip install tmbed && tmbed download)")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(cfg["gpu_device"]))
+    # OMP_NUM_THREADS and MKL_NUM_THREADS, unconditionally, from this stage's
+    # share. tmbed has no --torch_num_threads of its own -- signalp's is the
+    # only thread cap in the topology pair -- so torch takes every core it can
+    # see, and on a CPU fallback that is the whole box while share() has told
+    # three other stages they own most of it. The scheduler's cut is the
+    # authority here for the same reason it is everywhere else: an external
+    # tool's thread count is fixed when it is launched and cannot grow later,
+    # so a value inherited from the environment that disagrees with the cut
+    # silently defeats the division rather than refining it.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(cfg["gpu_device"]),
+               OMP_NUM_THREADS=str(cfg["threads"]),
+               MKL_NUM_THREADS=str(cfg["threads"]))
     # --use-gpu on its own is fatal on a CPU-only host: TMbed only tolerates a
     # missing/failing GPU when --cpu-fallback is given, so "auto" asks for the
     # GPU and lets it fall back rather than losing the topology evidence.
@@ -9574,9 +9676,15 @@ def read_fragpipe_tmt(root, cfg):
             "FragPipe TMT manifest names LC-MS runs, not reporter channels, "
             "and its experiment column is the plex — using it as a condition "
             "would infer the condition from the batch. Sample names come from "
-            "each plex's annotation file.", "WARN")
+            "each plex's annotation file.", "WARN", once=root)
 
     plexes = tmt_plex_dirs(root, cfg)
+    # The count BEFORE this pass, so the line at the end of it reports what
+    # this read withheld rather than everything every read has withheld. A
+    # third pass saying "30 lines were not shown again" reads as thirty on
+    # this pass, which is the kind of arithmetic this whole change is about.
+    dup0 = suppressed_repeats(root) + sum(
+        suppressed_repeats(d) for _, d in plexes)
     pref = excluded_prefixes(cfg)
     # The same word FragPipe uses in the label-free tables, used here as a
     # PREFIX ("Intensity Pool01") instead of a suffix ("Pool01 Intensity").
@@ -9638,7 +9746,7 @@ def read_fragpipe_tmt(root, cfg):
             bad |= df[prot].astype(str).map(first_token).str.startswith(pref)
         if bool(bad.any()):
             log(f"tmt {plex}: {int(bad.sum())} decoy/contaminant row(s) "
-                f"dropped from {path}", "WARN")
+                f"dropped from {path}", "WARN", once=root)
             df = df.loc[~bad].reset_index(drop=True)
 
         if level == "ion":
@@ -9669,7 +9777,7 @@ def read_fragpipe_tmt(root, cfg):
                 pep = pep.mask(empty, ms.map(strip_modifications))
                 log(f"tmt {plex}: {int(empty.sum())} row(s) have no "
                     "'Peptide Sequence'; the sequence was recovered from "
-                    "'Modified Sequence'", "WARN")
+                    "'Modified Sequence'", "WARN", once=root)
         # A row with neither a sequence nor a modified sequence identifies
         # nothing, and every such row seen so far is all-zero filler. Left in,
         # they all collapse onto one feature id and merge into each other.
@@ -9677,7 +9785,7 @@ def read_fragpipe_tmt(root, cfg):
         if bool(blank.any()):
             log(f"tmt {plex}: {int(blank.sum())} row(s) carry no peptide "
                 "identity at all (no sequence and no modified sequence) and "
-                "were dropped", "WARN")
+                "were dropped", "WARN", once=root)
             keep = ~blank
             df, fid, pep = (df.loc[keep].reset_index(drop=True),
                             fid[keep].reset_index(drop=True),
@@ -9699,7 +9807,7 @@ def read_fragpipe_tmt(root, cfg):
                 log(f"tmt {plex}: {int(unknown.sum())} of {len(fid)} feature(s) "
                     "match no row of psm.tsv, so their purity is unknown; "
                     "they are KEPT — an unmatched key is a join failure, not "
-                    "a co-isolated precursor", "WARN")
+                    "a co-isolated precursor", "WARN", once=root)
             log(f"tmt {plex}: min_purity={min_purity} drops "
                 f"{int(low.sum())} of {len(fid)} feature(s) whose MEDIAN PSM "
                 "purity is below it")
@@ -9714,7 +9822,7 @@ def read_fragpipe_tmt(root, cfg):
         if "Mapped Proteins" not in df.columns:
             log(f"tmt {plex}: no 'Mapped Proteins' column, so every feature "
                 "is treated as unique to its razor protein and shared-peptide "
-                "filtering is inactive", "WARN")
+                "filtering is inactive", "WARN", once=root)
 
         vals = df[cols].copy()
         vals.columns = samples
@@ -9730,7 +9838,7 @@ def read_fragpipe_tmt(root, cfg):
         if dup:
             log(f"tmt {plex}: {dup} row(s) repeat a feature id and were "
                 "summed; the reindex the outer join needs cannot carry a "
-                "duplicated key", "WARN")
+                "duplicated key", "WARN", once=root)
             vals = vals.groupby(level=0, sort=False).sum(min_count=1)
         for f, r, m, pp in zip(fid, razor, mapped, pep):
             rec = meta.get(f)
@@ -9754,14 +9862,14 @@ def read_fragpipe_tmt(root, cfg):
                 f"{[c for c, _ in empty_ch]} carry the placeholder name "
                 f"{[s for _, s in empty_ch]}, which is how FragPipe writes an "
                 "unassigned channel; dropped (set tmt.drop_empty_channels "
-                "false to keep them)", "WARN")
+                "false to keep them)", "WARN", once=root)
             keep_samples = [s for s in keep_samples
                             if s not in {s2 for _, s2 in empty_ch}]
         elif empty_ch:
             log(f"tmt {plex}: {len(empty_ch)} unassigned channel(s) "
                 f"{[s for _, s in empty_ch]} kept as samples "
                 "(tmt.drop_empty_channels is false); their signal is isotope "
-                "carry-over, not a sample", "WARN")
+                "carry-over, not a sample", "WARN", once=root)
 
         chan_of = {s: c for c, s in ann}
 
@@ -9784,7 +9892,7 @@ def read_fragpipe_tmt(root, cfg):
             if dead:
                 log(f"tmt {plex}: channel(s) {dead} have no positive median "
                     "and were left unscaled by the within-plex normalisation",
-                    "WARN")
+                    "WARN", once=root)
             if len(usable):
                 fac = float(usable.median()) / usable
                 vals[usable.index] = vals[usable.index].mul(fac, axis=1)
@@ -9817,11 +9925,11 @@ def read_fragpipe_tmt(root, cfg):
                         f"{100 * float(gaps.median()):.0f}%). The median is "
                         "taken over observed values, so these are "
                         "UNDER-corrected; check the loading before trusting "
-                        "them, or drop them from the annotation", "WARN")
+                        "them, or drop them from the annotation", "WARN", once=root)
         elif norm == "none" and len(plexes) > 1:
             log(f"tmt {plex}: tmt.within_plex_normalise is 'none', so the "
                 "channels of this plex keep whatever loading difference they "
-                "were labelled with; the roll-up sums across them", "WARN")
+                "were labelled with; the roll-up sums across them", "WARN", once=root)
 
         # ---- the reference channel, resolved per plex -----------------
         ref = ""
@@ -9852,7 +9960,7 @@ def read_fragpipe_tmt(root, cfg):
                     f"'{pool[0]}', which looks like a reference/bridge "
                     "channel. It is being quantified as an ordinary sample; "
                     "set tmt.reference_name: 'Pool*' to mark it, and "
-                    "tmt.use_reference_ratios: true to divide by it", "WARN")
+                    "tmt.use_reference_ratios: true to divide by it", "WARN", once=root)
 
         if use_ratios:
             # A reference of 0 is not a reference. FragPipe writes 0 for "not
@@ -9935,13 +10043,13 @@ def read_fragpipe_tmt(root, cfg):
         log(f"tmt: {n_zero} of {n_rows} reporter cell(s) "
             f"({100.0 * n_zero / max(n_rows, 1):.1f}%) are 0, which FragPipe "
             "writes for 'not quantified'; treated as missing (set "
-            "zero_intensity_is_missing false to keep them)", "WARN")
+            "zero_intensity_is_missing false to keep them)", "WARN", once=root)
     conflict = sum(1 for m in meta.values() if len(m["razors"]) > 1)
     if conflict:
         log(f"tmt: {conflict} feature(s) have a different razor protein in "
             "different plexes; the first plex that saw the feature wins and "
             "the candidate lists are unioned, so the shared-peptide rule sees "
-            "every protein any plex mapped the feature to", "WARN")
+            "every protein any plex mapped the feature to", "WARN", once=root)
 
     if min_purity > 0:
         log(f"tmt: min_purity={min_purity} dropped {pur_drop} of {pur_seen} "
@@ -9973,14 +10081,17 @@ def read_fragpipe_tmt(root, cfg):
                 "ratio matrix is substantially sparser than the intensities. "
                 "The covariate treatment (tmt.use_reference_ratios: false, "
                 "plex in design_formula) keeps them and models the plex "
-                "instead", "WARN")
+                "instead", "WARN", once=root)
 
     design = pd.DataFrame(design_rows)
     # The condition is NOT in these files and is never taken from the plex,
     # which is a batch: a plex-versus-plex contrast is a batch effect
     # presented as a hypothesis. It is either derivable from the sample names
     # or the user's to write down, and which of the two happened is recorded.
-    design, cond_note = _tmt_add_condition(design, cfg)
+    # once=root, like every other warning this reader emits: whether a
+    # condition can be got out of the sample names is a property of the plex
+    # annotations, so a second read of them reaches the same verdict.
+    design, cond_note = _tmt_add_condition(design, cfg, once=root)
     notes = ["input:            FragPipe TMT, "
              f"{len(plexes)} plex(es), {len(int_cols)} sample column(s)",
              f"condition source: {cond_note}"]
@@ -10018,6 +10129,23 @@ def read_fragpipe_tmt(root, cfg):
     # 3-tuple, and widening that signature for one format would touch every
     # label-free path.
     design.attrs["design_notes"] = notes
+    # What the dedup withheld, said rather than left as a silence. A
+    # fragpipe_tmt table is read by stage_join and again by peptide_features()
+    # for each taxonomy-ish stage that is on, and its warnings are properties
+    # of the plex files rather than of the read - so a second reading of them
+    # is a block of WARN lines carrying nothing the first did not. Suppressing
+    # them without saying so would be indistinguishable from a check that had
+    # stopped firing, which is the failure this would be introducing to fix a
+    # noise problem.
+    dup = suppressed_repeats(root) + sum(
+        suppressed_repeats(d) for _, d in plexes) - dup0
+    if dup:
+        log(f"tmt: {dup} warning line(s) about {root} repeated what was "
+            "already printed for it and were not shown again. This table is "
+            "read more than once per run - by the join stage, and by "
+            "peptide_features() for each taxonomy stage that is on - and its "
+            "warnings describe the files, not the read. Nothing new was "
+            "found on the later passes; scroll up for the block in full")
     return feats, int_cols, design
 
 
@@ -10065,7 +10193,7 @@ def _tmt_split_condition(samples):
     return found[sep], f"the sample name before the first '{sep}'"
 
 
-def _tmt_add_condition(design, cfg):
+def _tmt_add_condition(design, cfg, once=None):
     """Add a `group` column to the TMT design when it can be had honestly.
 
     -> (design, note). The note goes into design_record.txt, because a
@@ -10126,7 +10254,7 @@ def _tmt_add_condition(design, cfg):
         note, recovered = _metadata_note()
         log("tmt: tmt.condition_from_name is empty, so no condition is "
             f"derived from the sample names; {note}",
-            "INFO" if recovered else "WARN")
+            "INFO" if recovered else "WARN", once=once)
         return design, "not derived (tmt.condition_from_name is empty)"
     if spec == "auto":
         mapping, how = _tmt_split_condition(samples)
@@ -10135,7 +10263,7 @@ def _tmt_add_condition(design, cfg):
             log(f"tmt: the condition could not be derived from the sample "
                 f"names ({how}), so the design has no group column. It is NOT "
                 f"taken from the plex, which is a batch: {note}",
-                "INFO" if recovered else "WARN")
+                "INFO" if recovered else "WARN", once=once)
             return design, f"not derived ({how})"
     else:
         try:
@@ -10161,7 +10289,7 @@ def _tmt_add_condition(design, cfg):
     sizes = design.groupby("group").size().to_dict()
     log(f"tmt: condition derived from {how}: {sizes}. This is a GUESS from "
         "the annotation's sample names — check it, or set analysis.metadata "
-        "to state the condition explicitly", "WARN")
+        "to state the condition explicitly", "WARN", once=once)
     tab = design.groupby(["plex", "group"]).size().unstack(fill_value=0)
     if len(tab) > 1 and (tab > 0).sum(axis=1).max() == 1:
         die("the condition derived from the sample names is perfectly "
@@ -22709,7 +22837,8 @@ def cmd_run(args):
     if getattr(args, "ram", None) is not None:
         cfg["ram_gb"] = parse_ram(args.ram)
     try:
-        set_progress_interval(cfg["progress_interval_s"])
+        set_progress_interval(cfg["progress_interval_s"],
+                              cfg.get("progress_interval_s_max"))
     except (TypeError, ValueError):
         die(f"progress_interval_s must be a number of seconds (0 disables), "
             f"not {cfg['progress_interval_s']!r}")

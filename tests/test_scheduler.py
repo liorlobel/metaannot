@@ -5218,7 +5218,10 @@ def test_run_cmd_ends_the_tool_group_at_the_reap_and_not_after_the_join(ma):
     src = io.open(METAANNOT_PY, encoding="utf-8").read()
     i = src.index("def run_cmd(")
     body = src[i:src.index("\ndef ", i + 1)]
-    reap = body.index("proc.wait(timeout=_PROGRESS_INTERVAL or None)")
+    # The call, not the expression inside it: the heartbeat's timeout is now
+    # a per-command variable that backs off, and pinning this ordering to the
+    # NAME of that expression made a rename of it look like the sweep moving.
+    reap = body.index("proc.wait(timeout=")
     finish = body.index("proc.finish_group()")
     join = body.index("reader.join(")
     assert reap < finish < join, (

@@ -4,6 +4,45 @@
 
 ### Added
 
+**The heartbeat backs off instead of writing a line a minute for two days.**
+One line a minute is the right spacing for the first ten minutes of a stage
+and the wrong spacing for the next eighty hours: the first full real run wrote
+8,990 log lines of which 5,086 were heartbeats, and the twenty that mattered
+were somewhere in them. After `_PROGRESS_STEADY_TICKS` ticks of the same
+command the interval doubles until it reaches the new
+`progress_interval_s_max` (900 s), which on that run's longest stage is a few
+hundred lines instead of several thousand while still proving liveness four
+times an hour. The line on which the interval changes says `next in 15m00s`,
+because a heartbeat that quietly slows down looks exactly like a stage that
+quietly stopped — which is the one thing the line exists to rule out. Per
+command, so two stages running at once keep separate cadences; set the ceiling
+equal to `progress_interval_s` for the old fixed cadence, and a ceiling UNDER
+the interval is ignored rather than used to speed the heartbeat up, because
+the knob that sets the cadence is the other one.
+
+**A quant table read three times warned three times.** 117 WARN lines on that
+run, of which 97 were one block printed in triplicate: `stage_join` reads the
+quant table, and `peptide_features()` reads it again for each taxonomy-ish
+stage that is on, and for `fragpipe_tmt` that is every plex's level file,
+annotation and `psm.tsv` re-read and re-validated. Those warnings describe the
+FILES, so the later passes reach the same verdicts. `log()` takes an optional
+`once=` key now, the TMT reader passes the table it is reading, and the later
+passes are silent — except for one line saying how many they withheld and why.
+That line is the point: a suppression nobody accounts for is indistinguishable
+from a check that has stopped firing. The count is the delta for that pass and
+not a running total, and deduplication is of EXACT repeats under a key, so two
+different warnings about one table both still get through.
+
+**tmbed was the hole in the CPU split.** SignalP takes
+`--torch_num_threads`; tmbed has no equivalent flag, so torch took every core
+it could see — and on a CPU fallback that is the whole box, while `share()`
+has told the stages running beside it that they own most of it. It is launched
+with `OMP_NUM_THREADS` and `MKL_NUM_THREADS` set to its share. Unconditionally,
+for the reason the scheduler's cut is authoritative everywhere else here: an
+external tool's thread count is fixed when it is launched and cannot grow
+later, so a value inherited from the environment that disagrees with the split
+silently defeats it rather than refining it.
+
 **The sequences ESMFold's length cap skipped are written down.** The advice
 beside that cap has always been "fold them on a card with more memory and drop
 the models in", and it has always given a COUNT — on the first full real run,
