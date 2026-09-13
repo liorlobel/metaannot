@@ -1339,12 +1339,22 @@ def test_the_changelog_ordering_figures_are_a_replay_not_a_recollection(ma):
     selections = {"the whole pipeline": None,
                   "the eight cohort configs' selection": COHORT_SELECTION}
 
-    section = _newest_section(_text(CHANGELOG))
+    # The WHOLE document, not the newest section. The table is in a SHIPPED
+    # release now, and a claim does not stop needing to hold when the section
+    # below it is opened -- but the scan was bounded to the section in flight,
+    # so opening v0.7.1's `## Unreleased` made this assert nothing at all
+    # while still passing. That is the same failure `_newest_section_start()`
+    # had in v0.7.0, one layer up: a check that quietly stops checking. The
+    # bound exists to stop a shipped section being EDITED to match a later
+    # codebase; reading one in order to hold it to its own numbers is the
+    # opposite of that, and is why this entry's figures were replayed rather
+    # than typed in the first place.
     rows = re.findall(r"^\| (38,204|455,571) proteins \| ([^|]+?) \| (\d)"
                       r"[^|]*\| ([\d.]+) h \| ([\d.]+) h \|$",
-                      section, flags=re.M)
+                      _text(CHANGELOG), flags=re.M)
     assert len(rows) == 4, \
-        f"the ordering entry's replay table has {len(rows)} rows this can read"
+        f"the ordering entry's replay table has {len(rows)} rows this can " \
+        "read; it is in a shipped section and must stay readable from here"
 
     optimal = 0
     for size, selection, slots, said_was, said_now in rows:
@@ -1365,7 +1375,7 @@ def test_the_changelog_ordering_figures_are_a_replay_not_a_recollection(ma):
 
     # ...and the sentence under the table, which is a count of those rows
     said = re.search(r"(\w+) of the rows above land exactly on the dependency "
-                     r"graph's critical path", section)
+                     r"graph's critical path", _text(CHANGELOG))
     assert said, "the entry no longer says how many rows reach the floor"
     assert _count_value(said.group(1)) == optimal, \
         f"the entry says {said.group(1)} rows reach the critical path and " \
@@ -2523,7 +2533,7 @@ COUNT_PROSE = {
                     lambda ma: len(ma.ASSIGNMENT_CLASSES)),
     "eight configs": ("DERIVED", "examples/server-run-plan",
                       lambda ma: _example_configs()),
-    "nine columns": ("DERIVED", "the columns the README's own sentence lists",
+    "twelve columns": ("DERIVED", "the columns the README's own sentence lists",
                      lambda ma: _evidence_columns()[1]),
     "four columns": ("DERIVED", "the miss_cols slice in _manifest_checks",
                      lambda ma: _miss_cols_slice()),
@@ -2558,18 +2568,12 @@ COUNT_PROSE = {
     "four them": ("DERIVED", "context's dependencies - the first-wave stages "
                              "whose remaining path runs through it",
                   _context_deps),
-    "three groups": ("DERIVED", "the dispatch-key groups with more than one "
-                                "stage in them",
-                     _tied_dispatch_groups),
     "200,000 records": ("DERIVED", "DMND_FASTA_RECORD_CAP",
                         lambda ma: ma.DMND_FASTA_RECORD_CAP),
     "200 deflines": ("DERIVED", "DMND_DEFLINE_CAP",
                      lambda ma: ma.DMND_DEFLINE_CAP),
     "seven surfaces": ("DERIVED", "the surfaces this scan reads",
                      lambda ma: len(_count_surfaces(ma))),
-    "eleven configs": ("DERIVED", "CONFIGS in tests/test_doctor_json.py",
-                       lambda ma: _suite_tuple_len("test_doctor_json.py",
-                                                   "CONFIGS")),
     "four rows": ("DERIVED", "UNREADABLE_FALSE_PASSES",
                   lambda ma: _suite_tuple_len("test_doctor_json.py",
                                               "UNREADABLE_FALSE_PASSES")),
@@ -2585,7 +2589,7 @@ COUNT_PROSE = {
     # of this test exists to prevent, one level up: a reader meets DERIVED and
     # believes the number is pinned to something. It is pinned now, to the
     # thing the sentence itself enumerates - the slash-separated states in the
-    # scope heading it sits in - which is the same shape as "nine columns"
+    # scope heading it sits in - which is the same shape as "twelve columns"
     # above and fails if somebody adds a fourth state to the list and leaves
     # the word alone.
     "three states": ("DERIVED", "the states the scope heading itself lists",
@@ -2933,14 +2937,22 @@ COUNT_PROSE = {
     "four step": ("PROSE", "'a four-step runbook' - the steps are listed"),
     "four steps": ("PROSE", "'the four steps' - the sequence the #36 test "
                             "drives, written out in order beside it"),
-    "four defects": ("PROSE", "a group heading, counted by the group test"),
-    "six defects": ("PROSE", "a group heading, counted by the group test"),
-    "twenty-five entries": ("DERIVED", "the Unreleased/Fixed entries",
-                             lambda ma: sum(n for _h, n
-                                            in _unreleased_fixed_groups())),
-    "six groups": ("DERIVED", "the Unreleased/Fixed groups",
-                    lambda ma: len(_unreleased_fixed_groups())),
-    "seven defects": ("PROSE", "a group heading, counted by the group test"),
+    # Group-heading counts live and die with the section in flight. When a
+    # release ships, its headings leave the scanned surface and their entries
+    # here go stale -- which the stale check reports, and which is the prompt
+    # to remove them rather than to widen the scan. A shipped section is a
+    # RECORD: it is never edited to match a later codebase, so a rule held
+    # over it could only ever demand that it be.
+    "one gap": ("PROSE", "a group heading, counted by the group test"),
+    "four entries": ("DERIVED", "the Unreleased/Fixed entries",
+                    lambda ma: sum(n for _h, n
+                                   in _unreleased_fixed_groups())),
+    # NOT "six groups", which is also the TUTORIAL's sentence about a real
+    # run's design. Two registry entries under one phrase is a silent
+    # shadowing -- the later key wins and the earlier rule is never applied --
+    # and it went unnoticed only because both counts happened to be six.
+    "three groups": ("DERIVED", "the Unreleased/Fixed groups",
+                   lambda ma: len(_unreleased_fixed_groups())),
     "2 attempts": ("DERIVED", "the opens of the pre-write state read",
                    lambda ma: ma.STATE_READ_TRIES),
     "three candidates": ("PROSE", "'Three candidates were driven over real "
@@ -3024,6 +3036,43 @@ COUNT_PROSE = {
     "three things": ("PROSE", "'the same three things as ion.tsv' - named"),
     "three ways": ("PROSE", "'The verdict, three ways' - each is written"),
 }
+
+
+def test_no_two_count_prose_entries_share_a_phrase():
+    """A duplicate key here is a rule that is never applied.
+
+    Two entries under one phrase is not a syntax error: the dict literal keeps
+    the last one, and the earlier rule is silently gone. `six groups` was
+    registered twice — MEASURED, for the TUTORIAL's sentence about a real run's
+    design, and DERIVED, for the CHANGELOG's Fixed-group count — and the second
+    shadowed the first. It passed for as long as it did only because both
+    numbers happened to be six, and it surfaced the moment the group count
+    moved, as a TUTORIAL sentence failing against a CHANGELOG count.
+
+    Read out of the SOURCE with `ast`, because by the time the module object
+    exists the duplicate is gone: `len(COUNT_PROSE)` can never see it. That is
+    the same reason this whole registry is checked against the tree rather
+    than against itself.
+    """
+    import ast as _ast
+    src = io.open(__file__, encoding="utf-8").read()
+    tree = _ast.parse(src)
+    lit = None
+    for node in _ast.walk(tree):
+        if (isinstance(node, _ast.Assign)
+                and any(getattr(t, "id", "") == "COUNT_PROSE"
+                        for t in node.targets)):
+            lit = node.value
+    assert isinstance(lit, _ast.Dict), "COUNT_PROSE is no longer a dict literal"
+    keys = [k.value for k in lit.keys if isinstance(k, _ast.Constant)]
+    assert len(keys) == len(lit.keys), \
+        "a non-literal key would make this scan incomplete without saying so"
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    assert not dupes, (
+        f"COUNT_PROSE registers these phrases more than once: {dupes}. The "
+        "last entry wins and the earlier rule is never applied. Give the two "
+        "uses different phrases rather than merging their entries: they are "
+        "counts of different things that happen to read alike.")
 
 
 def test_every_count_in_prose_is_derived_from_the_thing_it_counts_or_pinned():

@@ -11058,18 +11058,30 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
     use = use.assign(one=1,
                      _is_unique=(use["_class"] == "unique").astype("int64"),
                      _is_taxu=(use["_class"] == "taxon_unique").astype("int64"),
-                     _is_famu=(use["_class"] == "family_unique").astype("int64"))
+                     _is_famu=(use["_class"] == "family_unique").astype("int64"),
+                     # Counted for the same reason as the three above, and
+                     # only reachable under `razor`: every other mode DROPS
+                     # these, so they are 0 there by construction. Without
+                     # them a protein carried entirely by cross-taxon features
+                     # had n_features_used > 0 and every class count 0, and
+                     # nothing in the table said what it rested on.
+                     _is_shared=(use["_class"] == "shared").astype("int64"),
+                     _is_shunk=(use["_class"]
+                                == "shared_unknown_taxon").astype("int64"))
     ev = use.groupby("_assigned", sort=False).agg(
         n_features_used=("one", "sum"),
         n_unique=("_is_unique", "sum"),
         n_taxon_unique=("_is_taxu", "sum"),
-        n_family_unique=("_is_famu", "sum"))
+        n_family_unique=("_is_famu", "sum"),
+        n_shared=("_is_shared", "sum"),
+        n_shared_unknown_taxon=("_is_shunk", "sum"))
     dropped = (feats.loc[~kept].assign(one=1)
                .groupby("razor_protein", sort=False)["one"].sum()
                .rename("n_features_dropped"))
     ev = ev.join(dropped, how="outer").fillna({"n_features_dropped": 0})
     for c in ("n_features_used", "n_unique", "n_taxon_unique",
-              "n_family_unique", "n_features_dropped"):
+              "n_family_unique", "n_shared", "n_shared_unknown_taxon",
+              "n_features_dropped"):
         ev[c] = ev[c].fillna(0).astype(int)
     # Named, not renamed afterwards: the outer join above takes its index name
     # from whichever side is non-empty, so with NO feature assigned at all
@@ -11089,6 +11101,26 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
                                      + ev["n_family_unique"])
                                     > ev["n_unique"])
     n_dom = int(ev["taxon_unique_dominated"].sum())
+    # A SEPARATE COLUMN, and the three decisions #44 asked for, made here.
+    #
+    # 1. Separate, not widened. `taxon_unique_dominated` says "the intensity
+    #    belongs to this taxon, and WHICH MEMBER is an assumption". Widening it
+    #    to cover cross-taxon features would make its name wrong in
+    #    peptide_evidence.tsv and annotated_quant.tsv, where the report and
+    #    require_taxonomy_concordance already read it. A column whose meaning
+    #    moves under a config flag is worse than one silent about a case.
+    # 2. It is a DIFFERENT and strictly weaker finding, so it gets its own
+    #    name: here the TAXON is an assumption too. That is why the test is
+    #    against everything that places the protein at all, rather than
+    #    against n_unique alone the way the flag above is.
+    # 3. Reachable only under `razor`. Every other mode drops these features,
+    #    so both counts are 0 and this is False by construction -- which is
+    #    correct rather than convenient: a dropped feature is not something
+    #    the intensity rests on.
+    ev["shared_dominated"] = ((ev["n_shared"] + ev["n_shared_unknown_taxon"])
+                              > (ev["n_unique"] + ev["n_taxon_unique"]
+                                 + ev["n_family_unique"]))
+    n_shared_dom = int(ev["shared_dominated"].sum())
     # WHICH POPULATION THIS RATE IS ABOUT, and why it is not len(ev).
     #
     # `ev` comes from an OUTER join with `dropped` a few lines above, so a
@@ -11148,10 +11180,38 @@ def rollup_features(feats, int_cols, taxon_of, mode, min_features,
                 f" peptide_evidence.tsv has {len(ev):,} rows; the other "
                 f"{n_none:,} had every feature dropped, are quantified "
                 "nowhere, and so could never be flagged.")
+        # Under `razor` that rate is a FLOOR and says so, which is the third
+        # thing #44 asked for. Nothing is dropped in that mode, so a protein
+        # carried entirely by cross-taxon features is quantified, sits in this
+        # denominator, and can never be in this numerator: the predicate is
+        # about same-taxon sharing and that protein has none. Read without
+        # this clause the line looks exactly like the `taxon_unique` one,
+        # which is the sense in which it was quietly optimistic.
+        floor = ("" if mode != "razor" else
+                 " Under peptide_assignment=razor this is a FLOOR rather than"
+                 " an estimate: nothing is dropped, so a protein carried"
+                 " entirely by features shared ACROSS taxa is counted in the"
+                 " denominator and can never reach the numerator. See"
+                 " shared_dominated, which is the question about those.")
         if assessable:
-            log(claim + "." + tail, "WARN")
+            log(claim + "." + tail + floor, "WARN")
         else:
-            log(claim + "; too few to state as a rate." + tail, "INFO")
+            log(claim + "; too few to state as a rate." + tail + floor, "INFO")
+
+    # The weaker finding, stated separately because it IS weaker: above, which
+    # member of a taxon owns the intensity is an assumption; here the taxon is
+    # one too. Only `razor` can produce it, so on every other mode this is
+    # silent rather than a line of zeros.
+    if n_shared_dom:
+        frac = f"{n_shared_dom:,}/{n_elig:,}"
+        if n_elig >= ASSESSABLE_MIN_N:
+            frac += f" ({100 * n_shared_dom / n_elig:.1f}%)"
+        log(f"{frac} protein(s) with at least one assigned feature rest more "
+            "on features shared ACROSS taxa than on every feature that places "
+            "them at all (shared_dominated in peptide_evidence.tsv and "
+            "annotated_quant.tsv). Their intensity is attributed to a razor "
+            "protein on evidence that does not identify even the taxon",
+            "WARN")
 
     # The other half of the duty owed for narrowing the denominator above:
     # the count of rows removed from it, printed on every run that has any,
