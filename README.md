@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1719 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1732 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
-`pytest -q -m R` selects the 60 R tests, which the default run **already
+`pytest -q -m R` selects the 71 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1659 passed and 61
+absent, so on a machine with no R the same run reports 1661 passed and 72
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -715,9 +715,39 @@ separately, so it is visible which one bit, along with the histogram of
 proteins by number of plexes. Both default to 1, so no run loses proteins to a
 filter it did not ask for — and with the protein-level filter at 1 the report
 still says how many of the proteins it kept are quantified in a single plex,
-which is the number to set it on. `analysis.min_plexes` is inert without a
-plex column, so label-free runs are unaffected; setting it above 1 where no
-per-sample plex exists stops the report rather than passing everything.
+which is the number to set it on, **and what setting it would leave**.
+
+Above 1 the report says the other half, because at that point the setting is
+what decided which proteins the document is about: how many protein groups
+that is, out of how many `min_valid_per_group` passed, and that at the default
+every one of the rest would be in the model. It is one comparison — the value
+in force against the default — and not a ladder, because the value in force is
+the only one the document can be exact about and 1 is not a point on a ladder
+but the absence of a choice. The sentence is silent where the filter took
+nothing `min_valid_per_group` would have kept, since the line above it already
+carries that as its `0 of which min_valid_per_group would have kept` clause —
+the removal count on that line can be any number, and it is the clause rather
+than the count that says the filter took nothing worth pricing.
+
+**That sentence is not the histogram cumulated, and the histogram cannot be
+made into it.** `n_plex` is counted over every quantified row, *before*
+`min_valid_per_group`, and the retained set is both filters at once, so a
+protein quantified in every plex can still be one `min_valid_per_group` drops.
+The caption says so where the table is printed.
+
+The counterfactual is only ever offered for `analysis.min_plexes`.
+`tmt.min_plexes` filtered features in the reader, before the roll-up, so every
+count in the report is already after it and what it cost in protein groups is
+not derivable from the document at all — only from a re-run. The report says
+that, in those words, on the runs where the feature-level filter was in force
+AND a protein-level sentence fired: the caveat is attached to that sentence
+rather than standing alone, so a run where `analysis.min_plexes` had nothing
+to say prints neither. That is deliberate — a caveat about a number the
+document did not print is a sentence with no referent — but it does mean the
+feature-level filter can be in force with the document silent about it, and
+the run log is where its cost in features is recorded either way. `analysis.min_plexes` is inert without a plex column, so label-free
+runs are unaffected; setting it above 1 where no per-sample plex exists stops
+the report rather than passing everything.
 
 #### `min_purity`, and where purity actually lives
 

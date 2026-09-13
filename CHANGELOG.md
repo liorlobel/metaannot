@@ -4,6 +4,67 @@
 
 ### Added
 
+**The report now says what `analysis.min_plexes` bought, whichever way the run
+set it.** The first full run on real data was filtered at 2 and the document
+never said what that decided: it printed how many protein groups the filter
+removed, in a clause subordinate to a sentence about removal, and the only
+counterfactual a reader could build out of the page was to cumulate the
+per-N-plex histogram. That reading is wrong, and the caption now says why —
+`n_plex` is counted over every quantified row, *before* `min_valid_per_group`,
+and the retained set is `keep_valid & keep_plex`, so the two filters interact
+and a protein quantified in every plex can still be one `min_valid_per_group`
+drops. With the setting above 1 the report states the conclusion instead:
+`analysis.min_plexes: %d keeps %d of the %d protein group(s)
+min_valid_per_group passed; the other %d reach no differential abundance,
+enrichment or shortlist table below, and at 1 - the default, where this filter
+does nothing - every one of them would.` At the default, the advice that was
+already there carries its price rather than naming a setting and stopping:
+`Set analysis.min_plexes: 2 to drop them, leaving %d of the %d retained here.`
+
+The counts are left as their format specifiers here deliberately. A triple for
+the first real run was written into this entry and taken back out: it was
+transcribed from a reconstruction rather than measured, and it contradicted
+this same section, which establishes from that run's own
+`min_features_per_protein` line that `annotated_quant.tsv` held 1,282 rows -
+so no figure larger than 1,282 can be what `min_valid_per_group` passed on it.
+The same rule was already being applied one paragraph away, where a plex count
+that had not been measured here was refused; applying it to one transcription
+and not the other is how a number nobody checked ends up quoted back as
+evidence. Both directions are priced with the same pair of counts, and the
+first
+of them is the retained count the next line prints, so the sentence can be
+checked against the rest of the page.
+
+One comparison and not a ladder, for the same reason the bin escalation prints
+a conclusion beside its table rather than a second table: what 1, 2, 3 ... each
+leave is the quiet table this change exists to replace, and every point past
+the retained set is non-linear anyway — `drop_zero_variance` runs after the
+subset and `eBayes` moderates across whatever survives — so a ladder implies a
+smoothness the code cannot support. The comparison is against 1 because 1 is
+not a point on a ladder: it is the shipped default, the run the user would have
+had without touching the key, and the only counterfactual this chunk can
+evaluate exactly, since `keep_valid` and `n_plex` are both in hand and neither
+depends on the setting. Escalated on `COVERAGE_MIN_N`, the floor every other
+coverage claim in the document uses: a filter that removed at least as much as
+it kept has redefined the experiment rather than trimmed it, which is a GATE,
+but the same judgement over a handful of protein groups is an anecdote and gets
+the quiet tier. Silent where the setting took nothing `min_valid_per_group`
+would have kept, on a label-free run, and on a one-plex run at the default,
+where every protein is confined by definition and the advice would be to delete
+the experiment. Not silent on a one-plex run with the filter set: that run is
+about to hand limma an empty matrix, and `keeps 0 of the N` is the most useful
+line on the page.
+
+**And the report no longer lets `analysis.min_plexes` be read as covering
+`tmt.min_plexes`.** The two share a name, one is protein level and applied in
+the report and the other is feature level and applied in the reader before the
+roll-up, and the report can be exact about the first and cannot say anything at
+all about the second: changing it re-runs the join. Where the feature-level
+filter is actually above 1 — read out of `quant/design_notes.txt`, the same way
+the reference treatment already is — the sentence above is followed by one
+saying so. At its default nothing was filtered before the roll-up, the protein
+counts are complete, and there is nothing to disclaim, so nothing is said.
+
 **The join stage now says how many proteins it quantified from nothing.**
 `{n}/{total} protein(s) had every feature dropped under '<mode>': they have a
 row in peptide_evidence.tsv, no number in annotated_quant.tsv, and appear in no
