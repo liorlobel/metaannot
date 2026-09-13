@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1746 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1753 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 71 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1675 passed and 72
+absent, so on a machine with no R the same run reports 1682 passed and 72
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1708,8 +1708,37 @@ esmfold_vram_reserve_gb: 0.5            # left for the driver and the display
 
 Whichever of this and `max_len_structure` is tighter wins, and the log says
 which. Sequences above the cap are reported as **never attempted**, not as
-failures — fold them on a card with more memory, in the cloud, or on CPU, and
-drop the models into `results/structures/` before rerunning `foldseek`.
+failures — and they are now written down, because "fold them elsewhere" is
+advice a reader cannot act on when the log gives only a count. Every run of
+the stage writes both files, empty ones included, so that their absence means
+the stage did not run rather than meaning nothing was skipped:
+
+| | |
+|---|---|
+| `results/structures/not_folded.tsv` | `protein_id`, `length`, `limit_aa`, `limit_from` |
+| `results/structures/not_folded.faa` | the same sequences, ready to fold |
+
+Fold the `.faa` on a card with more memory, in the cloud, or on CPU, and drop
+the models into `results/structures/` before rerunning `foldseek`.
+
+**A low cap is a statement about free VRAM, not about the coefficient.** On
+the first full real run the cap came out at 193 aa and excluded 1,462 of 2,000
+sequences, which reads like a badly-guessed constant and is not one: 20200
+reproduces both measured points exactly, and running the estimate backwards,
+a 193 aa cap means about **1.2 GB** was free with the weights resident, where
+the 478 aa measurement had 4.8 GB. On a 16 GB card holding an 11.2 GB trunk,
+4.8 GB is what should be left — so roughly 3.6 GB was held by something else,
+and that, not `esmfold_bytes_per_residue_pair`, is what to go and look at. The
+warning now prints the free VRAM the longest skipped sequence would have
+needed, one line under how much was actually free, so the comparison is on the
+page rather than left to be worked out. Lower the coefficient only where a
+card **demonstrably** folds longer sequences at a smooth rate; the guard is
+there because crossing the cliff bugchecked a host twice.
+
+Whether the skipped tail was worth much is a separate question and this run
+answered it for one dataset: 538 completed folds produced only 14 proteins
+whose *sole* evidence was structural. That is an argument about how much to
+spend chasing the cap, not an argument for raising it blind.
 
 It can get worse than slow. On the machine these numbers came from, folding
 above the cliff also produced repeated `CUDA driver error: device not ready`

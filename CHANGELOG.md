@@ -4,6 +4,38 @@
 
 ### Added
 
+**The sequences ESMFold's length cap skipped are written down.** The advice
+beside that cap has always been "fold them on a card with more memory and drop
+the models in", and it has always given a COUNT — on the first full real run,
+1,462 of 2,000 — leaving the reader to reconstruct which ones. Every run of the
+stage now writes `structures/not_folded.tsv` (`protein_id`, `length`,
+`limit_aa`, `limit_from`) and `structures/not_folded.faa` (the same sequences,
+ready to hand to another card). Both are written even when nothing was
+skipped, so that their absence means the stage did not run rather than meaning
+there was nothing to skip.
+
+**A low cap is a statement about free VRAM, and the log now says so.** A cap
+of 193 aa that excluded 1,462 of the 2,000 sequences on the work-list reads
+like a badly-guessed constant and is not one: 20200 reproduces both measured points exactly, and run
+backwards, a 193 aa cap means about 1.2 GB was free with the weights resident
+where the 478 aa measurement had 4.8 GB. On a 16 GB card holding an 11.2 GB
+trunk, 4.8 GB is what should be left, so about 3.6 GB was held by something
+else — and that is what to go and look at, not the coefficient. The warning
+now prints the free VRAM the longest skipped sequence would have needed, one
+line under how much was actually free, and says in as many words that it is
+the free VRAM and not the coefficient that decides the cap. It prints that
+clause only when the VRAM is what decided it; `max_len_structure` skipping
+prices nothing, because the memory had nothing to do with it.
+
+**`esmfold_failed.tsv` is written on every run too, and one branch stops
+lying.** Its absence used to mean either "nothing failed" or "this results
+directory predates the failure record", and `structure_shortfall_message` had
+to hedge across both. It is now header-only when nothing failed — but making
+that change alone would have been worse than leaving it: the consumer decided
+which sentence to print by asking whether the table had ROWS, so a clean run
+would have been told its directory predates a record it had just written. That
+branch now keys on the FILE, and both sentences are tested.
+
 **The two KEGG-invisibility rates are subtracted instead of left on two
 pages.** This pipeline has computed both for as long as it has had bins — the
 database rate in the finalise stage's log, the quantified rate in the join

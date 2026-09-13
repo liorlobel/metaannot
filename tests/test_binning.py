@@ -491,6 +491,38 @@ def test_a_protein_over_the_length_cap_is_not_blamed_on_oom(ma, tmp_path,
     assert "OOM" not in msg, "length, not memory, explains the only gap"
 
 
+def test_a_run_with_no_failures_is_not_read_as_predating_the_record(
+        ma, tmp_path, paths_for):
+    """A header-only esmfold_failed.tsv is a statement, not a missing file.
+
+    The stage writes it on every run now, so "the table exists and this
+    protein is not in it" means the protein was never attempted. Keying that
+    branch on whether the table had ROWS put a clean run back on the sentence
+    written for results directories that predate the record entirely.
+    """
+    cfg, p = paths_for("nofail")
+    cfg["max_len_structure"] = 5000
+    open(p.struct_done, "w", encoding="utf-8").close()
+    with open(f"{p.structures}/esmfold_failed.tsv", "w", encoding="utf-8") as fh:
+        fh.write("protein_id\tlength\terror\n")
+    msg, level = ma.structure_shortfall_message(
+        cfg, p, {"P_never": 90, "P_have": 40}, {"P_have"})
+    assert level == "WARN"
+    assert "never attempted" in msg, msg
+    assert "predates" not in msg, \
+        "a table that exists and says nothing failed is not a missing table"
+
+
+def test_a_directory_that_really_predates_the_record_still_says_so(
+        ma, tmp_path, paths_for):
+    cfg, p = paths_for("oldrun")
+    cfg["max_len_structure"] = 5000
+    open(p.struct_done, "w", encoding="utf-8").close()
+    msg, _ = ma.structure_shortfall_message(
+        cfg, p, {"P_never": 90, "P_have": 40}, {"P_have"})
+    assert "predates" in msg, msg
+
+
 # --- the effector score ----------------------------------------------
 def _two_vfdb_hits(ma, tmp_path, paths_for, name, **over):
     """P_dark1 at 95% identity and P_dark2 at 31%, both against VFDB."""
