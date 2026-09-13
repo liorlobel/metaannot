@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1753 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1763 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 71 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1682 passed and 72
+absent, so on a machine with no R the same run reports 1692 passed and 72
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -910,6 +910,18 @@ that out loud on the log beside the path, because a funnel that stopped at
 1,282 without saying it would be read as the end of the narrowing when it is
 the middle of it.
 
+**A quant table is read more than once per run, and it now warns once.** The
+join stage reads it, and `peptide_features()` reads it again for each
+taxonomy-ish stage that is on. For `fragpipe_tmt` that is every plex's level
+file, annotation and `psm.tsv` re-read, re-validated and re-warned about: on
+the first full real run, 117 WARN lines of which 97 were one block printed
+three times. Those warnings are properties of the plex FILES rather than of
+the read, so the later passes reach the same verdicts. They are printed once
+now, and the reader says at the end of each later pass how many lines it
+withheld and why — a suppression nobody accounts for is indistinguishable from
+a check that has stopped firing. Deduplication is of *exact* repeats under a
+key, so two different warnings about one table both still get through.
+
 `peptide_evidence.tsv` has one row per protein and nine columns:
 `protein_id`, `n_features_used`, `n_unique`, `n_taxon_unique`,
 `n_family_unique`, `n_features_dropped`, `taxon_unique_dominated`,
@@ -1353,6 +1365,15 @@ translated into each tool's own flag:
 | eggNOG-mapper | `--dbmem` | only above `emapper_dbmem_min_gb`; below it, loading the annotation database just swaps |
 | hmmsearch, KOfamScan | — | no memory flag; footprint tracks `--cpu`, so the CPU split is the control |
 
+The CPU split is translated the same way, and `tmbed` used to be the hole in
+it. SignalP takes `--torch_num_threads`; tmbed has no equivalent flag, so
+torch took every core it could see — which on a CPU fallback is the whole box
+while `share()` has told the stages beside it that they own most of it. It is
+launched with `OMP_NUM_THREADS` and `MKL_NUM_THREADS` set to its share, and
+set unconditionally: an external tool's thread count is fixed when it is
+launched and cannot grow later, so a value inherited from the environment that
+disagrees with the split silently defeats it rather than refining it.
+
 `doctor` prints the resulting per-stage allocation before you commit to a long
 run.
 
@@ -1789,8 +1810,23 @@ tag with how long it has been going:
 Set `progress_interval_s` to change the interval, or to `0` to turn it off:
 
 ```yaml
-progress_interval_s: 60   # seconds between progress lines; 0 = silent
+progress_interval_s: 60       # seconds between progress lines; 0 = silent
+progress_interval_s_max: 900  # the interval doubles up to this; = the above disables
 ```
+
+**It backs off.** A minute is the right spacing for the first ten minutes of a
+stage — it is how you tell a tool that started from one that did not — and the
+wrong spacing for the next eighty hours: the first full real run wrote 8,990
+log lines of which 5,086 were heartbeats. So after ten ticks of the same
+command the interval doubles until it reaches `progress_interval_s_max`, which
+turns a two-day stage's several thousand lines into a few hundred while still
+proving liveness four times an hour. The line on which the interval changes
+says `next in 15m00s`, because a heartbeat that quietly slows down looks
+exactly like a stage that quietly stopped. The backoff is per command, so two
+stages running at once keep separate cadences and a short stage never inherits
+a long one's ceiling. Set `progress_interval_s_max` equal to
+`progress_interval_s` for the old fixed cadence; a value *under* it is ignored
+rather than used to speed the heartbeat up.
 
 Only the newest line is kept, not the output: stdout still goes to
 `/dev/null`, because InterProScan and friends emit tens of MB of chatter, and

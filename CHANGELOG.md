@@ -4,6 +4,87 @@
 
 ### Added
 
+**The stub now waits for the child it forks, so the test stops failing when
+the sweep works.** Every CI failure across this whole stack was one test --
+`test_a_tool_that_exits_zero_leaving_a_child_behind_does_not_leak_it` -- dying
+with a bare `KeyError: 'child'` on some Pythons and not others, run to run.
+
+The cause is worth writing down because the test was failing FOR the mechanism
+rather than against it. The stub records its own pid, forks a grandchild that
+records its own pid from inside its own interpreter, and -- in this one shape,
+`STUB_SLEEP=0` -- exits immediately. That exit is the starting gun for the
+success-path group sweep: the run reaps the leader and takes the group down a
+few bytecodes later. A grandchild still inside interpreter startup is killed
+before it can write its line, so the line never lands and the test dies
+reading it. Reproduced deterministically by slowing interpreter startup by one
+second: unpatched, the exact CI failure five times out of five.
+
+The `want=` wait added to `_stub_pids` earlier could never have helped here,
+and its docstring said otherwise: by the time that helper runs, the writer is
+already dead, so no wait conjures the line. Twenty seconds bought nothing and
+cost twenty seconds an occurrence. That docstring is corrected, and the
+ordering is fixed where it lives -- the stub blocks until its grandchild's own
+line is on disk before it exits, bounded by `STUB_CHILD_WAIT_S` and failing
+loudly on expiry, because a grandchild that never starts must fail a test
+rather than wedge the suite.
+
+**The alternative was rejected for destroying evidence.** Having the stub
+record `kid.pid` parent-side also makes the test pass, and is what a first
+reading suggests -- but that line, written from inside the grandchild's own
+interpreter, is the suite's only proof the grandchild ever reached Python.
+Record it parent-side and a grandchild that dies of anything else (OOM on a
+small runner, a CI image that cannot start the interpreter) becomes a SILENT
+GREEN PASS in the one test that pins the safety property, at the same rate on
+the same machines that produce today's loud failure. It would also have gutted
+the readiness gate four other tests depend on. Waiting keeps the evidence and
+makes the claim honest: what is left in the group is now a process that
+provably reached Python, not a pid killed mid-exec.
+
+Verified both ways. Under the forced race it passes where it failed; with the
+reaped-leader arm of `_end_tool_group` removed it fails by its own named
+assertion rather than by `KeyError`, which is the regression it exists to
+catch. Nine further latent flakes in the same test family, and two assertions
+that can never fail, are filed rather than fixed here.
+
+**The heartbeat backs off instead of writing a line a minute for two days.**
+One line a minute is the right spacing for the first ten minutes of a stage
+and the wrong spacing for the next eighty hours: the first full real run wrote
+8,990 log lines of which 5,086 were heartbeats, and the twenty that mattered
+were somewhere in them. After `_PROGRESS_STEADY_TICKS` ticks of the same
+command the interval doubles until it reaches the new
+`progress_interval_s_max` (900 s), which on that run's longest stage is a few
+hundred lines instead of several thousand while still proving liveness four
+times an hour. The line on which the interval changes says `next in 15m00s`,
+because a heartbeat that quietly slows down looks exactly like a stage that
+quietly stopped — which is the one thing the line exists to rule out. Per
+command, so two stages running at once keep separate cadences; set the ceiling
+equal to `progress_interval_s` for the old fixed cadence, and a ceiling UNDER
+the interval is ignored rather than used to speed the heartbeat up, because
+the knob that sets the cadence is the other one.
+
+**A quant table read three times warned three times.** 117 WARN lines on that
+run, of which 97 were one block printed in triplicate: `stage_join` reads the
+quant table, and `peptide_features()` reads it again for each taxonomy-ish
+stage that is on, and for `fragpipe_tmt` that is every plex's level file,
+annotation and `psm.tsv` re-read and re-validated. Those warnings describe the
+FILES, so the later passes reach the same verdicts. `log()` takes an optional
+`once=` key now, the TMT reader passes the table it is reading, and the later
+passes are silent — except for one line saying how many they withheld and why.
+That line is the point: a suppression nobody accounts for is indistinguishable
+from a check that has stopped firing. The count is the delta for that pass and
+not a running total, and deduplication is of EXACT repeats under a key, so two
+different warnings about one table both still get through.
+
+**tmbed was the hole in the CPU split.** SignalP takes
+`--torch_num_threads`; tmbed has no equivalent flag, so torch took every core
+it could see — and on a CPU fallback that is the whole box, while `share()`
+has told the stages running beside it that they own most of it. It is launched
+with `OMP_NUM_THREADS` and `MKL_NUM_THREADS` set to its share. Unconditionally,
+for the reason the scheduler's cut is authoritative everywhere else here: an
+external tool's thread count is fixed when it is launched and cannot grow
+later, so a value inherited from the environment that disagrees with the split
+silently defeats it rather than refining it.
+
 **The sequences ESMFold's length cap skipped are written down.** The advice
 beside that cap has always been "fold them on a card with more memory and drop
 the models in", and it has always given a COUNT — on the first full real run,

@@ -2813,6 +2813,8 @@ COUNT_PROSE = {
     "4 jobs": ("MEASURED", "the same worked example"),
     "four jobs": ("MEASURED", "the README's peak-memory example"),
     "90 chunks": ("MEASURED", "a resumed run's chunk count"),
+    "ten ticks": ("DERIVED", "the heartbeats before the backoff starts",
+                  lambda ma: ma._PROGRESS_STEADY_TICKS),
     "538 folds": ("MEASURED", "completed folds on the first full real run, "
                               "reported with the 14 sole rescues they bought"),
     "14 proteins": ("MEASURED", "proteins on that run whose SOLE evidence was "

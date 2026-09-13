@@ -5047,12 +5047,19 @@ def _stub_pids(pidfile, roles=("tool", "child"), want=(), timeout=20.0):
     """{role: [pid, ...]} as the stub recorded them.
 
     `want` names roles the caller is about to SUBSCRIPT, and they are waited
-    for rather than assumed. The stub forks its child and the child writes its
-    own line, so on a loaded box the run can finish and this can be read
-    before that write has landed: measured as `KeyError: 'child'` in a full
-    suite, passing every time in isolation. A test that fails because a fork
-    was slow says nothing about the sweep it exists to pin, and reads to
-    whoever sees it as the sweep being broken.
+    for rather than assumed, for the roles whose writer is still running when
+    this is called.
+
+    IT CANNOT HELP A WRITER THAT IS ALREADY DEAD, and an earlier version of
+    this docstring claimed otherwise -- that the run could finish before the
+    write had landed, so waiting here would catch up with it. Once the
+    success-path sweep existed, the grandchild in the STUB_SLEEP=0 shape was
+    being killed mid-startup by that sweep, so the line was never going to
+    land however long this waited: twenty seconds bought nothing and cost
+    twenty seconds per occurrence. That ordering is fixed where it lives, in
+    the stub, which now refuses to exit until its grandchild has recorded
+    itself. Do not widen this timeout in response to a missing role; find out
+    whether anything is still alive to write it.
 
     Bounded, and the KeyError is still there at the end of it: if the role
     never appears that IS the finding, and the caller's subscript raises
@@ -5218,7 +5225,10 @@ def test_run_cmd_ends_the_tool_group_at_the_reap_and_not_after_the_join(ma):
     src = io.open(METAANNOT_PY, encoding="utf-8").read()
     i = src.index("def run_cmd(")
     body = src[i:src.index("\ndef ", i + 1)]
-    reap = body.index("proc.wait(timeout=_PROGRESS_INTERVAL or None)")
+    # The call, not the expression inside it: the heartbeat's timeout is now
+    # a per-command variable that backs off, and pinning this ordering to the
+    # NAME of that expression made a rename of it look like the sweep moving.
+    reap = body.index("proc.wait(timeout=")
     finish = body.index("proc.finish_group()")
     join = body.index("reader.join(")
     assert reap < finish < join, (
@@ -5378,6 +5388,14 @@ def test_a_tool_that_exits_zero_leaving_a_child_behind_does_not_leak_it(
     # 120s, and the assertion waits 20: a child that expires on its own
     # inside the window would make this pass with the sweep removed, which is
     # exactly what it happened to do the first time it was written.
+    #
+    # This test's NON-VACUITY rests on something invisible from here: the stub
+    # does not exit until its grandchild has written its own pidfile line, so
+    # what the sweep finds in the group is a process that provably reached
+    # Python. Without that wait the sweep kills the grandchild mid-startup,
+    # the line never lands, and this dies with `KeyError: 'child'` -- which is
+    # what it did on some CI Pythons and not others, run to run, until the
+    # stub was fixed. Do not remove that wait as dead weight.
     e = {"STUB_PIDFILE": pidfile, "STUB_FORK_CHILD": "1",
          "STUB_CHILD_SLEEP": "120", "STUB_SLEEP": "0"}
     try:
