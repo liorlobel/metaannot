@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1701 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1719 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
-`pytest -q -m R` selects the 57 R tests, which the default run **already
+`pytest -q -m R` selects the 60 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1644 passed and 58
+absent, so on a machine with no R the same run reports 1659 passed and 61
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -846,6 +846,29 @@ were made, because a `sum` run and a `median_polish` run are otherwise
 indistinguishable once the log is gone. `taxon_unique_dominated` flags proteins
 resting more on shared-but-taxon-unique features than on their own unique ones
 — the ones whose intensity is most sensitive to the assignment rule you chose.
+
+The file has a row for every razor protein the rule considered, **including
+those whose features were all dropped**. Those rows read `n_features_used = 0`,
+carry no number in `annotated_quant.tsv` and appear in no report table, and
+they can never be `taxon_unique_dominated` either, because a row of zeros
+cannot rest more on one kind of feature than on another. So the rate the join
+stage logs is over the proteins with at least one assigned feature — the ones
+the rule actually decided something about — and the run prints how many rows it
+left out, so a rate computed straight off this file will not match it. Where
+`min_features_per_protein` is set above its default of 1 the retention line
+beside it reports over that same population, which is the comparison to make;
+at the default that line does not print at all, because the filter is inert.
+
+The report states the rate again over ITS protein set, which is the one a claim
+about your results rests on. Whether that number differs from the stage's
+depends entirely on your config: `min_features_per_protein` defaults to 1 and
+`analysis.min_features` to 0, and both filters are skipped when they are at
+those values, so on a default run the two populations are the same and the two
+rates agree. Raise either and they part company — on the 455,571-protein run,
+at `min_features_per_protein: 2`, the stage logged 54.7% and the report 61.2%,
+because the single-feature proteins that filter removed were less often
+dominated than the ones it kept. That direction is a property of that dataset
+and not a rule.
 
 MSstats-format inputs carry only the razor protein per feature, so
 shared-peptide filtering is unavailable from them; metaannot says so.

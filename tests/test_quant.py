@@ -3,6 +3,7 @@ rule that decides which peptide quantifies which protein."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 
 import numpy as np
@@ -131,6 +132,30 @@ def test_a_fractionated_run_produces_the_same_quant_as_an_unfractionated_one(
     a = pd.read_csv(plain.rpath("quant", "annotated_quant.tsv"), sep="\t")
     b = pd.read_csv(frac.rpath("quant", "annotated_quant.tsv"), sep="\t")
     pd.testing.assert_frame_equal(a, b)
+
+
+def test_the_written_quant_table_carries_the_dominance_column_the_report_reads(
+        ma, tmp_path):
+    """The column the report's dominance line is computed from, on disk.
+
+    Everything else about that line is pinned on frames built inside the
+    tests, and the report's own half is pinned against an R literal - so a
+    rename on the Python side would leave the report reading a column that is
+    no longer written, which is the exact defect this change was made to fix,
+    with every test still green. This is the one assertion that couples the
+    two: the file a run really writes has to carry the name the report really
+    asks for.
+
+    Read off the R source rather than repeated here, so that the coupling is
+    to the report and not to a string in this file.
+    """
+    proj = build_project(tmp_path / "written", fractions=1)
+    proj.run()
+    cols = pd.read_csv(proj.rpath("quant", "annotated_quant.tsv"),
+                       sep="\t", nrows=0).columns
+    assert "taxon_unique_dominated" in cols, sorted(cols)
+    assert "taxon_unique_dominated" in ma.RMD_TEMPLATE, \
+        "the report no longer reads the column this test exists to couple"
 
 
 def test_a_manifest_run_matching_no_column_names_the_columns_present(ma,
@@ -290,6 +315,228 @@ def test_peptide_evidence_records_the_counts_per_protein(ma, tmp_path):
     assert row["n_taxon_unique"] == 1
     assert row["n_features_dropped"] == 2
     assert bool(row["taxon_unique_dominated"]) is False
+
+
+def _dominance_frame(ma, tmp_path, n_dominated, n_clean, n_dropped,
+                     name="dom.tsv"):
+    """A frame whose two candidate denominators differ, on purpose.
+
+    `n_dominated` proteins carry one unique feature and two taxon-unique ones
+    (flagged); `n_clean` carry one unique feature (quantified, not flagged);
+    `n_dropped` carry nothing but cross-taxon shared features, so every one of
+    their features is dropped and they arrive in peptide_evidence.tsv as a row
+    with n_features_used == 0 - quantified nowhere, and unflaggable whatever
+    the assignment rule decided.
+    """
+    ps, rows, shared, taxon_of = [], [], [], {}
+    i = 0
+    for k in range(n_dominated + n_clean):
+        pid = f"Q{k}"
+        ps.append(F.Protein(pid, "MKV" * 40)); taxon_of[pid] = str(800 + k)
+        rows.append({"peptide": f"UQ{k}AAAAK", "razor": pid,
+                     "candidates": [pid]})
+        i += 1
+        if k < n_dominated:
+            for j in range(2):
+                nb = f"N{k}x{j}"
+                ps.append(F.Protein(nb, "MKV" * 40)); taxon_of[nb] = str(800 + k)
+                rows.append({"peptide": f"TX{k}x{j}AAAK", "razor": pid,
+                             "candidates": [pid]})
+                shared.append((i, [nb])); i += 1
+    for k in range(n_dropped):
+        pid, other = f"Z{k}", f"W{k}"
+        ps.append(F.Protein(pid, "MKV" * 40)); taxon_of[pid] = "700"
+        ps.append(F.Protein(other, "MKV" * 40)); taxon_of[other] = "701"
+        rows.append({"peptide": f"ZX{k}AAAAK", "razor": pid,
+                     "candidates": [pid]})
+        shared.append((i, [other])); i += 1
+    path = str(tmp_path / name)
+    F.write_peptide_table(path, ps, ["S1", "S2"], rows=rows, shared=shared)
+    feats, int_cols, _ = ma.read_feature_table(path, "fragpipe_peptide",
+                                               _cfg(ma))
+    return feats, int_cols, taxon_of
+
+
+def _dom_line(err):
+    """The one logged line that states the dominance rate."""
+    hits = [ln for ln in err.splitlines() if "rest more on shared-but-taxon-" in ln]
+    assert len(hits) <= 1, f"more than one dominance line: {hits}"
+    return hits[0] if hits else ""
+
+
+def test_the_dominance_rate_is_over_the_proteins_that_could_carry_the_flag(
+        ma, tmp_path, capsys):
+    # symptom: the denominator was len(ev), and ev comes from an OUTER join
+    # with the dropped-feature counts, so every protein whose features were
+    # ALL dropped sat in it as a row of zeros. (0 + 0) > 0 is False, so such a
+    # row could never be flagged while still enlarging the denominator - on
+    # the first full real run 5,039 of 8,238 rows, which reported a 54.7%
+    # finding as 21.2%.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    _, ev, _ = ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    assert len(ev) == 18                      # 12 assessable + 6 with nothing
+    line = _dom_line(capsys.readouterr().err)
+    assert "7/12 (58.3%)" in line
+    assert "/18" not in line.split("peptide_evidence.tsv has")[0]
+    assert "with at least one assigned feature" in line
+
+
+def test_a_protein_with_every_feature_dropped_is_not_in_the_dominance_denominator(
+        ma, tmp_path, capsys):
+    # the mechanism, stated on its own: adding rows that hold no measurement
+    # must not move the rate. It is a positivity rate over patients who were
+    # never tested.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 0,
+                                                 name="a.tsv")
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    none_dropped = _dom_line(capsys.readouterr().err)
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 40,
+                                                 name="b.tsv")
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    many_dropped = _dom_line(capsys.readouterr().err)
+    assert "7/12 (58.3%)" in none_dropped
+    assert "7/12 (58.3%)" in many_dropped
+
+
+def test_the_dominance_line_names_the_rows_it_left_out_of_its_denominator(
+        ma, tmp_path, capsys):
+    # the duty owed for narrowing a denominator: say how many rows were taken
+    # out of it, in the sentence that used it, so nobody recomputes the rate
+    # off peptide_evidence.tsv and gets a different number.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    line = _dom_line(capsys.readouterr().err)
+    assert "peptide_evidence.tsv has 18 rows" in line
+    assert "the other 6 had every feature dropped" in line
+    assert "could never be flagged" in line
+
+
+def test_the_proteins_with_no_assigned_feature_are_counted_in_their_own_line(
+        ma, tmp_path, capsys):
+    # nothing in this pipeline used to state this count - the features line
+    # counts FEATURES, and the min_features line has already excluded these
+    # proteins - so a reader filtering peptide_evidence.tsv had no way to know
+    # a third of it held no number at all.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    err = capsys.readouterr().err
+    hits = [ln for ln in err.splitlines()
+            if "protein(s) had every feature dropped under" in ln]
+    assert len(hits) == 1
+    assert "6/18 protein(s)" in hits[0]
+    assert "under 'taxon_unique'" in hits[0]
+    assert "no number in annotated_quant.tsv" in hits[0]
+    # INFO and never WARN: in a strain-redundant database this is the rule the
+    # user chose doing what it says, and a WARN on every real run is the line
+    # a reader learns to skip.
+    assert hits[0].split("]")[1].strip().startswith("INFO")
+
+
+def test_a_run_that_drops_nothing_keeps_the_old_dominance_denominator(
+        ma, tmp_path, capsys):
+    # the property most worth having: where the defect does not exist the
+    # number does not move. With nothing dropped, len(ev) IS the assessable
+    # count, and the trailing sentence is not emitted at all.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 0)
+    _, ev, _ = ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    line = _dom_line(capsys.readouterr().err)
+    assert f"7/{len(ev)} (58.3%)" in line
+    assert "peptide_evidence.tsv has" not in line
+
+
+def test_the_dominance_denominator_is_the_min_features_line_s_own_denominator(
+        ma, tmp_path, capsys):
+    # the argument that settled which population to report over: `before` in
+    # the min_features WARN is len(quant), i.e. the proteins with at least one
+    # assigned feature. Two adjacent lines of one stage must not print
+    # different denominators with nothing saying they are different
+    # populations.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 2)
+    err = capsys.readouterr().err
+    retained = [ln for ln in err.splitlines() if "proteins retained with" in ln]
+    assert len(retained) == 1
+    # Parsed out of both lines rather than written twice here: the invariant
+    # is that they ARE one denominator, printed one way - "3,199" beside
+    # "3199" in one funnel reads as two populations.
+    mine = re.search(r"(\d[\d,]*)/(\d[\d,]*) \(", _dom_line(err))
+    theirs = re.search(r"(\d[\d,]*)/(\d[\d,]*) proteins retained", retained[0])
+    assert mine and theirs
+    assert mine.group(2) == theirs.group(2) == "12"
+    assert mine.group(1) == "7" and theirs.group(1) == "7"
+
+
+def test_a_handful_of_assessable_proteins_states_counts_without_a_percentage(
+        ma, tmp_path, capsys):
+    # below ASSESSABLE_MIN_N the counts are still printed; the quotable
+    # fraction is not, because a percentage over a handful of proteins is what
+    # gets pasted into a methods section as a claim about a population.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 3, 4, 6)
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    line = _dom_line(capsys.readouterr().err)
+    assert "3/7 protein(s)" in line
+    assert "%" not in line
+    assert "too few to state as a rate" in line
+    assert line.split("]")[1].strip().startswith("INFO")
+
+
+def test_enough_assessable_proteins_raises_the_dominance_rate_to_a_warning(
+        ma, tmp_path, capsys):
+    # the other side of the same floor, so the tier boundary is pinned from
+    # both directions rather than assumed.
+    assert ma.ASSESSABLE_MIN_N == 10
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 5, 5, 6)
+    ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    line = _dom_line(capsys.readouterr().err)
+    assert "5/10 (50.0%)" in line
+    assert line.split("]")[1].strip().startswith("WARN")
+
+
+def test_no_taxonomy_keeps_the_dominance_line_silent_rather_than_reporting_zero(
+        ma, tmp_path, capsys):
+    # under protein_unique - which is also where stage_join falls back when no
+    # seed_taxid exists - both taxon columns are structurally 0, so the flag
+    # can never be True. A line reading "0/12 (0.0%)" on every such run is the
+    # line that fires on everything and takes the real one with it.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    _, ev, _ = ma.rollup_features(feats, int_cols, taxon_of, "protein_unique",
+                                  1)
+    assert not bool(ev["taxon_unique_dominated"].any())
+    assert _dom_line(capsys.readouterr().err) == ""
+
+
+def test_a_run_where_nothing_is_assigned_states_no_rate_and_does_not_divide(
+        ma, tmp_path, capsys):
+    # the degenerate case the guard already covers, pinned rather than
+    # assumed: with every feature dropped the assessable count is 0, and a
+    # percentage computed before the guard would turn a reporting line into a
+    # ZeroDivisionError that takes the whole join stage with it.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 0, 0, 6)
+    q, ev, _ = ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    assert len(q) == 0
+    assert int((ev["n_features_used"] == 0).sum()) == len(ev) == 6
+    err = capsys.readouterr().err
+    assert _dom_line(err) == ""
+    assert "6/6 protein(s) had every feature dropped" in err
+
+
+def test_every_row_flagged_taxon_unique_dominated_rests_more_on_shared_features(
+        ma, tmp_path):
+    # the part that was already right, pinned so a fix to the SUMMARY cannot
+    # quietly widen the per-protein classification. The flag is written into
+    # peptide_evidence.tsv and annotated_quant.tsv and is true of exactly the
+    # rows whose taxon- plus family-unique features outnumber their own unique
+    # ones - a tie is False, because "rests MORE on" is strict.
+    feats, int_cols, taxon_of = _dominance_frame(ma, tmp_path, 7, 5, 6)
+    _, ev, _ = ma.rollup_features(feats, int_cols, taxon_of, "taxon_unique", 1)
+    flagged = ev["n_taxon_unique"] + ev["n_family_unique"] > ev["n_unique"]
+    assert list(ev["taxon_unique_dominated"]) == list(flagged)
+    assert int(flagged.sum()) == 7
+    dom = ev[ev["taxon_unique_dominated"]]
+    assert (dom["n_taxon_unique"] == 2).all() and (dom["n_unique"] == 1).all()
+    # and the rows that hold no measurement are flagged by neither.
+    empty = ev[ev["n_features_used"] == 0]
+    assert len(empty) == 6 and not bool(empty["taxon_unique_dominated"].any())
 
 
 def test_peptide_evidence_survives_a_run_where_nothing_is_assigned(ma,
