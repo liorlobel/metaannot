@@ -169,16 +169,54 @@ note("tool", os.getpid())
 # proc.kill() never reached: interproscan.sh -> java, emapper -> its children,
 # torch -> its dataloader workers. It outlives this stub on purpose.
 if os.environ.get("STUB_FORK_CHILD"):
-    subprocess.Popen([sys.executable, "-c",
-                      "import os,sys,time\n"
-                      "p = sys.argv[1]\n"
-                      "if p:\n"
-                      "    fh = open(p, 'a')\n"
-                      "    fh.write('child ' + str(os.getpid()) + chr(10))\n"
-                      "    fh.close()\n"
-                      "time.sleep(float(sys.argv[2]))\n",
-                      pidfile or "",
-                      os.environ.get("STUB_CHILD_SLEEP", "30")])
+    kid = subprocess.Popen([sys.executable, "-c",
+                            "import os,sys,time\n"
+                            "p = sys.argv[1]\n"
+                            "if p:\n"
+                            "    fh = open(p, 'a')\n"
+                            "    fh.write('child ' + str(os.getpid()) + chr(10))\n"
+                            "    fh.close()\n"
+                            "time.sleep(float(sys.argv[2]))\n",
+                            pidfile or "",
+                            os.environ.get("STUB_CHILD_SLEEP", "30")])
+    # AND THEN WAIT FOR THAT LINE BEFORE EXITING. This stub's exit is the
+    # starting gun for the success-path group sweep: the run reaps this
+    # process and takes the whole group down a few bytecodes later. A
+    # grandchild still inside interpreter startup is killed before it can
+    # record itself, the line never lands, and the test reading this pidfile
+    # dies with `KeyError: 'child'` -- failing BECAUSE the mechanism it pins
+    # worked fastest. Waiting on the far end cannot fix that: no wait
+    # conjures a line whose writer is already dead.
+    #
+    # It is not only a fix, it is the honest version of the claim. What this
+    # stub leaves in its group is now a process that provably reached Python
+    # rather than a pid killed mid-exec, so the grandchild's OWN line stays
+    # the evidence. Recording kid.pid from here instead would make the leak
+    # test pass for a grandchild that never ran at all.
+    #
+    # Matched on the pid we forked, so a wrapper put around that Popen fails
+    # here rather than silently leaving the test watching the wrong process,
+    # and a stale line in a reused pidfile cannot satisfy it.
+    #
+    # STUB_CHILD_WAIT_S is a backstop, not a feature, and is the same rule
+    # STUB_GATE_MAX_S states below: a grandchild that never starts must FAIL
+    # a test, loudly, rather than wedge the suite. Exit 3 puts that sentence
+    # in run_cmd's stderr tail.
+    mine = "child " + str(kid.pid)
+    limit = time.time() + float(os.environ.get("STUB_CHILD_WAIT_S", "60"))
+    while pidfile:
+        try:
+            with open(pidfile, encoding="utf-8") as fh:
+                if mine in fh.read().split("\n"):
+                    break
+        except OSError:
+            pass
+        if time.time() >= limit:
+            sys.stderr.write("STUB: the grandchild never recorded itself, so "
+                             "there is no live group member to leave behind\n")
+            sys.stderr.flush()
+            sys.exit(3)
+        time.sleep(0.01)
 # STUB_GROW appends to the output the run handed us, over and over, so a test
 # can produce the thing the leftover census is about: a real orphaned tool
 # writing into a real results directory, its `.part` file growing, after the
