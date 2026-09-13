@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1744 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1746 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 71 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1673 passed and 72
+absent, so on a machine with no R the same run reports 1675 passed and 72
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -1218,6 +1218,27 @@ LPxTG motif and an anchor domain — so with `topology` off it narrows to the
 last two rather than closing, and an empty shortlist is as likely to mean
 nothing was significant as it is to mean the tool was missing. Check the
 differential-abundance table before concluding either. See `docs/signalp-6.md`.
+
+**The two KEGG-invisibility rates are now subtracted rather than left on two
+pages.** The bin composition chunk states what fraction of the quantified
+protein groups is invisible to KEGG pathway enrichment; the finalise stage has
+always logged the same fraction over the whole search database. Both numbers
+have existed for as long as there have been bins, in different places, and
+nothing ever put them side by side — so on the first full real run, 43.6% of
+what was quantified against 29.4% of the database it was searched against went
+unremarked. That gap is the point: the KO-less fraction is not merely large,
+it is **over-represented among the proteins that were actually expressed and
+measured**. The report now prints the database rate on the line under the
+quantified one, with the ratio between them, and the join stage logs the same
+pair in a single line rather than half of it here and half of it two stages
+ago. Both are scored off `bin` on both sides, because `bin == "1_ko_pathway"`
+is what `kegg_enrichment_visible` is defined as, and both count only
+quantified groups that HAVE an annotation row — a group with none is not a
+KEGG-invisible protein, it is one the pipeline knows nothing about, and it is
+named separately. A NOTE carries the caveat the ratio needs: the two
+populations are selected very differently, the database being every predicted
+ORF and the quantified set being what was identified and survived every filter
+above, so the ratio is an observation about that run and not a general rate.
 
 The report also says when the statistics do not reach the bins this tool exists
 for, rather than leaving it in a table. `retention by bin` prints each bin's
