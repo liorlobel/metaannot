@@ -1,6 +1,41 @@
 # Changelog
 
-## Unreleased
+## v0.7.1 — 2026-09-13
+
+A patch release, and all of it is things v0.7.0 knew about. Two were filed
+against it and left open at the tag; the other two are what looking for those
+turned up.
+
+The pair that were filed are both cases a rule already enumerated and then
+fell out of. A state file holding `[1, 2, 3]` is valid JSON, so it was neither
+missing nor unparseable nor unreadable, and it killed the run with a
+`TypeError` before the first log line — while the WRITE side of the same file
+had answered that exact shape since v0.6.0. And under `peptide_assignment:
+razor` a protein carried entirely by cross-taxon peptides sat in the dominance
+denominator and could never reach the numerator, so that rate was a floor
+reading like an estimate.
+
+The other two are checks that had stopped checking, and both were found by
+doing the release rather than by reading the code. Opening this section above
+v0.7.0's turned off the dispatch-ordering replay, because its scan was bounded
+to the section in flight — the same defect v0.7.0 fixed one layer up, in the
+helper that finds that section. And a duplicate key in the count registry had
+been silently shadowing another rule for as long as the two numbers happened
+to agree; the test that now refuses duplicates found two more the moment it
+existed, one of them a stale entry the stale check could not see BECAUSE it
+was shadowed.
+
+Under Fixed: the two issues, the latent flakes in the scheduler test family
+that the same review turned up, and a tolerance band that had let a pinned
+count drift for a whole release.
+
+`SIGNATURE_VERSION`, `DESCRIBE_VERSION` and `DOCTOR_VERSION` do not move, and
+that was checked rather than assumed: no stage's `keys` list changed, nothing
+was removed from `describe --json`, and all seven of `doctor`'s closed enums
+are unchanged. Upgrading recomputes nothing. `peptide_evidence.tsv` gains
+three columns and no consumer requires them, so a results directory written by
+v0.7.0 is still adopted exactly as it was. `CONSOLE_VERSION` stays `0.1.2`;
+the console did not change.
 
 ### Fixed twelve entries, in five groups. Each heading carries its own count and
 a test pairs the two, so neither can drift from the other.
