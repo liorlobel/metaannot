@@ -1825,7 +1825,7 @@ def test_the_changelog_does_not_name_functions_that_do_not_exist(ma):
 # _S_NOT_A_NOUN, _count_head() and _count_phrase(), each of which carries its
 # own argument.
 #
-# This is the class: a scanner over the six surfaces a count can live in -
+# This is the class: a scanner over the seven surfaces a count can live in -
 # metaannot.py's comments and docstrings, the document `doctor --json` emits,
 # the test suite's own comments and docstrings, the README, the TUTORIAL and
 # the CHANGELOG's Unreleased section - which finds every "<number> <plural
@@ -2076,9 +2076,9 @@ def _unreleased(text):
 def _tests_prose():
     """Every comment and docstring in the suite, as one surface.
 
-    One surface and not one per file, so "six surfaces" stays a number about
-    KINDS of place a count can live rather than a number that moves whenever
-    somebody adds a test module.
+    One surface and not one per file, so "seven surfaces" stays a number
+    about KINDS of place a count can live rather than a number that moves
+    whenever somebody adds a test module.
     """
     d = os.path.join(ROOT, "tests")
     return "\n".join(_py_prose(os.path.join(d, f))
@@ -2187,11 +2187,22 @@ def _emitted_prose(ma):
 
 
 def _count_surfaces(ma):
-    """(name, prose) for each of the six surfaces a count can live in.
+    """(name, prose) for each of the seven surfaces a count can live in.
 
     The emitted document is one of them and is generated, not typed: every
     sentence in it that carries a number is built from a constant, and this is
     what says so rather than leaving it to be assumed.
+
+    CLAUDE.md IS ONE OF THEM, and it was the last to be added because it is
+    the one whose omission cost the most. Its whole job is to stop the next
+    reader reintroducing a defect, so an unpinned count there is a rule that
+    is wrong where it is most read - and it was outside this scan entirely
+    while every other prose surface in the repository was inside it. The
+    evidence for adding it is this change's own drafting, in which the scanner
+    caught two counts before they shipped; an earlier version of this
+    docstring claimed a third that had survived in a released CLAUDE.md, and
+    it had not - that sentence was written and corrected inside one uncommitted
+    tree, which is its own argument for scanning the file.
     """
     return [
         ("metaannot.py comments and docstrings", _py_prose(METAANNOT_PY)),
@@ -2199,6 +2210,7 @@ def _count_surfaces(ma):
         ("tests/ comments and docstrings", _tests_prose()),
         ("README.md", _text(README)),
         ("TUTORIAL.md", _text(TUTORIAL)),
+        ("CLAUDE.md", _text(CLAUDE)),
         ("CHANGELOG.md (Unreleased)", _unreleased(_text(CHANGELOG))),
     ]
 
@@ -2313,6 +2325,35 @@ def _suite_tuple_len(module, name):
     raise AssertionError(f"tests/{module} no longer defines {name}")
 
 
+def _spawn_helper_probe_count():
+    """How many probes the spawn-helper allowlist exempts from the helper.
+
+    The allowlist in test_every_long_lived_child_goes_through_the_spawn_helper
+    holds one entry for the helper's own `subprocess.Popen` and one per PROBE
+    that deliberately is not routed through it, so the probes are exactly its
+    `subprocess.run(` entries. Counting them rather than the whole tuple is
+    what keeps this from being "len minus one", which is a magic number in a
+    derivation.
+
+    Read by AST out of the test module, for the reason _suite_tuple_len gives.
+    """
+    src = _text(os.path.join(ROOT, "tests", "test_scheduler.py"))
+    want = "test_every_long_lived_child_goes_through_the_spawn_helper"
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == want), None)
+    assert fn is not None, f"tests/test_scheduler.py no longer defines {want}"
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "allowed"
+                        for t in node.targets)
+                and isinstance(node.value, (ast.Tuple, ast.List))):
+            return len([e for e in node.value.elts
+                        if isinstance(e, ast.Constant)
+                        and isinstance(e.value, str)
+                        and "subprocess.run(" in e.value])
+    raise AssertionError(f"{want} no longer assigns a tuple to `allowed`")
+
+
 def _fn_list_len(fn_name, var):
     """How many elements a list literal assigned inside a function has."""
     src = _text(METAANNOT_PY)
@@ -2372,7 +2413,7 @@ COUNT_PROSE = {
                         lambda ma: ma.DMND_FASTA_RECORD_CAP),
     "200 deflines": ("DERIVED", "DMND_DEFLINE_CAP",
                      lambda ma: ma.DMND_DEFLINE_CAP),
-    "six surfaces": ("DERIVED", "the surfaces this scan reads",
+    "seven surfaces": ("DERIVED", "the surfaces this scan reads",
                      lambda ma: len(_count_surfaces(ma))),
     "eleven configs": ("DERIVED", "CONFIGS in tests/test_doctor_json.py",
                        lambda ma: _suite_tuple_len("test_doctor_json.py",
@@ -2635,14 +2676,16 @@ COUNT_PROSE = {
     "eight directories": ("MEASURED", "the directories one cache bug hid"),
     "fifteen directories": ("MEASURED", "what `describe` used to leave behind"),
     "eight datasets": ("MEASURED", "the worked example's real plan"),
-    "eight functions": ("MEASURED", "the Windows-skipped signal tests"),
-    "eight items": ("MEASURED", "what those eight functions collect as"),
+    "eleven functions": ("MEASURED", "the Windows-skipped signal tests"),
+    "eleven items": ("MEASURED", "what those eleven functions collect as, "
+                                 "counted by "
+                                 "test_the_readme_names_every_signal_test_"
+                                 "windows_really_skips"),
     "five tests": ("MEASURED", "the tests the open xfail markers sit on"),
     "57 tests": ("MEASURED", "the R selection, counted exactly by "
                              "test_the_readme_test_counts_are_the_counts_"
                              "this_suite_really_has"),
     "seven strings": ("MEASURED", "the class names three outputs share"),
-    "seven markers": ("MEASURED", "the console's status markers"),
     "four endpoints": ("MEASURED", "the console's JSON routes"),
     "fourteen routes": ("MEASURED", "the console's routes, in a test's note"),
     "six predicates": ("MEASURED", "the predicates one fixture combines"),
@@ -2675,6 +2718,18 @@ COUNT_PROSE = {
                        lambda ma: _suite_tuple_len("test_doctor_json.py",
                                                    "CONFIGS")),
 
+    # ---- DERIVED, added with the tool-group kill ------------------------
+    "four probes": ("DERIVED", "the call sites the spawn helper's allowlist "
+                               "exempts, counted out of the allowlist itself",
+                    lambda ma: _spawn_helper_probe_count()),
+
+    # ---- MEASURED, added with the tool-group kill -----------------------
+    "three hmmsearches": ("MEASURED", "the incident's own log: three "
+                                      "concurrent Pfam searches of the same "
+                                      "455,571 proteins, 13:03 to 20:04"),
+    "200 spawns": ("MEASURED", "the setsid-before-exec check run for that "
+                               "change, 200 of 200 with pgid == pid"),
+
     # ---- PROSE, added by the sixth reading ------------------------------
     # Not a cardinality of anything this codebase has: a pair named in the
     # sentence, a position, a history quoted as the record of a defect, or
@@ -2693,11 +2748,16 @@ COUNT_PROSE = {
                              "refused files, named in the same comment"),
     "five them": ("PROSE", "'five of them went unguarded' - a history: the "
                            "vocabularies before `section` became the eighth"),
-    "five those": ("PROSE", "'Five of those seven markers are new' - a "
+    "five those": ("PROSE", "'Five of those markers are new in v0.5.0' - a "
                             "subset of a count pinned beside it"),
     "seven them": ("PROSE", "'all SEVEN of them have now been measured' - "
                             "the seven paths, pinned as `seven paths`"),
     "three these": ("PROSE", "'All three of these were real' - a named trio"),
+    "three parts": ("PROSE", "'What is true has three parts' - a trio the "
+                             "next three bullets spell out, in CLAUDE.md"),
+    "three results": ("PROSE", "'two of the three results discarded' - the "
+                               "same three searches, counted in the same "
+                               "sentence"),
     "four these": ("PROSE", "'false for four of these twelve' - a subset"),
     "thirty them": ("PROSE", "'all thirty of them' - the sentence this rule "
                              "was written for, quoted in the comment that "
@@ -2713,11 +2773,12 @@ COUNT_PROSE = {
     "four steps": ("PROSE", "'the four steps' - the sequence the #36 test "
                             "drives, written out in order beside it"),
     "four defects": ("PROSE", "a group heading, counted by the group test"),
-    "thirteen entries": ("DERIVED", "the Unreleased/Fixed entries",
-                         lambda ma: sum(n for _h, n
-                                        in _unreleased_fixed_groups())),
-    "three groups": ("DERIVED", "the Unreleased/Fixed groups",
-                     lambda ma: len(_unreleased_fixed_groups())),
+    "six defects": ("PROSE", "a group heading, counted by the group test"),
+    "twenty-three entries": ("DERIVED", "the Unreleased/Fixed entries",
+                             lambda ma: sum(n for _h, n
+                                            in _unreleased_fixed_groups())),
+    "five groups": ("DERIVED", "the Unreleased/Fixed groups",
+                    lambda ma: len(_unreleased_fixed_groups())),
     "seven defects": ("PROSE", "a group heading, counted by the group test"),
     "2 attempts": ("DERIVED", "the opens of the pre-write state read",
                    lambda ma: ma.STATE_READ_TRIES),
@@ -2808,7 +2869,7 @@ def test_every_count_in_prose_is_derived_from_the_thing_it_counts_or_pinned():
     """The class, not the five instances. See the block comment above.
 
     Two halves, and they do different jobs. The NEGATIVE SPACE half reads the
-    six surfaces and refuses any "<number> <plural noun>" the table does not
+    seven surfaces and refuses any "<number> <plural noun>" the table does not
     classify - that is the half that would have caught "thirteen test modules"
     and "all thirty of them", and it is the half that is new. The TABLE half
     goes the other way: it looks for each classified phrase where it is
@@ -2858,7 +2919,7 @@ def test_every_count_in_prose_is_derived_from_the_thing_it_counts_or_pinned():
     # A registry entry for a sentence nobody writes any more is a rule with
     # nothing under it, and the next reader believes it is still enforced.
     assert not stale, \
-        f"COUNT_PROSE classifies phrases that appear in none of the six " \
+        f"COUNT_PROSE classifies phrases that appear in none of the seven " \
         f"surfaces any more: {stale}"
 
 

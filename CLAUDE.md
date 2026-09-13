@@ -169,6 +169,27 @@ it names; do not force the file through another format.
      `hhblits` and `esmfold`. Those land in the live run's directory with no
      check and no warning.
 
+   **Its TOOLS are a claim of their own, and this is the one that cost 98
+   core-hours.** A `kill`, a `SIGHUP` and a Ctrl-C now take each tool's whole
+   process GROUP down — so `interproscan.sh`'s java goes with it, which
+   `proc.kill()` never reached — and the tools are killed before the lock is
+   released, so the moment the directory is unlocked nothing of that run is
+   still executing. What is NOT covered is every death that runs no handler:
+   `SIGKILL`, the OOM reaper, a host reset. Those leave a live `hmmsearch`
+   whose parent is gone, and the lock it was protected by is honestly
+   reclaimable, because the pid in it really is dead. That is the gap the
+   leftover census at the head of every run is for: it names the `.part` files
+   that are lying there, and where one is GROWING it refuses the run rather
+   than become the second writer. A refusal there is the tool holding you to
+   this rule, not a bug — find the writer with `lsof`/`fuser` and stop it
+   yourself. The one growing file it does NOT refuse is one minted by the live
+   holder `--force-unlock-live` has just displaced, which is that flag's own
+   case: it says so loudly and proceeds, because a second refusal on the
+   evidence the flag was typed over would leave the flag with nothing to do. And note the trade the group kill makes: a tool is no longer in
+   the terminal's foreground group, so it no longer dies with a closing tmux
+   pane either (rule 6 is why that matters less than it sounds), and Ctrl-Z
+   now suspends metaannot while its tools keep running.
+
    All of it is damage control after the fact, not permission: one writer per
    results directory is still the rule.
 
@@ -182,6 +203,15 @@ it names; do not force the file through another format.
    may be deleted by hand is scratch the run never records —
    `results/foldseek/tmp*`, `results/foldseek/tmpc`, `results/cluster/tmp` —
    which is never cleaned up and can reach hundreds of GB.
+
+   A dot-prefixed `.part` leftover is **not** in that carve-out, and the
+   program will never remove one: it is the part-written (sometimes the
+   complete) output of real work, it is the only artefact that shows a tool
+   ran twice, and while an orphaned writer still holds the inode an `unlink`
+   would not even free the space — it would only hide the bytes from `du` and
+   destroy `lsof <path>`, which is the one handle that gets from the file back
+   to the process. `find results -name '.*.part.*'` lists them and every run
+   says what it found; removing one is a human's `rm`, deliberately.
 
 6. **Long runs go in tmux.** An SSH drop mid-run leaves partial state. It
    resumes correctly, but only if the process was allowed to record what it
@@ -320,6 +350,38 @@ it names; do not force the file through another format.
 - A repeated sample name in an `.fp-manifest` is a **fraction**, not a
   duplicate. Fraction rows are collapsed to one sample; the manifest is only
   refused when the rows genuinely disagree about the design.
+- **Every tool is launched in a session of its own**
+  (`start_new_session=True`), through one helper, with `stdin` on
+  `/dev/null`. It is not tidiness: a process group is the only handle that
+  reaches a launcher's children, and `proc.kill()` left them alive with
+  `ppid 1` and still inside metaannot's OWN group, where no group kill could
+  reach them without suicide. Do not route a long-lived child around that
+  helper; the four probes that skip it are named in an allowlist a test
+  holds, and a test derives this number from that allowlist rather than
+  trusting the sentence. And do not add an `os.kill(pid)` beside the `killpg` as belt
+  and braces: a stale pgid usually names no group at all, while a stale pid
+  names whatever now holds it, so that backstop would be the one call able to
+  reach a stranger.
+- **The leftover census reports and refuses; it never kills and never
+  deletes.** The pid in a `.part` name is metaannot's, not the tool's, it
+  carries no host, and it can have been recycled — so there is no point at
+  which "this is mine to kill" can be asserted about an orphan, and the
+  program hands the operator `lsof`/`ps -p` instead. Do not add a reaper that
+  resolves the writer from `/proc/*/fd` and kills it: an inode proves a
+  process is *a* writer, not that it is *our tool*, and one wrongly killed
+  30-hour stage costs more than the core-hours it would save.
+- **It refuses on one piece of evidence and has exactly one exemption.** The
+  evidence is a `.part` file whose SIZE changed over the two-second watch. The
+  exemption is a file whose MINTING pid is the holder `--force-unlock-live`
+  has just taken the directory from, where this host proved that holder alive
+  before the lock changed hands: a live holder's tool is precisely what leaves
+  a file growing, so refusing there refused that flag's only case and made a
+  documented flag inert. The exemption is per FILE and keyed on what the lock
+  actually DISPLACED, never on the flag — a `--force-unlock-live` over a
+  corpse, a vacancy, a garbled file or another node's lock displaced no live
+  run and excuses nothing. Do not widen it to the flag: that flag is an
+  assertion about one process, and the writer the census is for is the one
+  nobody has heard of.
 - The console's three refusals are the design, not gaps to fill. It writes
   nothing into a results directory; it does not import metaannot, taking
   everything it knows from `metaannot.py describe --json`; and it never asserts

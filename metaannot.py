@@ -2678,6 +2678,573 @@ def _progress_line(text, width=160):
     return text[:width - 1] + "…" if len(text) > width else text
 
 
+# ======================================================================
+# every tool in a session of its own, so a stop can reach the whole tree
+# ======================================================================
+#
+# WHAT WAS ACTUALLY BROKEN, because it is not only the leak the title
+# suggests. run_cmd has always carried `except BaseException: proc.kill()`,
+# and that clause covers exactly one process: the direct child. Measured on
+# this Mac -- kill the /bin/sh that a launcher script is, and its `sleep`
+# survives with ppid 1 AND STILL SITTING IN METAANNOT'S OWN PROCESS GROUP, so
+# the only group that could reach it is the one we may not kill without
+# killing ourselves. That is interproscan.sh -> java, emapper -> its
+# children, and torch -> its dataloader workers holding VRAM: a whole family
+# of tools for which that clause has never worked.
+#
+# The second hole is the one that cost 98 core-hours. os._exit() in the
+# signal handler runs no `finally` and no `except BaseException`, so on a
+# `kill` the clause above is never reached AT ALL and every child survives -
+# behaviour the handler's own docstring documented, with a price nobody had
+# costed: three concurrent `hmmsearch --cpu 7` against the same 455,571
+# proteins from 13:03 to 20:04, the box 1.6x oversubscribed, two of the three
+# results discarded because a dot-prefixed `.part` file is something no stage
+# can adopt.
+#
+# start_new_session=True puts each tool in a session and process group of its
+# own, so `pgid == proc.pid` with no extra syscall and nothing to look up
+# later, and ONE os.killpg takes the tool and everything it spawned. Measured
+# here on 3.9.6: parent pid 7934 pgid 7931; child pid 7935 pgid 7935 with both
+# grandchildren of `/bin/sh -c "sleep 60 & sleep 60"` in group 7935; one
+# killpg took all three, and our own group was untouched.
+#
+# WHY NOT THE OTHER THREE WAYS. Popen(process_group=) is 3.11+ and the floor
+# is 3.9 (this venv is 3.9.6). preexec_fn runs Python between fork and exec
+# in a program whose stages run inside ThreadPoolExecutors, which is the
+# classic fork-in-a-threaded-program deadlock; start_new_session is
+# implemented in C on the child side of the fork and is safe there.
+# PR_SET_PDEATHSIG needs preexec_fn to set AND is keyed to the THREAD that
+# forked, so under a thread pool it would kill live tools whenever a pool
+# shrinks. One behaviour on the server, the laptop and this Mac beats two.
+#
+# WHAT IT COSTS, because the trade is intrinsic rather than an oversight. A
+# tool in its own session is no longer in the terminal's FOREGROUND process
+# group, so the tty's free broadcast -- which is what actually stops a tool
+# on a keyboard Ctrl-C today, and on a closing tmux pane -- no longer reaches
+# it. Every stop now depends on our own code running: the dispatch loop's
+# kill, the handler below, main()'s KeyboardInterrupt. Where our code does
+# NOT run -- SIGKILL, the OOM reaper, a host reset -- a tool now survives a
+# hangup that would previously have taken it with the pane. That is exactly
+# why the leftover census at the head of the next run ships WITH this and not
+# after it: see _census_leftover_parts().
+#
+# Ctrl-Z is the one regression left unaddressed. SIGTSTP today suspends the
+# whole foreground group, tools included; a tool in its own session keeps
+# running while metaannot sleeps. Forwarding SIGSTOP/SIGCONT to the tracked
+# groups would fix it and is a third and fourth signal in the function whose
+# history includes a measured hang, so it is deliberately not in this change.
+
+
+# How many tools can be live at once, which is what the registry has to hold.
+# DERIVED: stage_workers stages run concurrently and one stage can open an
+# inner pool of its own -- diamond_workers per database, hhblits_workers per
+# query -- so the bound is stage_workers x max(diamond_workers,
+# hhblits_workers), which for DEFAULT_CONFIG is 4 x 4 = 16. The list is 256,
+# so a config that raises both by a long way still fits, and
+# test_the_tool_registry_is_big_enough_for_the_shipped_config holds it
+# against those defaults rather than against this sentence.
+# The list is allocated ONCE, at import, and never resized: the signal handler
+# reads it BY INDEX, and a list that could grow is a list it could read mid-
+# resize.
+_TOOL_SLOTS = 256
+_TOOL_PGIDS = [0] * _TOOL_SLOTS
+# How far into that list anything has ever been written. The handler stops
+# here rather than at _TOOL_SLOTS, so the ordinary run walks a handful of
+# integers instead of 256.
+_TOOL_PG_HIGH = 0
+# WRITERS ONLY. The handler never takes this, which is the whole reason the
+# v0.4.0 deadlock shape cannot come back through it: a worker thread holding
+# it when the signal lands costs the handler nothing, because the handler does
+# not ask for it. A list item store and a list item read are one bytecode
+# each (STORE_SUBSCR, BINARY_SUBSCR), so a fixed-length list of ints is safe
+# to write from N worker threads and read from a handler in the main thread.
+_TOOL_PG_LOCK = threading.Lock()
+
+# Set the moment a stop path starts, and load-bearing rather than decoration:
+# tmbed catches RuntimeError PER CHUNK and launches the next one, and
+# diamond/hhblits have hundreds of queued inner jobs, so killing the current
+# tool without a latch just makes the worker start the next one. See
+# _tool_process(), which refuses to launch anything once this is set and does
+# it with die() -- a StageError, which is the one exception tmbed's per-chunk
+# handler re-raises rather than logging as a failed chunk.
+_STOPPING = False
+
+# Everything the handler needs about its own identity, resolved OUTSIDE it so
+# that it makes no syscall and does no attribute lookup that could raise.
+# Refreshed at registration time by _arm_tool_group_kill().
+_MY_PID = os.getpid()
+_MY_PGID = os.getpgrp() if hasattr(os, "getpgrp") else -1
+_SIGKILL = int(getattr(signal, "SIGKILL", 9))
+_SIGTERM_N = int(getattr(signal, "SIGTERM", 15))
+
+
+def _no_killpg(_pgid, _signum):
+    """Stand-in for os.killpg where there is none -- Windows.
+
+    Bound in place of a None so that the kill loop, which runs inside a signal
+    handler, cannot raise TypeError out of the handler and into whatever frame
+    it interrupted. `except OSError` would not catch that, and an exception
+    escaping a handler is the exact shape of the "release unlocked lock"
+    failure this file already paid for once.
+    """
+    return None
+
+
+_killpg = getattr(os, "killpg", None) or _no_killpg
+_HAVE_KILLPG = hasattr(os, "killpg")
+# Seconds a tool's group gets between SIGTERM and SIGKILL on the paths that
+# may wait -- an unwinding run_cmd, the dispatch loop, main(). Long enough for
+# hmmsearch and foldseek to remove their own scratch, short enough that a
+# supervisor's TimeoutStopSec is nowhere near. The signal handler gets none of
+# this: it may not wait, so it sends SIGKILL and nothing else.
+_TOOL_KILL_GRACE_S = 3.0
+
+
+def _arm_tool_group_kill():
+    """Resolve the handler's identity constants, at registration time.
+
+    They are computed at import as well, so nothing here is load-bearing for
+    correctness; this exists so that the two integers the kill loop compares
+    against are demonstrably the ones true at the moment the handler was
+    installed, rather than the ones true when the module happened to be
+    imported. Called from cmd_run beside the registration.
+    """
+    global _MY_PID, _MY_PGID
+    _MY_PID = os.getpid()
+    if hasattr(os, "getpgrp"):
+        _MY_PGID = os.getpgrp()
+
+
+# WHY THIS IS A MODULE-LEVEL FUNCTION AND NOT FOUR LINES INSIDE THE HANDLER.
+# tests/test_scheduler.py scans the handler's body for anything that takes a
+# lock or allocates through one, and the span it scans is anchored at the lock
+# release for a reason: the long WHY comment above that release contains the
+# names of two of the banned things AS PROSE. Widening the span to cover a
+# kill loop placed above the release would swallow that prose and fail the
+# suite. So the loop lives here, its own body is scanned by the same ban list,
+# and a second assertion pins the ORDERING -- that the handler calls this
+# BEFORE it releases the lock.
+#
+# The ordering is the invariant, and the reason is stronger than the one that
+# is obvious. `release_results_lock` is ResultsLock.__exit__, which calls
+# is_still_ours(), which does open() + fh.read() + json.loads() before it
+# reaches the os.remove. That is buffered text I/O and unbounded allocation
+# INSIDE a signal handler, today, and the source-level scan cannot see it
+# because it reads one frame deep. It does not deadlock -- a fresh file object
+# has a fresh buffer lock, unlike sys.stderr -- but on a wedged NFS mount it
+# blocks indefinitely, and a wedged mount is exactly when a run gets killed.
+# Losing the lock release costs one --force-unlock. Losing the kill costs 98
+# core-hours. So the kill goes first.
+#
+# HOW IT KNOWS A GROUP IS ITS OWN, without a lock and without asking anything.
+# Four steps, and the load-bearing one is a kernel property rather than a
+# timing argument:
+#   1. WE CREATED THE GROUP. A slot is written only by _tool_process, only
+#      from Popen(start_new_session=True), and the value stored is proc.pid.
+#      setsid guarantees pgid == pid for the new leader, so the number in the
+#      slot names a group this process brought into existence, and every
+#      member of it is a descendant of ours -- joining requires setpgid from
+#      inside the same session, and that session holds only our descendants.
+#   2. WHILE THE SLOT IS SET THE GROUP EXISTS, OR WENT AWAY ONE POLL AGO.
+#      The slot is cleared by the same call that sweeps the group, and that
+#      call is made AT the reap -- proc.finish_group(), which every caller
+#      that reaps for itself calls where it reaps: run_cmd, _run_rscript and
+#      doctor --fix's installer, all three -- rather than whenever
+#      the caller happens to leave the helper's `with`. So a non-zero slot
+#      means the leader is alive, is an unreaped zombie of ours, or has a
+#      surviving group member; the tail where it means none of those is
+#      bounded under THE ONE HOLE below, and it is the only part of this step
+#      that is not a kernel property.
+#   3. A PID THAT IS A LIVE GROUP ID IS NOT HANDED OUT AGAIN. Both kernels
+#      refuse to allocate a pid in use as a pgid or sid. Measured here: after
+#      killpg had killed the leader and both grandchildren, it remained
+#      <defunct> and
+#      a SECOND killpg returned EPERM (errno 1), not ESRCH; ESRCH (errno 3)
+#      appeared only once proc.wait() had reaped it. So a set slot whose
+#      group has not just gone (step 2, and that is the whole qualification)
+#      names a group that EXISTS => the number is not recyclable => the only
+#      things it can name are our descendants.
+#   4. IT CANNOT REACH US. Our own pgid is held by a live group leader (the
+#      shell, the tmux pane, or ourselves) and the child's pid was freshly
+#      allocated, so two live processes cannot share it. The two integer
+#      compares are kept anyway, as the cheap half of the proof.
+# killpg is SAFER here than kill-by-pid, not merely more complete: a stale
+# pgid usually names no group at all, whereas a stale pid names whatever now
+# holds it. That is why there is no os.kill(proc.pid) backstop beside it.
+#
+# THE ONE HOLE, AND ITS BOUND IS A CLOCK. Between the moment a group ceases to
+# exist and the store that clears its slot, the slot holds a pid whose pgid
+# reservation the kernel has already released. For a signal landing there to
+# do harm that pid must ALREADY have been recycled AND its new owner must have
+# made itself a group leader, since a non-leader with that pid is unreachable
+# by killpg.
+#
+# THIS COMMENT USED TO SAY THE BOUND WAS A COUNT -- "a few bytecodes", so that
+# the pid space would have to wrap inside them -- AND THAT WAS FALSE BY FIVE
+# SECONDS. The reap is run_cmd's own proc.wait(); the slot was cleared by
+# _tool_process's `finally`, which is reached only after run_cmd's
+# reader.join(timeout=5). And it was the WHOLE five seconds in exactly the
+# case the success-path sweep below exists for: a surviving child inherits the
+# tool's stderr, so iter(stream.readline, "") never sees EOF and the join
+# burns its entire timeout. Measured, with a tool that exits 0 leaving one
+# child behind --
+#     reap -> _end_tool_group gap: 5.02s
+#     reap -> slot cleared gap:    5.07s
+#     leader pid still in process table: False
+#     slot contents at _end_tool_group: [55810]
+# -- so for five seconds the registry advertised a leader that was gone from
+# the process table, and _end_tool_group then aimed killpg(pg, 0) -> SIGTERM
+# -> SIGKILL at that group. NOT at a recycled number, and the distinction is
+# the whole of step 3 above: the survivor that holds the pipe open is a member
+# of that group, so it RESERVES the pgid and the kernel cannot hand the number
+# out again while it lives. Driven: with the leader reaped and absent from
+# `ps`, killpg(leader, 0) still SUCCEEDS and _group_is_empty answers False,
+# both at the reap and five and a half seconds later, and answers True only
+# once the survivor dies. So the five seconds were a latency, not a recycle
+# hazard, and the reason to close them is that the group this run is
+# responsible for went on running for five seconds after the run had finished
+# with it -- which in the incident this change is about is the whole cost.
+# The recycle hazard lives in the OTHER case, the leaf tool whose group is
+# already empty at the reap, and there it is bounded by bytecodes rather than
+# by a clock because nothing is escalated at all: the signal-0 probe answers
+# ESRCH and _end_tool_group returns having sent nothing. 99998 process creations on macOS
+# (4194304 on a default Linux) inside a few bytecodes is unreachable; inside
+# five seconds on a fork-heavy box, or inside a pid namespace with a small
+# `pid_max`, it is not.
+#
+# So the sweep and the store both happen AT the reap now, and the bound is
+# what it says it is. Two cases, and neither is a bytecode count:
+#   * A GROUP ALREADY EMPTY AT THE REAP -- every leaf tool, thousands of times
+#     a run. _end_tool_group's signal-0 probe answers ESRCH and it returns
+#     having sent nothing at all, so the slot is cleared a few bytecodes after
+#     the reap and no signal is ever aimed at the released number. This is the
+#     case the old sentence described, and it is the only one it fitted.
+#   * A GROUP WITH A SURVIVOR IN IT. That survivor holds the pgid, so the
+#     number is not recyclable while it lives (step 3), and the sweep does not
+#     return until the group is empty or grace has run out. The slot is
+#     therefore cleared within one _group_is_empty() poll -- _GROUP_POLL_S,
+#     0.05 s -- of the group actually going away. That 0.05 s, not five
+#     seconds, is the residual window, and it is a clock.
+# os.waitid(P_PID, pid, WEXITED | WNOWAIT) would close the first case
+# completely by learning of the exit without reaping, and it does not exist on
+# this Mac's interpreter (3.9.6), though P_PID, WNOWAIT and WEXITED are all
+# defined there; a ctypes shim for a few bytecodes is not worth the complexity
+# in this path, and it would do nothing for the 0.05 s of the second case,
+# which is the larger of the two.
+def _kill_tool_groups():
+    """SIGKILL the process group of every tool this run still has running.
+
+    Raw syscalls only: this is called from a signal handler, which runs in the
+    main thread between two bytecodes of whatever that thread was doing, so
+    anything that can block is forbidden and any lock the interrupted frame
+    holds is still held. What is here is a list read by index, integer
+    compares against two module-level ints, and kill(2).
+
+    killpg cannot block. SIGKILL is delivered by the kernel, needs no
+    cooperation and no wait, and is the only reason doing this from a handler
+    is possible at all: we do not reap, we do not wait, we do not confirm. The
+    children are reparented to init when we exit microseconds later and are
+    reaped there, so no zombie is left behind.
+
+    A `while` with an index rather than `for ... in`: a worker thread can run
+    between two bytecodes of this loop, and index reads make that harmless --
+    "changed size during iteration" is impossible by construction.
+
+    The `_pg <= 0` guard is not tidiness. os.killpg(0, SIGKILL) means "my own
+    process group", which would kill this process before the lock release and
+    before the message, and would turn the pinned 128+N exit status into 137.
+    Measured: killpg(0, SIGKILL) does exactly that. The zero sentinel sits one
+    typo away from suicide, so the guard is explicit.
+    """
+    _i = 0
+    while _i < _TOOL_PG_HIGH:
+        _pg = _TOOL_PGIDS[_i]
+        _i += 1
+        if _pg <= 0 or _pg == _MY_PGID or _pg == _MY_PID:
+            continue
+        try:
+            _killpg(_pg, _SIGKILL)
+        except OSError:
+            pass
+
+
+def _claim_tool_slot(pgid):
+    """Record a tool's process group id, returning its slot or -1.
+
+    The store lands BEFORE the high-water mark moves, so the handler can never
+    see a slot index it is allowed to read holding something a writer has not
+    finished putting there.
+    """
+    global _TOOL_PG_HIGH
+    with _TOOL_PG_LOCK:
+        for i in range(_TOOL_PG_HIGH):
+            if _TOOL_PGIDS[i] == 0:
+                _TOOL_PGIDS[i] = pgid
+                return i
+        if _TOOL_PG_HIGH < _TOOL_SLOTS:
+            _TOOL_PGIDS[_TOOL_PG_HIGH] = pgid
+            _TOOL_PG_HIGH += 1
+            return _TOOL_PG_HIGH - 1
+    return -1
+
+
+def _release_tool_slot(slot):
+    """Forget a tool's group. One STORE_SUBSCR, no lock, no allocation.
+
+    Deliberately not under _TOOL_PG_LOCK: a claim that reads this slot a
+    moment too early sees a stale non-zero, skips it and takes another, which
+    costs nothing. Taking the lock here would put it on the cleanup path of
+    every tool in the run for no gain.
+    """
+    if 0 <= slot < _TOOL_SLOTS:
+        _TOOL_PGIDS[slot] = 0
+
+
+def _killpg_quiet(pgid, signum):
+    """os.killpg, with ESRCH and EPERM swallowed. Never called from a handler."""
+    if not _HAVE_KILLPG:
+        return
+    try:
+        os.killpg(pgid, signum)
+    except OSError:
+        pass
+
+
+# How often the two sweeps below ask whether a group has gone. It is also the
+# residual recycle window: the slot that advertises a pgid is cleared within
+# one of these of the group actually ceasing to exist. See THE ONE HOLE above
+# _kill_tool_groups().
+_GROUP_POLL_S = 0.05
+
+
+def _group_is_empty(pgid):
+    """Whether no process is left in `pgid`.
+
+    EPERM is NOT empty, and the distinction is the one that matters: a group
+    whose only remaining member is a zombie we have not reaped answers that
+    way -- measured -- and so does one holding a process owned by somebody
+    else. Only ESRCH is proof the group has gone.
+    """
+    if not _HAVE_KILLPG:
+        return True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _end_tool_group(proc, grace=None):
+    """Leave nothing of this tool behind, whichever way its caller is leaving.
+
+    TWO CASES, and they differ in what can be proved at the moment of the
+    kill, which is why they are not one code path.
+
+    THE LEADER IS STILL UNREAPED (proc.returncode is None) -- we are unwinding
+    out of a wait, which is the Ctrl-C and die() path. The group provably
+    exists, because its leader is our own live-or-zombie child, so its pgid is
+    still reserved and cannot name anything but our descendants. SIGTERM, a
+    bounded wait, then SIGKILL: waiting is legal here, and it is what lets
+    hmmsearch and foldseek remove their own scratch trees.
+
+    THE LEADER HAS BEEN REAPED -- the ordinary success path, where the wait
+    loop above has already collected the exit status. A tool can exit 0 and
+    leave a live member in its group (measured), and the group outlives the
+    leader's reap, so "hmmsearch said it was done" is not the same statement
+    as "nothing of hmmsearch is left". But the reap is also the moment the
+    pgid stops being reserved, so an unconditional killpg here would be a
+    signal to a number nobody holds -- thousands of times a run, with hhblits
+    launching one tool per query. So the first thing sent is signal 0, which
+    touches nothing: ESRCH means the group is empty and there is nothing to do
+    at all, which is the answer for every leaf tool. Only a group that is
+    still there is escalated.
+
+    Every signal sent on that arm follows an observation that the group was
+    still there by a few bytecodes -- signal 0, then SIGTERM, then a poll
+    loop, then SIGKILL only if the last poll said "still there". That is a
+    bytecode count and not a clock, but it is only worth having if this runs
+    at the reap: the probe is what the escalation rests on, and a probe taken
+    five seconds after the reap is a probe of whatever the pid has become
+    since. Which is why run_cmd calls proc.finish_group() where it reaps
+    rather than leaving it to the helper's `finally`. See THE ONE HOLE above
+    _kill_tool_groups() for the measurement that says so.
+    """
+    grace = _TOOL_KILL_GRACE_S if grace is None else grace
+    if not _HAVE_KILLPG:
+        # No process groups to kill. proc.kill() is what there is, and on
+        # Windows TerminateProcess does not reach a child's children either.
+        if proc.returncode is None:
+            proc.kill()
+            proc.wait()
+        return
+    pg = proc.pid
+    if pg <= 0 or pg == _MY_PGID or pg == _MY_PID:
+        return
+    if proc.returncode is None:
+        _killpg_quiet(pg, _SIGTERM_N)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+        if proc.returncode is None:
+            _killpg_quiet(pg, _SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=grace)
+    if _group_is_empty(pg):
+        return
+    _killpg_quiet(pg, _SIGTERM_N)
+    end = time.time() + grace
+    while time.time() < end and not _group_is_empty(pg):
+        time.sleep(_GROUP_POLL_S)
+    if not _group_is_empty(pg):
+        _killpg_quiet(pg, _SIGKILL)
+
+
+def _stop_tool_groups(why, grace=None):
+    """Set the stopping latch and take every live tool group down.
+
+    For the paths that UNWIND -- the dispatch loop, main()'s
+    KeyboardInterrupt, a die() out of a stage -- where logging and waiting are
+    both legal. The signal handler cannot use this and calls
+    _kill_tool_groups() instead.
+
+    The latch comes first and matters as much as the kill. Without it, killing
+    the tool a worker is waiting on just makes that worker start the next one:
+    tmbed would march through its remaining chunks and hhblits through its
+    remaining queries while the main thread sat in the executor's join.
+    """
+    global _STOPPING
+    _STOPPING = True
+    if not _HAVE_KILLPG:
+        return
+    live = [pg for pg in _TOOL_PGIDS[:_TOOL_PG_HIGH]
+            if pg > 0 and pg != _MY_PGID and pg != _MY_PID]
+    if not live:
+        return
+    grace = _TOOL_KILL_GRACE_S if grace is None else grace
+    log(f"{why}: sending SIGTERM to {len(live)} tool process group(s), then "
+        f"SIGKILL to whatever is left after {grace:.0f}s. "
+        "A tool is a separate process tree - interproscan.sh runs java, "
+        "emapper and torch fork children - so the whole group goes, not just "
+        "the process this run launched. Part-written output is left as a "
+        "`.part` file and nothing here deletes it.", "WARN")
+    for pg in live:
+        _killpg_quiet(pg, _SIGTERM_N)
+    end = time.time() + grace
+    while time.time() < end and not all(_group_is_empty(pg) for pg in live):
+        time.sleep(_GROUP_POLL_S)
+    for pg in live:
+        if not _group_is_empty(pg):
+            _killpg_quiet(pg, _SIGKILL)
+
+
+@contextlib.contextmanager
+def _tool_process(argv, **kw):
+    """The ONE place this program starts a tool, so that stopping one works.
+
+    Every long-lived child goes through here -- run_cmd for the search tools,
+    _run_rscript for the report and the object, and doctor --fix's installer
+    shell, whose curl/wget grandchild is the leak measured above. Four probes
+    deliberately do not -- `diamond dbinfo`, `nvidia-smi -L`, `sysctl -n
+    hw.memsize` and Rscript's version probe: they cannot outlive anything, and
+    a test's allowlist naming them is cheaper than registration on every
+    probe. test_every_long_lived_child_goes_through_the_spawn_helper holds
+    that line, and a test in test_docs.py derives the COUNT from that
+    allowlist, for every surface that states it.
+
+    stdin=DEVNULL is required rather than cosmetic. A child in a session of
+    its own that reads the inherited terminal gets SIGTTIN and STOPS; nothing
+    here is interactive and run_cmd has never had a stdin parameter, so a tool
+    that tries to prompt now gets EOF instead of wedging a three-day run.
+
+    There is no parent-side os.setpgid(proc.pid, proc.pid) beside this, and
+    the omission is deliberate: the race it would close does not exist.
+    Popen.__init__ blocks reading the exec error pipe until that pipe's write
+    end closes, which happens at exec, and the child calls setsid BEFORE exec
+    -- so by the time Popen returns the child is already a session leader.
+    Measured 200/200 spawns with pgid == pid and no sleep, with the parent-side
+    setpgid returning EPERM 200/200. In the only world where it could fire it
+    would make the CHILD's setsid fail instead, which _posixsubprocess reports
+    on the error pipe, so Popen would RAISE: a phantom race traded for a real
+    spawn failure.
+
+    The window that is left is one signal landing between Popen returning and
+    the slot store: that tool is then unregistered and survives the handler.
+    It cannot be closed without blocking signals around the launch, and
+    pthread_sigmask is per-thread while the Python handler runs in the main
+    thread, so a worker cannot help. It is covered by the leftover census at
+    the head of the next run.
+
+    A CALLER THAT REAPS THE CHILD ITSELF MUST CALL proc.finish_group() WHERE
+    IT REAPS. The reap is the moment the kernel stops reserving the pgid, so
+    from there on the slot advertises a number that can be handed out again
+    and the sweep's own probe is asking about whatever now holds it. Leaving
+    both to the `finally` below means "whenever this caller gets round to
+    leaving the block", which in run_cmd was a reader.join(timeout=5) -- five
+    measured seconds, and the whole five in the case the sweep exists for. See
+    THE ONE HOLE above _kill_tool_groups(). The hook is idempotent, so the
+    `finally` stays the guarantee and a caller that does not reap (or that
+    leaves by an exception) needs to know nothing about it.
+    """
+    name = argv if isinstance(argv, str) else str(argv[0])
+    if _STOPPING:
+        die(f"this run is stopping, so `{name}` was not started. The tools "
+            "that were already running have been sent SIGTERM and then "
+            "SIGKILL; nothing under the results directory has been deleted, "
+            "and the stage that was running is still recorded `running`, so "
+            "the next run recomputes it.")
+    session = {"start_new_session": True} if os.name != "nt" else {}
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **session, **kw)
+    slot = -1
+    if session:
+        slot = _claim_tool_slot(proc.pid)
+        if slot < 0:
+            log(f"the tool registry is full ({_TOOL_SLOTS} slots), so `{name}` "
+                "(pid " + str(proc.pid) + ") WILL NOT BE STOPPED by a signal: "
+                "a `kill` of this run leaves it running, holding its cores, "
+                "and writing into this results directory. The stage runs "
+                "anyway. Lower stage_workers, diamond_workers or "
+                "hhblits_workers if this ever appears.", "WARN")
+    ended = []
+
+    def finish_group():
+        """Sweep this tool's group and forget it. AT MOST ONCE, ever.
+
+        The once-ness is the safety property and not tidiness. Once the sweep
+        has returned and the slot is clear, this pgid names nothing this
+        process is entitled to signal -- the group is gone, or it has had a
+        SIGKILL and grace has run out -- so a SECOND sweep would aim killpg at
+        whatever the kernel has handed that number since. A list used as a
+        flag because a closure cannot rebind an enclosing name on 3.9 without
+        `nonlocal`, and one append reads the same either way.
+        """
+        if ended:
+            return
+        ended.append(True)
+        try:
+            _end_tool_group(proc)
+        finally:
+            _release_tool_slot(slot)
+
+    # Attached to the Popen rather than yielded as a second value: every call
+    # site here takes a bare `as proc`, the tests included, and the object
+    # that knows when the reap happened is exactly the object that knows which
+    # slot it claimed. A caller that ignores it behaves exactly as before.
+    proc.finish_group = finish_group
+    try:
+        yield proc
+    finally:
+        try:
+            finish_group()
+        finally:
+            # Breaks the proc -> closure -> proc cycle rather than leaving it
+            # for the collector. hhblits launches one tool per query, so this
+            # is a few hundred thousand Popen objects on a real run, and a
+            # later call on a finished group should raise rather than look
+            # like a no-op.
+            proc.finish_group = None
+
+
 def run_cmd(cmd, cwd=None, env=None):
     """Run a command, raising with the tail of stderr on failure.
 
@@ -2696,6 +3263,15 @@ def run_cmd(cmd, cwd=None, env=None):
     none of it reached the operator, so the only way to tell a live stage from
     a hung one was to watch its CPU ticks in /proc. The tutorial tells people
     to expect 1-3 DAY runs.
+
+    Every tool goes out through _tool_process, so it runs in a session of
+    its own and its entire process group is taken down on the way out of this
+    function - SIGTERM, a grace period, then SIGKILL. That is what makes a
+    Ctrl-C or a die() reach interproscan.sh's java, emapper's children and
+    torch's dataloader workers rather than only the process this function
+    launched, which is all proc.kill() ever reached. It also means a tool no
+    longer sits in the terminal's foreground process group, so the tty's own
+    Ctrl-C no longer arrives for free: see the block above _tool_process.
 
     Return value ("") and failure behaviour (RuntimeError quoting the tail)
     are deliberately unchanged: every stage depends on both.
@@ -2742,13 +3318,20 @@ def run_cmd(cmd, cwd=None, env=None):
         # that hides its actual failure.
         argv = [str(c) for c in cmd]
         argv[0] = resolve_tool(argv[0])
-        proc = subprocess.Popen(argv, cwd=cwd, env=env,
-                                stdout=null, stderr=subprocess.PIPE,
-                                text=True, errors="replace")
-        reader = threading.Thread(target=pump, args=(proc.stderr,),
-                                  daemon=True)
-        reader.start()
-        try:
+        # _tool_process, not subprocess.Popen. It puts the tool in a session
+        # of its own so that stopping it can reach the tools IT launched, and
+        # its `finally` takes that whole group down on every way out of this
+        # block - the exception path this used to handle with proc.kill(),
+        # which covered the direct child only, and the SUCCESS path, which
+        # nothing covered: a tool can exit 0 and leave a live member in its
+        # group, and "the tool said it was done" is not the same statement as
+        # "nothing of the tool is left". See _end_tool_group for both.
+        with _tool_process(argv, cwd=cwd, env=env,
+                           stdout=null, stderr=subprocess.PIPE,
+                           text=True, errors="replace") as proc:
+            reader = threading.Thread(target=pump, args=(proc.stderr,),
+                                      daemon=True)
+            reader.start()
             while True:
                 try:
                     proc.wait(timeout=_PROGRESS_INTERVAL or None)
@@ -2758,13 +3341,25 @@ def run_cmd(cmd, cwd=None, env=None):
                     log(f"{name} running {_elapsed_str(time.time() - started)}"
                         + (f" | {newest}" if newest else
                            " | no output yet on stderr"))
-        except BaseException:
-            # What subprocess.run did on Ctrl-C: do not leave a GPU job or an
-            # InterProScan behind, still running, after the pipeline exits.
-            proc.kill()
-            proc.wait()
-            raise
-        reader.join(timeout=5)
+            # HERE, AND NOT IN THE HELPER'S `finally` FIVE SECONDS FROM NOW.
+            # The wait above is the reap, and the reap is the moment the
+            # kernel stops reserving this tool's pgid: from here on the
+            # registry the signal handler reads advertises a number that can
+            # be handed out again, and the sweep's own signal-0 probe is
+            # asking about whatever now holds it. The `finally` is reached
+            # only after the join below, which burns its whole timeout in
+            # precisely the case the sweep exists for -- a surviving child
+            # inherits this tool's stderr, so iter(stream.readline, "") never
+            # sees EOF. Measured at 5.02s and 5.07s; see THE ONE HOLE above
+            # _kill_tool_groups(). The helper's `finally` still runs and is
+            # still the guarantee; this call makes it a no-op.
+            #
+            # It also makes the join below return instead of expiring, because
+            # the survivor whose write end was holding the pipe open has just
+            # been killed. That is a consequence and not the reason: the
+            # reason is the syscall.
+            proc.finish_group()
+            reader.join(timeout=5)
 
     if proc.returncode != 0:
         with kept_lock:
@@ -11472,6 +12067,18 @@ class ResultsLock:
         self.state_path = state_path
         self.empty_grace = float(empty_grace)
         self.held = False
+        # WHOM --force-unlock-live DISPLACED, or None. Set only on the arm the
+        # refusal below fires on when the flag is absent: this host PROVED the
+        # holder alive and the operator said to take the directory anyway.
+        #
+        # It exists for exactly one reader, the leftover census, and it is the
+        # only evidence that can tell that holder's tool -- which is a writer
+        # the operator has just asserted they know about -- from a writer
+        # nobody asked about. Without it the census refuses on the very state
+        # --force-unlock-live is for, and the flag is inert. See
+        # _census_leftover_parts(). Nothing else decides anything on it; no
+        # lock is taken, kept or released on it.
+        self.displaced_live = None
         # What __enter__ wrote into the file, and whether it got as far as
         # writing it. __exit__ reads both back: it may only remove a lock that
         # is still the one this object took. See is_still_ours().
@@ -11596,8 +12203,9 @@ class ResultsLock:
                         "Two runs sharing a results directory corrupt each "
                         "other. Wait for it, or use --force-unlock if you are "
                         "certain it is gone.")
+                proof = self._holder_proof(info)
                 if (self.force and not self.force_live
-                        and self._holder_proof(info) == PROVEN_ALIVE):
+                        and proof == PROVEN_ALIVE):
                     # The refusal, and it fires on the PROVEN arm alone. It
                     # takes nothing away: a holder on another node, a garbled
                     # lock, a pid this host cannot ask about and every Windows
@@ -11624,8 +12232,29 @@ class ResultsLock:
                         "once its owner is gone -- or if you are certain it "
                         "has to be taken over anyway, pass "
                         "--force-unlock-live as well.")
-                log(f"removing a stale lock from pid {pid} on {host or '?'}",
-                    "WARN")
+                if self.force_live and proof == PROVEN_ALIVE:
+                    # NOT "removing a stale lock": this one is not stale, and
+                    # the log has to say which of the two things happened or
+                    # the operator reading it afterwards cannot tell a
+                    # reclaimed corpse from a displaced live run. Recorded as
+                    # well as said, because the census two steps from now has
+                    # no other way to know that the growing file it is about
+                    # to find belongs to the run this flag displaced.
+                    self.displaced_live = {"pid": pid, "host": host,
+                                           "started": info.get("started")}
+                    log(f"--force-unlock-live: taking {self.path} from pid "
+                        f"{pid} on {host or '?'} (started "
+                        f"{info.get('started', '?')}), which this host can see "
+                        "is STILL RUNNING. That is the claim this flag makes, "
+                        "and from here on that run is the superseded one: it "
+                        "stops writing the state file when it notices, parks "
+                        "the declared outputs of a stage it was inside as "
+                        "`.superseded.*`, and its tools are not stopped by "
+                        "anything here. Two runs in one results directory is "
+                        "the corruption the lock exists to prevent.", "WARN")
+                else:
+                    log(f"removing a stale lock from pid {pid} on "
+                        f"{host or '?'}", "WARN")
                 try:
                     os.remove(self.path)
                 except OSError:
@@ -12004,6 +12633,408 @@ def _fs_clock_ahead(path):
         return os.path.getmtime(path) - time.time()
     except OSError:
         return None
+
+
+# ======================================================================
+# the leftover census: what is lying in a results directory, and who is
+# still writing it
+# ======================================================================
+#
+# WHY THIS EXISTS AND WHY IT IS NOT OPTIONAL. The group kill above closes
+# every stop path that delivers a signal we can handle. It cannot close
+# SIGKILL, the OOM reaper or a host reset, because no handler runs for those -
+# and the incident that prompted all of this was one of them. The proof is the
+# next run's own log line: "removing a stale lock from pid 336" is written
+# only on the branch that finds a lock FILE still on disk, and the handler
+# removes that file, so pid 336 never reached its handler. Nothing in a signal
+# handler could have prevented the measured 98 core-hours. This is what
+# covers it - and the group kill above makes it MORE necessary rather than
+# less, because a tool in its own session no longer dies with a closing tmux
+# pane either.
+#
+# That inference got tighter rather than looser with the --force-unlock-live
+# exemption below: a lock taken from a holder this host could SEE running now
+# logs a line of its own and not "removing a stale lock", so the 12:58 line
+# names a lock that really was a corpse's, which is the whole of the argument
+# above.
+#
+# WHAT IT REASONS ON, and it is deliberately not a pid. atomic_out mints
+# `.{stem}.{os.getpid()}.{tid}.part{ext}` from METAANNOT's pid, so the number
+# in `.pfam.336.140234.part.tblout` identifies the dead RUN that opened the
+# file and says nothing whatever about the hmmsearch that was writing it. The
+# tool's own pid is recorded nowhere - not on disk, not in a state key, not in
+# a log line - so a pid read out of that name is the wrong process, carries no
+# host, and can have been recycled by anything since. This asks the process
+# table exactly one question, and it is an identity comparison rather than a
+# lookup: is this pid our own? That cannot be fooled by recycling.
+#
+# The evidence it does use is host-independent, recycle-proof and
+# privilege-free:
+#   * SIZE, sampled twice. An integer, monotone for an append-only tblout,
+#     needing no clock at all, and immune to the two-second SMB and FAT mtime
+#     granularity that OUTPUT_STAMP_SLACK_S already documents. A size that
+#     CHANGES is positive proof that a process which is not this run is
+#     writing under a results directory this run is about to take. That is the
+#     one thing here that refuses a run.
+#   * MTIME, as corroboration and as the sentence an operator reads, compared
+#     against .metaannot_state.json's own mtime on the SAME filesystem -
+#     stat'ed before this run rewrites it - so it is two mtimes from one clock
+#     rather than an mtime against time.time(), which is the mistake
+#     _fs_clock_ahead() exists to guard. Suppressed above the same skew
+#     threshold report_output_stamps() uses, for the same reason.
+#
+# WHAT IT NEVER DOES. It does not delete, rename, move, truncate or read past
+# stat, and it never signals anything. The 237 MB tblout from the incident is
+# still in results/hmm/ and stays there: rule 5 of CLAUDE.md settles the
+# deletion, and
+# three further reasons settle the rest. It is the only artefact that shows
+# three hmmsearches ran. An unlink would not even free the space while an
+# orphaned writer holds the inode - it would make the bytes invisible to `du`
+# and destroy `lsof <path>`, the one handle that gets from the file back to
+# the live process - and on Windows it would fail outright. And it may be real
+# work: a complete tblout ending in `# [ok]` can be the only finished Pfam
+# search of the three, which is the argument _park_superseded() already makes
+# for the analogous case.
+#
+# It also cannot see an orphan that leaves no pid-bearing name, and the list
+# is the same one _park_superseded() already enumerates: hhblits' per-query
+# `<id>.hhr` and its own `.hhr.part`, esmfold's plddt.tsv and
+# esmfold_failed.tsv appended in place, the `.done` sentinels, and emapper's
+# annotations table, which its live branch writes in place with no temp and no
+# rename. Silence here is not health.
+
+# Derived from ATOMIC_SUFFIX rather than spelled out, so it cannot drift from
+# the writer that mints it. STRICTNESS IS THE WHOLE SAFETY OF IT: a leading
+# dot, a stem, TWO all-digit fields, the fixed suffix. Excluded by
+# construction, each for a reason -
+#   * `{parts}/{tag}.pred.part` - tmbed's per-chunk file, no leading dot and
+#     no numeric fields. It is deliberately KEPT and salvaged record by record
+#     by the concatenation, and already() re-plans against it, so reporting it
+#     would fire on every normal chunked tmbed resume on the laptop.
+#   * `{hhr_dir}/{id}.hhr.part` - names a protein, not a process, and is swept
+#     by the hhblits stage's own glob when it finishes.
+#   * rsync's in-flight `.plddt.tsv.a8Kd2p` - dot-prefixed, but no `.part` and
+#     no two numeric fields. This one matters more than it looks: TUTORIAL.md
+#     prescribes `rsync -a` everywhere for the two-machine workflow, an
+#     interrupted transfer leaves exactly that shape, and a looser `*.part*`
+#     or `.*` pattern would report every dropped ssh as an orphaned tool.
+#   * `.superseded.*` parked work - a different fixed marker, in front of the
+#     stem, with a `find` of its own.
+_PART_LEFTOVER_RE = re.compile(
+    r"^\.(?P<stem>.+)\.(?P<pid>[0-9]+)\.(?P<tid>[0-9]+)"
+    + re.escape(ATOMIC_SUFFIX) + r"(?P<ext>.*)$")
+
+# Seconds between the census's two stat samples. Spent ONCE, at the head of a
+# run measured in days, and only when a candidate actually exists - a results
+# directory with no leftovers never waits at all. It buys the one thing a
+# single sample cannot give: a bare mtime cannot tell a live writer from a
+# `cp -r` that restamped a corpse, and two sizes can.
+PART_GROWTH_WATCH_S = 2.0
+
+# How long the scan may take before it says so. structures/ holds one PDB per
+# dark protein - 455,571 entries on the real run - and that is the directory
+# whose cost drove the console's own part-file cache. One scandir per declared
+# output directory, twice at most per run, is a different order of magnitude
+# from one per poll per open tab, but it is not free and the cost should be
+# visible rather than inferred.
+PART_SCAN_SLOW_S = 2.0
+
+
+def _leftover_parts(dirs):
+    """Every `.part` leftover in `dirs` that this process did not mint.
+
+    Returns (candidates, unreadable): a list of dicts carrying path, dir,
+    stem, pid, size and mtime, and the directories that could not be read.
+
+    os.scandir and not os.walk: one level, names first, and stat() only on
+    the handful of names that match. A directory this run cannot read yields
+    no candidates and is REPORTED rather than skipped - the absence of
+    evidence is never reported here as evidence of absence.
+    """
+    me = os.getpid()
+    found, unreadable = [], []
+    for d in sorted({x for x in dirs if x}):
+        try:
+            entries = list(os.scandir(d))
+        except OSError as e:
+            unreadable.append(f"{d} ({e.strerror or e})")
+            continue
+        for e in entries:
+            m = _PART_LEFTOVER_RE.match(e.name)
+            if not m:
+                continue
+            # The ONE question asked of the process table, and it is an
+            # identity comparison and not a lookup. Belt and braces beside
+            # the ordering that makes it unnecessary: the census runs before
+            # this run has dispatched anything, so nothing of ours exists to
+            # be confused - but os.getpid() can itself collide with a
+            # leftover's pid after a reboot or on a small pid_max.
+            if int(m.group("pid")) == me:
+                continue
+            try:
+                st = e.stat()
+            except OSError:
+                continue          # gone between the listing and the stat
+            found.append({"path": os.path.join(d, e.name), "dir": d,
+                          "stem": m.group("stem"), "pid": int(m.group("pid")),
+                          "size": st.st_size, "mtime": st.st_mtime})
+    return found, unreadable
+
+
+def _part_leftover_stages(stages, p):
+    """(directory, stem) -> stage name, for every DECLARED stage output.
+
+    Built from the stages themselves and split exactly the way atomic_out
+    mints a temp name, so the mapping cannot drift from the writer. A leftover
+    whose (directory, stem) is not in here is a per-item output - one PDB per
+    dark protein, one .tsv per DIAMOND database - which no stage declares.
+    """
+    out = {}
+    for st in stages:
+        for o in st["out"](p):
+            if not o:
+                continue
+            d = os.path.dirname(o) or "."
+            stem = os.path.splitext(os.path.basename(o))[0]
+            out.setdefault((d, stem), st["name"])
+    return out
+
+
+def _census_leftover_parts(p, stage_of, selected, state_mtime, fs_ahead,
+                           watch_s=PART_GROWTH_WATCH_S, displaced_live=None):
+    """Say what `.part` leftovers are here, and REFUSE if one is growing.
+
+    Called once, at the head of a run, after the lock is taken and before any
+    stage is dispatched. That position is chosen rather than convenient: the
+    declared outputs are known, the filesystem clock has been measured, and
+    nothing of this run's own has been written yet - which is what makes the
+    own-temp exclusion a proof rather than a heuristic.
+
+    Returns the candidate list, for the tests. Raises through die() - and only
+    then - when a second sample shows one of them changing AND that change
+    cannot be attributed to the live holder `displaced_live` names; see the
+    long comment on that at the second sample.
+    """
+    dirs = {os.path.dirname(o) or "." for o in _DECLARED_OUTPUTS}
+    t0 = time.time()
+    cands, unreadable = _leftover_parts(dirs)
+    took = time.time() - t0
+    if took > PART_SCAN_SLOW_S:
+        log(f"the leftover scan of {len(dirs)} output director(ies) took "
+            f"{took:.1f}s; structures/ holds one file per dark protein, which "
+            "is the one that costs.", "WARN")
+    if unreadable:
+        log("these output directories could not be listed, so nothing can be "
+            "said about what is lying in them: " + "; ".join(unreadable)
+            + ". That is not the same answer as `nothing is there`.", "WARN")
+    if not cands:
+        return []
+
+    # Aggregated by DIRECTORY and by PID, and the aggregation is mandatory
+    # rather than cosmetic: _park_superseded() deliberately leaves one `.part`
+    # per item, so an interrupted esmfold legitimately leaves one per dark
+    # protein and structures/ accumulates them by design. One line per
+    # directory-and-pid keeps the length bounded by the number of directories
+    # instead of by the number of files.
+    groups = {}
+    for c in cands:
+        groups.setdefault((c["dir"], c["pid"]), []).append(c)
+    # Only the LEADING skew is asked about, and for the reason
+    # _fs_clock_ahead() gives: two clocks compared against each other say
+    # nothing, and the size comparison below survives the suppression, which
+    # is why size is the primary evidence and this is not.
+    datable = (state_mtime and (fs_ahead is None
+                                or fs_ahead <= OUTPUT_STAMP_SLACK_S))
+    lines, colliding = [], {}
+    for (d, pid), items in sorted(groups.items()):
+        newest = max(i["mtime"] for i in items)
+        total = sum(i["size"] for i in items)
+        stages = sorted({stage_of.get((i["dir"], i["stem"]), "") or "?"
+                         for i in items})
+        for s in stages:
+            if s in selected:
+                colliding[s] = True
+        when = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(newest))
+        gap = ""
+        if datable:
+            delta = newest - state_mtime
+            gap = (f", which is {_elapsed_str(abs(delta))} "
+                   + ("after" if delta >= 0 else "before")
+                   + " the last moment the run before this one recorded "
+                     "anything")
+        lines.append(
+            f"\n    [{d}] {len(items)} leftover(s) from metaannot pid {pid}, "
+            f"{total / 1e6:.1f} MB in all, newest written {when}{gap}"
+            + f"\n        stage(s) that write those names: {', '.join(stages)}"
+            + ("\n        " + _file_note(items[0]["path"])
+               if len(items) == 1 else
+               "\n        newest: " + _file_note(
+                   max(items, key=lambda i: i["mtime"])["path"])))
+
+    sel = sorted(colliding)
+    log(f"{len(cands)} in-progress output(s) under {p.R} were opened by a "
+        "metaannot process that is not this one:"
+        + "".join(lines)
+        + "\nTHE NUMBER IN THAT NAME IS METAANNOT'S PID, NOT THE TOOL'S. "
+        "hmmsearch, InterProScan and DIAMOND are separate processes and "
+        "nothing in this program records a tool's own pid anywhere, so that "
+        "number names the run that OPENED the file and not the process "
+        "writing it - and a pid can be recycled by anything once its owner is "
+        "gone, so `ps -p` on it may show something unrelated, or nothing. To "
+        "find what actually holds one of these open: `lsof <path>` on macOS, "
+        "`fuser -v <path>` on Linux. "
+        + (f"THE STAGE(S) THAT WRITE THESE NAMES ARE SELECTED FOR THIS RUN: "
+           f"{', '.join(sel)}. If a tool from an earlier run is still "
+           "searching the same input, starting it now runs two of them on "
+           "this box and one result is discarded. "
+           if sel else
+           "No stage selected for this run writes those names, so nothing "
+           "here collides with what is about to start. ")
+        + "Nothing has been deleted, renamed, moved or stopped, and this run "
+        "has not been refused. They are dot-prefixed, so no glob and no stage "
+        "can adopt one as a result; `find "
+        + os.path.basename(os.path.normpath(p.R))
+        + " -name '.*.part.*'` lists them all, and removing one is a human's "
+        "`rm` and never this program's. Redo a stage you cannot account for "
+        "with `--force --only <stage>`. One surface disagrees with this and "
+        "will until a separate change lands: the console picks the newest "
+        "`.part` file beside a stage's output and shows it as the bytes that "
+        "stage is writing right now, so it will attribute one of these to a "
+        "live stage - and, being older, will eventually report a healthy run "
+        "as stalled.", "WARN")
+
+    # The second sample, and the only thing here that refuses anything. Spent
+    # once, and only because a candidate exists.
+    time.sleep(watch_s)
+    moved = []
+    for c in cands:
+        try:
+            st = os.stat(c["path"])
+        except OSError:
+            continue              # gone is not growing
+        if st.st_size != c["size"] or st.st_mtime != c["mtime"]:
+            moved.append((c, st))
+    if not moved:
+        # A candidate that did not change is a corpse. One line, no refusal,
+        # nothing deleted.
+        log(f"none of those {len(cands)} file(s) changed over "
+            f"{watch_s:.0f}s, so nothing appears to be writing them now. "
+            "That is not proof - a tool between two flushes of a 237 MB "
+            "buffer looks the same - but it is the only reading available "
+            "without asking the process table about a pid that is not the "
+            "tool's.")
+        return cands
+    # THE ONE GROWING FILE THAT IS NOT NEWS, and telling it apart is what
+    # keeps --force-unlock-live from being inert.
+    #
+    # That flag's help text is "take the directory even when this host can see
+    # the holder is still running", and it shipped for the operator who knows
+    # the holder is alive and means to displace it. A live holder's tool is
+    # PRECISELY what leaves a `.part` file growing - so a census that refuses
+    # on that evidence refuses the flag's own case, every time, with no escape:
+    # measured before this, run B with `--only pfam --force-unlock-live`
+    # against a live run A inside pfam exited 1, refused by the census, and
+    # dispatched nothing. That also took the documented handover with it, since
+    # `another run holds this results directory` and the whole
+    # _park_superseded() apparatus TUTORIAL.md describes name a state nothing
+    # could then reach.
+    #
+    # THE TWO CASES ARE DIFFERENT AND CAN BE TOLD APART, which is why this is
+    # not "the flag turns the census off". --force-unlock-live is an assertion
+    # about ONE process: the holder of the lock this run has just taken. It is
+    # no assertion whatever about a foreign writer the operator has never heard
+    # of, and that is what the census is for. What distinguishes them is the
+    # only thing a leftover's NAME carries: the pid that MINTED it, which is
+    # metaannot's own (atomic_out uses os.getpid()) and therefore names a RUN.
+    # Compared against the pid of the lock this run displaced - and only when
+    # ResultsLock PROVED that holder alive on this host before removing it,
+    # which is the same arm the --force-unlock refusal fires on.
+    #
+    # Nothing here asks the process table anything. The proving happened in
+    # ResultsLock before the lock changed hands; what arrives in
+    # `displaced_live` is its answer, and the comparison below is `==` between
+    # two integers. The rule above _leftover_parts() - that a pid out of a
+    # filename is never read as evidence ABOUT a process - is intact: this
+    # reads it as evidence about a RUN, which is the only thing it identifies.
+    #
+    # Per FILE, not per run, because both can be true at once: A holds the
+    # lock and is alive, an orphan of long-dead C is also growing a file in the
+    # same directory, and the flag covers A alone. C still refuses the run.
+    #
+    # WHAT IT CANNOT TELL APART, said rather than rounded off: a file minted by
+    # a dead run whose pid has since been RECYCLED onto the live holder. The
+    # growing writer is then C's orphan and this attributes it to A. The number
+    # must have been reused by that one process for it to happen; the WARN
+    # below prints it so an operator can see the coincidence, and it is not
+    # called proof.
+    holder = (displaced_live or {}).get("pid")
+    mine, others = [], []
+    for c, st in moved:
+        (mine if isinstance(holder, int) and c["pid"] == holder
+         else others).append((c, st))
+
+    def _grew(c, st):
+        return (f"{c['path']} GREW while this run was starting: "
+                f"{c['size']} bytes -> {st.st_size} at "
+                + time.strftime("%Y-%m-%dT%H:%M:%S",
+                                time.localtime(st.st_mtime)))
+
+    if mine and not others:
+        c, st = mine[0]
+        log(_grew(c, st)
+            + (f" (and {len(mine) - 1} other(s) of that run's changed too)"
+               if len(mine) > 1 else "")
+            + f". It was minted by metaannot pid {holder}, which is the "
+            "holder --force-unlock-live has just taken this directory from "
+            f"and which this host proved was still running (on "
+            f"{(displaced_live or {}).get('host') or '?'}, started "
+            f"{(displaced_live or {}).get('started') or '?'}). So THIS RUN IS "
+            "NOT REFUSED: a live holder's tool still writing is the state "
+            "that flag exists to get past, and refusing on it again would "
+            "make the flag inert. What you have now is two writers in one "
+            "results directory, deliberately. The superseded run stops "
+            "writing the state file when it notices - within "
+            f"min(heartbeat_s, {STATE_PROBE_S:.0f}s) - and may park the "
+            "declared outputs of the stage it was inside as `.superseded.*`; "
+            "the outputs no stage declares, and its TOOLS, are stopped by "
+            "nothing here, so a stage you both compute may still be written "
+            "twice. THE NUMBER IN THAT NAME IS METAANNOT'S PID, NOT THE "
+            "TOOL'S, and it names the run that OPENED the file: if a dead "
+            f"run's pid had been recycled onto {holder} this attribution "
+            "would be wrong, so `lsof` on the path above is what settles it. "
+            "Nothing has been deleted, renamed, moved or stopped.", "WARN")
+        return cands
+
+    c, st = others[0]
+    rest = len(moved) - 1
+    die(_grew(c, st)
+        + f"{' (and ' + str(rest) + ' other(s) changed too)' if rest else ''}"
+        + ". Something that is NOT this run is writing inside this results "
+        "directory, which is two writers - the corruption the results lock "
+        "exists to prevent"
+        + (", and --force-unlock-live does not cover it: that flag is an "
+           f"assertion about pid {holder}, the holder this run displaced, and "
+           f"this file was minted by pid {c['pid']}"
+           if isinstance(holder, int) else
+           ", reached past a lock that was honestly vacant because the "
+           "process that held it really is gone while its TOOL is not")
+        + " (CLAUDE.md rule 4). This run has been refused before dispatching "
+        "anything, and nothing has been deleted, renamed or stopped.\n"
+        + (f"  {len(mine)} other file(s) that changed WERE minted by pid "
+           f"{holder} and are not the reason for this refusal.\n"
+           if mine else "")
+        + f"  Find the writer:  lsof {c['path']}      # macOS\n"
+        f"                    fuser -v {c['path']}  # Linux\n"
+        "  Then stop it yourself. Nothing here will: it is a dead run's "
+        "child, this process is not its parent, and the only handle on it is "
+        "a number in a filename that names the minting run rather than the "
+        "tool - so there is no point at which `this is mine to kill` can be "
+        "asserted.\n"
+        "  If that file is instead being written by an `rsync --inplace` or "
+        "`--partial` into this directory, or by any other copy in flight, let "
+        "it finish and start the run afterwards. Plain `rsync -a`, which the "
+        "two-machine workflow prescribes, writes a random temp name and "
+        "renames, so it never produces this.")
 
 
 # Threads of THIS process, and nothing else. It never implied anything about
@@ -16431,9 +17462,26 @@ def _run_rscript(cmd, what, hint=""):
     # type.
     argv = [str(c) for c in cmd]
     argv[0] = resolve_tool(argv[0])
-    proc = subprocess.run(argv, stdout=subprocess.DEVNULL,
-                          stderr=subprocess.PIPE, text=True)
-    tail = "\n".join((proc.stderr or "").strip().splitlines()[-20:])
+    # Through _tool_process for the same reason run_cmd is, and this site is
+    # the Mac's WHOLE exposure to it. `all` calls cmd_run, then cmd_report,
+    # then cmd_object in ONE process and signal handlers are never
+    # unregistered, so _release_lock_on_signal is still installed during the R
+    # phase: a `kill` there used to leave Rscript holding a 455k-row data
+    # frame in RAM with nothing able to stop it. subprocess.run would have
+    # registered nothing.
+    with _tool_process(argv, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, text=True) as proc:
+        _out, err = proc.communicate()
+        # AT the reap, not left to the helper's `finally`. communicate() is
+        # the reap here, and the rule _tool_process states in capitals is that
+        # whoever reaps calls this where they reap - so that the slot cannot
+        # advertise a group whose leader is gone while anything else that
+        # reads the registry (the signal handler, _stop_tool_groups) could aim
+        # at it. Harmless today only because the reap is the last statement in
+        # this block; a line added after it would reintroduce the five seconds
+        # this rule was written for, silently.
+        proc.finish_group()
+    tail = "\n".join((err or "").strip().splitlines()[-20:])
     if proc.returncode != 0:
         die(f"{what} failed: Rscript exited {proc.returncode}"
             + (f"\n{hint}" if hint else "")
@@ -20647,7 +21695,23 @@ def cmd_doctor(args):
                 try:
                     for c in r["cmds"]:
                         log(f"$ {c}")
-                        rc = subprocess.run(c, shell=True).returncode
+                        # Through _tool_process: `c` is POSIX shell, so
+                        # the child is a shell whose curl/wget/tar
+                        # GRANDCHILD does the multi-GB download, and
+                        # proc.kill() never reached those. doctor takes the
+                        # unwinding path on a signal (it holds no lock and
+                        # installs no handler of its own), so the helper's
+                        # `finally` is what stops the download.
+                        with _tool_process(c, shell=True) as sh:
+                            sh.wait()
+                            # AT the reap, for the reason _tool_process gives:
+                            # this is a `shell=True` install command, so its
+                            # group routinely holds a curl or a tar that
+                            # outlives the shell, and the sweep belongs where
+                            # the wait is rather than wherever this block
+                            # happens to end.
+                            sh.finish_group()
+                        rc = sh.returncode
                         if rc != 0:
                             raise RuntimeError(f"command exited {rc}: {c}")
                 except Exception as e:                      # noqa: BLE001
@@ -20817,6 +21881,12 @@ def cmd_run(args):
     # _fs_clock_ahead() and decide(). None until something has been written
     # that it can be measured on, which is never in a dry run.
     fs_ahead = None
+    # The last moment the run BEFORE this one recorded anything, stat'ed
+    # before this run rewrites that file. It is the leftover census's
+    # same-filesystem reference: an mtime against another mtime on one
+    # filesystem is one clock, while an mtime against time.time() is two.
+    # 0.0 on a first run, where there is nothing to date anything against.
+    prev_state_mtime = 0.0
     if not args.dry_run:
         # Not before the dry-run branch: a plan check should not leave fifteen
         # new directories behind for the next person to wonder about.
@@ -20847,8 +21917,8 @@ def cmd_run(args):
         lock.__enter__()
 
         def _release_lock_on_signal(sig, _frame):
-            """Release the results lock when the run is killed, not only when
-            it exits.
+            """Kill this run's tools, release the results lock, and exit
+            128+N - when the run is killed, not only when it exits.
 
             atexit does not run on SIGTERM or SIGHUP - Python's default
             handler terminates the process outright - so a run stopped by
@@ -20858,16 +21928,35 @@ def cmd_run(args):
             it; from another node of a cluster it cannot, and the resume
             became a stale-lock refusal needing --force-unlock.
 
-            What this does NOT do: stop the tools already running. TMbed,
-            InterProScan and DIAMOND are separate processes that outlive us,
-            and the state file is what records which stages were mid-flight.
-            It releases the lock, flushes the log, and exits 128+N so a
-            wrapper script still sees a killed process rather than a clean
-            one.
+            WHAT IT NOW ALSO DOES, and the sentence here used to say the
+            opposite. It stops the tools. Because this handler exits through
+            os._exit(), which runs no `finally` and no `except
+            BaseException`, run_cmd's own cleanup was never reached and EVERY
+            tool the run had launched survived: hmmsearch, InterProScan and
+            TMbed went on holding their cores and writing into this results
+            directory, with the lock that would have kept a second writer out
+            already removed. That is measured, not hypothetical - three
+            concurrent hmmsearches against the same 455,571 proteins for seven
+            hours, 98 core-hours, two of the three results discarded. So the
+            FIRST thing this does is take down each tool's process group, and
+            the ordering is the invariant; the reason is above
+            _kill_tool_groups().
+
+            WHAT IT STILL CANNOT DO. SIGKILL, the OOM reaper and a host reset
+            run no handler at all, so nothing here touches those - and the
+            incident above was one of them, since the lock file was still on
+            disk when the next run reclaimed it. The leftover census at the
+            head of every run is what covers that case; see
+            _census_leftover_parts(). And a tool that deliberately leaves its
+            own group by calling setsid itself escapes the group kill. None in
+            this tool set does, and this cannot prove it for a tool it has not
+            met.
 
             Windows delivers almost none of this: subprocess.terminate() is
-            TerminateProcess, which runs no handler at all. SIGBREAK
-            (Ctrl-Break) is the one that does arrive, so it is registered too.
+            TerminateProcess, which runs no handler at all, and there are no
+            POSIX process groups to kill there either - so no slot is ever
+            claimed and the kill loop cannot run. SIGBREAK (Ctrl-Break) is the
+            one signal that does arrive, so it is registered too.
             """
             # NOTHING in here may take a lock. A Python signal handler runs
             # IN THE MAIN THREAD, between two bytecodes of whatever that
@@ -20888,6 +21977,15 @@ def cmd_run(args):
             # at registration time. No formatting, no buffered I/O, no locks.
             # The cost is that the final line reaches stderr but not the log
             # FILE, whose buffer cannot be safely touched from here.
+            #
+            # The kill goes FIRST, and the ordering is load-bearing rather
+            # than a preference. Its whole argument - why a killpg is legal
+            # from here at all, how it knows the group is its own, and the one
+            # window it leaves - is written above _kill_tool_groups(), which
+            # is a module-level function precisely so that the source-level
+            # scan below can cover its body without swallowing the prose
+            # above this line.
+            _kill_tool_groups()
             release_results_lock()
             try:
                 os.write(2, _sig_msgs.get(int(sig), b"\nstopping on a signal; "
@@ -20922,6 +22020,10 @@ def cmd_run(args):
         # ...cmd_run_installs_supersedes_the_unwinding_one in
         # tests/test_scheduler.py, and what a killed run leaves behind by the
         # three tests beside it.
+        # The two integers the kill loop compares itself against, resolved
+        # here rather than inside the handler: a handler may make no syscall
+        # it can avoid, and these two never change for the life of a process.
+        _arm_tool_group_kill()
         _sig_msgs = {}
         for _name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
             _sig = getattr(signal, _name, None)
@@ -20929,9 +22031,13 @@ def cmd_run(args):
                 continue
             _sig_msgs[int(_sig)] = (
                 f"\nWARN  stopping on {_name}: releasing the results lock "
-                f"{p.lock}. Any tool already running is a separate process "
-                "and is not stopped by this, so its output may be "
-                f"incomplete; {p.state} records which stages were running.\n"
+                f"{p.lock}. Every tool this run started was killed first - "
+                "the whole process group of each, so a launcher's own "
+                "children went with it - and whatever one of them had "
+                "part-written is left behind as a dot-prefixed `.part` file "
+                "that nothing here deletes and no stage can adopt. "
+                f"{p.state} records which stages were running, and the next "
+                "run recomputes them and says what it found lying here.\n"
             ).encode("utf-8", "replace")
             # ValueError when this is not the main thread, OSError when the
             # platform refuses the signal. Neither is worth failing a run
@@ -20964,6 +22070,10 @@ def cmd_run(args):
         # See _park_superseded().
         _DECLARED_OUTPUTS.clear()
         _DECLARED_OUTPUTS.update(o for st in STAGES for o in st["out"](p))
+        # BEFORE the save below, which rewrites that file: what the census
+        # needs is the mtime the PREVIOUS run left, and one line further down
+        # it would be this run's own.
+        prev_state_mtime = _mtime(p.state)
         # Through the record, not a bare update_state(RUN_KEY). This is the
         # run's FIRST `_run` write and the lock was taken three lines ago, so
         # the gate cannot say anything but "ours" here - which is the point:
@@ -20996,6 +22106,28 @@ def cmd_run(args):
         selected = [n for n in STAGE_NAMES if n in set(args.only)]
     only_set = set(args.only or [])
     by_name = {st["name"]: st for st in STAGES}
+
+    # WHERE THIS SITS AND WHY. The lock is held, the declared outputs are
+    # known, the filesystem clock has been measured, the stage selection has
+    # been resolved so the message can name a collision rather than a file
+    # list - and NOTHING OF THIS RUN'S OWN HAS BEEN DISPATCHED, which is what
+    # makes the own-temp exclusion a proof rather than a heuristic. It is also
+    # before the --force discards below, so a refusal here costs nothing: the
+    # pops are in memory and nothing has been written.
+    #
+    # Not in a dry run: that path takes no lock, populates no declared
+    # outputs, and must not be able to refuse anything.
+    if not args.dry_run:
+        # lock.displaced_live, not args.force_unlock_live: the flag is what
+        # the operator typed and this is what it actually did. A
+        # --force-unlock-live over a lock that was vacant, garbled, on another
+        # node, or held by a process this host proved DEAD displaced no live
+        # holder at all, so it asserts nothing about a file that is growing
+        # now and the census must still refuse. See the long comment at the
+        # second sample there.
+        _census_leftover_parts(p, _part_leftover_stages(STAGES, p),
+                               set(selected), prev_state_mtime, fs_ahead,
+                               displaced_live=lock.displaced_live)
 
     # --force discards what the user asked to redo, and only that. Wiping the
     # whole file made every unselected stage look as if it had never been
@@ -21585,127 +22717,161 @@ def cmd_run(args):
     starved = set()               # said once per stage, not once per finish
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {}
-        while (remaining or futures) and not failure:
-            ready = [n for n in remaining
-                     if all(d in done for d in by_name[n]["deps"])]
-            progressed = False
-            run_now = []
-            for name in ready:
-                st = by_name[name]
-                # Decided at dispatch, after every dependency has finished, so
-                # a stage always sees its inputs in their final state.
-                action = decide(st)
-                if action != "RUN":
-                    remaining.remove(name)
-                    progressed = True
-                    if action == "adopt":
-                        log(f"--- {name}: adopting output this run did not "
-                            "produce: "
-                            + "; ".join(_file_note(o) for o in st["out"](p))
-                            + ". Check that it is complete — nothing here can "
-                              "tell a finished file from an interrupted one.",
-                            "WARN")
-                        finish(name, "adopt", sig=signature(st, cfg, p))
-                    else:
-                        log(f"--- {name}: {action}")
-                        finish(name, action)
-                    continue
-                unmet = unmet_deps(st)
-                if unmet:
-                    remaining.remove(name)
-                    progressed = True
-                    finish(name, "RUN", err=RuntimeError(
-                        # The stage names come after the phrase, not before
-                        # it, so the sentence reads the same for one stage as
-                        # for five and the troubleshooting table can quote it.
-                        "cannot run: the stage(s) this one reads produced "
-                        "nothing and were not selected: "
-                        f"{', '.join(unmet)}. Each of them is enabled in "
-                        "run:, so its evidence is expected here, not optional "
-                        "— running without it would produce a confident, "
-                        "empty answer. Rerun without --only/--from, or add "
-                        f"{' '.join(unmet)} to the selection."))
-                    continue
-                run_now.append(name)
-            # Longest first, so a long stage late in the table does not wait
-            # behind a short one ahead of it for a worker. Python's sort is
-            # stable, so stages of equal rank keep table order and the run
-            # log reads the way it always did.
-            run_now.sort(key=stage_priority, reverse=True)
-            # The GPU is not divisible the way the CPU and RAM budgets are, so
-            # it is leased rather than shared. A deferred stage stays in
-            # `remaining` and is reconsidered next round; it never occupies a
-            # worker while it waits.
-            held = [n for n in futures.values() if needs_gpu(n)]
-            run_now, waiting = gpu_lease(run_now, futures.values(), gpu_slots,
-                                         needs_gpu)
-            for name in waiting:
-                # Once per stage, not once per round: an enabled stage that has
-                # not started should be explained, not repeated at.
-                if name not in gpu_waiting:
-                    gpu_waiting.add(name)
-                    log(f"--- {name}: waiting for the GPU — "
-                        f"{', '.join(held) or 'another stage'} is using it "
-                        f"and gpu_workers is {gpu_slots}. It starts when that "
-                        "stage finishes; everything else carries on "
-                        "meanwhile.")
-            # Dispatched only once every ready stage has been decided, so the
-            # share each one gets is measured against the stages that really
-            # start alongside it.
-            for i, name in enumerate(run_now):
-                if len(futures) >= workers:
-                    break
-                st = by_name[name]
-                cpu, ram = share(run_now[i:])
-                remaining.remove(name)
-                progressed = True
-                log(f"=== {name}: running ({cpu} cpu"
-                    + (f", {ram} GB" if ram else "") + ")")
-                mark_running(name)
-                fut = ex.submit(worker, st, cpu, ram)
-                futures[fut] = name
-                alloc[fut] = (cpu, ram)
-            if not futures:
-                # Skipping stages is progress: their dependents may have become
-                # ready in this same round, so loop again before concluding
-                # anything is stuck.
-                if progressed:
-                    continue
-                if remaining:
-                    stuck = [n for n in remaining
-                             if not all(d in done for d in by_name[n]["deps"])]
-                    die(f"deadlock: {stuck} can never become ready "
-                        f"(unsatisfied deps: "
-                        f"{ {n: [d for d in by_name[n]['deps'] if d not in done] for n in stuck} })")
-                break
-            for fut in concurrent.futures.as_completed(list(futures)):
-                name, sig, err, secs = fut.result()
-                del futures[fut]
-                alloc.pop(fut, None)
-                set_log_context(None)
-                finish(name, "RUN", sig=sig, err=err, secs=secs)
-                # CPU freed here cannot be handed to a stage that is already
-                # running: its tool's thread count was fixed at launch. Only
-                # the hours-class stages are worth saying it about — a stage
-                # measured in minutes finishes before the waste matters — and
-                # only once each, because this runs on every completion.
-                free_cpu = total_cpu - sum(a[0] for a in alloc.values())
-                for other in list(futures.values()):
-                    held = next((a[0] for f, a in alloc.items()
-                                 if futures.get(f) == other), 0)
-                    if (other in starved or not held or free_cpu < held
-                            or stage_priority(other) < 3):
+        # WHY THIS IS INSIDE THE `with` AND NOT AROUND IT, which is the whole
+        # of it: ThreadPoolExecutor.__exit__ JOINS its workers, so a kill
+        # placed after the `with` waits for the very stage it is trying to
+        # stop - an InterProScan or a tmbed chunk, an hour - before it sends
+        # anything. report_output_stamps() below is outside this block for
+        # that reason and this must not be.
+        #
+        # WHAT REACHES HERE. A Ctrl-C, and a `kill -INT` from a script: both
+        # raise KeyboardInterrupt, and Python delivers a signal to the MAIN
+        # thread only - which is parked in as_completed() right here. It does
+        # NOT reach run_cmd's own `except BaseException`, which lives in a
+        # worker thread and is unreachable during dispatch; the reason a
+        # keyboard Ctrl-C stops a tool TODAY is that the tty broadcasts SIGINT
+        # to the whole foreground process group and the tool is in it. Putting
+        # each tool in a session of its own removes that broadcast, so without
+        # this hook Ctrl-C would stop reaching tools altogether and the main
+        # thread would unwind straight into a join measured in hours. That
+        # makes this hook a precondition of the session change and not an
+        # improvement on it.
+        #
+        # It is also a pre-existing hole closed: a Ctrl-C mid-tmbed today
+        # fails one chunk and then runs every remaining chunk to completion
+        # while the main thread sits in that join, because tmbed catches
+        # RuntimeError per chunk. _stop_tool_groups sets the latch that stops
+        # that, and run_cmd's refusal is a StageError so the per-chunk handler
+        # re-raises it instead of logging a failed chunk.
+        try:
+            while (remaining or futures) and not failure:
+                ready = [n for n in remaining
+                         if all(d in done for d in by_name[n]["deps"])]
+                progressed = False
+                run_now = []
+                for name in ready:
+                    st = by_name[name]
+                    # Decided at dispatch, after every dependency has finished, so
+                    # a stage always sees its inputs in their final state.
+                    action = decide(st)
+                    if action != "RUN":
+                        remaining.remove(name)
+                        progressed = True
+                        if action == "adopt":
+                            log(f"--- {name}: adopting output this run did not "
+                                "produce: "
+                                + "; ".join(_file_note(o) for o in st["out"](p))
+                                + ". Check that it is complete — nothing here can "
+                                  "tell a finished file from an interrupted one.",
+                                "WARN")
+                            finish(name, "adopt", sig=signature(st, cfg, p))
+                        else:
+                            log(f"--- {name}: {action}")
+                            finish(name, action)
                         continue
-                    starved.add(other)
-                    log(f"{other} holds {held} of {total_cpu} cpu and "
-                        f"{free_cpu} are now free, but a tool's thread count "
-                        "is fixed when it is launched, so this stage cannot "
-                        "grow into them — it will finish at the share it was "
-                        f"given. At this scale run it on its own "
-                        f"(--only {other}) to give it the whole machine, or "
-                        "lower stage_workers so fewer stages divide it.",
-                        "WARN")
-                break
+                    unmet = unmet_deps(st)
+                    if unmet:
+                        remaining.remove(name)
+                        progressed = True
+                        finish(name, "RUN", err=RuntimeError(
+                            # The stage names come after the phrase, not before
+                            # it, so the sentence reads the same for one stage as
+                            # for five and the troubleshooting table can quote it.
+                            "cannot run: the stage(s) this one reads produced "
+                            "nothing and were not selected: "
+                            f"{', '.join(unmet)}. Each of them is enabled in "
+                            "run:, so its evidence is expected here, not optional "
+                            "— running without it would produce a confident, "
+                            "empty answer. Rerun without --only/--from, or add "
+                            f"{' '.join(unmet)} to the selection."))
+                        continue
+                    run_now.append(name)
+                # Longest first, so a long stage late in the table does not wait
+                # behind a short one ahead of it for a worker. Python's sort is
+                # stable, so stages of equal rank keep table order and the run
+                # log reads the way it always did.
+                run_now.sort(key=stage_priority, reverse=True)
+                # The GPU is not divisible the way the CPU and RAM budgets are, so
+                # it is leased rather than shared. A deferred stage stays in
+                # `remaining` and is reconsidered next round; it never occupies a
+                # worker while it waits.
+                held = [n for n in futures.values() if needs_gpu(n)]
+                run_now, waiting = gpu_lease(run_now, futures.values(), gpu_slots,
+                                             needs_gpu)
+                for name in waiting:
+                    # Once per stage, not once per round: an enabled stage that has
+                    # not started should be explained, not repeated at.
+                    if name not in gpu_waiting:
+                        gpu_waiting.add(name)
+                        log(f"--- {name}: waiting for the GPU — "
+                            f"{', '.join(held) or 'another stage'} is using it "
+                            f"and gpu_workers is {gpu_slots}. It starts when that "
+                            "stage finishes; everything else carries on "
+                            "meanwhile.")
+                # Dispatched only once every ready stage has been decided, so the
+                # share each one gets is measured against the stages that really
+                # start alongside it.
+                for i, name in enumerate(run_now):
+                    if len(futures) >= workers:
+                        break
+                    st = by_name[name]
+                    cpu, ram = share(run_now[i:])
+                    remaining.remove(name)
+                    progressed = True
+                    log(f"=== {name}: running ({cpu} cpu"
+                        + (f", {ram} GB" if ram else "") + ")")
+                    mark_running(name)
+                    fut = ex.submit(worker, st, cpu, ram)
+                    futures[fut] = name
+                    alloc[fut] = (cpu, ram)
+                if not futures:
+                    # Skipping stages is progress: their dependents may have become
+                    # ready in this same round, so loop again before concluding
+                    # anything is stuck.
+                    if progressed:
+                        continue
+                    if remaining:
+                        stuck = [n for n in remaining
+                                 if not all(d in done for d in by_name[n]["deps"])]
+                        die(f"deadlock: {stuck} can never become ready "
+                            f"(unsatisfied deps: "
+                            f"{ {n: [d for d in by_name[n]['deps'] if d not in done] for n in stuck} })")
+                    break
+                for fut in concurrent.futures.as_completed(list(futures)):
+                    name, sig, err, secs = fut.result()
+                    del futures[fut]
+                    alloc.pop(fut, None)
+                    set_log_context(None)
+                    finish(name, "RUN", sig=sig, err=err, secs=secs)
+                    # CPU freed here cannot be handed to a stage that is already
+                    # running: its tool's thread count was fixed at launch. Only
+                    # the hours-class stages are worth saying it about — a stage
+                    # measured in minutes finishes before the waste matters — and
+                    # only once each, because this runs on every completion.
+                    free_cpu = total_cpu - sum(a[0] for a in alloc.values())
+                    for other in list(futures.values()):
+                        held = next((a[0] for f, a in alloc.items()
+                                     if futures.get(f) == other), 0)
+                        if (other in starved or not held or free_cpu < held
+                                or stage_priority(other) < 3):
+                            continue
+                        starved.add(other)
+                        log(f"{other} holds {held} of {total_cpu} cpu and "
+                            f"{free_cpu} are now free, but a tool's thread count "
+                            "is fixed when it is launched, so this stage cannot "
+                            "grow into them — it will finish at the share it was "
+                            f"given. At this scale run it on its own "
+                            f"(--only {other}) to give it the whole machine, or "
+                            "lower stage_workers so fewer stages divide it.",
+                            "WARN")
+                    break
+        except BaseException:
+            # Ctrl-C, kill -INT, or a die() out of the loop itself. Logging
+            # and waiting are both legal here - we are unwinding, not inside a
+            # signal handler - so the tools get SIGTERM and a few seconds to
+            # remove their own scratch before SIGKILL.
+            _stop_tool_groups("this run is stopping")
+            raise
 
     # Drain anything still running so every failure is reported, not just the
     # one that happened to be noticed first.
@@ -21977,6 +23143,16 @@ def main():
         # Ctrl-C, or SIGTERM via handle_sigterm_like_sigint(). Stamped before
         # sys.exit so it is written while the results lock is still held: the
         # atexit hook that releases the lock runs after this.
+        #
+        # The tools first, and this is the CATCH-ALL rather than the main
+        # hook: an interrupt landing inside the dispatch loop is handled there
+        # (it has to be, because the executor's __exit__ joins on the way out
+        # of that block), and this covers every interrupt that lands anywhere
+        # else - in the opening moments of a run, in the report or the object
+        # phase of `all`, in a doctor --fix download. Idempotent: a second
+        # signal to a group that has already gone answers ESRCH and is
+        # suppressed, and a run with no tool registered does nothing at all.
+        _stop_tool_groups("interrupted")
         stamp_run("interrupted")
         # One message, character for character, whichever signal brought us
         # here. A " (SIGTERM)" suffix was tried and taken out again: it

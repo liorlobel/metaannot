@@ -46,10 +46,11 @@ def ma():
 def _fresh_ownership_watch(ma):
     """Start every test with the module's ownership watch disarmed.
 
-    `_STATE_WATCH` and `_DECLARED_OUTPUTS` are process-wide because a process
-    runs exactly one metaannot run; a test session runs hundreds in the same
-    interpreter. Without this, one test that drove a run to the point of being
-    superseded would leave `lost` set for the rest of the session, and every
+    `_STATE_WATCH`, `_DECLARED_OUTPUTS` and `_STOPPING` are process-wide
+    because a process runs exactly one metaannot run; a test session runs
+    hundreds in the same interpreter. Without this, one test that drove a run
+    to the point of being superseded would leave `lost` set for the rest of
+    the session, and every
     later atomic_out() in the process would decline its rename - a green suite
     turning red three files away, for a reason nothing in the failing test
     mentions. Reset on the way in as well as out, so a test that fails half
@@ -58,6 +59,12 @@ def _fresh_ownership_watch(ma):
     def clear():
         ma._watch_state(None, None, ())
         ma._DECLARED_OUTPUTS.clear()
+        # The stopping latch, for the same reason and with a sharper edge: one
+        # test that drives an in-process run to an interrupt would leave it
+        # set, and every _tool_process() in the session afterwards would
+        # refuse to launch anything - a green suite turning red three files
+        # away, for a reason nothing in the failing test mentions.
+        ma._STOPPING = False
 
     clear()
     yield
@@ -143,18 +150,55 @@ def needs_r(*packages):
 STUBS = {
     # hmmsearch writes whatever --tblout / --domtblout names.
     "hmmsearch": r"""
-import sys, os, time
+import subprocess, sys, os, time
 a = sys.argv[1:]
+def val(flag):
+    return a[a.index(flag) + 1] if flag in a else None
+# STUB_PIDFILE records every process this stub is responsible for, one
+# "<role> <pid>" line each, so a test can ask the PROCESS TABLE whether a real
+# child of a real run is still alive after that run has been killed. Nothing
+# else in the suite could answer that question.
+pidfile = os.environ.get("STUB_PIDFILE")
+def note(role, pid):
+    if pidfile:
+        with open(pidfile, "a", encoding="utf-8") as fh:
+            fh.write(role + " " + str(pid) + "\n")
+            fh.flush()
+note("tool", os.getpid())
+# STUB_FORK_CHILD gives the stub a GRANDCHILD of the run, which is the shape
+# proc.kill() never reached: interproscan.sh -> java, emapper -> its children,
+# torch -> its dataloader workers. It outlives this stub on purpose.
+if os.environ.get("STUB_FORK_CHILD"):
+    subprocess.Popen([sys.executable, "-c",
+                      "import os,sys,time\n"
+                      "p = sys.argv[1]\n"
+                      "if p:\n"
+                      "    fh = open(p, 'a')\n"
+                      "    fh.write('child ' + str(os.getpid()) + chr(10))\n"
+                      "    fh.close()\n"
+                      "time.sleep(float(sys.argv[2]))\n",
+                      pidfile or "",
+                      os.environ.get("STUB_CHILD_SLEEP", "30")])
+# STUB_GROW appends to the output the run handed us, over and over, so a test
+# can produce the thing the leftover census is about: a real orphaned tool
+# writing into a real results directory, its `.part` file growing, after the
+# run that launched it is gone.
+if os.environ.get("STUB_GROW") and val("--tblout"):
+    grow = open(val("--tblout"), "a", encoding="utf-8")
 # STUB_WAIT_FOR blocks the stage until the test creates that path, which is
 # what turns "a run that unwinds slowly" from a sleep race into something a
 # test can time exactly: the run stays inside the stage, and so inside the
-# executor's shutdown wait, until the test says otherwise.
+# executor's shutdown wait, until the test says otherwise. STUB_GATE_MAX_S is
+# a backstop and not a feature: a regression that stops the gate from ever
+# being reached must FAIL a test rather than wedge the suite for ever.
 gate = os.environ.get("STUB_WAIT_FOR")
-while gate and not os.path.exists(gate):
+deadline = time.time() + float(os.environ.get("STUB_GATE_MAX_S", "120"))
+while gate and not os.path.exists(gate) and time.time() < deadline:
+    if os.environ.get("STUB_GROW") and val("--tblout"):
+        grow.write("# still searching\n")
+        grow.flush()
     time.sleep(0.02)
 time.sleep(float(os.environ.get("STUB_SLEEP", "0")))
-def val(flag):
-    return a[a.index(flag) + 1] if flag in a else None
 out = val("--tblout")
 dom = val("--domtblout")
 # The last two positionals are <hmm library> <query fasta>.

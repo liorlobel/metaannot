@@ -525,25 +525,44 @@ the run has to be taken over anyway, add `--force-unlock-live`. A lock from
 another node of the array is unprovable from here and is not refused: that is
 the case `--force-unlock` exists for, and the single flag still takes it.
 
+When `--force-unlock-live` does take a directory from a holder this host can
+see running, the leftover census a moment later will find that holder's
+`.part` file still growing — because its tool is still running, which is the
+thing you just said you knew. It says so at `WARN`, names the pid in the file
+(the holder's, not the tool's), and **does not refuse the run**: that is the
+one growing file this flag excuses. A growing file minted by any other pid
+still refuses, in the same census, even on the same run.
+
 `SIGTERM` no longer strands a lock, but it is not Ctrl-C with a different
-number. `kill` and `systemctl stop` release the lock, print one `WARN` line to
-stderr naming the signal and the lock file, and exit **immediately** — exit
-status 143 — with no unwinding, so no `interrupted` message, no `_run` stamp,
-and no waiting for the stage that is running. Ctrl-C is the other trade: it
-unwinds, which means it waits for the running stage to finish (an hour, for
-tmbed or InterProScan) and in exchange prints `interrupted` and stamps the
-record, exit status 130. A supervisor cannot afford the wait — `systemd` would
-reach `TimeoutStopSec` and `SIGKILL` the process, losing the lock release — so
-`kill` buys the lock and gives up the trace.
+number. `kill` and `systemctl stop` kill every tool the run started — the whole
+process group of each, so `interproscan.sh`'s java goes too — release the lock,
+print one `WARN` line to stderr naming the signal and the lock file, and exit
+**immediately** — exit status 143 — with no unwinding, so no `interrupted`
+message, no `_run` stamp, and no waiting for the stage that is running. Ctrl-C
+is the other trade: it unwinds, and in exchange prints `interrupted` and stamps
+the record, exit status 130. It too stops the tools now, so the unwind no
+longer sits through the running stage, but it is still an unwind and a
+supervisor cannot rely on one — `systemd` would reach `TimeoutStopSec` and
+`SIGKILL` the process, losing the lock release — so `kill` buys the lock and
+gives up the trace.
 
 What that leaves you is a directory whose lock is gone, whose `_run` still says
 `"final_status": "running"`, and whose mid-flight stage is still recorded
 `running`. **That is the normal appearance of a `kill`, not a sign of anything
 worse.** Just rerun the same command: the next run sees the `running` record,
-says the stage's output may be truncated, and recomputes it. Check `ps` first,
-though — the signal stops metaannot, not the InterProScan or DIAMOND it
-launched, and those keep writing into the same scratch paths with no lock left
-to keep a second writer out.
+says the stage's output may be truncated, and recomputes it.
+
+The case to watch for is the death that runs **no** handler — `kill -9`, the
+OOM reaper, a lost machine — because nothing in the program can act then and
+the tools really do keep going, writing into the same paths with no lock left
+to keep a second writer out. You do not have to remember to check: every run
+lists the in-progress `.part` files it finds before it dispatches anything, and
+where one is still GROWING it refuses to start and prints the `lsof` that finds
+the writer. Stop that process yourself and rerun. (The one growing file it does
+not refuse is the one belonging to a live holder you have just displaced with
+`--force-unlock-live`; see that flag above.) Nothing is ever deleted by
+that check, and the pid in the file's name is **metaannot's**, not the tool's —
+so do not `kill` it.
 
 `--force-unlock` on a directory whose holder is still unwinding is the case
 the refusal above exists for, and what it costs is worth stating exactly. Once
@@ -1005,6 +1024,9 @@ evaluates a document with the working directory set to its own folder.
 | report: `factor(s) with only one level` | the manifest does not distinguish conditions | check the `experiment` column of the manifest |
 | report: `N protein(s) have zero variance within every group` | identical in every replicate | listed in `zero_variance.tsv`; usually one shared peptide or an imputed constant. `drop_zero_variance: true` removes them |
 | `another metaannot is already running here` | a second run on the same results directory | wait for it; `--force-unlock` only if you are certain the other is gone |
+| `GREW while this run was starting` | a `.part` file under this results directory changed size in the two seconds after the lock was taken, so something that is not this run is writing here — almost always a tool orphaned by a `kill -9`, an OOM kill or a lost machine, whose parent is gone and whose lock was therefore reclaimable as stale | the run is refused before it dispatches anything, and nothing is deleted. Run the `lsof <path>` (macOS) or `fuser -v <path>` (Linux) the message prints, and stop that process yourself; nothing here will, because the pid in the file's name is metaannot's and not the tool's. Then rerun. If it is an `rsync --inplace`/`--partial` into this directory instead, let it finish first. `--force-unlock-live` does **not** get past this, and is not meant to: it is an assertion about the holder it displaced, and this message names a file minted by some other pid |
+| `GREW while this run was starting` ... `THIS RUN IS NOT REFUSED` | the same two-second watch, but the growing file was minted by the very holder `--force-unlock-live` has just taken this directory from — its tool is still running, which is what you said you knew | nothing to do: the run proceeds. You now have two writers in one results directory on purpose. The superseded run stops writing the state file when it notices, within `min(heartbeat_s, 30s)`, and may park the declared outputs of the stage it was inside as `.superseded.*`; its tools are stopped by nothing here, so a stage you both compute can still be written twice. `lsof <path>` is what confirms the writer is the run you meant |
+| `were opened by a metaannot process that is not this one` | `.part` leftovers whose writer is gone — the ordinary trace of any run that was killed inside a stage | one aggregated WARN per directory and pid, naming the sizes, the newest mtime and which stage writes those names. Not a refusal and not a problem: nothing is deleted, no stage can adopt a dot-prefixed file, and the stage is recomputed anyway. `find results -name '.*.part.*'` is the same list; removing one is your `rm` |
 | `--force-unlock refused` | the lock names a pid on this host that the process table says is still running | do what the message says and run the `ps -p` it prints. If that process is not a metaannot its pid was recycled and `--force-unlock-live` is the answer; if it is, stop it or wait. A lock from another node is never refused, because this host cannot see that process table |
 | `another run holds this results directory` | the `_run` record in the state file names a run this one has never seen — the directory was handed to a replacement while this run was still going | nothing to do about the message: that run stops writing to the state file and exits. From this message on its **records** cannot reach the live run's at all — the refusal is latched and is asked before anything is read, so no later write of any key is attempted. What it wrote BEFORE it saw this message went in as an ordinary merge, naming its own keys. Its **outputs** are a clock and not a guarantee: a stage already running at the handover renames over the live run's until the handover is noticed, within `min(heartbeat_s, STATE_PROBE_S)`. Normal after a `--force-unlock-live`; look for `.superseded.*` files afterwards, and note that the search comes back EMPTY for a run superseded inside `diamond` or `esmfold`, whose real outputs are not declared and so are never parked — there you will find a leftover `.<stem>.<pid>.<tid>.part<ext>` instead |
 | `is no longer there, so it is being recreated` | the state file was removed or emptied while a run was using it | the records written before it vanished are gone with the file, and this run writes only what it records from here on. Nothing is corrupt and nothing you produced is lost — the outputs are on disk — but the next run has no record of those stages and will recompute or re-adopt them, saying so. Do not restore the file from a copy underneath a live run |

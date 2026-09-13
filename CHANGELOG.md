@@ -123,7 +123,7 @@ of each loss is also said when it happens rather than only at the end.
 
 ### Fixed
 
-thirteen entries, in three groups. Each heading carries its own count and a
+twenty-three entries, in five groups. Each heading carries its own count and a
 test counts the entries under it.
 
 #### Four defects in the check this change set added
@@ -289,6 +289,200 @@ is wide enough that nothing failed, which is the point of the band and not a
 reason to leave a counted number wrong: the README's own claim about those
 numbers is that they are counted rather than estimated. Re-counted, with the
 no-R pair re-derived from them.
+
+#### Six defects in what a stop does to the tools a run launched
+
+**A `kill` of a run now stops the tools it launched, and it stops them before
+it lets go of the lock.** The signal handler exits through `os._exit()`, which
+runs no `finally` and no `except BaseException`, so `run_cmd`'s own cleanup was
+never reached and *every* child of a killed run survived — documented
+behaviour with an uncosted price. On the first full run on real data that price
+was three concurrent `hmmsearch --cpu 7` against the same 455,571 proteins from
+13:03 to 20:04, the box 1.6x oversubscribed during `pfam`, and two of the three
+finished results discarded because a dot-prefixed `.part` file is something
+no stage can adopt.
+
+Each tool is now launched through one helper with `start_new_session=True`, so
+it is a session and process-group leader (`pgid == pid`, no extra syscall) and
+one `os.killpg` takes it and everything it spawned. That is also the only thing
+that ever reached a launcher's children: `proc.kill()` left them alive with
+`ppid 1` and still inside metaannot's OWN process group, where no group kill
+could reach them without suicide — measured, and it is the shape of
+`interproscan.sh` -> java, `emapper` -> its children, and torch -> its
+dataloader workers holding VRAM. The kill happens on every stop path: the
+raw signal handler (a bare `SIGKILL` to each group, since a handler may not
+wait), an unwinding `run_cmd`, the dispatch loop, and `main()`'s
+`KeyboardInterrupt`; the three that unwind send `SIGTERM`, wait a few seconds
+so a tool can remove its own scratch tree, and then `SIGKILL`. The success path
+sweeps the group too, after asking with signal 0 — a tool can exit 0 leaving a
+live member behind, and "the tool said it was done" is not the same statement
+as "nothing of the tool is left".
+
+**Ctrl-C had to be fixed in the same change or it would have got worse.** What
+stops a tool on a keyboard Ctrl-C today is not any line in this program — it is
+the tty broadcasting `SIGINT` to the whole foreground process group, and
+`run_cmd`'s `except BaseException` is unreachable during dispatch because it
+runs in a worker thread while Python delivers signals to the main thread only.
+A session of its own removes that broadcast, so the interrupt is now caught
+*inside* the stage pool's `with` (not around it: `__exit__` joins, so a kill
+placed after it waits for the very stage it is stopping) and a latch stops the
+workers from starting the next tool while the run unwinds. Two pre-existing
+holes close with it: a `kill -INT` from a script, with no terminal, never
+reached a tool at all and left the main thread in a join measured in hours; and
+a Ctrl-C mid-`tmbed` failed one chunk and then ran every remaining chunk to
+completion, because that stage catches `RuntimeError` per chunk — which is why
+the refusal is a `StageError`, the one exception it re-raises.
+
+**And a leftover census at the head of every run, because the measured incident
+ran no handler at all.** The 12:58 log line `removing a stale lock from pid 336`
+is written only on the branch that finds a lock FILE still on disk, and the
+handler removes that file — so pid 336 never reached its handler, and nothing
+in a handler could have prevented those 98 core-hours. `SIGKILL`, the OOM
+reaper and a host reset all leave the same state, and the group kill makes it
+marginally worse, since a tool in its own session no longer dies with a closing
+tmux pane either.
+
+So after the lock is taken and before anything is dispatched, every run scans
+its declared output directories for names matching `atomic_out`'s convention
+(derived from `ATOMIC_SUFFIX`, so it cannot drift: a leading dot, a stem, two
+all-digit fields, `.part`), aggregates them by directory and pid — mandatory,
+not cosmetic, since an interrupted `esmfold` legitimately leaves one per dark
+protein — says one WARN naming the sizes, the newest mtime and which stage
+writes those names, and then stats them again two seconds later. A file
+whose **size** changes is positive proof of a second writer, and the run is
+refused with the `lsof`/`fuser` that finds it; a file that does not change is a corpse
+and gets one line. Size is the primary evidence because it is an integer,
+monotone for an append-only tblout, needs no clock, and is immune to the
+two-second SMB and FAT mtime granularity `OUTPUT_STAMP_SLACK_S` already
+documents; the mtime is compared against `.metaannot_state.json`'s own mtime on
+the same filesystem, stat'ed before this run rewrites it, and suppressed above
+the skew threshold `report_output_stamps` already uses. The two seconds are
+spent only when a candidate exists.
+
+**Nothing is deleted, renamed, moved, truncated or read past `stat`, and
+nothing is ever signalled on the strength of a filename.** The pid in
+`.pfam.336.140234.part.tblout` is metaannot's — `atomic_out` mints it with
+`os.getpid()` — so it names the run that opened the file and says nothing about
+the `hmmsearch` that was writing it; it carries no host, and it can have been
+recycled. The census therefore asks the process table exactly one question, and
+it is `== os.getpid()`. The 237 MB tblout from the incident is still in
+`results/hmm/` and stays there: rule 5, and because it is the only artefact
+showing three hmmsearches ran, because an `unlink` would not free the space while
+the writer holds the inode — it would only hide the bytes from `du` and destroy
+`lsof <path>`, the one handle from the file back to the process — and because
+a complete tblout may be real work.
+
+**What this does not cover, stated so nobody reads silence as health.** No
+handler runs for `SIGKILL`, an OOM kill or a host reset, and nothing in a
+process that has been killed uncooperatively can act; the census is the whole
+of the answer there. Under `systemd` the question does not arise —
+`KillMode=control-group` is the default, so a supervised run's cgroup is torn
+down whatever we do — and the leak was always specific to a bare `kill` from a
+shell or a tmux pane. A tool that calls `setsid` itself escapes the group kill;
+none in this tool set does, and that cannot be proved for a tool it has not
+met. An orphan that leaves no pid-bearing name is invisible to the census, and
+the list is the one `_park_superseded` already gives: `hhblits`' per-query
+`.hhr` and its own `.hhr.part`, `esmfold`'s `plddt.tsv` and
+`esmfold_failed.tsv` appended in place, the `.done` sentinels. Windows is
+uncovered: `TerminateProcess` runs no handler and there are no POSIX process
+groups, so no slot is claimed and the kill loop cannot run. On Windows the real
+answer is a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which is not
+testable from here and is not attempted.
+
+**Two costs, both real.** `emapper`'s live branch hands `emapper.py` the output
+path and lets it write `eggnog/emapper.emapper.annotations` in place, with no
+temp and no rename — the one declared output a kill can leave genuinely short.
+A group `SIGKILL` now truncates it in cases where an orphan would have finished
+it, and what stands between that and adoption is only the `running` record
+`mark_running` wrote first. That is the documented, correct outcome
+(recompute), but it is reached more often; routing `emapper` through
+`atomic_out` is the real fix and is a separate change. And Ctrl-Z now suspends
+metaannot while its tools keep running, because a tool in its own session is
+not in the foreground group — forwarding `SIGSTOP`/`SIGCONT` would fix it and
+is a third and fourth signal in the function whose history includes a measured
+hang, so it is deliberately left out and written down instead.
+
+#### Four defects an audit of the two changes above found
+
+**The recycle window the one dangerous syscall rests on was a CLOCK, and the
+clock was five seconds.** The comment above the handler's kill loop stated the
+residual hole "as a count and not as 'small'": between the wait that reaps and
+the store that clears the registry slot "there are a few bytecodes", so for a
+signal landing there to reach a stranger the pid space would have to wrap —
+99998 creations on macOS — inside them. That was false, and false by the whole
+of a `reader.join(timeout=5)`: the reap is `run_cmd`'s own `proc.wait()`, and
+the slot was cleared by the spawn helper's `finally`, which is reached only
+after that join. Worse, it was the entire timeout in exactly the case the
+success-path sweep exists for — a surviving child inherits the tool's stderr,
+so `iter(stream.readline, "")` never sees EOF. Measured, with a tool that exits
+0 leaving one child: reap to sweep 5.02s, reap to slot cleared 5.07s, the
+leader already out of the process table and the slot still advertising its pid,
+at which `_end_tool_group` aimed `killpg(pg, 0)` and then `SIGTERM` and
+`SIGKILL`. The sweep and the store now both happen AT the reap — the helper
+hands the caller that does its own reap an idempotent `finish_group()`, and
+`run_cmd` calls it between the wait and the join — so a group already empty
+there is forgotten a few bytecodes later having been sent nothing at all, and a
+group with a survivor in it still holds its own pgid, which makes the number
+unrecyclable until the sweep's poll notices it go. The residual window is one
+of those polls, 0.05 s, and the comment now says clock where it said count.
+A consequence rather than the reason: the join returns instead of expiring,
+because the survivor holding the pipe open has just been killed.
+
+**The census made `--force-unlock-live` inert, and it now tells the two writers
+apart instead.** That flag's help text is "take the directory even when this
+host can see the holder is still running", and a live holder's tool is
+precisely what leaves a `.part` file growing — so the growth check refused the
+flag's only case, every time. Measured: run A live inside `pfam` with a growing
+`.part`, then B with `--only pfam --force-unlock-live` — B exited 1, refused by
+the census, and dispatched nothing, with no escape anywhere. It took the
+documented handover with it, since `another run holds this results directory`
+and the whole `_park_superseded` apparatus the TUTORIAL describes then named a
+state nothing could reach. The suite missed it because the handover tests use
+stubs that have already exited.
+
+What tells the cases apart is the only thing a leftover's NAME carries: the pid
+that MINTED it, which is metaannot's own and therefore names a RUN. Where that
+is the pid of the lock this run has just taken from a holder **this host proved
+alive**, the file is the displaced holder's tool and the run proceeds behind a
+loud `WARN` naming the pid, the growth and the fact that there are now two
+writers in the directory on purpose. Anything else still refuses — including a
+file lying beside it, because the exemption is per FILE and the flag is an
+assertion about one process rather than about the directory. It is keyed on
+what the lock really DISPLACED and not on the flag being typed, so
+`--force-unlock-live` over a vacant, garbled, remote or provably dead holder
+excuses nothing and the `kill -9` orphan is refused exactly as before. Nothing
+here asks the process table anything: `ResultsLock` did the proving before the
+lock changed hands and the census only consumes its answer, which keeps the
+rule that a pid out of a filename is never read as evidence about a process.
+The one case it cannot separate is a file minted by a dead run whose pid was
+later recycled onto the live holder; the message prints the number and points
+at `lsof` rather than calling it proof.
+
+**`CLAUDE.md` is now one of the surfaces the count scanner reads.** It was
+outside it entirely, and a standing-instruction file is the worst place for an
+unpinned count: its whole job is to stop the next reader reintroducing a
+defect, so a number that is wrong there is a rule that is wrong where it is
+most read. The rule this change adds to it names the spawn-helper allowlist,
+and that number is DERIVED from the allowlist itself — counted as its
+`subprocess.run(` entries, so it cannot be "length minus one". Two counts were
+caught by the scanner in the drafting of this very change, which is the
+argument for the surface; no released `CLAUDE.md` ever carried a wrong one,
+and an earlier draft of this entry said otherwise. Making the file scannable
+cost one further classification — "three parts", a trio the bullets under it
+spell out.
+
+**The test named for `_run_rscript`'s spawn site did not pin that spawn site.**
+It was cited as covering the Mac's whole exposure to the group kill, on the
+grounds that its spy had moved from `subprocess.run` to `subprocess.Popen`.
+Measured: with `metaannot.py` reverted to the commit before this change set and
+that test file unchanged, it PASSES — `subprocess.run` calls `Popen` itself, so
+a spy there sees the launch either way, and moving it changed what the test
+watches and not what it proves. Its name is about the resolved PATH, which it
+does pin, so it keeps that job and says so. What actually changed at that call
+site is the session and the registration, and a second test now asserts those:
+`start_new_session=True` in the launch, a tool slot claimed for the launched
+pid — only the helper claims one — and `stdin` on `/dev/null`. It fails on the
+old spawn site, which is what the one beside it never did.
 
 ## v0.6.0 — 2026-09-12
 

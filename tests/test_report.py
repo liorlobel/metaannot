@@ -946,18 +946,84 @@ def test_rscript_is_launched_by_the_path_that_was_resolved_for_it(
             f'@echo off\r\n"{sys.executable}" "%~dp0Rscript" %*\r\n',
             encoding="utf-8")
     monkeypatch.setenv("PATH", str(d) + os.pathsep + os.environ["PATH"])
+    # The spy is on Popen because that is what _run_rscript calls now, and it
+    # would see the launch either way: subprocess.run calls Popen itself, so
+    # nothing here distinguishes the two. THIS TEST IS ABOUT THE PATH AND ONLY
+    # THE PATH, which is what its name says. What covers the spawn site is
+    # test_rscript_goes_through_the_spawn_helper_so_a_kill_reaches_it below.
     launched = []
-    real = ma.subprocess.run
+    real = ma.subprocess.Popen
 
     def spy(argv, *a, **k):
         launched.append([str(c) for c in argv])
         return real(argv, *a, **k)
-    monkeypatch.setattr(ma.subprocess, "run", spy)
+    monkeypatch.setattr(ma.subprocess, "Popen", spy)
     ma._run_rscript(["Rscript", "-e", "invisible(NULL)"], "a test")
     assert launched, "no Rscript process was launched"
     assert os.path.isabs(launched[0][0]), \
         f"Rscript was launched as {launched[0][0]!r}, not the resolved path"
     assert os.path.dirname(launched[0][0]) == str(d)
+
+
+def test_rscript_goes_through_the_spawn_helper_so_a_kill_reaches_it(
+        ma, monkeypatch):
+    """The Mac's whole exposure to the tool-group kill, actually pinned.
+
+    `all` calls cmd_run, then cmd_report, then cmd_object in ONE process and
+    signal handlers are never unregistered, so _release_lock_on_signal is
+    still installed during the R phase: a `kill` there used to leave Rscript
+    holding a 455k-row data frame in RAM with nothing able to stop it, because
+    subprocess.run registers nothing and the handler exits through os._exit().
+
+    THE TEST ABOVE DOES NOT COVER THAT, and it was cited as though it did.
+    Measured: with metaannot.py reverted to HEAD -- _run_rscript still on
+    subprocess.run -- and that test file unchanged, it PASSES. Its spy is on
+    subprocess.Popen and subprocess.run calls Popen itself, so moving the spy
+    from one to the other changed what the test watches and not what it
+    proves.
+
+    What actually changed at that call site is the SESSION and the
+    REGISTRATION, so those are what this asserts. Only _tool_process claims a
+    slot, so a claim for the launched pid is proof the launch went through it;
+    start_new_session is what makes one killpg reach whatever R forks. A stub
+    that exits immediately is enough: neither property is about R.
+    """
+    kw, claimed = {}, []
+    real_popen = ma.subprocess.Popen
+    real_claim = ma._claim_tool_slot
+
+    def popen_spy(argv, *a, **k):
+        kw.update(k)
+        proc = real_popen(argv, *a, **k)
+        kw["pid"] = proc.pid
+        return proc
+
+    def claim_spy(pgid):
+        claimed.append(pgid)
+        return real_claim(pgid)
+
+    monkeypatch.setattr(ma.subprocess, "Popen", popen_spy)
+    monkeypatch.setattr(ma, "_claim_tool_slot", claim_spy)
+    ma._run_rscript([sys.executable, "-c", "pass"], "a test")
+    assert kw, "no process was launched"
+    if os.name == "nt":
+        # No POSIX sessions there, so the helper passes none and claims no
+        # slot - which is the gap the README and the CHANGELOG both state.
+        assert "start_new_session" not in kw
+        assert claimed == []
+    else:
+        assert kw.get("start_new_session") is True, (
+            "Rscript was not launched in a session of its own, so one killpg "
+            "cannot reach what R forks and the run's own group kill would "
+            "have to signal itself to try")
+        assert claimed == [kw["pid"]], (
+            "no tool slot was claimed for the Rscript pid, so a `kill` during "
+            f"the R phase of `all` cannot see it: claimed {claimed}, pid "
+            f"{kw['pid']}")
+    # stdin on /dev/null, for the reason the helper gives: a child in a
+    # session of its own that reads the inherited terminal gets SIGTTIN and
+    # STOPS, and a three-day run does not come back from that.
+    assert kw.get("stdin") == subprocess.DEVNULL
 
 
 @needs_r("SummarizedExperiment", "S4Vectors")

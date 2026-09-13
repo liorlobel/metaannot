@@ -714,7 +714,11 @@ def test_the_scheduler_sorts_the_ready_set_before_it_caps_at_stage_workers(
     # wrong after gpu_lease, which hands the card to whichever gpu stage it
     # sees first.
     src = io.open(METAANNOT_PY, encoding="utf-8").read()
-    decide = src.index("                run_now.append(name)")
+    # Matched without its leading whitespace: the dispatch loop is now nested
+    # one level deeper, inside the try: that kills the tool groups on a
+    # Ctrl-C, and this test is about the ORDER of four statements rather than
+    # about how far in they sit.
+    decide = src.index("run_now.append(name)")
     srt = src.index("run_now.sort(key=stage_priority, reverse=True)", decide)
     lease = src.index("run_now, waiting = gpu_lease(", decide)
     cap = src.index("if len(futures) >= workers:", decide)
@@ -4449,3 +4453,1014 @@ def test_a_full_log_disk_costs_the_log_line_and_not_the_run(ma, tmp_path,
                 fh.close()
             except OSError:
                 pass
+
+
+# ======================================================================
+# a stop that reaches the tools, and the leftovers of one that did not
+# ======================================================================
+#
+# WHY THESE TESTS ASK THE PROCESS TABLE RATHER THAN READING THE SOURCE. The
+# defect was not a missing line of code but a missing PROCESS DEATH: a `kill`
+# of a run left `hmmsearch --cpu 7` running for seven more hours, and nothing
+# in a state file, a log line or a source scan can say whether that happened.
+# So each of these starts a real run, lets it launch a real child (and, where
+# it matters, a real GRANDCHILD, which is the shape proc.kill() never reached),
+# signals the run for real, and then asks the kernel whether those pids are
+# still there.
+#
+# Every spawned process is given a deadline, in the test and in the stub
+# (STUB_GATE_MAX_S), and every one of these tests kills whatever it finds
+# alive on the way out: a test that leaks a sleeping child IS the defect under
+# test.
+SIG_SKIP = ("TerminateProcess runs no handler on Windows, so a SIGTERM cannot "
+            "be delivered to a child there at all, and there are no POSIX "
+            "process groups to kill either - so nothing these assert (a dead "
+            "tool, a dead grandchild, the 128+N status) can happen. Deduced "
+            "from the platform rather than measured on it.")
+
+
+def _pid_alive(pid):
+    """Whether `pid` is still in the process table.
+
+    PermissionError is ALIVE: on a shared box the answer for somebody else's
+    process is that it exists, which is the same reading ResultsLock's
+    _holder_proof takes of the same errno.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _stub_pids(pidfile, roles=("tool", "child")):
+    """{role: [pid, ...]} as the stub recorded them."""
+    out = {}
+    try:
+        with open(pidfile, encoding="utf-8") as fh:
+            for line in fh:
+                bits = line.split()
+                if len(bits) == 2 and bits[0] in roles:
+                    out.setdefault(bits[0], []).append(int(bits[1]))
+    except OSError:
+        pass
+    return out
+
+
+def _reap_stub_pids(pidfile):
+    """Kill anything the stub recorded that is somehow still running.
+
+    Called from a `finally` in every test here. It is a cleanup and NOT part of
+    any assertion: the assertions run first and this only ever has work to do
+    when one of them has already failed - or when the test is the one that
+    asserts a SIGKILL leaves orphans behind, which is the case the census
+    exists for and which this is the reason the suite can afford to test.
+    """
+    for pids in _stub_pids(pidfile).values():
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _run_with_children(proj, pidfile, gate, *extra, **env):
+    """A background run parked inside pfam, whose stub has a child of its own.
+
+    Returns the Popen once the stub AND its grandchild have both recorded
+    themselves, so a test that signals the run afterwards knows there was
+    something there to kill.
+    """
+    e = dict(os.environ)
+    # The child outlives every deadline in these tests ON PURPOSE. A sleep
+    # short enough to expire inside the window a test waits for its death
+    # would make that test pass whether anything killed it or not, which is
+    # the way a test like this rots; the `finally` is what stops it leaking.
+    e.update(STUB_WAIT_FOR=gate, STUB_SLEEP="0", STUB_PIDFILE=pidfile,
+             STUB_FORK_CHILD="1", STUB_CHILD_SLEEP="120",
+             STUB_GATE_MAX_S="150", PYTHONHASHSEED="0")
+    e.update(env)
+    proc = subprocess.Popen(
+        [sys.executable, METAANNOT_PY, "run", "--config", proj.config_path,
+         "--only", "pfam", *extra],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e,
+        cwd=proj.root)
+    if not _wait_for(lambda: len(_stub_pids(pidfile).get("tool", [])) >= 1
+                     and len(_stub_pids(pidfile).get("child", [])) >= 1,
+                     timeout=60):
+        proc.kill()
+        proc.communicate()
+        _reap_stub_pids(pidfile)
+        raise AssertionError("the run never launched a tool with a child")
+    return proc
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_a_tool_runs_in_a_process_group_of_its_own(ma):
+    # The property everything else here rests on, and the reason the group can
+    # be killed without killing us: setsid makes the child a session and group
+    # leader, so pgid == pid with no extra syscall and nothing to look up.
+    with ma._tool_process([sys.executable, "-c", "import time; time.sleep(30)"],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL) as proc:
+        try:
+            assert os.getpgid(proc.pid) == proc.pid, \
+                "the tool is in somebody else's process group"
+            assert os.getpgid(proc.pid) != os.getpgrp(), \
+                "the tool shares our group, so killing it would kill us"
+        finally:
+            proc.kill()
+    assert not _pid_alive(proc.pid), "the helper left the tool running"
+
+
+# A tool that leaves one child behind and exits 0 -- the success path the
+# group sweep exists for. The child INHERITS the tool's stderr, which is the
+# pipe run_cmd handed it, so run_cmd's `iter(stream.readline, "")` never sees
+# EOF: that is what made the reap-to-sweep gap the reader join's whole timeout
+# rather than a few bytecodes. It writes its own exit instant and its child's
+# pid to argv[1] before exiting, so the test can date the reap from the child
+# rather than from anything this process guesses.
+_TOOL_LEAVING_A_CHILD = (
+    "import os, sys, time, subprocess\n"
+    "k = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'])\n"
+    "sys.stderr.write('chatter\\n'); sys.stderr.flush()\n"
+    "open(sys.argv[1], 'w').write(repr(time.time()) + ' ' + str(k.pid))\n"
+    "os._exit(0)\n")
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_the_slot_is_cleared_at_the_reap_and_not_when_the_caller_leaves(
+        ma, tmp_path):
+    """The recycle window is a clock, and it used to be five seconds of one.
+
+    The comment above _kill_tool_groups() claimed the slot held a released pid
+    for "a few bytecodes", so that the pid space would have to wrap 99998
+    times inside them for a signal landing there to reach a stranger. It was
+    false by five seconds: run_cmd's proc.wait() is the reap, and the slot was
+    cleared by _tool_process's `finally`, which is reached only after
+    reader.join(timeout=5) -- and that join burns its WHOLE timeout in exactly
+    this case, because the surviving child holds the tool's stderr open.
+    Measured before the fix: reap -> _end_tool_group 5.02s, reap -> slot
+    cleared 5.07s, with the leader already out of the process table and the
+    slot still advertising its pid. For those five seconds the registry the
+    signal handler reads named a pgid the kernel had released, and
+    _end_tool_group aimed killpg(pg, 0) -> SIGTERM -> SIGKILL at it.
+
+    So this is a timing assertion on purpose. 2.0s is far above the 0.07s this
+    measures now -- one _GROUP_POLL_S plus the sweep -- and far below the 5.07s
+    it measured before.
+    """
+    stamp = tmp_path / "tool_exit"
+    ma.run_cmd([sys.executable, "-c", _TOOL_LEAVING_A_CHILD, str(stamp)])
+    returned = time.time()
+    exited, kid = open(stamp, encoding="utf-8").read().split()
+    kid = int(kid)
+    try:
+        gap = returned - float(exited)
+        assert gap < 2.0, (
+            f"{gap:.2f}s from the reap to run_cmd returning. The slot is "
+            "being cleared when the caller leaves _tool_process rather than "
+            "at the reap, so for that long this run goes on being responsible "
+            "for a group it has finished with - which is the cost the "
+            "incident was: a tool that outlived the run that launched it. The "
+            "pgid is NOT recyclable meanwhile, because the survivor holding "
+            "the pipe open is a member of that group and reserves it")
+        assert not _pid_alive(kid), \
+            "the sweep did not reach the child the tool left behind"
+        assert not [pg for pg in ma._TOOL_PGIDS[:ma._TOOL_PG_HIGH] if pg], \
+            "the registry still names a tool group after run_cmd returned"
+    finally:
+        # Never leave a 90-second sleeper behind on a failure.
+        with contextlib.suppress(OSError):
+            os.kill(kid, signal.SIGKILL)
+
+
+def test_run_cmd_ends_the_tool_group_at_the_reap_and_not_after_the_join(ma):
+    """The ordering, pinned at the source, because the timing test above can
+    only see the consequence.
+
+    The reap is the moment the kernel stops reserving the pgid. Anything
+    between it and the sweep - the reader join, a log line, a future caller's
+    own tidying - is time in which the number in the slot can be handed out
+    again, and both the registry and _end_tool_group's signal-0 probe then
+    speak about a stranger.
+    """
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("def run_cmd(")
+    body = src[i:src.index("\ndef ", i + 1)]
+    reap = body.index("proc.wait(timeout=_PROGRESS_INTERVAL or None)")
+    finish = body.index("proc.finish_group()")
+    join = body.index("reader.join(")
+    assert reap < finish < join, (
+        "run_cmd must sweep and forget the tool group between the wait that "
+        "reaps and the reader join, not afterwards")
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_a_tools_group_is_swept_once_however_many_times_it_is_asked(
+        ma, monkeypatch):
+    """Once-ness is the safety property, not tidiness.
+
+    After the sweep has returned the group is gone, or it has had a SIGKILL
+    and grace has run out -- either way this process is no longer entitled to
+    signal that pgid, and a SECOND sweep would aim killpg at whatever the
+    kernel has handed the number since. run_cmd asks at the reap and the
+    helper's `finally` asks again on the way out, so two asks per tool is the
+    ordinary case rather than an error path.
+    """
+    swept = []
+    real = ma._end_tool_group
+
+    def spy(proc, grace=None):
+        swept.append(proc.pid)
+        return real(proc, grace)
+    monkeypatch.setattr(ma, "_end_tool_group", spy)
+    with ma._tool_process([sys.executable, "-c", "pass"],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL) as proc:
+        proc.wait()
+        proc.finish_group()
+        proc.finish_group()
+    assert swept == [proc.pid], \
+        f"the group was swept {len(swept)} times, not once"
+    assert not [pg for pg in ma._TOOL_PGIDS[:ma._TOOL_PG_HIGH] if pg], \
+        "the slot was not cleared"
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGHUP"])
+def test_a_killed_run_takes_its_tool_and_the_tools_own_child_with_it(
+        tmp_path, stub_bin, signame):
+    """The 98 core-hours, as a test.
+
+    os._exit() in the signal handler runs no `finally` and no `except
+    BaseException`, so run_cmd's own cleanup was never reached and every child
+    of a killed run survived: three concurrent `hmmsearch --cpu 7` against the
+    same 455,571 proteins for seven hours, two of the three results thrown
+    away. The handler now takes each tool's whole process GROUP down before it
+    releases the lock, which is also the only thing that ever reached the
+    grandchild - proc.kill() left it alive with ppid 1, still sitting in
+    metaannot's own process group, where no group kill could reach it without
+    suicide.
+    """
+    sig = getattr(signal, signame)
+    proj = _searchable(tmp_path, tmp_path / f"grp{signame}")
+    pidfile = str(tmp_path / f"pids_{signame}")
+    gate = str(tmp_path / f"gate_{signame}")
+    proc = _run_with_children(proj, pidfile, gate)
+    try:
+        pids = _stub_pids(pidfile)
+        tool, child = pids["tool"][0], pids["child"][0]
+        assert _pid_alive(tool) and _pid_alive(child)
+
+        proc.send_signal(sig)
+        _out, err = proc.communicate(timeout=60)
+
+        # The tool dies, and so does the tool's own child. Given a moment:
+        # SIGKILL is delivered by the kernel and the corpses are reaped by
+        # init, which is not instantaneous.
+        assert _wait_for(lambda: not _pid_alive(tool), timeout=20), \
+            f"the tool (pid {tool}) outlived the run that launched it"
+        assert _wait_for(lambda: not _pid_alive(child), timeout=20), \
+            (f"the tool's own child (pid {child}) outlived the run. This is "
+             "the case proc.kill() never covered: interproscan.sh -> java")
+        # and everything the handler did before is still true.
+        assert proc.returncode == 128 + int(sig)
+        assert f"stopping on {signame}: releasing the results lock" in err
+        assert not os.path.exists(proj.rpath(".metaannot.lock")), \
+            "the lock survived the signal it exists to be released by"
+        # The gate was never opened, so the run cannot have waited for its
+        # stage: it was gone long before the stub's own backstop.
+        assert not os.path.exists(gate)
+    finally:
+        _reap_stub_pids(pidfile)
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="send_signal(SIGINT) is unsupported on Windows and CTRL_C_EVENT "
+           "goes to the whole console group including the test runner, and "
+           "there are no process groups to kill there either. " + SIG_SKIP)
+def test_ctrl_c_still_stops_the_tools_now_that_the_tty_no_longer_does_it(
+        tmp_path, stub_bin):
+    """The regression this change had to avoid, pinned.
+
+    Today a keyboard Ctrl-C stops a tool for a reason that is not in this
+    program: the tty sends SIGINT to the whole FOREGROUND PROCESS GROUP and
+    the tool is in it. run_cmd's `except BaseException: proc.kill()` cannot be
+    what does it - run_cmd runs in a ThreadPoolExecutor worker and Python
+    delivers signals to the main thread only, which is parked in
+    as_completed() - and this test proves the point by sending the signal to
+    the metaannot process ALONE, with no terminal involved, which is also what
+    `kill -INT` from a script does.
+
+    Putting each tool in a session of its own removes that broadcast. So
+    without the kill inside the executor's `with`, this would stop reaching
+    tools altogether AND the main thread would unwind straight into a join
+    that waits for the stage - hours on a real run. Both halves are asserted:
+    the children are gone, and the process exits without waiting for a gate
+    nobody opens.
+    """
+    proj = _searchable(tmp_path, tmp_path / "int_grp")
+    pidfile = str(tmp_path / "pids_int")
+    gate = str(tmp_path / "gate_int")
+    proc = _run_with_children(proj, pidfile, gate)
+    try:
+        pids = _stub_pids(pidfile)
+        tool, child = pids["tool"][0], pids["child"][0]
+
+        t0 = time.time()
+        proc.send_signal(signal.SIGINT)
+        _out, err = proc.communicate(timeout=60)
+        took = time.time() - t0
+
+        assert _wait_for(lambda: not _pid_alive(tool), timeout=20), \
+            f"Ctrl-C left the tool (pid {tool}) running"
+        assert _wait_for(lambda: not _pid_alive(child), timeout=20), \
+            f"Ctrl-C left the tool's own child (pid {child}) running"
+        # It did not wait for the stage. The gate is never created and the
+        # stub's own backstop is 90s, so anything under that is proof the
+        # executor's join did not sit through it.
+        assert took < 60, \
+            f"the interrupt waited {took:.0f}s for the stage it was stopping"
+        assert not os.path.exists(gate)
+
+        # and the Ctrl-C path still leaves everything it left before.
+        assert proc.returncode == 128 + int(signal.SIGINT)
+        assert "interrupted" in err
+        rec = _run_record(proj)
+        assert rec["final_status"] == "interrupted" and rec["finished"]
+    finally:
+        _reap_stub_pids(pidfile)
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_a_tool_that_exits_zero_leaving_a_child_behind_does_not_leak_it(
+        tmp_path, stub_bin):
+    # "the tool said it was done" is NOT the same statement as "nothing of the
+    # tool is left": a tool can exit 0 with a live member still in its group,
+    # and the group outlives the leader's reap (measured: killpg answers EPERM
+    # while the leader is an unreaped zombie, ESRCH only once it is reaped).
+    # So the success path sweeps the group too - after asking with signal 0,
+    # so that the ordinary leaf tool costs one syscall and no signal at all.
+    proj = _searchable(tmp_path, tmp_path / "zero")
+    pidfile = str(tmp_path / "pids_zero")
+    # 120s, and the assertion waits 20: a child that expires on its own
+    # inside the window would make this pass with the sweep removed, which is
+    # exactly what it happened to do the first time it was written.
+    e = {"STUB_PIDFILE": pidfile, "STUB_FORK_CHILD": "1",
+         "STUB_CHILD_SLEEP": "120", "STUB_SLEEP": "0"}
+    try:
+        proc = proj.run("--only", "pfam", env=e, timeout=180)
+        assert "done:" in proc.stderr
+        child = _stub_pids(pidfile)["child"][0]
+        assert _wait_for(lambda: not _pid_alive(child), timeout=20), \
+            (f"a tool exited 0 and left pid {child} behind, which is then "
+             "unreachable from the signal handler as well")
+    finally:
+        _reap_stub_pids(pidfile)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_a_kill_9_leaves_an_orphan_and_the_next_run_refuses_to_join_it(
+        tmp_path, stub_bin):
+    """The incident exactly as it happened, and the only part of this that
+    covers it.
+
+    The 12:58 log line `removing a stale lock from pid 336` is written only on
+    the branch that finds a lock FILE still on disk, and the handler removes
+    that file - so pid 336 never reached its handler, and the death that
+    burned 98 core-hours delivered no signal anything could handle. SIGKILL,
+    the OOM reaper and a host reset all leave this state: the parent gone, the
+    lock reclaimable as stale with no flag at all, and a live `hmmsearch`
+    still writing 237 MB into results/hmm/.
+
+    So the first half of this test asserts the ORPHAN SURVIVES, because it
+    must - nothing in a process that has been SIGKILLed can act - and the
+    second half asserts what the next run does about it: it finds the `.part`
+    file, says whose it is, watches it for two seconds, sees it grow, and
+    refuses before dispatching the stage that would have been the second
+    writer.
+    """
+    proj = _searchable(tmp_path, tmp_path / "k9")
+    pidfile = str(tmp_path / "pids_k9")
+    gate = str(tmp_path / "gate_k9")
+    proc = _run_with_children(proj, pidfile, gate, STUB_GROW="1")
+    try:
+        tool = _stub_pids(pidfile)["tool"][0]
+        # Wait until the orphan-to-be has actually written something, so the
+        # `.part` file the next run reasons about exists.
+        hm = os.path.dirname(proj.rpath("hmm", "x"))
+
+        def part_files():
+            try:
+                return [f for f in os.listdir(hm)
+                        if f.startswith(".") and ".part" in f]
+            except OSError:
+                return []
+
+        assert _wait_for(lambda: bool(part_files()), timeout=60), \
+            "the stub never opened the output the run handed it"
+
+        proc.send_signal(signal.SIGKILL)
+        proc.communicate(timeout=60)
+        assert proc.returncode == -int(signal.SIGKILL)
+
+        # THE GAP, asserted rather than hidden. No handler ran, so the tool is
+        # still there, still writing, with the lock it was protected by now
+        # reclaimable by anyone.
+        assert _pid_alive(tool), \
+            ("a SIGKILLed run cannot stop its own tools, and a test that "
+             "says otherwise is testing something else")
+        assert os.path.exists(proj.rpath(".metaannot.lock")), \
+            "SIGKILL ran the handler, which would make this whole case moot"
+
+        # The next run. It is entitled to the directory - the holder really is
+        # dead - and it refuses anyway, because the file is GROWING.
+        again = proj.run("--only", "pfam", env={"STUB_SLEEP": "0"},
+                         expect=1, timeout=300)
+        err = again.stderr
+        assert "removing a stale lock" in err, \
+            "the lock was not reclaimable, so this is not the incident"
+        assert "GREW while this run was starting" in err, err[-1500:]
+        assert "lsof" in err and "fuser" in err
+        assert "Something that is NOT this run is writing inside this " \
+               "results directory" in err
+        # it says whose pid the name carries, before anyone reads it as the
+        # tool's and kills a stranger.
+        assert "METAANNOT'S PID, NOT THE TOOL'S" in err
+        assert "recycled by anything once its owner is gone" in err
+        # and nothing was dispatched, deleted or renamed.
+        assert "=== pfam: running" not in err
+        assert "Nothing has been deleted, renamed, moved or stopped" in err
+        assert part_files(), "the leftover the refusal is about was removed"
+    finally:
+        _reap_stub_pids(pidfile)
+
+
+# These three are POSIX-only for a cleanup reason and not a signal one: the
+# `finally` reaps the stub's recorded pids with SIGKILL, which Windows has not
+# got. Nothing about the census, the flag or either verdict is POSIX-only, and
+# none of these sends a signal to a run - so they are not part of the README's
+# Windows signal-test note.
+LIVE_HOLDER_SKIP = ("the cleanup reaps the stub's pids with signal.SIGKILL, "
+                    "which Windows has not got. The refusal and the WARN "
+                    "these assert are platform-independent.")
+
+
+def _foreign_growing_part(dirpath, pid=424242):
+    """A `.part` file that something nobody has displaced keeps appending to.
+
+    The shape the census is FOR, and deliberately not the shape a live
+    holder's own tool leaves: the pid in the name is a metaannot run that this
+    run has taken nothing from, so --force-unlock-live is no assertion about
+    it. Returns (path, Popen); the caller kills the writer in a `finally`.
+    """
+    path = os.path.join(dirpath, f".pfam.{pid}.1.part.tblout")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# starting\n")
+    grower = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time\n"
+         "fh = open(sys.argv[1], 'a')\n"
+         "while True:\n"
+         "    fh.write('# still searching' + chr(10))\n"
+         "    fh.flush()\n"
+         "    time.sleep(0.05)\n", path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return path, grower
+
+
+@pytest.mark.skipif(os.name == "nt", reason=LIVE_HOLDER_SKIP)
+def test_force_unlock_live_still_takes_the_directory_from_a_live_holder(
+        tmp_path, stub_bin):
+    """The flag's own case, which the census had made unreachable.
+
+    `--force-unlock-live` means "take the directory even when this host can
+    see the holder is still running", and it shipped for the operator who
+    knows that and means to displace it. A live holder's tool is PRECISELY
+    what leaves a `.part` file growing, so a census that refuses on that
+    evidence refuses the flag's only case. Measured before the fix: run A live
+    inside pfam with a growing `.part`, then B with
+    `--only pfam --force-unlock-live` -- B exited 1, refused by the census,
+    and dispatched nothing. There was no escape, and the TUTORIAL's
+    `another run holds this results directory` row and the whole
+    _park_superseded() handover it describes named a state nothing could
+    reach.
+    """
+    proj = _searchable(tmp_path, tmp_path / "live")
+    pidfile = str(tmp_path / "pids_live")
+    gate = str(tmp_path / "gate_live")
+    a = _run_with_children(proj, pidfile, gate, STUB_GROW="1")
+    try:
+        hm = os.path.dirname(proj.rpath("hmm", "x"))
+        assert _wait_for(lambda: any(f.startswith(".") and ".part" in f
+                                     for f in os.listdir(hm)), timeout=60), \
+            "the holder's tool never opened the output it was handed"
+        assert a.poll() is None, "the holder is not alive, so this is a "  \
+                                 "different test"
+        b = proj.run("--only", "pfam", "--force-unlock-live", timeout=300)
+        err = b.stderr
+        # It is not refused, and it dispatches.
+        assert "=== pfam: running" in err, err[-2000:]
+        assert "THIS RUN IS NOT REFUSED" in err, err[-2000:]
+        # It still SAYS what it found, loudly, and the growth is the evidence.
+        assert "GREW while this run was starting" in err
+        # And it says so because of the one thing that tells the two cases
+        # apart: the pid that MINTED the file is the holder it displaced.
+        assert f"minted by metaannot pid {a.pid}" in err, err[-2000:]
+        assert f"from pid {a.pid}" in err, \
+            "the lock handover did not name the live holder it took it from"
+        # ...and it does not pretend the holder was gone.
+        assert "removing a stale lock" not in err
+        assert "STILL RUNNING" in err
+        # Nor that anything was tidied away.
+        assert "Nothing has been deleted, renamed, moved or stopped" in err
+    finally:
+        with contextlib.suppress(OSError):
+            open(gate, "w").close()
+        with contextlib.suppress(Exception):
+            a.kill()
+            a.communicate(timeout=60)
+        _reap_stub_pids(pidfile)
+
+
+@pytest.mark.skipif(os.name == "nt", reason=LIVE_HOLDER_SKIP)
+def test_force_unlock_live_does_not_excuse_a_writer_it_says_nothing_about(
+        tmp_path, stub_bin):
+    """The other half, and the reason this is not "the flag turns it off".
+
+    --force-unlock-live is an assertion about ONE process: the holder of the
+    lock this run just took. It says nothing whatever about a foreign writer
+    the operator has never heard of, which is what the census is for. So when
+    both are present - A holds the lock and is alive, and an orphan of a run
+    nobody displaced is also growing a file in the same directory - the
+    holder's file is excused and the orphan's still refuses the run. Per file,
+    because both are true at once.
+    """
+    proj = _searchable(tmp_path, tmp_path / "mixed")
+    pidfile = str(tmp_path / "pids_mixed")
+    gate = str(tmp_path / "gate_mixed")
+    a = _run_with_children(proj, pidfile, gate, STUB_GROW="1")
+    grower = None
+    try:
+        hm = os.path.dirname(proj.rpath("hmm", "x"))
+        assert _wait_for(lambda: any(f.startswith(".") and ".part" in f
+                                     for f in os.listdir(hm)), timeout=60)
+        foreign, grower = _foreign_growing_part(hm)
+        b = proj.run("--only", "pfam", "--force-unlock-live",
+                     expect=1, timeout=300)
+        err = b.stderr
+        assert "GREW while this run was starting" in err, err[-2000:]
+        assert os.path.basename(foreign) in err, err[-2000:]
+        assert "--force-unlock-live does not cover it" in err, err[-2000:]
+        assert f"assertion about pid {a.pid}" in err, err[-2000:]
+        assert "minted by pid 424242" in err, err[-2000:]
+        # the holder's own file is accounted for rather than ignored...
+        assert f"file(s) that changed WERE minted by pid {a.pid}" in err, \
+            err[-2000:]
+        # ...and nothing was dispatched, deleted or renamed.
+        assert "=== pfam: running" not in err
+        assert "Nothing has been deleted, renamed, moved or stopped" in err
+        assert os.path.exists(foreign), "the refusal removed the evidence"
+    finally:
+        if grower is not None:
+            with contextlib.suppress(Exception):
+                grower.kill()
+                grower.wait(timeout=30)
+        with contextlib.suppress(OSError):
+            open(gate, "w").close()
+        with contextlib.suppress(Exception):
+            a.kill()
+            a.communicate(timeout=60)
+        _reap_stub_pids(pidfile)
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="a pid this host can prove is DEAD is what this "
+                           "needs, and on Windows the proof is OpenProcess "
+                           "rather than os.kill.")
+def test_force_unlock_live_over_a_dead_holder_excuses_nothing(tmp_path,
+                                                              stub_bin):
+    """The escape is keyed on what the lock DISPLACED, not on the flag.
+
+    --force-unlock-live over a lock whose holder this host proved DEAD -- or
+    a vacant, garbled, or another node's lock -- displaced no live run at all,
+    so it asserts nothing about a file that is growing now. This is the
+    SIGKILL orphan case with the flag typed anyway, and the census still
+    refuses: that is the whole difference between telling the two writers
+    apart and switching the check off.
+    """
+    proj = _searchable(tmp_path, tmp_path / "deadholder")
+    proj.run()
+    _plant_lock(proj, _dead_pid())
+    hm = os.path.dirname(proj.rpath("hmm", "x"))
+    foreign, grower = _foreign_growing_part(hm)
+    try:
+        b = proj.run("--only", "pfam", "--force-unlock-live",
+                     expect=1, timeout=300)
+        err = b.stderr
+        assert "removing a stale lock" in err, \
+            "the holder was not proved dead, so this is a different test"
+        assert "GREW while this run was starting" in err, err[-2000:]
+        assert "THIS RUN IS NOT REFUSED" not in err, \
+            "a flag that displaced nothing excused a writer anyway"
+        # and the message stays the one that is true here: the lock really
+        # was vacant, and it is the TOOL that is not gone.
+        assert "honestly vacant" in err, err[-2000:]
+        assert "--force-unlock-live does not cover it" not in err
+        assert "=== pfam: running" not in err
+    finally:
+        with contextlib.suppress(Exception):
+            grower.kill()
+            grower.wait(timeout=30)
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_a_dead_leftover_is_named_and_left_exactly_where_it_is(tmp_path,
+                                                               stub_bin):
+    # The other half of the census, and the common one: a `.part` file whose
+    # writer is gone. One line naming it, no refusal, and the bytes untouched
+    # - rule 5, and because it is the only artefact that shows what happened.
+    # An unlink would not even free the space while a writer holds the inode;
+    # it would only make the bytes invisible to `du` and destroy `lsof`, the
+    # one handle that gets from the file back to the process.
+    proj = _searchable(tmp_path, tmp_path / "dead")
+    proj.run("--only", "pfam", env={"STUB_SLEEP": "0"})
+    hm = os.path.dirname(proj.rpath("hmm", "x"))
+    left = os.path.join(hm, ".pfam.336.140234.part.tblout")
+    body = b"# target name        accession  query name\n" + b"x" * 4096
+    with open(left, "wb") as fh:
+        fh.write(body)
+    again = proj.run("--only", "pfam", env={"STUB_SLEEP": "0"})
+    err = again.stderr
+    assert "were opened by a metaannot process that is not this one" in err
+    assert ".pfam.336.140234.part.tblout" in err
+    assert "metaannot pid 336" in err
+    assert "stage(s) that write those names: pfam" in err
+    assert "nothing appears to be writing them now" in err
+    assert "done:" in err, "a corpse must not refuse a run"
+    assert open(left, "rb").read() == body, \
+        "the census touched a file it only ever had licence to describe"
+
+
+def test_the_leftover_pattern_matches_what_atomic_out_mints_and_nothing_else(
+        ma, tmp_path):
+    """The whole safety of the census is that this pattern is strict.
+
+    Every excluded shape is a real file this program or the documented
+    workflow writes, and a looser `*.part*` or `.*` would report each of them
+    as an orphaned tool.
+    """
+    d = tmp_path / "r"
+    d.mkdir()
+    with ma.atomic_out(str(d / "pfam.tblout")) as tmp:
+        open(tmp, "w", encoding="utf-8").close()
+        minted = os.path.basename(tmp)
+    m = ma._PART_LEFTOVER_RE.match(minted)
+    assert m, f"the pattern does not match what atomic_out mints: {minted}"
+    assert int(m.group("pid")) == os.getpid()
+    assert m.group("stem") == "pfam" and m.group("ext") == ".tblout"
+
+    for name in (
+            # tmbed's per-chunk file: KEPT and salvaged record by record by
+            # the concatenation, and already() re-plans against it, so this
+            # would fire on every normal chunked tmbed resume on the laptop.
+            "03.pred.part",
+            # hhblits' per-query file: names a protein, not a process, and is
+            # swept by the stage's own glob when it finishes.
+            "P0001.hhr.part",
+            # rsync in flight. TUTORIAL.md prescribes `rsync -a` everywhere
+            # for the two-machine workflow, and an interrupted transfer leaves
+            # exactly this: dot-prefixed, but no `.part` and no numeric field.
+            ".plddt.tsv.a8Kd2p",
+            # parked superseded work, which has a `find` of its own.
+            ".superseded.pfam.run-2026-09-12T12-00-00.tblout",
+            # and the ordinary results, which must never match.
+            "pfam.tblout", "annotation_final.tsv", ".metaannot_state.json",
+            # one numeric field is not two: the tid is what says a thread of a
+            # process wrote this, and a name with only a pid is not ours.
+            ".pfam.336.part.tblout"):
+        assert not ma._PART_LEFTOVER_RE.match(name), \
+            f"{name!r} is not an orphaned tool's output and must not match"
+
+
+def test_leftovers_are_reported_one_line_per_directory_and_pid(ma, tmp_path,
+                                                               capsys):
+    # MANDATORY rather than cosmetic: _park_superseded deliberately leaves one
+    # `.part` per item, so an interrupted esmfold legitimately leaves one per
+    # dark protein and structures/ accumulates them by design. One line per
+    # file would be four hundred lines on the GPU laptop, which is a report
+    # nobody reads to the end of.
+    cfg = json.loads(json.dumps(ma.DEFAULT_CONFIG))
+    cfg["results_dir"] = str(tmp_path / "res")
+    p = ma.Paths(cfg)
+    p.mkdirs()
+    d = os.path.dirname(p.pfam) or "."
+    for i in range(40):
+        with open(os.path.join(d, f".P{i:04d}.9134.14023{i % 3}.part.pdb"),
+                  "w", encoding="utf-8") as fh:
+            fh.write("x" * 100)
+    ma._DECLARED_OUTPUTS.clear()
+    ma._DECLARED_OUTPUTS.add(p.pfam)
+    capsys.readouterr()
+    got = ma._census_leftover_parts(p, {}, set(), 0.0, None, watch_s=0.05)
+    err = capsys.readouterr().err
+    assert len(got) == 40
+    assert "40 in-progress output(s)" in err
+    # one line per (directory, pid), and there is one pid here.
+    assert err.count("leftover(s) from metaannot pid 9134") == 1, err[-800:]
+    assert err.count("P0001") + err.count("P0039") <= 1, \
+        "the report lists files individually instead of aggregating them"
+
+
+def test_the_pid_in_a_part_name_is_never_read_as_evidence_about_a_process(ma):
+    """Structural, because this is the reason the census can never kill.
+
+    The pid in a `.part` name is METAANNOT'S - atomic_out mints it from
+    os.getpid() - so it identifies the run that OPENED the file and says
+    nothing about the hmmsearch that was writing it. It carries no host, so on
+    the shared array it cannot even be attributed to this machine, and it can
+    have been recycled by anything since. The census therefore asks the
+    process table exactly one question, and it is an identity comparison
+    rather than a lookup: `== os.getpid()`.
+
+    The --force-unlock-live exemption does not change that and this pins it.
+    That exemption compares the minting pid against `displaced_live["pid"]`,
+    which is two integers and no syscall: ResultsLock did the proving before
+    the lock changed hands, and the census only ever CONSUMES its answer. A
+    census that reached for _holder_proof, os.kill or the process table itself
+    would be reading a filename's pid as evidence about a process, which is
+    the thing this whole file is written against.
+    """
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    for fn in ("_leftover_parts", "_census_leftover_parts"):
+        i = src.index(f"def {fn}(")
+        j = src.index("\ndef ", i + 1)
+        body = src[i:j]
+        for banned in ("os.kill(", "_holder_proof", "_holder_is_alive",
+                       "killpg", "os.remove", "os.replace", "os.rename",
+                       "shutil.", "socket.gethostname", "PROVEN_ALIVE"):
+            assert banned not in body, (
+                f"{banned!r} in {fn}: the census reports and refuses, it does "
+                "not act on a pid it cannot own or a file it did not write, "
+                "and it does not prove anything about a process for itself")
+        assert "os.getpid()" in body or "getpid" not in body
+
+    # And the proving really is done where the lock changes hands, on the arm
+    # the --force-unlock refusal fires on: displaced_live is set nowhere else,
+    # so a flag that displaced a corpse, a vacancy, a garbled file or another
+    # node's lock excuses nothing.
+    i = src.index("class ResultsLock:")
+    cls = src[i:src.index("\nclass ", i + 1)]
+    sets = [ln.strip() for ln in cls.split("\n")
+            if "self.displaced_live" in ln and "=" in ln
+            and "displaced_live ==" not in ln]
+    assert sets == ["self.displaced_live = None",
+                    'self.displaced_live = {"pid": pid, "host": host,'], sets
+    arm = cls.index('self.displaced_live = {"pid": pid')
+    guard = cls.rindex("if self.force_live and proof == PROVEN_ALIVE:", 0, arm)
+    assert guard < arm, \
+        "displaced_live is set outside the proven-alive arm"
+
+
+def test_the_census_and_the_killed_runs_own_message_do_not_contradict(ma):
+    # Two texts about the same event, written in two places, and the whole
+    # point of the pre-encoded one is that it is built at registration and
+    # never revisited. Held against each other so they cannot drift into
+    # saying opposite things about whether a killed run's tools are still
+    # running.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("def _release_lock_on_signal(sig, _frame)")
+    tail = src[i:src.index("signal.signal(_sig, _release_lock_on_signal)", i)]
+    assert "Any tool already running is a separate process" not in tail, \
+        "the pre-encoded line still says the tools are left running"
+    assert "Every tool this run started was killed first" in tail
+    assert "`.part` file" in tail, \
+        "the killed run does not say what it leaves for the next one to find"
+    # and the same word for the same thing at the other end.
+    j = src.index("def _census_leftover_parts(")
+    census = src[j:src.index("\ndef ", j + 1)]
+    assert "dot-prefixed" in census and "dot-prefixed" in tail
+    # Ctrl-C, spelled that way on purpose: the source-level scan over this
+    # span asserts the word for the signal Python's default handles is not in
+    # it, because registering a handler for it would replace an orderly stop
+    # with an abrupt one.
+    assert "SIGINT" not in tail
+
+
+def test_the_signal_handler_kills_the_tool_groups_before_it_frees_the_lock(ma):
+    """The ORDERING is the invariant, and the reason is not the obvious one.
+
+    `release_results_lock` is ResultsLock.__exit__, which calls
+    is_still_ours(), which does open() + read() + json.loads() BEFORE it
+    reaches the os.remove. That is buffered text I/O and unbounded allocation
+    inside a signal handler, today, and the ban-list scan cannot see it
+    because it reads one frame deep. It does not deadlock - a fresh file
+    object has a fresh buffer lock, unlike sys.stderr - but on a wedged NFS
+    mount it blocks for ever, and a wedged mount is exactly when a run gets
+    killed. Losing the lock release costs one --force-unlock; losing the kill
+    costs 98 core-hours.
+    """
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("def _release_lock_on_signal(sig, _frame):")
+    kill = src.index("_kill_tool_groups()", i)
+    free = src.index("release_results_lock()", i)
+    exit_ = src.index("os._exit(128 + int(sig))", i)
+    assert kill < free < exit_, \
+        "the kill no longer precedes the lock release in the handler"
+
+    # And the new function's own body, scanned by the same ban list as the
+    # handler body. It is a module-level function precisely so this can widen
+    # the pin: the long WHY comment above the lock release contains the names
+    # of two of the banned things AS PROSE, so anchoring the existing scan any
+    # higher would swallow that prose instead of covering this loop.
+    k = src.index("def _kill_tool_groups():")
+    body = src[k:src.index("\ndef ", k + 1)]
+    for banned in ("log(", "sys.stderr", "_LOGFH", "print(", ".flush()",
+                   "f\"", "format("):
+        assert banned not in body, (
+            f"{banned!r} in _kill_tool_groups: it either takes a lock or "
+            "allocates through one, and this runs inside a signal handler, "
+            "between two bytecodes of the main thread")
+    # The rest of the rule is about BLOCKING rather than about locks, and it
+    # is asked of the code alone: the docstring has to be able to use the
+    # English word "with" and to name time.sleep as something it does not do.
+    statements = body.split('"""')[2]
+    for banned in ("with ", "_TOOL_PG_LOCK", "time.sleep", ".append(",
+                   " for ", "sorted(", "list("):
+        assert banned not in statements, (
+            f"{banned!r} in _kill_tool_groups: it can block, take a lock, or "
+            "allocate - none of which a signal handler may do")
+    assert "while _i <" in statements, \
+        "an index loop, not an iterator: a worker thread can run between two " \
+        "bytecodes of this one, and index reads make that harmless"
+
+
+def test_the_kill_loop_can_never_signal_our_own_process_group(ma,
+                                                              monkeypatch):
+    # os.killpg(0, SIGKILL) means "my own process group", measured: it kills
+    # the caller. It would take this process down before the lock release and
+    # before the message, and would turn the 128+N exit status three tests
+    # above into 137. The zero sentinel sits one typo away from suicide.
+    sent = []
+    monkeypatch.setattr(ma, "_killpg", lambda pg, sig: sent.append((pg, sig)))
+    monkeypatch.setattr(ma, "_TOOL_PGIDS", [0, ma._MY_PGID, ma._MY_PID, -1,
+                                            424242, 0])
+    monkeypatch.setattr(ma, "_TOOL_PG_HIGH", 6)
+    ma._kill_tool_groups()
+    assert sent == [(424242, ma._SIGKILL)], sent
+
+
+def test_a_stopping_run_refuses_to_start_another_tool_and_says_so_fatally(
+        ma, monkeypatch):
+    """The latch, and why it has to be a StageError.
+
+    Killing the tool a worker is waiting on just makes that worker start the
+    next one: tmbed catches RuntimeError PER CHUNK, logs "chunk N failed" and
+    continues, and hhblits has one queued job per query. So the refusal has to
+    be the ONE exception tmbed's per-chunk handler re-raises rather than
+    logging - which is StageError, and die() is what raises it.
+    """
+    monkeypatch.setattr(ma, "_STOPPING", True)
+    with pytest.raises(ma.StageError) as e:
+        with ma._tool_process([sys.executable, "-c", "pass"]):
+            raise AssertionError("a tool was launched while stopping")
+    assert "this run is stopping" in str(e.value)
+    assert isinstance(e.value, RuntimeError), \
+        "StageError must stay a RuntimeError or every stage's except changes"
+
+    # and tmbed's own handler order, which is what makes that work: the
+    # StageError arm has to come BEFORE the RuntimeError arm that keeps going.
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    i = src.index("def stage_tmbed(")
+    j = src.index("\ndef ", i + 1)
+    body = src[i:j]
+    se = body.index("except StageError:")
+    re_ = body.index("except RuntimeError as e:", se)
+    assert se < re_, \
+        "tmbed would swallow the stopping refusal and run the next chunk"
+
+
+def test_every_long_lived_child_goes_through_the_spawn_helper(ma):
+    """One helper, or the guarantee has a hole per unrouted call site.
+
+    The allowlist is explicit rather than implied, and each entry is a probe
+    that cannot outlive anything: sub-second, no output of its own, nothing to
+    orphan. Registration on those would cost the whole program a slot claim
+    per probe to buy nothing.
+    """
+    src = io.open(METAANNOT_PY, encoding="utf-8").read()
+    allowed = (
+        # the helper itself, which is where the one real Popen lives
+        '    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,',
+        # `diamond dbinfo` - reports a database's size and exits
+        '            r = subprocess.run([resolve_tool("diamond"), "dbinfo",',
+        # `nvidia-smi -L` - lists the cards and exits
+        '            r = subprocess.run([resolve_tool("nvidia-smi"), "-L"],',
+        # `sysctl -n hw.memsize` - one integer, on the Mac
+        '            out = subprocess.run(["sysctl", "-n", "hw.memsize"],',
+        # Rscript's version probe, which is doctor asking whether R is usable
+        '        r = subprocess.run([resolve_tool("Rscript"), "-e", chk],',
+    )
+    stray = []
+    for n, line in enumerate(src.split("\n"), 1):
+        if "subprocess.Popen(" not in line and "subprocess.run(" not in line:
+            continue
+        if any(line.startswith(a) for a in allowed):
+            continue
+        stray.append(f"metaannot.py:{n}: {line.strip()}")
+    assert not stray, (
+        "these launch a child without going through _tool_process, so a "
+        "`kill` of the run cannot reach it or anything it spawns:\n"
+        + "\n".join(stray))
+
+
+def test_the_tool_registry_is_big_enough_for_the_shipped_config(ma):
+    # Derived, not asserted as a literal: the bound on how many tools can be
+    # live at once is stage_workers stages times the widest inner pool one
+    # stage opens, and both halves are config with defaults.
+    d = ma.DEFAULT_CONFIG
+    bound = d["stage_workers"] * max(d["diamond_workers"],
+                                     d["hhblits_workers"])
+    assert ma._TOOL_SLOTS >= bound, (
+        f"the registry holds {ma._TOOL_SLOTS} process groups and the shipped "
+        f"config can have {bound} tools live at once")
+    assert len(ma._TOOL_PGIDS) == ma._TOOL_SLOTS, \
+        "the registry is not the fixed-length list the handler reads by index"
+    assert all(isinstance(x, int) for x in ma._TOOL_PGIDS), \
+        "a slot that is not a plain int makes the handler's read allocate"
+
+
+def _an_appender(path, seconds=20):
+    """A real process appending to `path`, standing in for an orphaned tool.
+
+    Real, and not a monkeypatched stat: what the census refuses on is a second
+    WRITER, and the only honest way to assert that is to have one. It writes
+    on a short interval and stops on its own, so a failure here cannot leave
+    anything running for long, and the caller kills it either way.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time\n"
+         "end = time.time() + float(sys.argv[2])\n"
+         "while time.time() < end:\n"
+         "    fh = open(sys.argv[1], 'a')\n"
+         "    fh.write('x' * 4096)\n"
+         "    fh.close()\n"
+         "    time.sleep(0.05)\n",
+         path, str(seconds)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@pytest.mark.skipif(os.name == "nt", reason=SIG_SKIP)
+def test_a_growing_leftover_refuses_the_run_before_anything_is_dispatched(
+        tmp_path, stub_bin):
+    """A size that CHANGES is proof of a second writer, not an inference.
+
+    That is why this is the one thing in the census that refuses a run, and
+    why the refusal is justified against a lock that was honestly vacant: the
+    process that held it really is gone, and its tool is not. Size is the
+    primary evidence rather than mtime because it is an integer, monotone for
+    an append-only tblout, needs no clock at all, and is immune to the
+    two-second SMB and FAT mtime granularity OUTPUT_STAMP_SLACK_S already
+    documents.
+    """
+    proj = _searchable(tmp_path, tmp_path / "grow")
+    proj.run("--only", "pfam", env={"STUB_SLEEP": "0"})
+    hm = os.path.dirname(proj.rpath("hmm", "x"))
+    left = os.path.join(hm, ".pfam.4242.140234.part.tblout")
+    open(left, "w", encoding="utf-8").close()
+    writer = _an_appender(left)
+    try:
+        again = proj.run("--only", "pfam", env={"STUB_SLEEP": "0"}, expect=1,
+                         timeout=180)
+        err = again.stderr
+        assert "GREW while this run was starting" in err, err[-1200:]
+        assert "two writers" in err
+        assert "=== pfam: running" not in err, \
+            "the refusal came after the stage it exists to keep out"
+        assert "rsync --inplace" in err, \
+            "the refusal does not name its own likeliest false positive"
+        assert os.path.exists(left), "the refusal deleted its own evidence"
+    finally:
+        writer.kill()
+        writer.wait(timeout=30)
+
+
+def test_a_dry_run_neither_scans_nor_refuses(tmp_path, stub_bin):
+    # A plan check takes no lock, populates no declared outputs and writes
+    # nothing, so it has no business refusing anything - and a growing file
+    # under a directory it is not going to touch is not its problem.
+    proj = _searchable(tmp_path, tmp_path / "dry")
+    proj.run("--only", "pfam", env={"STUB_SLEEP": "0"})
+    hm = os.path.dirname(proj.rpath("hmm", "x"))
+    left = os.path.join(hm, ".pfam.4242.140234.part.tblout")
+    with open(left, "w", encoding="utf-8") as fh:
+        fh.write("x" * 64)
+    dry = proj.run("--dry-run", env={"STUB_SLEEP": "0"})
+    assert "were opened by a metaannot process that is not this one" \
+        not in dry.stderr

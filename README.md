@@ -73,14 +73,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1663 passed, 1 skipped, 6 xfailed, 37
+A healthy default run on this tree is **1687 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
-this document describes, so they are counted rather than estimated. The 37
+this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 57 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1606 passed and 58
+absent, so on a machine with no R the same run reports 1630 passed and 58
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -105,34 +105,42 @@ only `--fix` is refused. The three `--fix` tests carry that as their skip
 reason on Windows, and a fourth runs **only** on Windows to pin the refusal —
 it is the one skip in the count above.
 
-Eight test functions that signal a child process are skipped there as well,
-eight collected items in a default run, because
-`test_a_killed_run_releases_the_results_lock` is parametrized `SIGTERM` and
-`SIGHUP` for two of them while
-`test_a_killed_runs_tail_never_lands_on_the_run_that_replaced_it` carries the
-`slow` marker and is deselected. They do not all carry the same reason.
-`test_an_interrupted_run_leaves_parseable_state_and_resumes` is the `SIGINT`
-one: `send_signal(SIGINT)` is unsupported on Windows and `CTRL_C_EVENT` goes to
-the whole console group including the test runner. The other seven —
+Eleven test functions that signal a child process are skipped there as well,
+eleven collected items in a default run, and the arithmetic is a coincidence
+rather than a rule: `test_a_killed_run_releases_the_results_lock` and
+`test_a_killed_run_takes_its_tool_and_the_tools_own_child_with_it` are each
+parametrized `SIGTERM` and `SIGHUP`, which adds two, while
+`test_a_killed_runs_tail_never_lands_on_the_run_that_replaced_it` and
+`test_a_kill_9_leaves_an_orphan_and_the_next_run_refuses_to_join_it` carry the
+`slow` marker and are deselected, which takes two away. They do not all carry
+the same reason. `test_an_interrupted_run_leaves_parseable_state_and_resumes`
+is the `SIGINT` one: `send_signal(SIGINT)` is unsupported on Windows and
+`CTRL_C_EVENT` goes to the whole console group including the test runner, and
+`test_ctrl_c_unwinds_and_stamps_where_a_sigterm_cannot` and
+`test_ctrl_c_still_stops_the_tools_now_that_the_tty_no_longer_does_it` need
+both halves — the `SIGINT` above and the `SIGTERM` below. The other eight —
 `test_a_killed_run_releases_the_results_lock`,
 `test_a_run_killed_that_way_resumes_without_force_unlock`,
 `test_a_run_killed_with_sigterm_releases_the_results_lock`,
 `test_a_sigterm_releases_the_lock_and_leaves_a_resumable_trace`,
 `test_a_sigtermed_run_is_exactly_the_case_the_heartbeat_exists_for`,
-`test_ctrl_c_unwinds_and_stamps_where_a_sigterm_cannot` and
+`test_a_killed_run_takes_its_tool_and_the_tools_own_child_with_it`,
+`test_a_kill_9_leaves_an_orphan_and_the_next_run_refuses_to_join_it` and
 `test_a_killed_runs_tail_never_lands_on_the_run_that_replaced_it` — are skipped
 because `TerminateProcess` runs no handler on Windows, so a `SIGTERM` cannot be
 delivered to a child there at all and none of what they assert (a released
-lock, a `128 + N` exit status, the WARN line the handler writes) can happen.
-All eight are verified under Linux.
+lock, a `128 + N` exit status, the WARN line the handler writes, a dead tool
+and a dead grandchild) can happen. There are no `POSIX` process groups to kill
+there either, which is the other half of the newer three. All eleven are
+verified under Linux and on this Mac.
 
-Five of those seven markers are new in v0.5.0 and were **deduced, not
-measured**: they arrived with the console's engine half (#24), which added
-signal tests on a machine that is not the machine they describe, and the
-deduction rests on the same `TerminateProcess` fact the markers written before
-them give. If you run the suite on Windows and one of the five would in fact
-have passed, the marker is wrong and worth removing — that is a better failure
-than the silent red it replaced.
+Five of those markers are new in v0.5.0 and three more arrived with the tool-
+group kill, and every one of them was **deduced, not measured**: they describe
+a machine that is not the machine they were written on, and the deduction rests
+on the same `TerminateProcess` fact the markers written before them give. If
+you run the suite on Windows and one of them would in fact have passed, the
+marker is wrong and worth removing — that is a better failure than the silent
+red it replaced.
 
 **One further test signals a child and carries no Windows marker whatsoever**,
 so it is not a skip there: it runs.
@@ -140,7 +148,7 @@ so it is not a skip there: it runs.
 only to stop the run, and everything it asserts afterwards — that the lock
 survives, that a second run refuses it — is what `TerminateProcess` leaves
 behind anyway, so it is left alone deliberately rather than overlooked. Read
-the count above as "eight items are skipped on Windows", not as "the signal
+the count above as "eleven items are skipped on Windows", not as "the signal
 tests are handled on Windows".
 
 The old note here also listed a path test asserting forward slashes among the
@@ -1906,9 +1914,14 @@ results.
 **The lock is released on `SIGTERM`**, not only on Ctrl-C. `kill`,
 `systemctl stop` and `wsl --terminate` used to end the process where it stood,
 leaving `.metaannot.lock` behind. `run` and `all` now install a handler for
-`SIGTERM`, `SIGHUP` and (on Windows) `SIGBREAK` that does exactly three things:
-it removes the lock file, it writes one line to stderr, and it calls
-`os._exit(128 + N)`.
+`SIGTERM`, `SIGHUP` and (on Windows) `SIGBREAK` that does exactly four things,
+in this order: it `SIGKILL`s the process **group** of every tool the run
+started, it removes the lock file, it writes one line to stderr, and it calls
+`os._exit(128 + N)`. The kill is first on purpose — `ResultsLock.__exit__`
+reads and parses the lock file before it unlinks it, which on a wedged NFS
+mount blocks indefinitely, and a wedged mount is exactly when a run gets
+killed. Losing the lock release costs one `--force-unlock`; losing the kill
+costs core-hours.
 
 **That is a different path from Ctrl-C, deliberately, and the difference is
 worth knowing before you `kill` a run.** The handler does not unwind, so there
@@ -1916,7 +1929,14 @@ is no `interrupted` message, no `_run` stamp, and no waiting for the stage that
 is running. Ctrl-C is the opposite trade: `SIGINT` is left as Python's default,
 raises `KeyboardInterrupt`, unwinds through the stage pool's `with` — which
 **waits for its workers** — and only then prints `interrupted` and stamps the
-record. Unwinding on `SIGTERM` was tried and taken out again, because waiting
+record. That wait used to be the length of the stage, because nothing in the
+program stopped the tool: a keyboard Ctrl-C reached it only because the tty
+broadcasts `SIGINT` to the whole foreground process group. It is now short,
+because the interrupt is caught **inside** the executor's `with` and kills the
+tool groups there before re-raising, and a latch stops the workers from
+starting the next chunk or the next query while it unwinds. `kill -INT` from a
+script, which has no terminal and so never got that broadcast at all, now
+behaves the same way. Unwinding on `SIGTERM` was tried and taken out again, because waiting
 is precisely what a supervisor cannot afford: a tmbed chunk or an InterProScan
 stage is an hour, `systemd` hits `TimeoutStopSec` long before that and sends
 `SIGKILL`, and the lock release that is the whole point of handling the signal
@@ -1925,9 +1945,10 @@ buys the trace at the cost of the wait. The one line the handler does write is
 pre-formatted and pre-encoded at registration and goes out through
 `os.write(2, ...)` — a handler runs between two bytecodes of the main thread,
 so touching `sys.stderr`'s buffer lock can deadlock the process it was meant to
-release — and it names the signal, the lock file, and the fact that any tool
-already running is a separate process this does not stop. It reaches stderr but
-not `results/metaannot.log`, whose buffer cannot be flushed from a handler.
+release — and it names the signal, the lock file, the fact that every tool the run
+started was killed group and all, and the dot-prefixed `.part` file a
+part-written output is left behind as. It reaches stderr but not
+`results/metaannot.log`, whose buffer cannot be flushed from a handler.
 
 The exit status is **128 + the signal**: `130` for Ctrl-C, `143` for `SIGTERM`,
 `129` for `SIGHUP`. That is what a shell and `systemd` both expect — units carry
@@ -1960,12 +1981,73 @@ without unwinding, say nothing, because that handler may not format a string or
 take a lock. On Windows `TerminateProcess` runs nothing at all. That is why
 each such loss is also said in the log at the moment it happens.
 
-The one thing to check first is `ps`. The handler stops metaannot, not the
-tools metaannot launched: an InterProScan, a DIAMOND or a TMbed started by the
-killed run is a separate process that keeps going, writing into the same scratch
-paths under the results directory, and the lock that would have kept a second
-writer out is already released. So before restarting a `kill`ed run, confirm the
-children are actually gone.
+**Under a supervisor the question does not arise, and that is worth knowing
+before reaching for anything cleverer.** `systemd`'s default is
+`KillMode=control-group`, so a run started as a unit or under
+`systemd-run --scope` has its whole cgroup torn down on `systemctl stop`
+whatever this program does or fails to do — `setsid` does not change cgroup
+membership — and the same holds for a Slurm step. The leak this section is
+about was always specific to a bare `kill` from a shell or a tmux pane, which
+is how the run that burned the core-hours was started. If you have a machine
+where runs get killed and you want the guarantee to hold even for `kill -9`,
+the answer is a unit (or `systemd-run --scope -p KillMode=control-group -- \
+python metaannot.py all --config config.yaml`), not code in here.
+
+**The deaths no handler runs for are the ones left, and the next run is
+what covers them.** A `kill` now takes the tools with it, but `SIGKILL`, the
+OOM reaper, a host reset and Windows' `TerminateProcess` run no handler at all
+— and putting each tool in a session of its own has made that case slightly
+worse, because a tool is no longer in the terminal's foreground group and so
+no longer dies with a closing tmux pane either. What such a death leaves is an
+orphan: an `hmmsearch` whose parent is gone, still holding its cores, still
+writing into this results directory, and the lock that would have kept a
+second writer out is reclaimable as stale by anyone, because the process it
+names really is dead.
+
+So every run, immediately after it takes the lock and **before** it dispatches
+anything, lists the in-progress `.part` files under its declared output
+directories, says one aggregated `WARN` naming each directory, the minting pid,
+the size, the mtime and which stage writes those names — and then stats them
+again two seconds later. A file whose **size changes** is positive proof that
+something which is not this run is writing here, and the run is refused with
+the `lsof`/`fuser` to find the writer — with the one exception in the next
+paragraph. A file that does not change is a corpse:
+one line, no refusal, and **nothing is deleted, renamed or touched** (rule 5,
+and because it is the only artefact showing what happened — an `unlink` would
+not even free the space while the writer holds the inode, and it would destroy
+the one handle that gets from the file back to the process). The two seconds
+are spent only when a candidate exists. `find results -name '.*.part.*'` is the
+same list by hand.
+
+**`--force-unlock-live` is the one exemption, and it is per file.** That flag
+means "take the directory even though this host can see the holder is still
+running", and a live holder's tool is exactly what leaves a `.part` file
+growing — so refusing there would refuse the flag's only case, every time,
+with no escape, and would make the handover this section goes on to describe
+unreachable. Where the pid that MINTED the growing file is the pid of the lock
+this run has just taken from a holder **this host proved alive**, the run is
+not refused: it says what it found, at `WARN`, names the pid and the growth,
+says that you now have two writers in one results directory deliberately, and
+goes on. Any other growing file still refuses the run, in the same census, on
+the same evidence — including one lying beside it, because the flag is an
+assertion about one process and not about the directory. And the exemption is
+keyed on what the lock really displaced rather than on the flag being typed: a
+`--force-unlock-live` over a lock that was vacant, garbled, on another node, or
+held by a process this host proved **dead** displaced no live run at all, so
+the orphan case above is refused exactly as before. The one thing it cannot
+tell apart is a file minted by a dead run whose pid was later recycled onto the
+live holder; the message prints the number so you can see that, and `lsof` is
+what settles it.
+
+The number in `.pfam.336.140234.part.tblout` is **metaannot's** pid, not the
+tool's: `atomic_out` mints the name with `os.getpid()`, and a tool's own pid is
+recorded nowhere. So `ps -p 336` may show something unrelated, or nothing — a
+pid can be recycled by anything once its owner is gone — and nothing in the
+program ever reads that number as evidence about a process. One surface
+disagrees and will until a separate change lands: the console picks the newest
+`.part` file beside a stage's output and shows it as that stage's live
+progress, so it will attribute an orphan's bytes to a healthy run, and
+eventually report that run as stalled.
 
 **A run that is unwinding stops writing when it is superseded.** That is the
 Ctrl-C case, and the reason it matters is that a run can still be inside a stage
