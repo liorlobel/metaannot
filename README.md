@@ -33,10 +33,11 @@ database` if it looks like markup. The two that have no guard — the KOfam
 tarball and `ko_list`, and the taxdump — are compressed archives whose `tar` or
 `gunzip` step fails loudly on a web page anyway. None of this covers a file you
 fetched by hand, so for those check the format yourself (`head -1` of an HMM
-file should start with `HMMER3/`). HMM libraries are additionally required to be
-`hmmpress`ed, which rejects a truncated download on its own. Paths and URLs from the config are shell-quoted, so a directory
-containing a space works and one containing shell metacharacters is treated as
-a literal name.
+file should start with `HMMER3/`). HMM libraries are additionally required to
+be `hmmpress`ed, which rejects a truncated download on its own. Paths and URLs
+from the config are shell-quoted, so a directory containing a space works; a
+path containing a single quote still breaks the HTML guard's error message, so
+avoid one.
 
 Download URLs live in the config under `sources:`, so a moved link is an edit
 there rather than a patch to the tool.
@@ -49,13 +50,15 @@ days of compute.
 An unrecognised key in `config.yaml` is reported with a spelling suggestion
 rather than silently ignored — `run: {unipep: true}` used to leave the stage
 disabled with nothing said. The check stops at the free-form blocks
-(`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`, `vfdb_category_weights`,
-`diamond_evalues`, `diamond_min_pidents`), whose keys are user-chosen and
-cannot be checked, so a typo there is silent and simply has no effect. Proof-read those blocks by hand.
-The `analysis:` block is **not** free-form and **is** checked: its keys are
-exactly the Rmd's params, so `fdrr: 0.01` is reported rather than written into
-the Rmd header as a spurious param while `fdr: 0.05` stays quietly in force.
-Read the `== config ==` block of `doctor` before a run you intend to publish.
+(`tool_args`, `db.diamond`, `sources.diamond`, `diamond_weights`,
+`vfdb_category_weights`, `diamond_evalues`, `diamond_min_pidents`), whose keys
+are user-chosen and cannot be checked, so a typo there is silent and simply has
+no effect. Proof-read those blocks by hand. The `analysis:` block is **not**
+free-form and **is** checked: its keys are exactly the Rmd's params, so `fdrr:
+0.01` is reported — by `doctor` as a failure and by a run as a WARN — instead
+of passing unnoticed while `fdr: 0.05` stays quietly in force. It is still
+written into the generated Rmd header, where nothing reads it. Read the `==
+config ==` block of `doctor` before a run you intend to publish.
 
 A second top-level `run:` or `db:` key in a config that already has one is
 refused. YAML itself would retain only the later mapping and silently throw the
@@ -63,8 +66,9 @@ earlier block away, so `load_config` installs a no-duplicate loader: the run
 exits naming the duplicate key and both line numbers instead. Merge the two
 into a single block.
 
-Requires python3 + pandas + pyyaml. R is needed only for the report; external
-tools only by the stages that use them. `doctor` says which are missing.
+Requires python3 + pandas + pyyaml. R is needed only for the report and the R
+object; external tools only by the stages that use them. `doctor` says which
+are missing.
 
 ## Tests
 
@@ -73,14 +77,14 @@ pip install pytest && pytest -q          # a few minutes
 pytest -q -m slow                        # the rest: resume, parallel vs serial
 ```
 
-A healthy default run on this tree is **1774 passed, 1 skipped, 6 xfailed, 38
+A healthy default run on this tree is **1775 passed, 1 skipped, 6 xfailed, 38
 deselected**, in three to five minutes depending on the machine. Those numbers
 are the only yardstick you have for deciding whether your checkout is the one
 this document describes, so they are counted rather than estimated. The 38
 deselected are the `slow` marker, and they are the second command above.
 `pytest -q -m R` selects the 72 R tests, which the default run **already
 includes**: they skip rather than fail when `Rscript` or one of its packages is
-absent, so on a machine with no R the same run reports 1702 passed and 73
+absent, so on a machine with no R the same run reports 1703 passed and 73
 skipped. The single skip here is a Windows-only test pinning a refusal that
 cannot happen on POSIX.
 
@@ -189,12 +193,13 @@ below describes — and the marker is what keeps the wish from being forgotten.
 
 ## A worked example
 
-`examples/server-run-plan/` is a real plan for running eight metaproteome datasets on one
-server: eight configs plus a four-step runbook (`subset` → `doctor` → run in tmux →
-collect). Its paths and dataset names are one lab's, so it is a template rather than
-something to run as-is, but it is the shape of a multi-dataset run and it records the
-decisions such a run has to make — which stages are on and *why each of the others is
-off*, why `min_features_per_protein` is left at 1, which three things to check before
+`examples/server-run-plan/` is a real plan for running eight metaproteome
+datasets on one server: eight configs plus a four-step runbook (`subset` →
+`doctor` → run in tmux → collect). Its paths and dataset names are one lab's,
+so it is a template rather than something to run as-is, but it is the shape of
+a multi-dataset run and it records the decisions such a run has to make — which
+stages are on and *why each of the others is off*, why
+`min_features_per_protein` is left at 1, which three things to check before
 anything long starts (the tool version on the server, the mount point every
 path assumes, and the database paths that are inferred rather than confirmed),
 and what the whole thing is expected to cost.
@@ -208,9 +213,10 @@ quant_format: "fragpipe_peptide"
 ```
 
 For a **label-free** run the `.fp-manifest` holds path, experiment and
-bioreplicate per run, and that is the whole experimental design. metaannot renames the quant columns to the
-manifest's sample names, writes `results/quant/design_from_input.tsv`, and
-derives the pairwise contrasts. Nothing else is hand-written.
+bioreplicate per run, and that is the whole experimental design. metaannot
+renames the quant columns to the manifest's sample names, writes
+`results/quant/design_from_input.tsv`, and derives the pairwise contrasts.
+Nothing else is hand-written.
 
 It tries `experiment_bioreplicate`, then `experiment`, then the file basename
 against the quant columns, and `doctor` reports whether every manifest run
@@ -257,6 +263,13 @@ than absorbed:
   prefix that would have matched, so you do not have to guess, and the run
   reports how many rows matched only because of it. It applies to
   `emapper_precomputed` reuse only.
+- **The run stops below `emapper_min_coverage` (default `0.50`)**, rather than
+  annotating half a proteome and reporting bins over it. A precomputed eggNOG
+  table matching under half the FASTA is almost always an id-space mismatch,
+  not a biological result, and the message is the diagnostic above — it names
+  the transform, or the prefix, that would have matched. **Lowering the
+  threshold to get past it hides the mismatch rather than fixing it**: the
+  proteins that did not match do not become unannotated, they become wrong.
 
 For covariates beyond condition and replicate — sex, age, cage — copy
 `design_from_input.tsv`, add columns, and point `analysis.metadata` at it with
@@ -273,7 +286,7 @@ Every identified protein is binned on the evidence that actually exists for it:
 | `3_annotated_no_ko` | no KO; informative Pfam (hmmsearch **or** eggNOG's own `PFAMs`) / NCBIfam / InterPro / CAZy / dbCAN / VFDB / MEROPS / CARD / TADB / BAGEL |
 | `3d_duf_only` | no KO; only domain evidence is a DUF |
 | `3s_structure_only` | no KO and no sequence annotation; confident Foldseek hit to a target that is itself described |
-| `3p_profile_only` | no KO, no sequence annotation, no DUF and no fold; only a remote HHblits/jackhmmer profile hit, and only where the hit's target is not itself uncharacterised |
+| `3p_profile_only` | no KO, no sequence annotation, no DUF and no fold; only a remote HHblits/jackhmmer profile hit; an HHblits hit is discounted when its target's description is itself uncharacterised, while jackhmmer records no target description, so its hits are never discounted |
 | `4_dark` | no evidence |
 
 **A hit to an uncharacterised target is not a rescue.** `3s_structure_only` and
@@ -284,19 +297,19 @@ named`, `predicted protein` or `putative protein` (case-insensitive; the same
 test that decides whether a Pfam or NCBIfam hit is informative) is demoted: the
 protein keeps its `foldseek_*` / `hh_*` columns but stays in `4_dark`, or in
 `3d_duf_only` if it has a DUF. The run logs the count as a single WARN over
-both sources, so quote it next to any 3s/3p number. One exemption, which can
-only shrink the rescue claim rather than inflate it: an **empty** description
-keeps its evidence, so a bare AlphaFold accession is not demoted — on the
-default AFDB50 target the demotion therefore fires rarely, for want of any text
-to test.
+both sources, so quote it next to any 3s/3p number. The demotion itself can
+only shrink the rescue claim, never inflate it. It has one carve-out, which
+works the other way: an **empty** description keeps its evidence, so a bare
+AlphaFold accession is not demoted — on the default AFDB50 target the demotion
+therefore fires rarely, for want of any text to test.
 
-That is the complete set; `annotation_final.tsv`, `bin_summary.tsv`,
-`tier_coverage.tsv` and the report's factor levels use exactly these seven
-strings. The tests are applied in
-the order KO-with-pathway, KO, sequence annotation, DUF, structure, profile, so a
-DUF-only protein stays in `3d_duf_only` however good its fold or profile hit is
-— deliberate, since a DUF still names a family, and the run counts how many were
-held back so the 3s/3p rescue numbers are read with that in mind.
+That is the complete set; `annotation_final.tsv`, `bin_summary.tsv` (plus a
+`TOTAL` row) and the report's factor levels use exactly these seven strings.
+The tests are applied in the order KO-with-pathway, KO, sequence annotation,
+DUF, structure, profile, so a DUF-only protein stays in `3d_duf_only` however
+good its fold or profile hit is — deliberate, since a DUF still names a family,
+and the run counts how many were held back so the 3s/3p rescue numbers are read
+with that in mind.
 
 **eggNOG's own `PFAMs` column counts as domain evidence.** Binning on the
 `pfam` stage's `hmmsearch` hits alone meant that with `run.pfam: false` a
@@ -306,11 +319,12 @@ search stages were run, so not the completed UC run quoted later in this file �
 6,271 of 17,377 dark proteins (36%) carried an eggNOG Pfam: the dark bin was
 inflated by a missing join rather than by biology. The fix is in, so that
 figure is a record of the defect rather than something a current run
-reproduces; in the completed UC run `4_dark` is 3.8%. An eggNOG Pfam whose only
-accession is a DUF/UPF lands the protein in `3d_duf_only` rather than
-`3_annotated_no_ko`, on the same rule as an `hmmsearch` DUF. So expect a
-smaller `4_dark` than earlier versions of this tool produced, for a join reason
-rather than a biological one.
+reproduces; in the completed UC run `4_dark` is 3.8%. An eggNOG `PFAMs` value
+whose family names are uninformative (the test is a match anywhere in the
+comma-joined cell, so it is not quite the hmmsearch rule, which requires
+*every* hit to be uninformative) lands the protein in `3d_duf_only` rather than
+`3_annotated_no_ko`. So expect a smaller `4_dark` than earlier versions of this
+tool produced, for a join reason rather than a biological one.
 
 Bins 2 to 4 are what KEGG enrichment silently discards. Global KEGG maps
 (01100, 01110, …) are excluded from the pathway test: a protein whose only
@@ -348,17 +362,18 @@ stages you left enabled.
 ### Added evidence
 
 - **`ncbifam`** — NCBIfam/TIGRFAM HMMs. The stage itself is one more
-  `hmmsearch` (`thresholds.ncbifam_cutoff`, default `--cut_tc`), so it is the
-  cheapest coverage gain here — but it is not only a coverage gain. `integrate`
-  reads each family's `DESC` out of `db.ncbifam_hmm` itself and caches it,
-  because `hmmsearch --tblout` records the description of the *target* protein
-  and never of the query HMM. A protein whose NCBIfam families **all** describe
-  nothing — DUF, UPF, hypothetical, uncharacterised — is marked
-  `ncbifam_uninformative` and does not leave `4_dark` on that evidence, the
-  same test the Pfam DUF rule applies. Set `ncbifam_uninformative_test: false`
-  to count every hit as annotation. The accession is kept alongside the family
-  name as `ncbifam_accs`, which is what makes the call comparable with
-  InterProScan's NCBIfam member database.
+`hmmsearch` (`thresholds.ncbifam_cutoff`, default `--cut_tc`), so it is the
+cheapest coverage gain here — but it is not only a coverage gain. `integrate`
+reads each family's `DESC` out of `db.ncbifam_hmm` itself and caches it,
+because `hmmsearch --tblout` records the description of the *target* protein
+and never of the query HMM. A protein whose NCBIfam families **all** describe
+nothing — DUF, UPF, hypothetical, uncharacterised — is marked
+`ncbifam_uninformative`, counts as no sequence annotation, and lands in
+`3d_duf_only` rather than being promoted to an annotated bin — the same test
+the Pfam DUF rule applies. Set `ncbifam_uninformative_test: false` to count
+every hit as annotation. The accession is kept alongside the family name as
+`ncbifam_accs`, which is what makes the call comparable with InterProScan's
+NCBIfam member database.
 - **`kofam`** — KOfamScan. A *control*, not just coverage. eggNOG assigns KOs
   by DIAMOND search; KOfam uses per-family HMMs with adaptive thresholds. The
   run reports how many proteins KOfam rescues from the KO-less bins and how
@@ -371,26 +386,26 @@ stages you left enabled.
   TMHMM, Phobius, SignalP) are excluded from the "informative" test so they
   cannot promote a protein out of the dark bin on their own.
 - **`hhblits` / `jackhmmer`** — profile-profile and iterative profile search,
-  run on the unannotated bins only. This is the real answer to "more sensitive
-  than BLAST"; a hit creates the `3p_profile_only` bin. BLASTp is not included.
-  Note what that leaves: with the default configuration the DIAMOND stage
-  searches only the targeted databases listed under `db.diamond` (VFDB, MEROPS,
-  CARD, TADB, BAGEL) with `--max-target-seqs 5`, so it is not a general
-  homology search. `db.diamond` is free-form — add a tag and the stage searches
-  it, and `integrate` picks it up by globbing `results/diamond/*.tsv` with no
-  code change. A tag with no matching `diamond_weights` entry still counts as
-  annotation, so it can lift a protein out of `4_dark` while contributing
-  nothing to the export score, and the run warns when that happens. The only general-reference search here is
-  `jackhmmer` against UniRef50, which is off by default and must be enabled
-  explicitly.
+run on the unannotated bins only. This is the real answer to "more sensitive
+than BLAST"; a hit creates the `3p_profile_only` bin. BLASTp is not included.
+Note what that leaves: with the default configuration the DIAMOND stage
+searches only the targeted databases listed under `db.diamond` (VFDB, MEROPS,
+CARD, TADB, BAGEL) with `--max-target-seqs 5`, so it is not a general homology
+search. `db.diamond` is free-form — add a tag and the stage searches it, and
+`integrate` picks it up by globbing `results/diamond/*.tsv` with no code
+change. A tag with no matching `diamond_weights` entry still counts as
+annotation, so it can lift a protein out of `4_dark` while contributing nothing
+to the export score, and the run warns when that happens. The only
+general-reference search here is `jackhmmer` against UniRef50, which is off by
+default and must be enabled explicitly.
 - **`context`** — genomic neighbourhood. Needs a `gff` whose identifiers match
   `proteins_faa` exactly; without it the stage has nothing to work from.
   `context_window` counts neighbours on **each side, in genes**, while
   `immunity_max_gap` is in **base pairs** — different units, adjacent keys.
 - **`smorf`** — smORFinder and Macrel on the assembly, so it needs
-  `contigs_fna`. Note the direction: this produces ORFs that must be **added
-  to the search database and the MS data re-searched**. Nothing on the annotation side recovers peptides that
-  were never in the search space.
+`contigs_fna`. Note the direction: this produces ORFs that must be **added to
+the search database and the MS data re-searched**. Nothing on the annotation
+side recovers peptides that were never in the search space.
 
 Foldseek now searches several targets (`foldseek_extra_targets` — PDB and
 Swiss-Prot carry far better annotation than mostly-unreviewed AFDB50) and
@@ -464,6 +479,21 @@ by default and the run warns with the cell count. Summed as real zeros they turn
 missingness into fold change. `zero_intensity_is_missing: false` restores the
 old behaviour if you need to reproduce someone else's numbers.
 
+**Which columns are samples**, for the wide protein formats `diann` and
+`fragpipe` only — the feature-level and TMT readers already know, and
+re-detecting would overwrite that with a guess:
+
+```yaml
+intensity_columns: []     # an explicit list wins outright
+intensity_regex: ""       # else a regex on the column name
+```
+
+With neither set, every numeric column that is not known metadata is taken as
+a sample, and the run says so and warns — that warning is the one that tells
+you to set one of these. A manifest overrides the detection entirely. Booleans
+are excluded by name rather than by type, because pandas calls a bool column
+numeric and `Is Decoy` was being summed as an intensity.
+
 ### FragPipe TMT (isobaric): `fragpipe_tmt`
 
 Isobaric runs are read by exactly one route, and it is the **per-plex** one:
@@ -473,9 +503,11 @@ run directory — the one holding `TMT1/`, `TMT2/`, … — not a file.
 
 - **Read:** `TMTn/ion.tsv` or `TMTn/peptide.tsv`, `TMTn/<PLEX>_annotation.txt`,
   and `TMTn/psm.tsv` when `tmt.min_purity` is set.
-- **Not read, and refused by name under every `quant_format`:** the eight
-  `tmt-report/` matrices, the TMT flavour of `MSstats.csv`, and the per-plex
-  `protein.tsv`. Those are the three files a user reaches for first, and each
+- **Not read:** the eight `tmt-report/` matrices and the TMT flavour of
+  `MSstats.csv`, refused by name under every `quant_format`; and the per-plex
+  `protein.tsv`, refused by name under the protein-level formats (`diann`,
+  `fragpipe`, `msstats_protein`), which are the ones that would otherwise
+  quantify it. Those are the three files a user reaches for first, and each
   is a worse input than it looks; *The TMT files that are still refused*, at
   the end of this section, says why for each. Nothing here falls back to any of
   them — a missing per-plex table is a failure, not a reason to read a
@@ -556,10 +588,10 @@ Every plex is described by its own annotation, and nothing assumes a common
 channel count, a common channel set, or a bridge, so all of these read:
 
 - **Reference-free** — no pool anywhere. Nothing is divided by anything and no
-  channel is held back as a denominator; the `plex` term carries the batch. This is what you get
-  when neither `tmt.reference_name` nor `tmt.reference_channel` is set. A lone
-  channel named `Pool*` is pointed out in the log rather than being treated as
-  a reference behind your back.
+channel is held back as a denominator; the `plex` term carries the batch. This
+is what you get when neither `tmt.reference_name` nor `tmt.reference_channel`
+is set. A lone channel named `Pool*` is pointed out in the log rather than
+being treated as a reference behind your back.
 - **Multi-plex without a bridge** — several plexes with no channel in common.
   Read, and honest as long as each condition appears in more than one plex.
   What links the plexes is then the plex coefficient and the report's median
@@ -615,9 +647,11 @@ These are not supported-with-a-caveat. Two of them stop the run:
 
 #### The reference channel is not a sample
 
-A pooled bridge channel is not a biological sample and never enters the design
-as one. Which of the two treatments is used is yours to choose, and both are
-written into `design_record.txt` beside the numbers they produced:
+A pooled bridge channel is not a biological sample, and once it is named
+(`tmt.reference_name` or `tmt.reference_channel`) it never enters the design as
+one. Unnamed, it is quantified as an ordinary sample and the log says so. Which
+of the two treatments is used is yours to choose, and both are written into
+`design_record.txt` beside the numbers they produced:
 
 - **covariate** (the default, `use_reference_ratios: false`). The reference is
   dropped from the sample columns; the plex stays in the model as a batch term
@@ -741,13 +775,14 @@ count in the report is already after it and what it cost in protein groups is
 not derivable from the document at all — only from a re-run. The report says
 that, in those words, on the runs where the feature-level filter was in force
 AND a protein-level sentence fired: the caveat is attached to that sentence
-rather than standing alone, so a run where `analysis.min_plexes` had nothing
-to say prints neither. That is deliberate — a caveat about a number the
-document did not print is a sentence with no referent — but it does mean the
-feature-level filter can be in force with the document silent about it, and
-the run log is where its cost in features is recorded either way. `analysis.min_plexes` is inert without a plex column, so label-free
-runs are unaffected; setting it above 1 where no per-sample plex exists stops
-the report rather than passing everything.
+rather than standing alone, so a run where `analysis.min_plexes` had nothing to
+say prints neither. That is deliberate — a caveat about a number the document
+did not print is a sentence with no referent — but it does mean the
+feature-level filter can be in force with the document silent about it, and the
+run log is where its cost in features is recorded either way.
+`analysis.min_plexes` is inert without a plex column, so label-free runs are
+unaffected; setting it above 1 where no per-sample plex exists stops the report
+rather than passing everything.
 
 #### `min_purity`, and where purity actually lives
 
@@ -882,7 +917,7 @@ steps down as it takes them, beside the table they produce:
 | features read from the quant table | feature | | … | |
 | `peptide_assignment=taxon_unique` | feature | … | … | … |
 | proteins carrying at least one assigned feature | protein | … | … | … |
-| `min_features_per_protein=1` | protein | … | … | 0 |
+| `min_features_per_protein=2` | protein | 3,199 | 1,282 | 1,917 |
 | rows written to `annotated_quant.tsv` | protein | … | 1,282 | … |
 
 **The `unit` column is the load-bearing one.** A funnel that chained a feature
@@ -895,10 +930,12 @@ words; a filter that removes nothing is still listed, priced at zero, because a
 funnel silent about a filter reads as a funnel with no such filter.
 
 A **negative** `dropped` is not an arithmetic bug: it means a step's
-population is not a subset of the one above it, which here has exactly one
-cause — protein ids the quant table names that `annotation_final.tsv` does
-not. A run where that is true of most ids dies; a run where it is true of some
-warns and carries on, and this is where the consequence becomes visible.
+population is not a subset of the one above it, which here has two causes —
+protein ids the quant table names that `annotation_final.tsv` does not, and a
+duplicate key on the right-hand side of one of the left joins that build
+`annotated_quant.tsv`. A run where the first is true of most ids dies; a run
+where it is true of some warns and carries on, and this is where the
+consequence becomes visible.
 
 Two things it does not cover, and says so rather than leaving them to be
 inferred. Rows the quant reader refused before this stage was handed anything
@@ -1002,7 +1039,7 @@ top-level `run:` or `db:` key (see above; a duplicate key is refused):
 run:                              # in the existing run: block
   unipept: true
   taxonomy: true
-unipept: {result: "pept2lca.csv", split_missed_cleavages: true}
+unipept: {result: "pept2lca.csv"}   # split_missed_cleavages stays off against the current Unipept
 db:                               # in the existing db: block
   ncbi_taxonomy: "/data/db/taxdump"          # nodes/names/merged/delnodes.dmp
 taxonomy_source: "concordant"                # eggnog | unipept | concordant
@@ -1171,7 +1208,7 @@ qf <- readRDS("results/metaannot.rds")
 qf                                     # peptides -> proteins
 assay(qf, "proteins")                  # intensities, proteins x samples
 rowData(qf[["proteins"]])$bin          # annotation evidence bin
-rowData(qf[["proteins"]])$effector_score
+rowData(qf[["proteins"]])$export_score      # effector_score is the retained old name
 rowData(qf[["peptides"]])$assignment_class  # five values, see below
 colData(qf)                            # the design in quant/design_from_input.tsv
 metadata(qf)$taxon_size_factors
@@ -1236,9 +1273,10 @@ separate keys, but the defaults deliberately hold them equal at 4 and nothing
 enforces it. Keep them equal: the report's "reference is the plain sum" flag is
 only evaluated over taxa the R threshold already admitted, so setting
 `analysis.taxon_min_proteins` higher drops exactly the taxa that flag exists to
-mark.
-Proteins whose significance disappears under the second model were tracking
-their organism, not being regulated.
+mark. Proteins whose significance disappears under the second model were
+often tracking their organism rather than being regulated — but a small taxon
+reference adds noise of its own, so read the verdict beside `logFC_naive` and
+`logFC_adj` rather than on its own.
 
 The shortlist is not the top of `effector_score`: significant, no KO, and
 predicted to reach the host. `surface_or_secreted` gates the list; the score
@@ -1322,8 +1360,12 @@ on real runs — and it is also the ratio the machine is divided by, which is
 why it stays coarse. The second is what that stage took on the release's
 reference run, and it exists to break the ties in the first: eleven stages
 are hours-class, so the rank on its own left all of them in table order, and
-`interpro` — the longest stage in the pipeline by an order of magnitude, and
-the stage the ordering was written for — was dispatched seventh of them.
+`interpro` — the longest stage in the pipeline on both measured runs, and the
+stage the ordering was written for — was dispatched seventh of them. Not by an
+order of magnitude, which an earlier version of this sentence claimed: it is
+1.8× the next longest on the 38,204-protein run and 1.02× on the
+455,571-protein one, where signalp and tmbed run nearly as long. The point is
+the tie, not a gap.
 Dispatching in pure table order instead, as it did before v0.4.0, gave the
 first wave to `dbcan` (10 min) and `diamond` (5 min) while `signalp` and
 `tmbed` (about an hour each) queued.
@@ -1341,15 +1383,16 @@ The order is a starting order and not a schedule — nothing in it decides when 
 stage finishes — but the sentence that used to stand here, "it makes nothing
 faster", was wrong, and it was wrong in the same way the code was: on every
 selection this repository has published durations for, dispatching `interpro`
-first instead of seventh takes hours off the run, and at the default
+first instead of seventh shortens the run — minutes on the 38,204-protein
+measurements, hours on the 455,571-protein one — and at the default
 `stage_workers: 4` it lands the whole pipeline exactly on the dependency
 graph's critical path — the shortest that any ordering of the same work can
 make it. THE SLOT COUNT IS PART OF THAT CLAIM AND NOT A DETAIL: at
 `stage_workers: 3`, which is what the 455,571-protein run used, the same
 reordering saves 13.7 h and is still 13.4 h above the critical path, because
 there the run is bounded by the work rather than by the graph. What is left
-after that is `stage_workers` and InterProScan itself.
-See [Sizing your run](TUTORIAL.md#sizing-your-run) for both.
+after that is `stage_workers` and InterProScan itself. See [Sizing your
+run](TUTORIAL.md#sizing-your-run) for both.
 
 ```yaml
 threads: 32
@@ -1409,13 +1452,20 @@ tool_args:
 A results directory takes a lock for the run, so two processes cannot
 interleave their writes. Reclamation is deliberately conservative: a lock is
 removed automatically only when it names a pid **on this host that is provably
-gone**. A lock written on another host, one owned by another user, a garbled
-lock file, and *every* lock on Windows — where `os.kill(pid, 0)` calls
-`TerminateProcess`, so asking whether the holder is alive would kill it — all
-read as live. Trampling a live run is silent corruption; refusing is a
-message. So an ordinary crashed run on Windows exits with `another metaannot is
-already running here` and needs `--force-unlock`, which is the escape hatch for
-a holder you are certain is gone.
+gone**. A lock written on another host, one owned by another user, and a
+garbled lock file all read as live. Trampling a live run is silent corruption;
+refusing is a message. `--force-unlock` is the escape hatch for a holder you
+are certain is gone.
+
+**Windows is asked, not assumed.** `os.kill(pid, 0)` there calls
+`TerminateProcess`, so asking that way would kill the process you were asking
+about — liveness is asked with `OpenProcess`/`GetExitCodeProcess` instead,
+which touches nothing. A pid Windows does not know at all, and a pid it hands
+back a real exit code for, are both answers it can prove — so a lock left by a
+crashed run on Windows is reclaimed automatically like any other. Only a
+missing API, a refused handle, or the `STILL_ACTIVE` ambiguity — exit code 259,
+which a live process and a process that genuinely exited 259 share — prove
+nothing, and those read as live.
 
 `--force-unlock` is refused in the one case where this host can prove you are
 wrong about that: the lock names a pid **here**, and the process table says it
@@ -1423,11 +1473,11 @@ is running. The refusal prints what you would otherwise go and assemble — pid,
 host, when it started, when it last stamped `_run`, the stages it has recorded
 running, its command line, and the `ps -p` to run — and `--force-unlock-live`
 takes the directory anyway if that is really what you mean. Note the asymmetry
-with the paragraph above, which is deliberate: reclaiming needs proof of
-DEATH, refusing needs proof of LIFE, and everything unprovable — another node,
-another user's garbled file, every lock on Windows — is left exactly where it
-was. A refusal that fired on "not provably dead" would take `--force-unlock`
-away on the cluster, which is the machine this tool runs on.
+with the paragraph above, which is deliberate: reclaiming needs proof of DEATH,
+refusing needs proof of LIFE, and everything unprovable — another node, another
+user's garbled file, a Windows handle this host is refused — is left exactly
+where it was. A refusal that fired on "not provably dead" would take
+`--force-unlock` away on the cluster, which is the machine this tool runs on.
 
 The `_run.last_seen` heartbeat below does **not** change that. It is advisory:
 it tells you *how long* a lock has been silent, and nothing reclaims a lock on
@@ -1744,8 +1794,20 @@ esmfold_bytes_per_residue_pair: 20200   # raise = more conservative
 esmfold_vram_reserve_gb: 0.5            # left for the driver and the display
 ```
 
-Whichever of this and `max_len_structure` is tighter wins, and the log says
-which. Sequences above the cap are reported as **never attempted**, not as
+There is a third, independent cap, and it is applied before either of these:
+
+```yaml
+max_dark_structures: 2000   # a GPU-hours budget, not a quality filter
+```
+
+The fold work-list is ordered by `export_score` and cut to that many, so the
+budget is spent on the proteins most likely to be worth it. It is a decision
+about your hardware rather than about the proteins, which is why it is a plain
+count and not a threshold — and a run that raises it is buying more GPU hours,
+not more evidence per hour.
+
+Whichever of the VRAM cap and `max_len_structure` is tighter wins, and the log
+says which. Sequences above the cap are reported as **never attempted**, not as
 failures — and they are now written down, because "fold them elsewhere" is
 advice a reader cannot act on when the log gives only a count. Every run of
 the stage writes both files, empty ones included, so that their absence means
@@ -1845,20 +1907,22 @@ a long one's ceiling. Set `progress_interval_s_max` equal to
 `progress_interval_s` for the old fixed cadence; a value *under* it is ignored
 rather than used to speed the heartbeat up.
 
-Only the newest line is kept, not the output: stdout still goes to
-`/dev/null`, because InterProScan and friends emit tens of MB of chatter, and
-stderr is held in a small ring whose only other use is the tail quoted when a
-tool fails. That tail is unchanged. Before this, tmbed could run for 2 h 36 min
-and InterProScan for 2.9 h with nothing between the command and its failure,
-and the only way to tell either apart from a hang was to watch its CPU ticks
-accumulate in `/proc`. Tools that write a `tqdm` bar (tmbed, InterProScan,
-ESMFold's own loop) are the ones this shows; a tool that writes nothing still
-gets `no output yet on stderr` on the same schedule, which is the heartbeat.
+Only the newest line is kept, not the output: stdout still goes to `/dev/null`,
+because InterProScan and friends emit tens of MB of chatter, and stderr is held
+in a small ring whose only other use is the tail quoted when a tool fails. That
+tail is unchanged. Before this, tmbed could run for 2 h 36 min and InterProScan
+for 2.9 h with nothing between the command and its failure, and the only way to
+tell either apart from a hang was to watch its CPU ticks accumulate in `/proc`.
+Tools that write a `tqdm` bar (tmbed, InterProScan) are the ones this shows;
+a tool that writes nothing still gets `no output yet on stderr` on the same
+schedule, which is the heartbeat. `esmfold` is not among them: it runs torch
+in-process rather than shelling out, so it has no stderr for the heartbeat to
+read and logs its own `esmfold: N/M` counter instead.
 
 #### How far through InterProScan is
 
 InterProScan is the exception that paragraph does not cover. It is the longest
-stage in the pipeline — 57 h of the 455,571-protein run — and what reaches
+stage in the pipeline — 57.9 h of the 455,571-protein run — and what reaches
 stderr from it says that it is alive without ever saying how far through it
 is. What it does leave is a trail under the `-T` directory this tool hands it:
 a `.fasta` per chunk it splits out, and a `.raw` beside that chunk once the
@@ -1915,13 +1979,14 @@ Three limits are worth knowing before relying on it:
   progress lines however long they take, so a silent stretch during those is
   not evidence of a hang either way.
 * **Progress is not a checkpoint.** Watching a stage does not make it
-  resumable. `esmfold` and `hhblits` resume, because they work one protein at a
-  time and skip what is already on disk (`<id>.pdb`, `<id>.hhr`). Every stage
-  that shells out to one long command — `hmmsearch` for `pfam`, `dbcan` and
-  `ncbifam`, InterProScan, KOfamScan, `tmbed`, DIAMOND, `jackhmmer`, Foldseek,
-  MMseqs2 — starts again from the beginning if it is killed at 90%, and a stage
-  recorded as `running` when the process died is always recomputed rather than
-  adopted.
+resumable. `esmfold` and `hhblits` resume, because they work one protein at a
+time and skip what is already on disk (`<id>.pdb`, `<id>.hhr`). Drop `tmbed`
+from the list and say so explicitly: "...InterProScan, KOfamScan, DIAMOND,
+`jackhmmer`, Foldseek, MMseqs2 — starts again from the beginning if it is
+killed at 90%. `tmbed` is the exception among the shell-outs: it is chunked
+(`tmbed_chunk_residues`), each finished chunk is committed, and a rerun adopts
+the chunks already on disk.", and a stage recorded as `running` when the
+process died is always recomputed rather than adopted.
 
 `progress_interval_s` is read once, at the start of `run` (and `all`), and
 nothing else reads it, because nothing else calls the wrapper that watches a
@@ -1963,14 +2028,18 @@ answer changes with it — a project with `run.unipept` on reads its quant table
 once more than one without, so a pipe that works in the first config does not
 work in the second. `doctor`'s row for a FIFO prints the count and the reads.
 
-On a default label-free project the plan is: `proteins_faa` **3** (the emapper
-stage, then the integrate stage twice), `quant_table` **1**, `manifest` **1**,
-each `emapper_precomputed` entry **1**. So a pipe works at all of those but
-the FASTA. That is a change: `quant_table` and `manifest` were read three
-times and twice before, in a way nothing could see — `header_columns()` opened
-the table and then `read_delim_table()` opened it for the delimiter and pandas
-opened it for the body, and the join read the manifest once for the column
-mapping and again for the design. Those reads are now one open each.
+On a default (DIA-NN protein-matrix) project the plan is: `proteins_faa` **3**,
+`quant_table` **2** (join reads the header before pandas is allowed near the
+body), `manifest` **1**, each `emapper_precomputed` entry **1**. A pipe works
+at the manifest and the emapper tables, but not at the FASTA or at a
+protein-level quant table; on a feature-level format `quant_table` is **1** and
+a pipe works there too. Fix the follow-on "Those reads are now one open each"
+the same way - only the manifest became one open. That is a change:
+`quant_table` and `manifest` were read three times and twice before, in a way
+nothing could see — `header_columns()` opened the table and then
+`read_delim_table()` opened it for the delimiter and pandas opened it for the
+body, and the join read the manifest once for the column mapping and again for
+the design. Those reads are now one open each.
 
 **Turn a stage on and the plan changes, which is the point of computing it.**
 With `run.taxonomy` on and a feature-level table, `manifest` is **2** — the
@@ -2107,8 +2176,10 @@ that refused every pipe would be removing something that works.
 ### What a results directory says about itself
 
 A results directory now says what produced it and whether that is still
-happening. Neither file below is ever read back by metaannot, and neither is in
-any stage's signature, so neither can make a stage recompute.
+happening. "`config.effective.yaml` is never read back by metaannot; `_run` is
+read back - by the succession check and by the `--force-unlock` refusal message
+- but neither is in any stage's signature, so neither can make a stage
+recompute."
 
 **`config.effective.yaml`** is the merged configuration the run actually used:
 the built-in defaults, then your config file, then the command line. It is not
@@ -2152,12 +2223,13 @@ stops writing `_run` altogether and keeps recording its stages, and it says
 that once in the log. From the record alone those cases are indistinguishable —
 which is the point of writing it down rather than interpreting it, and the log
 is where they are told apart. `last_seen` tells you how long ago the process
-last wrote a `_run` it could prove it was entitled to write. It is for reading, not for deciding: nothing in metaannot reclaims a
-lock because a heartbeat went quiet (see the lock section above). Both timestamps are the same
-instant: the string is local time for reading, the epoch is for arithmetic,
-because two hosts sharing one filesystem cannot subtract each other's local
-clocks. `heartbeat_s` appears in the record exactly as you set it, so an
-integer there stays an integer. Set the interval, or turn it off, with:
+last wrote a `_run` it could prove it was entitled to write. It is for reading,
+not for deciding: nothing in metaannot reclaims a lock because a heartbeat went
+quiet (see the lock section above). Both timestamps are the same instant: the
+string is local time for reading, the epoch is for arithmetic, because two
+hosts sharing one filesystem cannot subtract each other's local clocks.
+`heartbeat_s` appears in the record exactly as you set it, so an integer there
+stays an integer. Set the interval, or turn it off, with:
 
 ```yaml
 heartbeat_s: 30   # seconds between last_seen stamps; 0 = no heartbeat
@@ -2197,18 +2269,18 @@ because the interrupt is caught **inside** the executor's `with` and kills the
 tool groups there before re-raising, and a latch stops the workers from
 starting the next chunk or the next query while it unwinds. `kill -INT` from a
 script, which has no terminal and so never got that broadcast at all, now
-behaves the same way. Unwinding on `SIGTERM` was tried and taken out again, because waiting
-is precisely what a supervisor cannot afford: a tmbed chunk or an InterProScan
-stage is an hour, `systemd` hits `TimeoutStopSec` long before that and sends
-`SIGKILL`, and the lock release that is the whole point of handling the signal
-is then lost. So `SIGTERM` buys the lock at the cost of the trace, and Ctrl-C
-buys the trace at the cost of the wait. The one line the handler does write is
-pre-formatted and pre-encoded at registration and goes out through
-`os.write(2, ...)` — a handler runs between two bytecodes of the main thread,
-so touching `sys.stderr`'s buffer lock can deadlock the process it was meant to
-release — and it names the signal, the lock file, the fact that every tool the run
-started was killed group and all, and the dot-prefixed `.part` file a
-part-written output is left behind as. It reaches stderr but not
+behaves the same way. Unwinding on `SIGTERM` was tried and taken out again,
+because waiting is precisely what a supervisor cannot afford: a tmbed chunk or
+an InterProScan stage is an hour, `systemd` hits `TimeoutStopSec` long before
+that and sends `SIGKILL`, and the lock release that is the whole point of
+handling the signal is then lost. So `SIGTERM` buys the lock at the cost of the
+trace, and Ctrl-C buys the trace at the cost of the wait. The one line the
+handler does write is pre-formatted and pre-encoded at registration and goes
+out through `os.write(2, ...)` — a handler runs between two bytecodes of the
+main thread, so touching `sys.stderr`'s buffer lock can deadlock the process it
+was meant to release — and it names the signal, the lock file, the fact that
+every tool the run started was killed group and all, and the dot-prefixed
+`.part` file a part-written output is left behind as. It reaches stderr but not
 `results/metaannot.log`, whose buffer cannot be flushed from a handler.
 
 The exit status is **128 + the signal**: `130` for Ctrl-C, `143` for `SIGTERM`,
@@ -2352,10 +2424,10 @@ document to `save_state` from one process's in-memory dict, so a superseded run
 recording the single stage it had just finished replaced the file with a
 snapshot that had never heard of the stages the replacement completed
 meanwhile. A reviewer reproduced it: run B finished `pfam`, `dbcan`, `diamond`
-and `cluster`, run A wrote its own older one-stage view over the top, the
-other records were gone, and the next run printed `adopting output this run did
-not produce` for every one of them — the warning that says outright it cannot tell a
-finished file from an interrupted one. Writes name the keys they change now:
+and `cluster`, run A wrote its own older one-stage view over the top, the other
+records were gone, and the next run printed `adopting output this run did not
+produce` for every one of them — the warning that says outright it cannot tell
+a finished file from an interrupted one. Writes name the keys they change now:
 the file is re-read immediately before each one, the changed key is merged into
 what is there, and the file is written back and read back to check it still
 says what we wrote. Where that re-read comes back **missing or unparseable** —
@@ -2364,9 +2436,9 @@ should be — the write creates a document holding *only the keys it names*, and
 every other record stays gone. It does **not** rebuild the document from the
 writing run's own snapshot. Three earlier revisions of this fix kept that
 rebuild and tried to gate it, and there is no gate that works: the losing
-ordering needs no race at all, because a replacement that has *finished*
-leaves a vacant lock and no `_run` to read, and a vacant lock reads exactly
-the same as a replacement that has not started yet.
+ordering needs no race at all, because a replacement that has *finished* leaves
+a vacant lock and no `_run` to read, and a vacant lock reads exactly the same
+as a replacement that has not started yet.
 
 Read what that buys the way the outputs half below is read — as a guarantee, a
 clock and an uncovered part — because it does not all fall in one. An earlier
@@ -2503,12 +2575,12 @@ whether this run still owns the directory, and on proof that it does not a
 deleted, and the log says where the work went. Declared is the whole of it: the
 check lives in `atomic_out`, so a file a stage writes some other way is not
 covered, and for several stages the declared entry is a `.done` sentinel rather
-than the table beside it. That check is an in-memory flag plus, at most, one rate-limited read
-of the state file; it renames on every doubt, so a transient error can never
-abort a stage that is legitimately finishing. A stage that *starts* after the
-handover cannot rename at all; one already running when the directory changed
-hands is only **noticed**, and the difference between those two words is the
-whole of what this buys. Read them separately:
+than the table beside it. That check is an in-memory flag plus, at most, one
+rate-limited read of the state file; it renames on every doubt, so a transient
+error can never abort a stage that is legitimately finishing. A stage that
+*starts* after the handover cannot rename at all; one already running when the
+directory changed hands is only **noticed**, and the difference between those
+two words is the whole of what this buys. Read them separately:
 
 * **The guarantee.** A stage that *starts* after the handover cannot rename.
   `mark_running` is a merged write, the succession check reads the document
@@ -2789,19 +2861,19 @@ renders verbatim:
 That is the boundary, and `depth` is what keeps it honest per row rather than
 as a promise in a docstring: four checks do read past a file's existence — the
 DIAMOND usability check, each plex's TMT annotation file, the manifest itself
-(`read_manifest`, in full, because the mapping check has no runs to map
-without it) and `pd.read_csv(nrows=0)` on the quant table's header line — and
-each of those carries a `caveat` naming exactly what it opened. The DIAMOND one is the
-reason the caveat is **derived and not declared**: what it reads depends on
-the host. With `diamond` on PATH it reads the database header
-(`diamond dbinfo`, `depth: "header"`); without it — the ordinary state the
-first time anyone runs `doctor` — it falls back to the source FASTA beside the
-database and reads up to 200,000 records for a length profile, plus 200
-deflines for the motif-seed signal, which is `depth: "parsed"`. A zero-byte
-`.dmnd` is refused on `os.path.getsize` alone and reads nothing at all
-(`depth: "kind"`). Nothing in the shape can carry a parse result; there is no
-`rows`, no `columns`, no record count and no id list, which is what stops this
-growing into a different program.
+(`read_manifest`, in full, because the mapping check has no runs to map without
+it) and `pd.read_csv(nrows=0)` on the quant table's header line — and each of
+those carries a `caveat` naming exactly what it opened. The DIAMOND one is the
+reason the caveat is **derived and not declared**: what it reads depends on the
+host. With `diamond` on PATH it reads the database header (`diamond dbinfo`,
+`depth: "header"`); without it — the ordinary state the first time anyone runs
+`doctor` — it falls back to the source FASTA beside the database and reads up
+to 200,000 records for a length profile, plus 200 deflines for the motif-seed
+signal, which is `depth: "parsed"`. A zero-byte `.dmnd` is refused on
+`os.path.getsize` alone and reads nothing at all (`depth: "kind"`). Nothing in
+the shape can carry a parse result; there is no `rows`, no `columns`, no record
+count and no id list, which is what stops this growing into a different
+program.
 
 **Every one of those reads goes through one gate, and `doctor` opens nothing
 the gate has not already opened.** `regular_readable()` proves a path with an
@@ -2828,37 +2900,37 @@ a timeout, so a future hang fails a test rather than wedging a suite.
 
 "The right kind of thing" is **derived, never assumed**. `expect.kind` is
 `file` for every quant format but one, and `dir` for `fragpipe_tmt`, which
-reads the run directory holding the per-plex folders;
-`expect.derived_from: ["quant_format"]` names the key that decided, so a ninth
-format changes the value and not the schema. Its full vocabulary is `file`,
-`dir`, `on_path`, `probe` (the host was asked — CUDA, an import,
-`requireNamespace`), `setting` (a claim about the config and nothing else) and
-`r_package`. `expect.members` carries the siblings the engine's **own** test
-requires beside the thing named — the four `hmmpress` files for an HMM
-library, `.dbtype` and `.index` for a Foldseek target, the `nodes.dmp` inside
-a taxdump directory — and is empty where that test names none, as for
-`hhblits_db`, whose `_prefix_exists()` accepts any non-empty sibling of the
-stem. `found.kind` names what is really there — `file`, `dir`, `empty_file`,
-`empty_dir`, `symlink_broken`, `absent`, `unset`, `other` (present, and
-neither a regular file nor a directory: a FIFO, a socket, a device node) and
-`unreadable` (there, and this process may not read it — a directory with no
-read bit, or a file whose mode or ACL refuses an `open()`) — so a consumer
-never has to do arithmetic on `bytes`, and a dangling symlink is reported as
-one instead of as a plain absence. `unreadable` is reached for a **file** as
-well as a directory, which it was not until now: `os.path.getsize()` is a stat
-and answers happily for a mode-000 file, so four rows that branch on
-`kind == "file"` used to report `ok` for one while `run` died on "Permission
-denied" in the stage that opened it. `other` is not a curiosity: `os.path.exists()`
-is **true** for a FIFO, so `run` does not refuse one and every row that read
-`absent` for it told an operator the opposite of what happens. What `run` does
-with one is its own section below; what matters here is that the two commands
-answer differently on purpose, and `doctor` is the one that may never wait.
+reads the run directory holding the per-plex folders; `expect.derived_from:
+["quant_format"]` names the key that decided, so a ninth format changes the
+value and not the schema. Its full vocabulary is `file`, `dir`, `on_path`,
+`probe` (the host was asked — CUDA, an import, `requireNamespace`), `setting`
+(a claim about the config and nothing else) and `r_package`. `expect.members`
+carries the siblings the engine's **own** test requires beside the thing named
+— the four `hmmpress` files for an HMM library, `.dbtype` and `.index` for a
+Foldseek target, the `nodes.dmp` inside a taxdump directory — and is empty
+where that test names none, as for `hhblits_db`, whose `_prefix_exists()`
+accepts any non-empty sibling of the stem. `found.kind` names what is really
+there — `file`, `dir`, `empty_file`, `empty_dir`, `symlink_broken`, `absent`,
+`unset`, `other` (present, and neither a regular file nor a directory: a FIFO,
+a socket, a device node) and `unreadable` (there, and this process may not read
+it — a directory with no read bit, or a file whose mode or ACL refuses an
+`open()`) — so a consumer never has to do arithmetic on `bytes`, and a dangling
+symlink is reported as one instead of as a plain absence. `unreadable` is
+reached for a **file** as well as a directory, which it was not until now:
+`os.path.getsize()` is a stat and answers happily for a mode-000 file, so four
+rows that branch on `kind == "file"` used to report `ok` for one while `run`
+died on "Permission denied" in the stage that opened it. `other` is not a
+curiosity: `os.path.exists()` is **true** for a FIFO, so `run` does not refuse
+one and every row that read `absent` for it told an operator the opposite of
+what happens. What `run` does with one is its own section below; what matters
+here is that the two commands answer differently on purpose, and `doctor` is
+the one that may never wait.
 
-**`other` is three things, and `found.other_kind` says which.** It is `fifo`,
+**`other` is four things, and `found.other_kind` says which.** It is `fifo`,
 `socket`, `char_device` or `block_device`, and `null` for every other `kind`.
 It is a new KEY and not a new `kind`, so `DOCTOR_VERSION` does not move and a
 consumer that has never heard of it keeps every answer it had. It exists
-because a sentence derived from `kind` alone is written for one of the three
+because a sentence derived from `kind` alone is written for one of the four
 and printed over all of them: a UNIX socket at `proteins_faa` published "dies,
 but not at once ... A FIFO in particular is not refused on sight ... waits
 `fifo_wait_s`", and a socket cannot be opened as a file at all — `os.open()`
@@ -2928,11 +3000,11 @@ they were found outside it, which is the difference between a contract and a
 suggestion: this page tells you to switch on `found.kind` rather than compute
 `bytes > 0`, and a `fifo` or an `unreadable` appearing there would not have
 been a version bump. Both of those states now have a name **in** the set, and
-`fails_reason`'s first value was renamed in the same pass, neither of which is
-a bump only because `doctor_version` 1 has not shipped: it and this page are
-in the same unreleased change set, so there is no consumer to break.
-`finding`, the stage names in `blocks`, and every `detail` and `caveat` are
-open: a consumer that meets an unfamiliar value there keeps `status` and
+`fails_reason`'s first value was renamed in the same pass, and neither of which
+was a bump: both were settled before `doctor_version` 1 first shipped, in
+v0.6.0, so there was no consumer to break. A change to one of these sets now is
+a bump. `finding`, the stage names in `blocks`, and every `detail` and `caveat`
+are open: a consumer that meets an unfamiliar value there keeps `status` and
 renders `detail`.
 
 ## The console: watching a run without touching it
@@ -3046,10 +3118,11 @@ implements `GET` and `HEAD` and nothing else. A watcher that cannot act cannot
 act wrongly on a directory you care about, and that is what makes "point it at
 the running job and see" a reasonable first thing to do rather than a decision.
 
-The preflight checklist, the server-side directory picker, a `doctor --json` to
-feed them and the config authoring described in `docs/gui-design.md` are later
-milestones and are **not** in this release. This is M1, a watcher, and it is
-deliberately the whole of it: if the pane is not useful, the loss is one file.
+The preflight checklist, the server-side directory picker and the config
+authoring described in `docs/gui-design.md` are later milestones and
+are **not** in this release (`doctor --json`, which M2 was blocked on, shipped in
+v0.6.0). This is M1, a watcher, and it is deliberately the whole of it: if the
+pane is not useful, the loss is one file.
 
 ## What has actually been run
 
@@ -3093,9 +3166,10 @@ with pandoc 3.1 was simply the earlier validation environment. The object
 script can still degrade in two independent places and each names the real
 error rather than guessing: if `addAssayLink` fails you still get a QFeatures,
 both assays present but unlinked, logged as `assay link not added (<the real
-condition>)`; only a failure of the QFeatures constructor itself falls back to
-a SummarizedExperiment, with the peptide assay in `metadata()$peptides`. Check
-the class of the object you get back.
+condition>)`; Drop "only": "a failure of the QFeatures constructor falls back
+to a SummarizedExperiment, as do a missing QFeatures package and a
+protein-level input — see the object section above.". Check the class of the
+object you get back.
 
 A test suite does ship, in `tests/` — `conftest.py`, `fixtures.py` and sixteen
 test modules — so the plumbing described here is reproducible offline from what
@@ -3137,23 +3211,42 @@ sequences above that machine's VRAM cliff were projected at 7.4 h on their own.
 See **The length a card can actually fold**.
 
 **They do not scale linearly.** On a 455,571-protein run — 11.9× the size —
-the stages that finished came in at 14–30×, not 12×: kofam 14.3 h (29×), pfam
-7.2 h (16×), ncbifam 5.6 h (14×), dbcan 617 s (15×), diamond 291 s (30×). The
-cause is contention rather than size: at 38k a long stage rarely overlaps
+the stages came in at **14–66×**, not 12×: tmbed 65×, signalp 61×, kofam 29×,
+diamond 29×, emapper 25×, interpro 20×, pfam 16×, dbcan 15×, ncbifam 14×. The
+figures are `MEASURED_38K` and `MEASURED_455K` in `tests/test_scheduler.py`,
+where the dispatch-order replay takes its durations from, so they can be
+re-derived rather than taken on trust.
+
+An earlier version of this paragraph said 14–30×, and it was not wrong when it
+was written — it was computed over the stages that had finished by then. The ones that finished afterwards were the worst of the set, which is the direction that matters for planning.
+
+The cause is contention rather than size: at 38k a long stage rarely overlaps
 another long stage, and at 455k every one of them overlaps every other for its
 whole life. SignalP measured 11.4 sequences/s with the machine mostly to
 itself and 2.0–3.2 sequences/s alongside tmbed and kofam — the same work,
-three to five times slower. Doubling the linear estimate past ~100k proteins
-is a fair planning rule and an optimistic one for the worst stage.
+three to five times slower.
+
+**Doubling the linear estimate is the wrong planning rule**, and this is the
+correction that costs real hours: at 65× for 11.9× the proteins, tmbed is
+5.5× its linear estimate, not 2×. Budget against the worst stage you have
+enabled, not the median — past ~100k proteins, **five times** the linear
+estimate is the safe figure for `tmbed` and `signalp`, and doubling is fair
+only for the hmmsearch-class stages at the bottom of that list.
 
 MMseqs2 is the exception: 455,571 proteins clustered into 49,347 families in
 109 seconds, 7.6× for 11.9× the proteins, because clustering scales with
 redundancy rather than with count.
 
-Three of that run's stages had not finished when this was written, and are
-deliberately not quoted rather than rounded: SignalP was 58% through after
-30.7 h, InterProScan had been going 3.7 h, and TMbed had written nothing at
-all in 30.7 h. See [TUTORIAL.md](TUTORIAL.md#resource-guide--and-how-to-size-a-run).
+Three of that run's stages were still going when this section was first
+written, and were left unquoted rather than rounded: SignalP was 58% through
+after 30.7 h, InterProScan had been going 3.7 h, and TMbed had written nothing
+at all in 30.7 h. **They finished, and the figures are now in the tree**, in
+`MEASURED_455K` in `tests/test_scheduler.py`, where the dispatch-order replay
+takes its durations from: InterProScan 57.9 h, SignalP 57.0 h, TMbed 57.0 h.
+All three are the same order as each other because they ran concurrently for
+almost their whole lives, which is the contention this section is about rather
+than an exception to it. See
+[TUTORIAL.md](TUTORIAL.md#resource-guide--and-how-to-size-a-run).
 
 The hot paths are vectorised: protein-group explosion, bin assignment and
 export scoring are array operations, not row-wise `apply`, and sequences are
@@ -3164,17 +3257,20 @@ Quant tables are read by `read_delim_table`, which takes the delimiter from the
 header line alone and hands the body to pandas' C parser. The old
 delimiter-sniffing path (`sep=None, engine="python"`) is gone from every quant
 read — roughly 18× slower and 4–6× the memory for no benefit, since the first
-line already says which delimiter this is. It survives only for the Unipept
-result file and a header-only peek in `doctor`. Reading is no longer the
-dominant cost.
+line already says which delimiter this is. Replace with: "It survives nowhere:
+the Unipept result reader and `doctor`'s header peek were the last two, and
+both now go through the header-line sniff and the C parser." Reading is no
+longer the dominant cost.
 
 Scratch is **partly** cleaned up. The two trees that can reach hundreds of GB
 are removed by the run itself: each Foldseek target search deletes its
 `{results}/foldseek/tmp{i}` when the search returns, and self-clustering
 deletes `{results}/foldseek/tmpc`, so scratch peaks at one target's tree rather
 than the sum over targets — but that peak is real: against AFDB50 budget tens
-to hundreds of GB of free space for the duration of the stage. A Foldseek that
-is killed, or that exits non-zero, still leaves the tree it died in.
+to hundreds of GB of free space for the duration of the stage. "A killed
+Foldseek still leaves the tree it died in; a non-zero exit does not, for the
+target searches — their tree is removed in a `finally`. Self-clustering's
+`tmpc` does leak on a non-zero exit."
 
 What survives a clean run is smaller and fixed in kind: `{results}/kofam/tmp`
 is the largest leftover at 229 MB on a 38k-protein run;
