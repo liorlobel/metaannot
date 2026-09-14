@@ -234,6 +234,57 @@ def test_signature_version_bump_does_invalidate_the_stage_cache(ma, project,
     assert ma.signature(st, cfg, p) != before
 
 
+# The third member of that family. `__version__` must not invalidate the cache
+# and SIGNATURE_VERSION must; source_digest() is the thing that identifies a
+# build WITHOUT being allowed to do either.
+def test_the_source_digest_names_the_bytes_that_ran(ma):
+    # symptom: a finished 84-hour cohort logged "metaannot 0.2.0 starting",
+    # and that machine holds five metaannot.py files that all say 0.2.0 and
+    # are four different builds. Nothing recorded which of them made the
+    # results, so "which version produced this table" had no answer.
+    import hashlib
+    with open(ma.__file__, "rb") as fh:
+        want = hashlib.sha256(fh.read()).hexdigest()
+    assert ma.source_digest() == want
+    assert len(ma.source_digest()) == 64
+    # Memoised: read once for the life of the process, not once per caller.
+    assert ma.source_digest() is ma.source_digest()
+
+
+def test_the_source_digest_is_recorded_and_never_compared(ma, project,
+                                                          monkeypatch):
+    # THE LOAD-BEARING ONE. If this key ever reached a stage signature, every
+    # edit to metaannot.py would discard every cached stage -- which is the
+    # exact failure SIGNATURE_VERSION exists to prevent, arriving by another
+    # door. A digest that identifies a build is only safe because nothing
+    # decides anything with it.
+    cfg = ma.load_config(project.config_path)
+    p = ma.Paths(cfg)
+    p.mkdirs()
+    before = {st["name"]: ma.signature(st, cfg, p) for st in ma.STAGES}
+    monkeypatch.setattr(ma, "source_digest", lambda: "0" * 64)
+    after = {st["name"]: ma.signature(st, cfg, p) for st in ma.STAGES}
+    moved = sorted(n for n in before if before[n] != after[n])
+    assert not moved, f"the build digest moved these stage signatures: {moved}"
+    # Belt and braces, because the monkeypatch above only catches a call made
+    # through the module attribute: an inlined hashlib call inside signature()
+    # would pass the assertion above and still break every resume.
+    import inspect
+    body = inspect.getsource(ma.signature)
+    assert "source_digest" not in body and "_SOURCE_DIGEST" not in body
+
+
+def test_an_unreadable_source_is_unknown_rather_than_a_failed_run(ma, tmp_path,
+                                                                  monkeypatch):
+    # zipimport, a frozen bundle, or a file that has since been replaced. None
+    # of those is a reason to fail a run that would otherwise work. The answer
+    # is the literal "unknown" and not a hash-shaped placeholder, so a reader
+    # can tell "I could not look" from "I looked, and it was this".
+    monkeypatch.setattr(ma, "_SOURCE_DIGEST", None)
+    monkeypatch.setattr(ma, "__file__", str(tmp_path / "not-here.py"))
+    assert ma.source_digest() == "unknown"
+
+
 # --- finding 4 --------------------------------------------------------
 @pytest.mark.parametrize("given,want", [
     ("512M", 1), ("64G", 64), ("64GB", 64), ("64", 64), (64, 64),
@@ -1091,7 +1142,13 @@ def test_describe_carries_the_preflight_data_model(ma, tmp_path):
 # failure here, which is why both sets are compared as supersets of nothing -
 # they are compared exactly.
 DESCRIBE_TOP_LEVEL = {
-    "describe_version", "metaannot_version", "signature_version", "generated",
+    # `metaannot_source` joined with source_sha256: the sha256 of the
+    # metaannot.py that answered. DESCRIBE_VERSION is NOT bumped, by the same
+    # rule as `cost` below -- a key was added, none removed, and no meaning
+    # changed. Registered here because that rule only holds if the addition
+    # was a DECISION, which is what this set exists to force.
+    "describe_version", "metaannot_version", "metaannot_source",
+    "signature_version", "generated",
     "host", "config_path", "config", "default_config", "path_keys",
     "db_path_keys", "replace_blocks", "freeform_keys", "retired_keys",
     "stage_names", "stages", "bins", "quant_formats", "paths", "run_key",

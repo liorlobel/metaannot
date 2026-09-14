@@ -1938,10 +1938,12 @@ read and logs its own `esmfold: N/M` counter instead.
 
 #### How far through InterProScan is
 
-InterProScan is the exception that paragraph does not cover. It is the longest
-stage in the pipeline — 57.9 h of the 455,571-protein run — and what reaches
-stderr from it says that it is alive without ever saying how far through it
-is. What it does leave is a trail under the `-T` directory this tool hands it:
+InterProScan is the exception that paragraph does not cover. It ran 56.8 h on
+the 455,571-protein run, which puts it third in a near-tie with SignalP (57.9 h)
+and TMbed (57.0 h) rather than first — those three are the long pole together,
+and no one of them is the stage to plan around. What makes InterProScan the
+exception is the other half: what reaches stderr from it says that it is alive
+without ever saying how far through it is. What it does leave is a trail under the `-T` directory this tool hands it:
 a `.fasta` per chunk it splits out, and a `.raw` beside that chunk once the
 chunk has been analysed. The heartbeat counts them:
 
@@ -2212,6 +2214,7 @@ underscore, no stage is named that, and `--force` never clears it:
 "_run": {
  "run_id": "20260901T144530-31284",
  "version": "0.7.1",
+ "source_sha256": "5189cb47431bb7b463cc7206b38645ebb29e9107cd52161acdf97c90704b186c",
  "config_path": "/data/projects/gut2/config.yaml",
  "argv": ["<script>", "run", "--config", "config.yaml"],
  "host": "server", "pid": 31284,
@@ -2220,6 +2223,16 @@ underscore, no stage is named that, and `--force` never clears it:
  "heartbeat_s": 30, "finished": null, "final_status": "running"
 }
 ```
+
+`source_sha256` is the sha256 of the `metaannot.py` that ran. `version` names
+a RELEASE and cannot name a BUILD: the machine that produced the 8-plex cohort
+holds five copies of this file that all say `0.2.0` and are four different
+builds, so a results directory carrying only a version string cannot be traced
+to the code that filled it. It is recorded and never compared — nothing in
+the cache or the resume decision reads it, because a digest that invalidated
+stages would make every edit to this file discard days of InterProScan, which
+is the failure `SIGNATURE_VERSION` exists to prevent. `"unknown"` when the file
+could not be read (zipimport, a frozen bundle, a copy already replaced).
 
 `argv` is `sys.argv` verbatim, so the `<script>` above is really the path of
 the `metaannot.py` that ran — useful when more than one copy is installed.
@@ -3162,18 +3175,61 @@ ESMFold built 1,821 models, 993 of them passed the pLDDT gate, and Foldseek
 returned 21,791 hits over PDB and AlphaFold Swiss-Prot plus 664 self-clustered
 fold groups.
 
-A FragPipe TMT run is in progress on a second dataset — 8 plexes, 88 channels,
-75 biological samples, 74,051 features, 455,571 proteins, eggNOG coverage
-98.4% — and a 3-plex subset of it has already completed end to end including
-the report. So `quant_format: fragpipe_tmt` is not a paper path.
+**A second dataset has now finished**, and it is the larger one: a FragPipe
+TMT run over 8 plexes, 88 channels, 75 biological samples, 74,051 features and
+455,571 proteins, eggNOG coverage 98.4%, in 84.2 h. A 3-plex subset of it had
+already completed end to end including the report, so `quant_format:
+fragpipe_tmt` was not a paper path before this and is not one now. Final bins:
+`1_ko_pathway` 70.6%, `2_ko_orphan` 15.4%, `3_annotated_no_ko` 12.1%,
+`3d_duf_only` 0.5%, `3s_structure_only` 14 proteins, `4_dark` **1.5%**. Dark
+rescue took 15,135 proteins dark on eggNOG alone down to 6,934 — 8,201
+rescued, 54%. ESMFold built 538 models and Foldseek returned 818 hits plus 254
+self-clustered fold groups. Pfam and NCBIfam were each searched twice, by
+hmmsearch and by InterProScan, and the two implementations agree **100.0%** on
+431,946 and 301,863 proteins respectively — zero disjoint calls on Pfam,
+**7** on NCBIfam (`source_agreement.tsv`). 100.0% is the rounded `pct_agree`
+column and 7/301,863 rounds `pct_disjoint` to 0.0, which is why this file's own
+worked example a few sections up tells you to read `disjoint` first and not the
+percentage.
 
-**Not on real data:** `smorf`, `context`, `hhblits`, `jackhmmer`, `unipept` and
-`taxonomy` — all off by default — have still never run. So the profile
-searches, the Unipept API and the peptide-LCA taxonomy comparison remain
-unexercised outside their output parsers, and `3p_profile_only` has never been
-produced by any run: it is fed only by `hh_hit` and `jackhmmer_hit`, so it
-stays empty until one of those two stages runs. `3s_structure_only` **has**
-been populated — 141 proteins, from the Foldseek search above.
+**Two caveats on that run's figures, and they are not the same size.** It
+used the global `diamond_min_pident: 30` this file used to default to, and the
+current default floors CARD, VFDB and BAGEL at 50. Re-deriving it under the
+current defaults — `run --from integrate`, 3 min 49 s — shows exactly what that
+is worth:
+
+| | at `--id 30` | at the current floors | |
+|---|---|---|---|
+| proteins with a VFDB hit | 68,103 | **19,169** | –71.9% |
+| proteins with a CARD hit | 15,374 | **4,128** | –73.1% |
+| `3_annotated_no_ko` | 54,923 | 54,919 | **–4** |
+| `4_dark` | 6,934 | 6,938 | **+4** |
+| every other bin | — | unchanged | |
+
+**So the two columns move and the result does not.** Four proteins out of
+455,571 leave `3_annotated_no_ko` for `4_dark`; every other bin is identical
+to the digit, and `source_agreement.tsv` is byte-identical. Nearly every
+protein a weak DIAMOND hit annotated had other evidence for the same protein,
+which is why the dark-matter figures above survive the floor unchanged — and
+why the virulence and resistance columns must be quoted from a re-derived run
+rather than from the 84.2 h one.
+
+The second caveat is smaller to state and harder to repair: that run predates
+`source_sha256`, so the build behind it is named only by a version string that
+four distinct builds on that machine all carried. Every run from the next release on
+records its own digest, and the re-derivation above is the first Pittsburgh
+output that can be traced to the bytes that made it.
+
+**Not on real data:** `smorf`, `context`, `hhblits` and `jackhmmer` — all off
+by default — have still never run. So the profile searches remain unexercised
+outside their output parsers, and `3p_profile_only` has never been produced by
+any run: it is fed only by `hh_hit` and `jackhmmer_hit`, so it stays empty
+until one of those two stages runs. **`unipept` and `taxonomy` are off that
+list**: the 8-plex run above ran them, in 195 s and 27 s, so the Unipept API
+and the peptide-LCA taxonomy comparison have both now been exercised on real
+data. This paragraph went on naming them for longer than that was true.
+`3s_structure_only` **has** been populated — 141 proteins on the label-free
+run, 14 on the TMT one.
 
 **Report and R object: built from the real run.** Both were produced from the
 38,204-protein dataset above on R 4.6.1 — the report knits to HTML with figures
@@ -3269,10 +3325,20 @@ written, and were left unquoted rather than rounded: SignalP was 58% through
 after 30.7 h, InterProScan had been going 3.7 h, and TMbed had written nothing
 at all in 30.7 h. **They finished, and the figures are now in the tree**, in
 `MEASURED_455K` in `tests/test_scheduler.py`, where the dispatch-order replay
-takes its durations from: InterProScan 57.9 h, SignalP 57.0 h, TMbed 57.0 h.
+takes its durations from: SignalP 57.9 h, TMbed 57.0 h, InterProScan 56.8 h.
 All three are the same order as each other because they ran concurrently for
 almost their whole lives, which is the contention this section is about rather
-than an exception to it. See
+than an exception to it.
+
+Two of those three were wrong here, and all three were wrong in the test
+table, until they were read off that run's own `.metaannot_state.json`.
+SignalP's 57.9 h had been filed under InterProScan, which left InterProScan's
+own 56.8 h unrecorded anywhere; TMbed's 57.0 h was right by accident, because
+205,039.6 s really does round there, while the test table had reached it by
+copying a shared 205,200 s — exactly 57.0 h, the shape of a number taken from
+a sentence rather than measured. The run recorded a different duration for each
+stage, and the longest of them was the one attributed to the wrong stage. Prose
+rounds; the state file does not. See
 [TUTORIAL.md](TUTORIAL.md#resource-guide--and-how-to-size-a-run).
 
 The hot paths are vectorised: protein-group explosion, bin assignment and

@@ -413,7 +413,7 @@ def test_claude_md_told_the_next_session_to_refuse_tmt(ma):
     assert "quant_format: fragpipe_tmt" in txt, \
         "CLAUDE.md does not name the format that reads a TMT run"
     # and what replaces rule 8 has to be the real division
-    assert "Fifteen of the twenty-one stages" in txt
+    assert "Seventeen of the twenty-one stages" in txt
     for never in ("smorf", "context", "hhblits", "jackhmmer", "unipept",
                   "taxonomy"):
         assert f"`{never}`" in txt, f"CLAUDE.md no longer names {never}"
@@ -2664,6 +2664,33 @@ COUNT_PROSE = {
                                 "turns on"),
     "nine fields": ("MEASURED", "the documented describe fields one commit "
                                 "deleted, listed beside the number"),
+
+    # ---- MEASURED, added with source_sha256 and the corrected 455k table ----
+    # Facts about one machine and one cohort. None is recomputable from this
+    # tree -- the cohort's results are not redistributable and the machine is
+    # not this one -- so the pin is that the SENTENCE STILL EXISTS, which is
+    # what the MEASURED class is for. Every one of them was read off that run's
+    # own outputs rather than recalled: `.metaannot_state.json` for the
+    # durations, `results/structures/` and `foldseek/hits.tsv` for these two.
+    "538 models": ("MEASURED", "the ESMFold models the real 8-plex run built"),
+    "818 hits": ("MEASURED", "the Foldseek hits the real 8-plex run returned"),
+    "five files": ("MEASURED", "the metaannot.py copies on the machine that "
+                               "ran the 8-plex cohort, all of them saying "
+                               "0.2.0 -- the reason source_sha256 exists"),
+    "five copies": ("MEASURED", "the same five, counted in the README's "
+                                "run-record section"),
+    "four builds": ("MEASURED", "the DISTINCT contents among those five: one "
+                                "pair is byte-identical, so five copies are "
+                                "four builds and a version string names "
+                                "neither"),
+    "six stages": ("MEASURED", "the stages that had finished when TUTORIAL's "
+                               "first planning rule was derived from them, "
+                               "which is why that rule was too optimistic"),
+    "four proteins": ("MEASURED", "everything the current DIAMOND identity "
+                                  "floors move in the 8-plex cohort's bins, "
+                                  "measured by re-deriving it: the columns "
+                                  "lose ~72% of their calls and the bins "
+                                  "move by four proteins out of 455,571"),
 
     # ---- PROSE added by the fifth reading -----------------------------
     "0 row": ("PROSE", "'a 0-row matrix' - an empty one, not a count"),
