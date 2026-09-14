@@ -389,6 +389,32 @@ def test_an_interrupted_run_leaves_parseable_state_and_resumes(tmp_path,
     assert _outputs(proj, skip=(PASS1,)) == want
 
 
+def test_a_run_records_the_build_that_made_it(tmp_path, stub_bin, ma):
+    """The state file names the BYTES, not just the release.
+
+    A results directory outlives the checkout that filled it, and `version`
+    alone has already failed to identify one: an 84-hour cohort logged
+    "metaannot 0.2.0 starting" while five files on the same machine said 0.2.0
+    and were four different builds. What makes the digest usable is that BOTH
+    halves are present -- the full hash where a machine reads it, the short
+    form on the log line a person quotes -- so this asserts both rather than
+    whichever one is easier to reach.
+    """
+    proj = _searchable(tmp_path, tmp_path / "p")
+    proc = proj.run()
+
+    rec = proj.state()[ma.RUN_KEY]
+    assert rec["source_sha256"] == ma.source_digest()
+    assert len(rec["source_sha256"]) == 64, "the full digest, not the short one"
+    assert rec["version"] == ma.__version__, "and the release, still, beside it"
+
+    short = ma.source_digest()[:ma.SOURCE_DIGEST_SHORT]
+    assert f"metaannot {ma.__version__} starting (source {short})" \
+        in proc.stderr, \
+        "version and digest have to be on ONE line, or a quoted log can carry "\
+        "the half that identifies nothing"
+
+
 def test_an_unreadable_state_file_stops_adoption(tmp_path, stub_bin):
     # a run that cannot read the state knows nothing about the outputs lying
     # in the directory, so it must not adopt them as its own.
@@ -702,27 +728,40 @@ def _ordinal_only(ma):
 
 
 # The two runs this repository has published per-stage durations for, in
-# seconds. Every figure for a stage those runs ACTUALLY RAN is a measurement
-# quoted in README's Scale section or TUTORIAL's resource guide: the cells
-# that still said "still running" when those tables were written are the ones
-# the ordering work finally measured — InterProScan at 57.9 h, and SignalP
-# and TMbed at the 57 h that weighted_share()'s own docstring already records
-# for the pair.
+# seconds.
 #
-# THE STAGES NEITHER RUN ENABLED — jackhmmer, hhblits, unipept, context, smorf
-# and taxonomy — carry the same placements STAGE_ORDER_S gives them, because
-# nothing better exists for them anywhere in this repository and a replay has
-# to give every selected stage some duration. That makes those rows the
-# one part of these tables that is not independent of the thing being tested,
-# so the test below multiplies them up and down and shows the comparison does
-# not rest on them.
+# THE 455K ROW IS READ OFF THAT RUN'S OWN .metaannot_state.json, not off a
+# figure in prose, and that is a correction rather than a refinement. The
+# table used to carry SignalP's 208,396 s in interpro's cell, and to give
+# SignalP and TMbed a shared 205,200 s — exactly 57.0 h, which is the shape of
+# a number copied from a sentence rather than measured. The run records
+# interpro 204,303.8 s (56.75 h), signalp 208,395.6 s (57.89 h) and tmbed
+# 205,039.6 s (56.96 h): a different figure for each, and the largest of them
+# is the one that had been filed under the wrong stage. Prose rounds, loses the
+# ordering between stages that finish within an hour of each other, and cannot
+# be diffed; the state file is what the run itself wrote down.
+#
+# unipept (195.1 s) and taxonomy (26.5 s) are measurements now. They are in
+# this table because that run RAN them — a fact several documents in this
+# repository denied for longer than they should have — and they are small
+# enough that nothing about the ordering turns on them, which is precisely why
+# nobody noticed the claim was false.
+#
+# THE STAGES NEITHER RUN ENABLED — jackhmmer, hhblits, context and smorf —
+# carry the same placements STAGE_ORDER_S gives them, because nothing better
+# exists for them anywhere in this repository and a replay has to give every
+# selected stage some duration. They are also the only four cells MEASURED_38K
+# still supplies to MEASURED_455K: every stage the Pittsburgh run timed is
+# overridden below, so what the base dict contributes IS the untimed set. That
+# makes those rows the one part of these tables that is not independent of the
+# thing being tested, so the test below multiplies them up and down and shows
+# the comparison does not rest on them.
 #
 # The tables are here to be REPLAYED, which is the point: the tests below do
 # not assert that the new order is better, they compute what each order costs
 # on measured durations and compare the two. A hand-written expected makespan
 # could agree with a wrong implementation; a replay of measurements cannot.
-UNTIMED_BY_EITHER_RUN = ("jackhmmer", "hhblits", "unipept", "context",
-                         "smorf", "taxonomy")
+UNTIMED_BY_EITHER_RUN = ("jackhmmer", "hhblits", "context", "smorf")
 MEASURED_38K = {
     "emapper": 3, "pfam": 1620, "dbcan": 41, "diamond": 10, "signalp": 3348,
     "tmbed": 3132, "cluster": 14, "ncbifam": 1440, "kofam": 1764,
@@ -730,9 +769,12 @@ MEASURED_38K = {
     "jackhmmer": 1000, "hhblits": 1000, "esmfold": 5760, "foldseek": 57,
     "finalise": 30, "unipept": 1000, "taxonomy": 10, "join": 30,
 }
-MEASURED_455K = dict(MEASURED_38K, emapper=76, diamond=291, cluster=109,
-                     dbcan=617, ncbifam=20160, pfam=25920, kofam=51480,
-                     interpro=208396, signalp=205200, tmbed=205200)
+MEASURED_455K = dict(
+    MEASURED_38K,
+    cluster=109, dbcan=617, diamond=291, emapper=76, esmfold=1075,
+    finalise=66, foldseek=28, integrate=88, interpro=204304, join=13,
+    kofam=51384, ncbifam=20214, pfam=25827, signalp=208396, taxonomy=27,
+    tmbed=205040, unipept=195)
 # What the eight configs in examples/server-run-plan select: no topology, no
 # structure, no hhblits, jackhmmer, context, smorf, unipept or taxonomy. Their
 # hours class is a different set from the full pipeline's — emapper, pfam,

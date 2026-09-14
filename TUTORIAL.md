@@ -1084,20 +1084,30 @@ three stages at a time:
 | `ncbifam` | 0.40 h | **5.6 h** | 14× |
 | `pfam` | 0.45 h | **7.2 h** | 16× |
 | `kofam` | 0.49 h | **14.3 h** | 29× |
-| `signalp` | 0.93 h | *still running* | — |
-| `tmbed` | 0.87 h | *still running* | — |
-| `interpro` | 2.84 h | *still running* | — |
-| `foldseek` | 57 s | — | — |
-| `esmfold` | 1.6 h for 1,805 models under 478 aa | — | — |
+| `signalp` | 0.93 h | **57.9 h** | **62×** |
+| `tmbed` | 0.87 h | **57.0 h** | **66×** |
+| `interpro` | 2.84 h | **56.8 h** | 20× |
+| `foldseek` | 57 s | 28 s | 0.5× |
+| `esmfold` | 1.6 h for 1,805 models under 478 aa | 1,075 s for 538 models | — |
+| `unipept` | — | 195 s | — |
+| `taxonomy` | — | 27 s | — |
 
-The three *still running* cells are not estimates withheld for tidiness —
-that run was in its 31st hour when this table was written and those stages had
-not finished. What was known at that moment: SignalP was 58% through
-(262,200 of 455,571 sequences after 30.7 h, so on the order of 53 h);
-InterProScan had been going 3.7 h; TMbed had written **nothing at all** in
-30.7 h, which is what that tool does — see `tmbed_chunk_residues` below.
-Rather than round those into the table, read your own: every stage records
-its `seconds` in `results/.metaannot_state.json`.
+**Those long cells used to read *still running*, and what they say now
+changes the advice below.** That run was in its 31st hour when this table was
+first written; the guess recorded here at the time was that SignalP was 58%
+through and so "on the order of 53 h". It finished at 57.9 h. TMbed, which had
+written **nothing at all** in 30.7 h — which is what that tool does, see
+`tmbed_chunk_residues` below — finished at 57.0 h having emitted its entire
+output at the end.
+
+These are read off that run's `.metaannot_state.json`, and so should yours be:
+every stage records its own `seconds` there. That is not a stylistic
+preference. Each of those was previously carried in prose and in
+`MEASURED_455K`, and there they had drifted: SignalP's 57.9 h was filed under
+InterProScan, and the table gave SignalP and TMbed a shared 205,200 s. TMbed's
+half of that is right to this page's precision — 205,039.6 s really is 57.0 h
+— which is exactly what made the error hard to see. SignalP's half was out by
+almost an hour, and the 205,200 s both cells held is a number no stage took.
 
 ### The thing that surprises people: it is not linear
 
@@ -1111,10 +1121,42 @@ they share 22 cores. SignalP measured **11.4 sequences/s** with the machine
 mostly to itself and **2.0–3.2 sequences/s** with tmbed and KOfam alongside —
 the same work, three to five times slower.
 
-So: **scale by observed contention, not by protein count.** The measured
-overshoot against a linear estimate ran from 1.2× (ncbifam) to 2.5× (kofam),
-so doubling the linear estimate past about 100k proteins is a fair planning
-rule and an optimistic one for the worst stage.
+So: **scale by observed contention, not by protein count.** This guide used to
+finish that thought by saying the overshoot against a linear estimate ran
+1.2× (ncbifam) to 2.5× (kofam), so doubling a linear estimate past about
+100k proteins was fair and if anything pessimistic. **The three long stages
+have since finished, and that rule under-budgets the two worst of them by a
+factor of nearly three.** Against a
+linear 11.9×:
+
+| stage | actual | overshoot vs linear |
+|---|---|---|
+| `ncbifam` | 14× | 1.2× |
+| `interpro` | 20× | 1.7× |
+| `kofam` | 29× | 2.5× |
+| **`signalp`** | **62×** | **5.2×** |
+| **`tmbed`** | **66×** | **5.5×** |
+
+**Budget five times a linear estimate for `signalp` and `tmbed` past about
+100k proteins, and double it for the rest.**
+
+The old rule was derived from the six stages that had finished at the time, and
+the tempting explanation — that those six ran unopposed — is wrong. Recovering
+each stage's start from that run's state file (`finished` minus `seconds`) puts
+`pfam`, `ncbifam` and `kofam` inside the SignalP and TMbed windows for
+essentially their whole lives, and `dbcan` and `diamond` started in the same
+second as `pfam`. Only `emapper`, which ran for 76 seconds, had the machine to
+itself. At `stage_workers: 3` an uncontended stage is the exception.
+
+What actually made the rule optimistic is that the six were **short**. None
+lived long enough for contention to compound: the longest of them, `kofam`,
+ran 14.3 h against SignalP's 57.9 h. Contention costs a stage more the longer
+it is exposed to it, so sampling only the stages that finish early understates
+it no matter how busy the machine was while they ran. InterProScan is the same
+effect from the other side – it overlaps TMbed for 30.0 h and SignalP for
+30.9 h, a little over half its life, then runs its last 25.9 h with the
+machine largely to itself, which is why it overshoots 1.7× where the two that overlapped each
+other end to end overshoot more than five.
 
 MMseqs2 is the exception worth noting — 455,571 proteins clustered into 49,347
 families in 109 seconds, **7.6×** for 11.9× the proteins, because clustering
@@ -1258,17 +1300,20 @@ R 4.6.1, not from synthetic data. Final bins were 47.6 / 28.2 / 19.0 / 1.0 /
 0.4 / 3.8%, and the dark bin fell from 11,106 proteins on eggNOG alone to
 1,462 — 9,644 rescued.
 
-A FragPipe **TMT** run is in progress on a second dataset — 8 plexes, 88
-channels, 75 biological samples, 455,571 proteins — and a 3-plex subset of it
-has completed end to end including the report, so `quant_format: fragpipe_tmt`
-is not a paper path either. The full 8-plex run has not finished; README and
-CLAUDE.md say the same, and this page used to say it had.
+A second dataset has since finished: a FragPipe **TMT** run over 8 plexes, 88
+channels, 75 biological samples and 455,571 proteins, in **84.2 h**. A 3-plex
+subset of it had already completed end to end including the report, so
+`quant_format: fragpipe_tmt` was not a paper path before that and is not one
+now. This page, README and CLAUDE.md all went on calling that run unfinished
+after it had finished.
 
-**What still has not run on real data:** `smorf`, `context`, `hhblits`,
-`jackhmmer`, `unipept` and `taxonomy`, all off by default. So the remote-profile
-searches and the peptide-LCA taxonomy comparison remain unexercised outside
-their output parsers, and `3p_profile_only` has never been populated by any run
-— it is fed only by `hh_hit` and `jackhmmer_hit`.
+**What still has not run on real data:** `smorf`, `context`, `hhblits` and
+`jackhmmer`, all off by default. So the remote-profile searches remain
+unexercised outside their output parsers, and `3p_profile_only` has never been
+populated by any run — it is fed only by `hh_hit` and `jackhmmer_hit`.
+`unipept` and `taxonomy` were on that list until the 8-plex run above ran them,
+in 195 s and 27 s; the Unipept API and the peptide-LCA taxonomy comparison have
+both been exercised on real data since.
 
 A test suite ships in `tests/`, so the plumbing described in this tutorial is
 reproducible offline. What does not ship is a benchmark script, and the datasets

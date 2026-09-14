@@ -239,20 +239,31 @@ it names; do not force the file through another format.
    in `emapper_strip_id_prefix` instead. Apply what it names. Do not raise
    `emapper_min_coverage` to get past it.
 
-8. **Fifteen of the twenty-one stages have been run on real data. Six have
-   not.** One label-free dataset went end to end — FragPipe
+8. **Seventeen of the twenty-one stages have been run on real data. Four
+   have not.** One label-free dataset went end to end — FragPipe
    `combined_peptide.tsv` + manifest + precomputed eggNOG, 38,204 proteins —
    through `emapper`, `pfam`, `dbcan`, `diamond`, `cluster`, `ncbifam`,
    `kofam`, `interpro`, `signalp`, `tmbed`, `esmfold`, `foldseek`,
    `integrate`, `finalise` and `join`, and both the report and the R object
-   were built from it. A 3-plex subset of an 8-plex FragPipe TMT run has also
-   completed end to end including the report. What has still never run on real
-   data is `smorf`, `context`, `hhblits`, `jackhmmer`, `unipept` and
-   `taxonomy` — all off by default — so a run that enables one of those is
-   validation rather than production: sanity-check its counts against the
-   expectations in `TUTORIAL.md` and say plainly when something looks wrong.
-   `3p_profile_only` is fed only by `hhblits` and `jackhmmer`, so no run has
-   ever put a protein in it.
+   were built from it. The 8-plex FragPipe TMT run has since finished too —
+   455,571 proteins in 84.2 h — and it added `unipept` (195 s) and
+   `taxonomy` (27 s) to the list above. What has still never run on real data
+   is `smorf`, `context`, `hhblits` and `jackhmmer` — all off by default —
+   so a run that enables one of those is validation rather than production:
+   sanity-check its counts against the expectations in `TUTORIAL.md` and say
+   plainly when something looks wrong. `3p_profile_only` is fed only by
+   `hhblits` and `jackhmmer`, so no run has ever put a protein in it.
+
+   **The TMT run ran under the old global `diamond_min_pident: 30`, and it
+   has been re-derived under the current floors.** `run --from integrate`
+   takes 3 min 49 s and settles it: the CARD column goes 15,374 – 4,128
+   proteins and VFDB 68,103 – 19,169, while the BINS move by four proteins
+   in total (`3_annotated_no_ko` –4, `4_dark` +4) and `source_agreement.tsv`
+   comes back byte-identical. **Quote the dark-matter figures from either
+   run; quote CARD and VFDB only from a re-derived one.** That run also
+   predates `source_sha256`, so its build is named only by a version string
+   four distinct builds on that machine shared — which is the other reason
+   the re-derivation, not the original, is the citable artefact.
 
 9. **A `parsed 0 ... from a non-empty file` warning is not noise.** It means a
    tool's output is truncated or in an unexpected format, so every protein

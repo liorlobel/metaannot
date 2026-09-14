@@ -14087,6 +14087,71 @@ def save_state(path, state):
         return payload
 
 
+# Memo for source_digest(). One file, read once, for the life of the process.
+# Unlocked on purpose: two threads racing here both read the same bytes and
+# store the same answer, so the worst case is one wasted read of a file this
+# process has already mapped. A lock would cost more to explain than it saves.
+_SOURCE_DIGEST = None
+
+
+def source_digest():
+    """sha256 of THIS FILE, memoised. "unknown" when it cannot be read.
+
+    The build, not the version string. `__version__` names a RELEASE; it does
+    not name the bytes that ran, and the difference has already cost this
+    project something. A finished 84-hour cohort logged "metaannot 0.2.0
+    starting", and the machine that ran it holds five metaannot.py files that
+    all say 0.2.0 and are four different builds, one pair among them being
+    byte-identical. Nothing recorded which of them produced the results, so
+    the results could not be cited -- "which version made Table 2" had no
+    answer. Size is not the fix, though on this machine it would have got
+    further than the version string did: no two of the four builds share a
+    size, and the only size collision on the machine is between the two copies
+    that are byte-identical -- one build filed in two places. What size cannot do is
+    NAME a build. It tells you two files differ; it does not tell you which
+    code ran, it cannot be matched against a checkout, and two builds that
+    differ by a renamed variable collide in it. A digest does all three,
+    which is why this records the content rather than any property of the
+    copy.
+
+    RECORDED, NEVER COMPARED. Nothing in the cache, the resume decision or any
+    stage signature reads this. A run that resumes a directory whose state
+    file carries a different digest carries on exactly as it did before,
+    because a patch release that fixes a log message must not discard days of
+    InterProScan compute. That is the judgement SIGNATURE_VERSION already
+    encodes, and this key does not relitigate it -- it answers "which bytes
+    produced this", and only that. If it were ever compared, it would make
+    every edit to this file a full recompute, which is precisely the failure
+    SIGNATURE_VERSION was introduced to prevent.
+
+    Unreadable is a real state rather than an error. metaannot can be run from
+    a zipimport, from a frozen bundle, or from a file that has since been
+    replaced, and none of those is a reason to fail a run that would otherwise
+    work. The answer is the literal "unknown" and not a hash-shaped
+    placeholder, so that a reader can tell "I could not look" apart from "I
+    looked, and it was this".
+    """
+    global _SOURCE_DIGEST
+    if _SOURCE_DIGEST is None:
+        h = hashlib.sha256()
+        try:
+            with open(os.path.abspath(__file__), "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            _SOURCE_DIGEST = h.hexdigest()
+        except (OSError, NameError):
+            _SOURCE_DIGEST = "unknown"
+    return _SOURCE_DIGEST
+
+
+# How much of the digest goes in a log line: the same abbreviation git shows,
+# for the same reason. Long enough to name one build among any plausible number
+# of them, short enough to sit in a line someone reads. The FULL digest goes in
+# every machine-readable place, so nothing that needs to VERIFY a build is ever
+# working from the abbreviation.
+SOURCE_DIGEST_SHORT = 12
+
+
 # The key the run record lives under. A leading underscore because the rest of
 # the state file is keyed by stage name and this is not a stage: nothing may
 # look it up as one. STAGE_NAMES never contains it, so --force skips it and
@@ -15132,6 +15197,11 @@ class RunRecord:
             # uuid, and legible in a log line or a directory listing.
             "run_id": f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
             "version": __version__,
+            # Beside the version, and for the version's sake: `version` alone
+            # has proven unable to name a build. Full digest, not the short
+            # form -- this is the machine-readable copy, and the whole point
+            # of it is that someone can verify a file against it later.
+            "source_sha256": source_digest(),
             "config_path": config_path,
             "argv": list(argv),
             "host": socket.gethostname(),
@@ -19162,6 +19232,11 @@ def describe(cfg, p, config_path=None):
     return {
         "describe_version": DESCRIBE_VERSION,
         "metaannot_version": __version__,
+        # ADDED, which by DESCRIBE_VERSION's own rule is not a bump. A console
+        # that has never heard of this key is unaffected; one that has can
+        # tell two hosts claiming the same version apart without shipping a
+        # second subprocess to do it.
+        "metaannot_source": source_digest(),
         "signature_version": SIGNATURE_VERSION,
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "host": socket.gethostname(),
@@ -22579,6 +22654,10 @@ def doctor(cfg, p, reqs, checks, config_path=None, install_plan=None):
         # subprocess to find that out.
         "describe_version": DESCRIBE_VERSION,
         "metaannot_version": __version__,
+        # Same rule as describe's: adding a key is not a DOCTOR_VERSION
+        # bump. A doctor report is the thing pasted into an issue, so it
+        # is the single most useful place for the build to be named.
+        "metaannot_source": source_digest(),
         "signature_version": SIGNATURE_VERSION,
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "host": socket.gethostname(),
@@ -23051,7 +23130,13 @@ def cmd_run(args):
         # new directories behind for the next person to wonder about.
         p.mkdirs()
         _LOGFH = open(p.logfile, "a", encoding="utf-8")
-        log(f"metaannot {__version__} starting")
+        # The digest is on the SAME LINE as the version, because the
+        # question it answers ("which build is this?") is the one a
+        # reader thinks they have already answered by reading the
+        # version. Splitting them across two lines would let a log
+        # get quoted with the half that does not identify anything.
+        log(f"metaannot {__version__} starting "
+            f"(source {source_digest()[:SOURCE_DIGEST_SHORT]})")
         # --force-unlock-live IMPLIES --force-unlock: the refusal it exists to
         # get past is only reachable through --force-unlock in the first
         # place, and an operator who has typed the narrower flag has already

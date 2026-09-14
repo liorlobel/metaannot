@@ -1,5 +1,97 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+**`source_sha256` in the state file, and the same digest on the log's first
+line.** `__version__` names a RELEASE and has never named a BUILD. The machine
+that produced the 8-plex cohort holds five `metaannot.py` files that all say
+`0.2.0` and are four different builds, and that cohort's own log opens with
+`metaannot 0.2.0 starting` — so "which version made this table" had no answer,
+and the results were not citable. Every run now records the sha256 of the file
+that ran, in `_run.source_sha256` and on the banner
+(`metaannot 0.7.2 starting (source 07af56d5b6e0)`), and `describe --json` and
+`doctor --json` carry it as `metaannot_source`. Adding a key is not a
+`DESCRIBE_VERSION` or `DOCTOR_VERSION` bump, so neither is bumped.
+
+**RECORDED, NEVER COMPARED.** Nothing in the cache, the resume decision or any
+stage signature reads it. A digest that invalidated stages would make every
+edit to this file discard days of InterProScan — precisely the failure
+`SIGNATURE_VERSION` exists to prevent, arriving by another door.
+`test_the_source_digest_is_recorded_and_never_compared` pins it from both
+sides: it moves the digest under every stage signature and finds none of them
+shifts, and it reads `signature()`'s own source to catch an inlined hash that
+the monkeypatch would miss. `"unknown"` when the file cannot be read
+(zipimport, a frozen bundle, a copy already replaced) — deliberately not
+hash-shaped, so a reader can tell "I could not look" from an answer.
+
+### Fixed three entries, in two groups.
+
+#### One measurement filed under the wrong stage
+
+**`MEASURED_455K` carried SignalP's duration in InterProScan's cell.** The
+replay table in `tests/test_scheduler.py` had `interpro=208396`, which is
+SignalP's figure, and gave SignalP and TMbed a shared `205200` — exactly
+57.0 h, the shape of a number copied out of a sentence rather than measured.
+That run's own `.metaannot_state.json` records a different duration for each:
+signalp 208,395.6 s (57.89 h), tmbed 205,039.6 s (56.96 h), interpro
+204,303.8 s (56.75 h). The largest was the one attributed to the wrong stage.
+Every cell the Pittsburgh run timed is now read off that file, which also
+brought `esmfold`, `foldseek`, `integrate`, `finalise`, `join`, `unipept` and
+`taxonomy` in from placeholders and left `MEASURED_38K` supplying exactly the
+four stages neither run enabled. The ordering claim survives the correction,
+and this file's own replay table moved with it: 86.6 –> 84.2 h, 66.7 –> 64.3 h,
+63.5 –> 62.4 h, with the 38k row unchanged.
+
+The corrected table also corroborates the replay model itself, and stage by
+stage rather than in aggregate. The Pittsburgh run PREDATES the dispatch order:
+its log carries no `stage order for this selection` line, and it started
+`emapper`, `pfam` and `dbcan` — the first three IN TABLE ORDER, which is the
+behaviour v0.4.0 replaced. So table order at `stage_workers: 3` is what it
+really ran, and replaying that on the corrected durations gives 303,135 s
+against a measured 303,133 s, with nearly every stage landing where the log
+puts it: diamond 76 against 75.8, tmbed 617 against 617.1, cluster 25,827
+against 25,826.9, ncbifam 25,936 against 25,935.4, kofam 46,150 against
+46,149.0, interpro 97,534 against 97,533.5, integrate 301,838 against
+301,837.3. A model that reproduces an 84-hour schedule stage by
+stage is a model of the scheduler rather than of itself, and none of it was
+visible while the durations were wrong.
+
+But makespan alone would not have shown this, and would nearly have said the
+opposite. The cost-rank-only order replays to 303,026 s on the same durations — 107 s from
+the measurement, closer in aggregate than the order that was actually used —
+while scheduling `signalp` at t=0 and deferring `dbcan` to 57 h, neither of
+which the run did. Two orders can agree on when the work ends and disagree
+about all of it in between; the per-stage starts are what tell them apart.
+
+#### Two documents that described a run they had
+
+**README, TUTORIAL and CLAUDE.md denied stages that had run.** All three
+listed `unipept` and `taxonomy` among the stages that "have still never run on
+real data". The 8-plex Pittsburgh run ran both, in 195.1 s and 26.5 s, leaving
+16 MB of `taxonomy_comparison.tsv` on disk; all three also still described that
+run as in progress, when it had finished in 84.2 h. Seventeen of the
+twenty-one stages have now run on real data, not fifteen. That run's DIAMOND
+columns are the one part of it that does not carry forward: it used the old
+global `diamond_min_pident: 30`, and re-deriving it under the current floors
+(`run --from integrate`, 3 min 49 s) takes CARD from 15,374 proteins to 4,128
+and VFDB from 68,103 to 19,169, while moving the bins by four proteins in
+total and leaving `source_agreement.tsv` byte-identical.
+
+**TUTORIAL's planning rule was derived from the stages that were not
+contending.** The resource guide said the overshoot against a linear estimate
+ran 1.2× to 2.5×, so doubling a linear estimate past ~100k proteins was
+fair and if anything pessimistic. That was computed from the six stages that
+had finished, and not because those six ran unopposed — reconstructing their
+starts from the state file puts `pfam`, `ncbifam` and `kofam` inside the
+SignalP and TMbed windows for almost all of their lives. They were simply
+SHORT, and contention costs a stage more the longer it is exposed to it, so a
+sample of early finishers understates it however busy the machine was. With
+the three long stages in, SignalP overshoots 5.2× and TMbed 5.5×. The guide
+now says to budget **five times** linear for those two and double for the rest,
+and shows the per-stage table it comes from.
+
 ## v0.7.2 — 2026-09-13
 
 A documentation release, with one code fix that auditing the documentation
@@ -762,9 +854,9 @@ other:
 
 | durations | selection | `stage_workers` | cost rank alone | with the tie broken |
 |---|---|---|---|---|
-| 455,571 proteins | the whole pipeline | 3 | 86.6 h | 72.9 h |
-| 455,571 proteins | the whole pipeline | 4 (the default) | 66.7 h | 59.5 h |
-| 455,571 proteins | the eight cohort configs' selection | 3 | 63.5 h | 57.9 h |
+| 455,571 proteins | the whole pipeline | 3 | 84.2 h | 71.4 h |
+| 455,571 proteins | the whole pipeline | 4 (the default) | 64.3 h | 58.3 h |
+| 455,571 proteins | the eight cohort configs' selection | 3 | 62.4 h | 56.8 h |
 | 38,204 proteins | the whole pipeline | 4 (the default) | 4.9 h | 4.5 h |
 
 Three of the rows above land exactly on the dependency graph's critical path,

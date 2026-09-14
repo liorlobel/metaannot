@@ -803,7 +803,13 @@ def test_the_taxdump_row_promises_a_restored_quant_table_only_where_it_helps(
 # why both are compared exactly rather than as supersets - the pin has to be
 # able to see a deletion.
 DOCTOR_TOP_LEVEL = {
+    # `metaannot_source` joined with source_sha256 -- the sha256 of the
+    # metaannot.py that answered. No DOCTOR_VERSION bump: a key was added,
+    # none removed, no meaning changed, and no closed enum grew. A doctor
+    # report is what gets pasted into an issue, which makes it the single
+    # most useful place for the build to be named.
     "doctor_version", "describe_version", "metaannot_version",
+    "metaannot_source",
     "signature_version", "generated", "host", "config_path",
     "ok", "exit_status", "counts", "verdict", "scope", "sections",
     "requirements", "checks", "totals", "install_plan",
